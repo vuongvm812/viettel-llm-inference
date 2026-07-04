@@ -18,6 +18,8 @@ correctness; core-pinning and perf numbers are only meaningful on the Linux targ
   Prefer the feature gate — smallest change, keeps upstream intact.
 - Scaffold `crates/inference-runtime`: `main.rs`, module stubs for the 3 cores + slab + rings.
 
+**Design refs.** [Disruptor Pipeline & Request Slab](design/disruptor-pipeline/design.md).
+
 **Exit criteria.** `cargo build` succeeds from `services/`. `cargo test -p disruptor` passes.
 
 **Risks.** `lossy` may be entangled in `lib.rs` re-exports — gating must cover the `pub use`.
@@ -34,6 +36,11 @@ deterministic tokens. No llama.cpp yet.
 - Core 0: minimal `tokio` + `hyper`/`axum` OpenAI endpoint, SSE streaming, egress poller.
 - Core 1: byte-length "tokenizer" mock (or real llama.cpp vocab if ready) + detokenize mock.
 - Core 2: mock "decode" that returns N canned tokens per request, exercising R3/R4.
+
+**Design refs.** [Disruptor Pipeline & Request Slab](design/disruptor-pipeline/design.md),
+[Core 0: Web I/O & Streaming](design/web-io/design.md),
+[Core 1: Text Processing](design/text-processing/design.md),
+[Core 2: The Fast Loop](design/fast-loop/design.md).
 
 **Exit criteria.** `curl` an OpenAI request → receive a streamed SSE response through all
 four rings; slot returns to the free-list; no deadlock under the 120-request trace replayed
@@ -53,6 +60,9 @@ one-directional and generation feedback stays intra-Core-2 (no ring cycle → no
 - Core 1 tokenize/detokenize via llama.cpp vocab.
 - Core 2: prefill + greedy sample (`temp=0`, `seed=42` for determinism) one seq to EOS/max.
 
+**Design refs.** [Inference Backend (llama.cpp via FFI)](design/inference-backend/design.md),
+[Core 1: Text Processing](design/text-processing/design.md).
+
 **Exit criteria.** A single trace request returns text matching a direct `llama-cli` run
 (determinism check). TTFT/tokens measured on Linux+GPU.
 
@@ -68,6 +78,9 @@ exact `llama-cpp-2` method names for KV/sampling must be confirmed against the c
 - Core 2 scheduler: running set + pending queue; each iteration builds one `llama_batch`
   across all active seqs, `decode()`, sample per seq, emit tokens, retire finished seqs.
 - Dynamic batcher: cap by max batch size and per-iteration token budget.
+
+**Design refs.** [Core 2: The Fast Loop](design/fast-loop/design.md),
+[Inference Backend (llama.cpp via FFI)](design/inference-backend/design.md).
 
 **Exit criteria.** Replaying the 120-request trace, multiple requests are in-flight per
 `decode()`; throughput (tok/s) scales above the P2 single-seq number.
@@ -87,6 +100,9 @@ chunked prefill or separate prefill/decode scheduling (note for P7).
   user suffix at `pos = prefix_len`.
 - GPU/KV monitor: track free KV cells, admit new seqs only while memory allows.
 
+**Design refs.** [Core 2: The Fast Loop](design/fast-loop/design.md),
+[Inference Backend (llama.cpp via FFI)](design/inference-backend/design.md).
+
 **Exit criteria.** On the trace, the system prompt is prefilled once (verified by prefill token
 count); TTFT for requests 2..120 drops sharply vs P3.
 
@@ -104,6 +120,8 @@ under memory pressure.
   percentiles. Same script targets `:8000` (vLLM) and our port.
 - Bring up vLLM via `docker-compose up`; run both; produce a comparison report.
 
+**Design refs.** [Benchmark Harness](design/benchmark/design.md).
+
 **Exit criteria.** One command produces a side-by-side table (ours vs vLLM) on `trace-round1.jsonl`.
 
 **Risks.** Fairness — same model quantization matters (GGUF vs vLLM's format); note in the report.
@@ -118,6 +136,8 @@ under memory pressure.
 - PGO: `-Cprofile-generate` build → replay trace → `llvm-profdata merge` → `-Cprofile-use`.
 - BOLT (Linux only): `-Wl,--emit-relocs` → `perf record` the replay → `perf2bolt` → `llvm-bolt`.
 - `build-pgo-bolt.sh` orchestrates all stages (`design/build-optimization/design.md`).
+
+**Design refs.** [Build Optimization (PGO → LTO → BOLT)](design/build-optimization/design.md).
 
 **Exit criteria.** Optimized binary beats the plain `--release` build on the P5 metrics
 (measure, don't assume). BOLT step documented as Linux-only.
@@ -134,3 +154,7 @@ paths; note coverage limits. Optimizes our code only, not `libllama`.
 - Chunked prefill / prefill-decode disaggregation to fix P3 head-of-line blocking.
 - `libllama` build tuning (its own PGO, CUDA graph capture, quantization sweep).
 - Multi-GPU / tensor-parallel (out of scope at 1 GPU).
+
+**Design refs.** [Core 2: The Fast Loop](design/fast-loop/design.md) (radix cache, chunked prefill),
+[Core 0: Web I/O & Streaming](design/web-io/design.md) (WebSocket),
+[Inference Backend (llama.cpp via FFI)](design/inference-backend/design.md) (`libllama` tuning).
