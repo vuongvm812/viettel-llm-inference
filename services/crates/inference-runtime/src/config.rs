@@ -10,6 +10,8 @@ use std::path::Path;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub server: Server,
+    // Read by Core 2 once llama.cpp lands (P2); parsed now for config parity.
+    #[allow(dead_code)]
     pub model: Model,
     pub runtime: Runtime,
 }
@@ -21,6 +23,7 @@ pub struct Server {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // read once llama.cpp lands (P2)
 pub struct Model {
     /// Path to the GGUF-quantized model.
     pub gguf_path: String,
@@ -50,12 +53,46 @@ pub struct Cores {
 }
 
 impl Config {
-    /// Load and parse a YAML config file.
+    /// Load, parse, and validate a YAML config file.
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
-        serde_yaml::from_str(&raw).map_err(ConfigError::Parse)
+        let cfg: Config = serde_yaml::from_str(&raw).map_err(ConfigError::Parse)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Check the invariants the pipeline relies on, at the config trust boundary,
+    /// so a bad value fails with a clear error instead of panicking deep in the
+    /// disruptor builder (or, worse, deadlocking ingress at runtime).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let r = &self.runtime;
+        if r.max_inflight == 0 {
+            return Err(ConfigError::Invalid("runtime.max_inflight must be > 0".into()));
+        }
+        if !r.ring_size.is_power_of_two() {
+            return Err(ConfigError::Invalid(format!(
+                "runtime.ring_size ({}) must be a power of two",
+                r.ring_size
+            )));
+        }
+        // R1 is multi-producer (crate requires >= 64), and a ring smaller than the
+        // slab could fill from ingress alone → the single Core-0 thread would spin
+        // on a blocked publish and starve egress. Keep ring_size >= max_inflight.
+        if r.ring_size < 64 {
+            return Err(ConfigError::Invalid(format!(
+                "runtime.ring_size ({}) must be >= 64 (multi-producer R1)",
+                r.ring_size
+            )));
+        }
+        if r.ring_size < r.max_inflight {
+            return Err(ConfigError::Invalid(format!(
+                "runtime.ring_size ({}) must be >= runtime.max_inflight ({})",
+                r.ring_size, r.max_inflight
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -65,6 +102,8 @@ pub enum ConfigError {
     Read(String, #[source] std::io::Error),
     #[error("parsing config: {0}")]
     Parse(#[source] serde_yaml::Error),
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 #[cfg(test)]
@@ -96,5 +135,34 @@ runtime:
         assert_eq!(cfg.model.n_threads, 1);
         assert_eq!(cfg.runtime.max_inflight, 256);
         assert_eq!(cfg.runtime.cores.fast_loop, 2);
+        cfg.validate().expect("default shape is valid");
+    }
+
+    // The canonical repo config must load and validate — catches drift between
+    // the struct and the shipped file, and any regression in the load path.
+    #[test]
+    fn canonical_config_file_loads_and_validates() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../config/default-config.yaml");
+        let cfg = Config::from_yaml_file(path).expect("load canonical config");
+        assert_eq!(cfg.runtime.cores.web_io, 0);
+    }
+
+    #[test]
+    fn validate_rejects_bad_runtime() {
+        let base = |mi: u32, rs: u32| Runtime {
+            max_inflight: mi,
+            ring_size: rs,
+            cores: Cores { web_io: 0, text: 1, fast_loop: 2 },
+        };
+        let with = |rt| Config {
+            server: Server { host: "h".into(), port: 1 },
+            model: Model { gguf_path: "g".into(), n_ctx: 1, n_threads: 1, n_gpu_layers: -1 },
+            runtime: rt,
+        };
+        assert!(with(base(0, 1024)).validate().is_err(), "max_inflight 0");
+        assert!(with(base(256, 1000)).validate().is_err(), "ring_size not power of two");
+        assert!(with(base(256, 32)).validate().is_err(), "ring_size < 64");
+        assert!(with(base(2048, 1024)).validate().is_err(), "ring_size < max_inflight");
+        assert!(with(base(256, 1024)).validate().is_ok(), "valid");
     }
 }

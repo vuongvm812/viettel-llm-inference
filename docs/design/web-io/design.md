@@ -66,6 +66,16 @@ loop {
 - **Dropping the `EventGuard` is mandatory** — it commits the consumed sequence and releases
   R4 backpressure.
 
+> **P1 deviation (implemented).** `newly_appended_out_bytes()` — Core 0 reading the slab's
+> `out_bytes` while Core 1 is still appending later tokens — is a **data race**: the slot is in
+> the detokenize stage and the egress stage simultaneously (two cores, one slot), and a realloc
+> of `out_bytes` would dangle Core 0's slice. P1 sidesteps it by carrying the detokenized byte in
+> the R4 `Token` event, so no cross-core buffer is shared and the slab holds no output buffer.
+> A ring event can only carry one byte, so **P2 (real multi-byte vocab pieces) needs a proper
+> handoff**: a per-slot output buffer whose capacity *never* reallocates, where Core 0 reads only
+> indices below an acquire-synchronized watermark. The egress also carries the `conn` handle on
+> the Core-0 side, not in the slab, so cores 1/2 stay `tokio`-free.
+
 ## slot ↔ connection mapping
 
 The `EgressHandle` lives **in the slab** (`slab[slot].conn`), so egress needs no side map —
