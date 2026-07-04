@@ -20,8 +20,13 @@ pub enum EventKind {
     /// R1, R2: a fresh request to process.
     #[default]
     New,
-    /// R3, R4: one generated token id / detokenized piece for `slot`.
+    /// R3 (Core 2 → Core 1): one generated token id to detokenize.
     Token(u32),
+    /// R4 (Core 1 → Core 0): count of newly-committed complete-UTF-8 output bytes
+    /// for `slot`. Core 0 reads that many bytes from the slab's `out_bytes` at its
+    /// cursor. A separate variant from [`Token`] so the two ring meanings — token
+    /// id vs byte delta — can't be confused.
+    Piece(u32),
     /// Stream complete.
     Finish(FinishReason),
 }

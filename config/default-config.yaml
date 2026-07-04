@@ -6,9 +6,11 @@ server:
   host: "0.0.0.0"
   port: 8001            # 8000 is the vLLM baseline (docker-compose)
 
-# Model backend — llama.cpp via FFI (GGUF Qwen3.5-2B)
+# Model backend — llama.cpp via FFI.
+# Qwen3.5-2B dense transformer, BF16 (unquantized). Converted from the HF
+# safetensors to a BF16 GGUF (convert_hf_to_gguf.py --outtype bf16); see script/setup.sh.
 model:
-  gguf_path: "models/qwen3.5-2b.gguf"
+  gguf_path: "models/qwen3.5-2b-bf16.gguf"
   n_ctx: 262144         # 256K context, baseline parity
   n_threads: 1          # full GPU offload → 1 CPU thread
   n_gpu_layers: -1      # -1 = offload all layers

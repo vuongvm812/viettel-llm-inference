@@ -46,6 +46,9 @@ const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 type Free = Arc<Mutex<Vec<u32>>>;
 type Conns = Arc<Mutex<Vec<Option<EgressHandle>>>>;
+/// Per-slot read cursor into the slab's `out_bytes`: how many detok bytes Core 0
+/// has already streamed. Reset on claim. Only Core 0 touches it.
+type Cursors = Arc<Mutex<Vec<usize>>>;
 
 /// Recover from mutex poisoning instead of cascading a panic to every later
 /// request — one panicking handler must not wedge the whole server.
@@ -58,6 +61,7 @@ struct AppState {
     slab: Arc<Slab>,
     free: Free,
     conns: Conns,
+    cursor: Cursors,
     ingress: Arc<Mutex<IngressProducer>>,
 }
 
@@ -70,6 +74,7 @@ impl AppState {
             // Vec behind one Mutex suffices — no Treiber stack, no atomics.
             free: Arc::new(Mutex::new((0..cap as u32).rev().collect())),
             conns: Arc::new(Mutex::new((0..cap).map(|_| None).collect())),
+            cursor: Arc::new(Mutex::new(vec![0; cap])),
             ingress: Arc::new(Mutex::new(ingress)),
         }
     }
@@ -120,8 +125,10 @@ pub fn serve(cfg: &Config, slab: Arc<Slab>, pipeline: Pipeline) -> std::io::Resu
         println!("inference-runtime listening on http://{addr} (P1 mock backend)");
 
         tokio::task::spawn_local(egress_loop(
+            Arc::clone(&state.slab),
             Arc::clone(&state.conns),
             Arc::clone(&state.free),
+            Arc::clone(&state.cursor),
             egress,
         ));
         axum::serve(listener, build_app(state)).await?;
@@ -139,22 +146,41 @@ fn build_app(state: AppState) -> Router {
 }
 
 /// Cooperatively drain R4 and stream bytes to the right connection.
-async fn egress_loop(conns: Conns, free: Free, mut r4: EgressPoller) {
+async fn egress_loop(slab: Arc<Slab>, conns: Conns, free: Free, cursor: Cursors, mut r4: EgressPoller) {
     loop {
         match r4.poll() {
             Ok(mut guard) => {
                 for ev in &mut guard {
                     let idx = ev.slot as usize;
                     match ev.kind {
-                        EventKind::Token(piece) => {
-                            // The detokenized byte rides the event (see core1).
-                            if let Some(tx) = lock(&conns)[idx].as_ref() {
-                                // ponytail: mock emits ASCII bytes; partial-UTF-8
-                                // buffering lands with the real multi-byte vocab (P2).
-                                let byte = [piece as u8];
-                                let _ = tx.send(Egress::Chunk(
-                                    String::from_utf8_lossy(&byte).into_owned(),
-                                ));
+                        EventKind::Piece(delta) => {
+                            // Piece carries the count of newly-committed complete-
+                            // UTF-8 bytes; read them from the slab's out_bytes at
+                            // our cursor. Core 1 appended and published these bytes
+                            // before this event (R4 release/acquire), so the read is
+                            // of settled, disjoint bytes. `read_committed` builds the
+                            // slice from a raw base — no reference into a cell Core 1
+                            // may write — and bounds-checks. Bytes are already complete
+                            // UTF-8, so from_utf8_lossy is belt-and-suspenders.
+                            // Advance the cursor in the same lock scope (one acquire).
+                            let start = {
+                                let mut c = lock(&cursor);
+                                let s = c[idx];
+                                c[idx] = s + delta as usize;
+                                s
+                            };
+                            // SAFETY: [start, start+delta) is a range Core 1 committed
+                            // and published; read_committed bounds-checks the rest.
+                            match unsafe { slab.read_committed(ev.slot, start, delta as usize) } {
+                                Ok(bytes) => {
+                                    let piece = String::from_utf8_lossy(bytes).into_owned();
+                                    if let Some(tx) = lock(&conns)[idx].as_ref() {
+                                        let _ = tx.send(Egress::Chunk(piece));
+                                    }
+                                }
+                                // A bounds error is a logic bug, not client input —
+                                // drop the chunk (don't UB) and keep the stream alive.
+                                Err(e) => eprintln!("core0 egress read (slot {}): {e}", ev.slot),
                             }
                         }
                         EventKind::Finish(_) => {
@@ -163,7 +189,7 @@ async fn egress_loop(conns: Conns, free: Free, mut r4: EgressPoller) {
                             }
                             lock(&free).push(ev.slot);
                         }
-                        EventKind::New => {}
+                        EventKind::Token(_) | EventKind::New => {} // R3/R1 kinds; never on R4
                     }
                 }
                 // Yield so ingress handlers on this single thread get a turn.
@@ -212,6 +238,11 @@ async fn chat(State(app): State<AppState>, Json(req): Json<ChatRequest>) -> Resp
         }
         s.max_tokens = max_tokens;
     }
+    // Reset the egress read cursor for the reused slot: `s.reset()` cleared
+    // out_bytes/out_committed, so Core 0 must stream this request from offset 0.
+    // Without this the cursor keeps a prior request's byte count → stale reads and,
+    // once it exceeds out_bytes capacity, an out-of-bounds read.
+    lock(&app.cursor)[slot as usize] = 0;
     lock(&app.conns)[slot as usize] = Some(tx);
 
     // `try_publish`, never a blocking `publish`: this runs on Core 0's single
@@ -262,7 +293,7 @@ fn capacity_503(msg: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core2::CANNED_REPLY;
+    use crate::backend::CANNED_REPLY;
     use crate::pipeline;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -311,7 +342,7 @@ runtime:
     #[test]
     fn http_streams_sse_validates_and_recycles() {
         let cfg = test_cfg(2);
-        let slab = Arc::new(Slab::new(2, 128, 128));
+        let slab = Arc::new(Slab::new(2, 128, 128, 256));
         let Pipeline {
             ingress,
             egress,
@@ -327,8 +358,10 @@ runtime:
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async {
             tokio::task::spawn_local(egress_loop(
+                Arc::clone(&state.slab),
                 Arc::clone(&state.conns),
                 Arc::clone(&state.free),
+                Arc::clone(&state.cursor),
                 egress,
             ));
 
@@ -373,6 +406,62 @@ runtime:
         });
 
         // Clean shutdown: drop the producer → cascade R1→R2→R3→R4, join workers.
+        drop(state);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+    }
+
+    /// Concatenate the `delta.content` of every `chat.completion.chunk` SSE frame.
+    /// Each frame is rendered independently by Core 0 (`from_utf8_lossy` per Piece),
+    /// so if the UTF-8 gate ever emitted a partial code point this would contain a
+    /// U+FFFD replacement char instead of the real multi-byte character.
+    fn sse_content(body: &str) -> String {
+        body.lines()
+            .filter_map(|l| l.strip_prefix("data:").map(str::trim))
+            .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .filter_map(|v| v["choices"][0]["delta"]["content"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// End-to-end streaming must reconstruct the full multi-byte reply (`café ☕`)
+    /// exactly — proving the detokenize handoff never splits a code point across
+    /// SSE frames. Runs TWO requests through a **single-slot** server so the second
+    /// reuses the slot: that catches a stale egress cursor (which would stream the
+    /// first reply's leftover bytes, or read out of bounds).
+    #[test]
+    fn http_streams_multibyte_and_recycles_the_cursor() {
+        let expected = std::str::from_utf8(CANNED_REPLY).expect("canned reply is valid utf8");
+        assert!(expected.contains('☕'), "reply must exercise a 3-byte char");
+
+        let cfg = test_cfg(1); // single slot → the 2nd request must reuse slot 0
+        let slab = Arc::new(Slab::new(1, 128, 512, 256));
+        let Pipeline { ingress, egress, core1, core2 } = pipeline::spawn(&cfg, Arc::clone(&slab));
+        let state = AppState::new(slab, ingress);
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            tokio::task::spawn_local(egress_loop(
+                Arc::clone(&state.slab),
+                Arc::clone(&state.conns),
+                Arc::clone(&state.free),
+                Arc::clone(&state.cursor),
+                egress,
+            ));
+
+            // max_tokens above the reply length → full reply, natural (Eos) end.
+            let body = r#"{"model":"m","messages":[{"role":"u","content":"hi"}],"max_tokens":500}"#;
+            for attempt in 0..2 {
+                let resp = build_app(state.clone()).oneshot(post(body)).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "attempt {attempt}");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let content = sse_content(&String::from_utf8_lossy(&bytes));
+                assert_eq!(content, expected, "attempt {attempt}: full multi-byte reply reconstructed");
+                // Slot freed → next iteration reuses slot 0 (cursor must have reset).
+                assert_eq!(lock(&state.free).len(), 1, "slot recycled after attempt {attempt}");
+            }
+        });
+
         drop(state);
         core1.join().expect("core1 join");
         core2.join().expect("core2 join");

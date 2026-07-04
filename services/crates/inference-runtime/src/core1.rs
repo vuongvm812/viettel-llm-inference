@@ -1,12 +1,15 @@
-//! Core 1 — text processing, mock backend (P1).
+//! Core 1 — text processing (P2).
 //!
-//! Sits on both the ingress and egress sides. Tokenize (R1→R2): mock = one token
-//! per prompt byte. Detokenize (R3→R4): mock = `id as u8` appended to `out_bytes`,
-//! the exact inverse of Core 2's byte-tokens. Real llama.cpp vocab is P2. See
+//! Ingress (R1→R2): tokenize the prompt. Egress (R3→R4): detokenize each token
+//! id into `out_bytes` and tell Core 0 how many newly-complete-UTF-8 bytes it
+//! can stream. The backend-specific "text ↔ tokens" step is a [`TextBackend`]
+//! (mock byte-codec, or real llama.cpp vocab under `--features llama`); the
+//! multi-byte handoff and UTF-8 framing below are backend-independent. See
 //! `design/text-processing/`.
 
 use crate::affinity;
-use crate::rings::{EventKind, RingEvent};
+use crate::backend::{complete_utf8_len, TextBackend};
+use crate::rings::{EventKind, FinishReason, RingEvent};
 use crate::slab::Slab;
 use disruptor::{EventPoller, MultiProducerBarrier, Polling, Producer, SingleProducerBarrier};
 use std::sync::Arc;
@@ -19,12 +22,17 @@ pub fn run(
     r2: impl Producer<RingEvent>,
     mut r3: EventPoller<RingEvent, SingleProducerBarrier>,
     mut r4: impl Producer<RingEvent>,
+    text: TextBackend,
 ) {
     affinity::pin(core); // no-op on macOS
     // Held in an Option so we can drop the R2 producer the moment R1 shuts down.
     // That drop is what lets Core 2 (and then this loop via R3) shut down — Core 1
     // must not keep R2's producer alive while waiting on R3, or the two deadlock.
     let mut r2 = Some(r2);
+    // Reused detok scratch: a piece is built here, then copied into the slab up to
+    // remaining capacity — so `out_bytes` never reallocates (Core 0 reads it via a
+    // fixed base address). One buffer, no per-token heap churn.
+    let mut scratch: Vec<u8> = Vec::with_capacity(64);
 
     loop {
         // Ingress: tokenize R1 → R2.
@@ -32,21 +40,32 @@ pub fn run(
             Ok(mut guard) => {
                 for ev in &mut guard {
                     // Scope the &mut so the slab borrow ends BEFORE the publish —
-                    // after publish, Core 2 owns this slot. Keeping `s` live across
-                    // the publish would be one edit away from a cross-thread &mut alias.
+                    // after publish, Core 2 owns this slot.
                     // SAFETY: slot arrived via R1 → Core 1 owns the tokenize stage.
-                    {
+                    let tokenized = {
                         let s = unsafe { slab.slot_mut(ev.slot) };
                         s.tokens.clear();
-                        s.tokens.extend(s.prompt.bytes().map(|b| b as i32));
-                    }
-                    if let Some(p) = r2.as_mut() {
-                        p.publish(|e| {
-                            *e = RingEvent {
-                                slot: ev.slot,
-                                kind: EventKind::New,
+                        text.tokenize(&s.prompt, &mut s.tokens)
+                    };
+                    match tokenized {
+                        Ok(()) => {
+                            if let Some(p) = r2.as_mut() {
+                                p.publish(|e| *e = RingEvent { slot: ev.slot, kind: EventKind::New });
                             }
-                        });
+                        }
+                        // Tokenize failed: don't hand a bad/empty prompt to Core 2.
+                        // Signal the client an error directly on R4 (Core 0 closes
+                        // the stream and recycles the slot). No R2 publish → Core 2
+                        // never sees this slot, so there's no later Finish to race.
+                        Err(e) => {
+                            eprintln!("core1 tokenize failed (slot {}): {e}", ev.slot);
+                            r4.publish(|e2| {
+                                *e2 = RingEvent {
+                                    slot: ev.slot,
+                                    kind: EventKind::Finish(FinishReason::Error),
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -60,21 +79,36 @@ pub fn run(
                 for ev in &mut guard {
                     match ev.kind {
                         EventKind::Token(id) => {
-                            // Mock detokenize: token id → one output byte. The piece
-                            // rides the R4 event so Core 0 never reads a buffer Core 1
-                            // is still appending to (that would race). Real vocab pieces
-                            // are multi-byte and need a slab-based handoff — see P2.
-                            let piece = id as u8;
-                            r4.publish(|e| {
-                                *e = RingEvent {
-                                    slot: ev.slot,
-                                    kind: EventKind::Token(piece as u32),
-                                }
-                            });
+                            if let Some(delta) = detokenize(&slab, &text, &mut scratch, ev.slot, id) {
+                                r4.publish(|e| {
+                                    *e = RingEvent {
+                                        slot: ev.slot,
+                                        kind: EventKind::Piece(delta),
+                                    }
+                                });
+                            }
                         }
-                        EventKind::Finish(_) => {
-                            r4.publish(|e| *e = *ev);
+                        EventKind::Finish(reason) => {
+                            // Flush any trailing bytes the UTF-8 gate held back, and
+                            // read whether detok/overflow flagged this request. An
+                            // incomplete tail at stream end is malformed model output;
+                            // hand it up so Core 0 renders it lossily rather than
+                            // silently dropping generated bytes.
+                            let (tail, errored) = flush_tail(&slab, ev.slot);
+                            if let Some(delta) = tail {
+                                r4.publish(|e| {
+                                    *e = RingEvent {
+                                        slot: ev.slot,
+                                        kind: EventKind::Piece(delta),
+                                    }
+                                });
+                            }
+                            // A detok failure or output-buffer overflow makes the
+                            // output corrupt/truncated → report Error, not success.
+                            let reason = if errored { FinishReason::Error } else { reason };
+                            r4.publish(|e| *e = RingEvent { slot: ev.slot, kind: EventKind::Finish(reason) });
                         }
+                        EventKind::Piece(_) => {} // never arrives on R3 (R4-only)
                         EventKind::New => {} // never emitted on R3
                     }
                 }
@@ -86,5 +120,78 @@ pub fn run(
         }
 
         std::hint::spin_loop();
+    }
+}
+
+/// Detokenize `id` into the slot's `out_bytes` and return the count of bytes that
+/// newly completed a UTF-8 code point (to publish on R4), or `None` if the piece
+/// only extended a partial multi-byte sequence (nothing to stream yet).
+///
+/// SAFETY: `slot` reached Core 1's egress stage via R3 → Core 1 owns it here.
+fn detokenize(
+    slab: &Slab,
+    text: &TextBackend,
+    scratch: &mut Vec<u8>,
+    slot: u32,
+    id: u32,
+) -> Option<u32> {
+    let detok = text.token_bytes(id, scratch);
+    let s = unsafe { slab.slot_mut(slot) };
+    if let Err(e) = detok {
+        // Flag the request so its terminal Finish becomes Finish(Error) rather than
+        // silently dropping this token's output and finishing as success.
+        eprintln!("core1 detokenize failed (slot {slot}, token {id}): {e}");
+        s.out_error = true;
+        return None;
+    }
+    // Never reallocate `out_bytes`: Core 0 reads it through a fixed base address,
+    // so append only what fits the pre-reserved capacity. Overflow means the output
+    // would be truncated → flag it as an error (the stream must not report success
+    // on a clipped reply).
+    let room = s.out_bytes.capacity() - s.out_bytes.len();
+    if scratch.len() > room {
+        s.out_error = true;
+    }
+    let take = scratch.len().min(room);
+    s.out_bytes.extend_from_slice(&scratch[..take]);
+
+    // `out_committed` is always a code-point boundary (`valid_up_to` returns one),
+    // so only the uncommitted tail can newly complete — validate just that, not the
+    // whole buffer, keeping this O(bytes-per-token) instead of O(output²)/request.
+    let good = s.out_committed + complete_utf8_len(&s.out_bytes[s.out_committed..]);
+    let delta = good - s.out_committed;
+    s.out_committed = good;
+    if delta > 0 {
+        Some(delta as u32)
+    } else {
+        None
+    }
+}
+
+/// Commit any bytes still held back by the UTF-8 gate at stream end, and report
+/// whether this request was flagged (detok failure / overflow).
+/// SAFETY: as [`detokenize`].
+fn flush_tail(slab: &Slab, slot: u32) -> (Option<u32>, bool) {
+    let s = unsafe { slab.slot_mut(slot) };
+    let delta = s.out_bytes.len() - s.out_committed;
+    s.out_committed = s.out_bytes.len();
+    ((delta > 0).then_some(delta as u32), s.out_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::backend::complete_utf8_len;
+
+    #[test]
+    fn complete_utf8_len_stops_before_a_partial_code_point() {
+        // "é" is 0xC3 0xA9. A buffer ending mid-sequence commits only the ASCII.
+        assert_eq!(complete_utf8_len(b"caf"), 3);
+        assert_eq!(complete_utf8_len(b"caf\xC3"), 3, "hold back the lone lead byte");
+        assert_eq!(complete_utf8_len(b"caf\xC3\xA9"), 5, "full 'é' completes");
+        // "☕" is 0xE2 0x98 0x95 — three-byte, commits only as each byte lands.
+        assert_eq!(complete_utf8_len(b"\xE2"), 0);
+        assert_eq!(complete_utf8_len(b"\xE2\x98"), 0);
+        assert_eq!(complete_utf8_len(b"\xE2\x98\x95"), 3);
+        assert_eq!(complete_utf8_len(b""), 0);
     }
 }

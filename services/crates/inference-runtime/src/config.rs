@@ -25,7 +25,7 @@ pub struct Server {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // read once llama.cpp lands (P2)
 pub struct Model {
-    /// Path to the GGUF-quantized model.
+    /// Path to the GGUF model file (Qwen3.5-2B dense transformer, BF16).
     pub gguf_path: String,
     /// KV context length.
     pub n_ctx: u32,
@@ -90,6 +90,27 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "runtime.ring_size ({}) must be >= runtime.max_inflight ({})",
                 r.ring_size, r.max_inflight
+            )));
+        }
+
+        // Model invariants — P2 mandates full GPU offload + a single CPU thread, and
+        // the context builder needs a non-zero n_ctx (it becomes a NonZeroU32, which
+        // would otherwise silently clamp to the default). Enforce them here so a bad
+        // value fails at the config boundary, not deep in llama.cpp.
+        let m = &self.model;
+        if m.n_ctx == 0 {
+            return Err(ConfigError::Invalid("model.n_ctx must be > 0".into()));
+        }
+        if m.n_threads != 1 {
+            return Err(ConfigError::Invalid(format!(
+                "model.n_threads ({}) must be 1 — full GPU offload keeps CPU for the 3 pinned cores",
+                m.n_threads
+            )));
+        }
+        if m.n_gpu_layers != -1 {
+            return Err(ConfigError::Invalid(format!(
+                "model.n_gpu_layers ({}) must be -1 (offload all layers to the GPU; P2 requires full offload)",
+                m.n_gpu_layers
             )));
         }
         Ok(())
@@ -164,5 +185,23 @@ runtime:
         assert!(with(base(256, 32)).validate().is_err(), "ring_size < 64");
         assert!(with(base(2048, 1024)).validate().is_err(), "ring_size < max_inflight");
         assert!(with(base(256, 1024)).validate().is_ok(), "valid");
+    }
+
+    #[test]
+    fn validate_rejects_bad_model() {
+        let rt = || Runtime {
+            max_inflight: 256,
+            ring_size: 1024,
+            cores: Cores { web_io: 0, text: 1, fast_loop: 2 },
+        };
+        let with = |n_ctx, n_threads, n_gpu_layers| Config {
+            server: Server { host: "h".into(), port: 1 },
+            model: Model { gguf_path: "g".into(), n_ctx, n_threads, n_gpu_layers },
+            runtime: rt(),
+        };
+        assert!(with(0, 1, -1).validate().is_err(), "n_ctx 0");
+        assert!(with(1024, 4, -1).validate().is_err(), "n_threads != 1");
+        assert!(with(1024, 1, 20).validate().is_err(), "partial GPU offload");
+        assert!(with(1024, 1, -1).validate().is_ok(), "full offload, 1 thread, n_ctx>0");
     }
 }

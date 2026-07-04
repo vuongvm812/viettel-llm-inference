@@ -12,8 +12,9 @@ pinned cores with minimal coordination latency.
 context, `--enable-prefix-caching`, single GPU, port `8000`.
 
 **Model execution** is delegated to **llama.cpp** via FFI (`llama-cpp-2` → `libllama`,
-GGUF-quantized Qwen3.5-2B). Our runtime is the *serving + scheduling + batching* layer; the
-GPU forward pass is llama.cpp's `decode()`.
+Qwen3.5-2B dense transformer, **BF16** — a lossless BF16 GGUF conversion of the HF weights, not
+a lower-bit quant). Our runtime is the *serving + scheduling + batching* layer; the GPU forward
+pass is llama.cpp's `decode()`.
 
 ## 2. Design principles (hard constraints)
 
