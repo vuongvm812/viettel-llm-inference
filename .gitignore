@@ -1,0 +1,24 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# PGO / BOLT artifacts
+*.profraw
+*.profdata
+*.fdata
+perf.data*
+
+# Python (benchmark harness)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+.serena/
