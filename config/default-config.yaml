@@ -1,0 +1,23 @@
+# Default runtime configuration for inference-runtime.
+# Loaded by main() from cwd; override with `inference-runtime <path>`.
+
+# Core 0 — Web I/O & streaming
+server:
+  host: "0.0.0.0"
+  port: 8001            # 8000 is the vLLM baseline (docker-compose)
+
+# Model backend — llama.cpp via FFI (GGUF Qwen3.5-2B)
+model:
+  gguf_path: "models/qwen3.5-2b.gguf"
+  n_ctx: 262144         # 256K context, baseline parity
+  n_threads: 1          # full GPU offload → 1 CPU thread
+  n_gpu_layers: -1      # -1 = offload all layers
+
+# Disruptor serving fabric
+runtime:
+  max_inflight: 256     # RequestSlab size = max concurrent requests
+  ring_size: 1024       # power of two; R1 (multi-producer) needs >= 64
+  cores:                # pinned core ids (no-op on macOS)
+    web_io: 0
+    text: 1
+    fast_loop: 2

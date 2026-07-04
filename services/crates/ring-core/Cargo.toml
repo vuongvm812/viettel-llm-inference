@@ -1,0 +1,10 @@
+[package]
+name    = "ring-core"
+version = "0.0.0"
+edition = "2021"
+# Placeholder for the absent sibling crate that disruptor's `lossy` module needs
+# (ROADMAP P0). Exists only so the optional `ring-core` path dep resolves while
+# the `lossy` feature stays off. Drop in the real crate to enable `lossy`.
+publish = false
+
+[dependencies]
