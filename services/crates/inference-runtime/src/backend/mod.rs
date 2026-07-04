@@ -19,6 +19,34 @@ mod llama;
 #[cfg(feature = "llama")]
 pub use llama::*;
 
+use crate::slab::Slab;
+
+/// Outcome of [`Decoder::admit`] — the admission decision for one pending slot.
+/// Backend-independent so Core 2's scheduler loop can match on it without knowing
+/// which backend is compiled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admit {
+    /// Admitted into the running set; carries the prompt-token count it prefilled
+    /// (Core 2 charges it against the per-iteration prefill-token budget).
+    Admitted(usize),
+    /// KV budget is full *right now* — leave the slot in `pending` and retry after a
+    /// decode step frees cells by retiring a sequence. Only returned when the running
+    /// set is non-empty, so an empty pipeline always makes progress.
+    Deferred,
+    /// Cannot ever be admitted (its prompt + generation exceeds `n_ctx` alone). The
+    /// backend already published `Finish(Error)` on R3; Core 2 drops it from `pending`.
+    Rejected,
+}
+
+/// Prompt-token count of a pending slot, for Core 2's admission token budget. Reads
+/// only `tokens.len()` (written by Core 1 during tokenize).
+///
+/// SAFETY: `slot` is sitting in Core 2's `pending` queue (it arrived via R2 and Core 2
+/// has not published anything on R3 for it yet), so Core 2 solely owns it here.
+pub fn prompt_len(slab: &Slab, slot: u32) -> usize {
+    unsafe { slab.slot_mut(slot) }.tokens.len()
+}
+
 /// Concrete backend error (no `Box<dyn Error>` — keeps the "static polymorphism"
 /// discipline and lets callers match). Feature-independent: the mock never
 /// constructs one; the real backend maps `llama-cpp-2` errors into it.
