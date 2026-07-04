@@ -1,0 +1,187 @@
+//! Ring wiring + worker spawn (P1).
+//!
+//! Builds the 4 one-directional Disruptor rings, spawns the Core 1 and Core 2
+//! threads, and hands the caller the Core-0-side handles (R1 producer to publish
+//! ingress, R4 poller to drain egress). Reused by both `main` (real Core 0 over
+//! HTTP) and the pipeline integration test (Core 0 played by the test thread).
+
+use crate::config::Config;
+use crate::rings::RingEvent;
+use crate::slab::Slab;
+use crate::{core1, core2};
+use disruptor::{
+    build_multi_producer, build_single_producer, BusySpin, BusySpinWithSpinLoopHint, EventPoller,
+    MultiProducer, SingleConsumerBarrier, SingleProducerBarrier,
+};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+
+/// R1 ingress producer (owned by Core 0). Multi-producer: one clone per HTTP task.
+pub type IngressProducer = MultiProducer<RingEvent, SingleConsumerBarrier>;
+/// R4 egress poller (owned by Core 0), drained cooperatively from the tokio loop.
+pub type EgressPoller = EventPoller<RingEvent, SingleProducerBarrier>;
+
+/// Core-0-side handles plus the worker thread joins.
+pub struct Pipeline {
+    pub ingress: IngressProducer,
+    pub egress: EgressPoller,
+    pub core1: JoinHandle<()>,
+    pub core2: JoinHandle<()>,
+}
+
+/// Build the rings and spawn Core 1 + Core 2. Dropping [`Pipeline::ingress`]
+/// starts a clean shutdown that cascades R1→R2→R3→R4 and lets both threads join.
+pub fn spawn(cfg: &Config, slab: Arc<Slab>) -> Pipeline {
+    let size = cfg.runtime.ring_size as usize;
+    let (c1_core, c2_core) = (cfg.runtime.cores.text, cfg.runtime.cores.fast_loop);
+
+    // Every consumer here is an EventPoller (non-blocking `poll()`), so the wait
+    // strategy passed below governs only *producer* back-pressure spin, not
+    // consumption. The consume-side wait is the hand-coded loop in each core
+    // (spin_loop on cores 1/2, cooperative sleep on Core 0). Strategies still
+    // match the design table for when producers block on a full ring.
+    //
+    // Build each ring, splitting it into (poller for the consumer, producer for
+    // the producer). R1 is multi-producer (many HTTP conns); R2–R4 single.
+    let (r1_poller, r1_builder) =
+        build_multi_producer(size, RingEvent::default, BusySpinWithSpinLoopHint).new_event_poller();
+    let ingress = r1_builder.build();
+
+    let (r2_poller, r2_builder) =
+        build_single_producer(size, RingEvent::default, BusySpin).new_event_poller();
+    let r2_producer = r2_builder.build();
+
+    let (r3_poller, r3_builder) =
+        build_single_producer(size, RingEvent::default, BusySpinWithSpinLoopHint).new_event_poller();
+    let r3_producer = r3_builder.build();
+
+    let (r4_poller, r4_builder) =
+        build_single_producer(size, RingEvent::default, BusySpin).new_event_poller();
+    let r4_producer = r4_builder.build();
+
+    let slab1 = Arc::clone(&slab);
+    let core1 = std::thread::Builder::new()
+        .name("core1-text".into())
+        .spawn(move || {
+            core1::run(c1_core, slab1, r1_poller, r2_producer, r3_poller, r4_producer);
+        })
+        .expect("spawn core1");
+
+    let slab2 = slab;
+    let core2 = std::thread::Builder::new()
+        .name("core2-fastloop".into())
+        .spawn(move || {
+            core2::run(c2_core, slab2, r2_poller, r3_producer);
+        })
+        .expect("spawn core2");
+
+    Pipeline {
+        ingress,
+        egress: r4_poller,
+        core1,
+        core2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core2::CANNED_REPLY;
+    use crate::rings::{EventKind, RingEvent};
+    use crate::slab::Slab;
+    use disruptor::{Polling, Producer};
+
+    fn test_cfg(max_inflight: u32, ring_size: u32) -> Config {
+        let yaml = format!(
+            r#"
+server: {{ host: "127.0.0.1", port: 0 }}
+model: {{ gguf_path: "x", n_ctx: 1024, n_threads: 1, n_gpu_layers: -1 }}
+runtime:
+  max_inflight: {max_inflight}
+  ring_size: {ring_size}
+  cores: {{ web_io: 0, text: 1, fast_loop: 2 }}
+"#
+        );
+        serde_yaml::from_str(&yaml).expect("cfg")
+    }
+
+    /// The design's `demo()` self-check: drive K requests through R1→R2→R3→R4
+    /// with the test thread playing Core 0. A capacity smaller than K forces slot
+    /// recycling under backpressure — proving no deadlock, that every slot returns
+    /// to the free-list, and that each request's output is its full canned reply.
+    #[test]
+    fn pipeline_streams_all_requests_and_recycles_slots() {
+        const CAP: u32 = 8;
+        const K: usize = 120;
+        let cfg = test_cfg(CAP, 1024);
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128));
+
+        let Pipeline {
+            mut ingress,
+            mut egress,
+            core1,
+            core2,
+        } = spawn(&cfg, Arc::clone(&slab));
+
+        let mut free: Vec<u32> = (0..CAP).rev().collect();
+        let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); K];
+        let mut slot_req: Vec<usize> = vec![usize::MAX; CAP as usize];
+        let mut next_req = 0usize;
+        let mut finished = 0usize;
+
+        while finished < K {
+            // Publish while slots and requests remain (Core 0 ingress).
+            while next_req < K {
+                let Some(slot) = free.pop() else { break };
+                // SAFETY: slot just came off the free-list; no core holds it.
+                unsafe {
+                    let s = slab.slot_mut(slot);
+                    s.reset();
+                    s.prompt.push_str("hello");
+                    s.max_tokens = 200; // > CANNED_REPLY.len() → full reply, Eos
+                }
+                slot_req[slot as usize] = next_req;
+                ingress.publish(|e| {
+                    *e = RingEvent {
+                        slot,
+                        kind: EventKind::New,
+                    }
+                });
+                next_req += 1;
+            }
+
+            // Drain egress (Core 0 egress).
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        let req = slot_req[ev.slot as usize];
+                        match ev.kind {
+                            EventKind::Token(piece) => {
+                                // Detokenized byte rides the event (see core1).
+                                outputs[req].push(piece as u8);
+                            }
+                            EventKind::Finish(_) => {
+                                free.push(ev.slot);
+                                finished += 1;
+                            }
+                            EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+
+        // Clean shutdown: drop ingress → cascade R1→R2→R3→R4, join workers.
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert_eq!(finished, K, "every request finished");
+        assert_eq!(free.len(), CAP as usize, "every slot returned to free-list");
+        for (r, out) in outputs.iter().enumerate() {
+            assert_eq!(out, CANNED_REPLY, "request {r} streamed the full canned reply");
+        }
+    }
+}

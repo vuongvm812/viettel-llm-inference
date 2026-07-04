@@ -31,6 +31,13 @@ enum EventKind {
 through a ring. All four rings share the type (a single enum keeps handlers monomorphic and
 lets `Token`/`Finish` ride the same ring).
 
+> **P1 note.** `Token(u32)` is overloaded by ring: on **R3** it's a token id (Core 2 → Core 1);
+> on **R4** it's the detokenized output *byte* (Core 1 → Core 0). P1 carries the byte in the
+> event on purpose — Core 0 reading a shared `out_bytes` buffer that Core 1 is still appending
+> to is a streaming-stage data race (see `web-io/design.md`). This works only because a mock
+> piece is one byte; **P2's multi-byte pieces need a non-reallocating per-slot output buffer**
+> read below an acquire watermark, not a `u32`.
+
 > For decode, Core 2 may emit several tokens per iteration across sequences — use
 > `batch_publish(n, ..)` on R3 to publish a burst in one shot (Disruptor's batch path is the
 > throughput sweet spot per the crate benchmarks).

@@ -306,6 +306,10 @@ mod cursor;
 /// lapped and resynchronises independently (tail-versioned seqlock). Use this
 /// for loss-tolerant fan-out where a slow consumer must not back-pressure the
 /// producer or starve its peers.
+///
+/// Gated behind the `lossy` feature (off by default): it depends on the
+/// `ring-core` sibling crate, which is absent and unused by the runtime.
+#[cfg(feature = "lossy")]
 pub mod lossy;
 mod producer;
 mod ringbuffer;
