@@ -2,7 +2,8 @@
 
 The GPU compute layer. We do **not** reimplement the transformer; `libllama` runs the forward
 pass. Our runtime owns scheduling/batching around it. Crate: **`llama-cpp-2`** (safe wrapper
-over `libllama`), GGUF-quantized **Qwen3.5-2B**.
+over `libllama`), **Qwen3.5-2B** dense transformer, **BF16 (unquantized)** — converted from the
+HF safetensors to a BF16 GGUF (`convert_hf_to_gguf.py --outtype bf16`; see `script/setup.sh`).
 
 > Exact method names below track the `llama.cpp` C API; confirm the `llama-cpp-2` version's
 > spelling at implementation time (the crate renames some C functions). The *mechanisms* are stable.
@@ -85,9 +86,11 @@ caching a few calls instead of a subsystem:
 
 ## Build/link notes
 
-- `llama-cpp-2` links `libllama` (CUDA build) — needs the CUDA toolchain + a GGUF Qwen3.5-2B
-  on the deploy box. Document the GGUF conversion/quantization used (affects benchmark fairness
-  vs vLLM's weights — note in the benchmark report).
+- `llama-cpp-2` links `libllama` (CUDA on Linux, Metal on macOS) — needs the accelerator
+  toolchain + the BF16 GGUF on the deploy box. The GGUF is a **lossless BF16** conversion of
+  the HF weights (not a lower-bit quant), so it matches vLLM's BF16 precision — good for
+  benchmark fairness; note the conversion in the report. (Metal's BF16 support is newer than
+  CUDA's — confirm the kernels run BF16 rather than silently upcasting on the mac dev box.)
 - `libllama` is a C++ dependency; our PGO/BOLT optimizes **our Rust binary**, not `libllama`
   (its own tuning is P7).
 

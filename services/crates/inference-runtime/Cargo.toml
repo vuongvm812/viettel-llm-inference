@@ -3,6 +3,14 @@ name    = "inference-runtime"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Real llama.cpp GPU inference (P2). Off by default: the mock backend keeps the
+# crate building + testable without cmake / a GGUF model. Turn on with
+# `--features llama` on a box that has the toolchain + model. Acceleration is
+# picked per-OS by the target-specific dependency below (Metal on macOS, CUDA
+# elsewhere), so no separate feature flag is needed for the accelerator.
+llama = ["dep:llama-cpp-2"]
+
 [dependencies]
 disruptor     = { path = "../disruptor-rs" }
 core_affinity = "0.8.1"
@@ -13,6 +21,14 @@ thiserror     = "1.0"
 tokio         = { version = "1", features = ["rt", "macros", "net", "sync", "time"] }
 tokio-stream  = "0.1"
 axum          = "0.7"
+
+# macOS target → Metal acceleration.
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-2 = { version = "0.1.150", features = ["metal"], optional = true }
+
+# Everything else (Linux deploy box) → CUDA.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+llama-cpp-2 = { version = "0.1.150", features = ["cuda"], optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] } # ServiceExt::oneshot in HTTP tests

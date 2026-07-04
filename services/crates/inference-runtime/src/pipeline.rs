@@ -35,6 +35,11 @@ pub fn spawn(cfg: &Config, slab: Arc<Slab>) -> Pipeline {
     let size = cfg.runtime.ring_size as usize;
     let (c1_core, c2_core) = (cfg.runtime.cores.text, cfg.runtime.cores.fast_loop);
 
+    // Load the backends before wiring: the real `load` reads the GGUF and leaks
+    // the model to `'static` so Core 1 (vocab) and Core 2 (context) can share it.
+    // The mock `load` is a no-op. Startup fails loudly here on a bad model.
+    let (text, decoder_init) = crate::backend::load(cfg);
+
     // Every consumer here is an EventPoller (non-blocking `poll()`), so the wait
     // strategy passed below governs only *producer* back-pressure spin, not
     // consumption. The consume-side wait is the hand-coded loop in each core
@@ -63,7 +68,7 @@ pub fn spawn(cfg: &Config, slab: Arc<Slab>) -> Pipeline {
     let core1 = std::thread::Builder::new()
         .name("core1-text".into())
         .spawn(move || {
-            core1::run(c1_core, slab1, r1_poller, r2_producer, r3_poller, r4_producer);
+            core1::run(c1_core, slab1, r1_poller, r2_producer, r3_poller, r4_producer, text);
         })
         .expect("spawn core1");
 
@@ -71,7 +76,7 @@ pub fn spawn(cfg: &Config, slab: Arc<Slab>) -> Pipeline {
     let core2 = std::thread::Builder::new()
         .name("core2-fastloop".into())
         .spawn(move || {
-            core2::run(c2_core, slab2, r2_poller, r3_producer);
+            core2::run(c2_core, slab2, r2_poller, r3_producer, decoder_init);
         })
         .expect("spawn core2");
 
@@ -86,7 +91,7 @@ pub fn spawn(cfg: &Config, slab: Arc<Slab>) -> Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core2::CANNED_REPLY;
+    use crate::backend::CANNED_REPLY;
     use crate::rings::{EventKind, RingEvent};
     use crate::slab::Slab;
     use disruptor::{Polling, Producer};
@@ -114,7 +119,7 @@ runtime:
         const CAP: u32 = 8;
         const K: usize = 120;
         let cfg = test_cfg(CAP, 1024);
-        let slab = Arc::new(Slab::new(CAP as usize, 128, 128));
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
 
         let Pipeline {
             mut ingress,
@@ -126,6 +131,8 @@ runtime:
         let mut free: Vec<u32> = (0..CAP).rev().collect();
         let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); K];
         let mut slot_req: Vec<usize> = vec![usize::MAX; CAP as usize];
+        // Core-0-side read cursor into each slot's `out_bytes` (reset on claim).
+        let mut cursor: Vec<usize> = vec![0; CAP as usize];
         let mut next_req = 0usize;
         let mut finished = 0usize;
 
@@ -140,6 +147,7 @@ runtime:
                     s.prompt.push_str("hello");
                     s.max_tokens = 200; // > CANNED_REPLY.len() → full reply, Eos
                 }
+                cursor[slot as usize] = 0;
                 slot_req[slot as usize] = next_req;
                 ingress.publish(|e| {
                     *e = RingEvent {
@@ -150,21 +158,26 @@ runtime:
                 next_req += 1;
             }
 
-            // Drain egress (Core 0 egress).
+            // Drain egress (Core 0 egress): a Token event carries the count of
+            // newly-committed complete-UTF-8 bytes; read them from the slab.
             match egress.poll() {
                 Ok(mut guard) => {
                     for ev in &mut guard {
                         let req = slot_req[ev.slot as usize];
                         match ev.kind {
-                            EventKind::Token(piece) => {
-                                // Detokenized byte rides the event (see core1).
-                                outputs[req].push(piece as u8);
+                            EventKind::Piece(delta) => {
+                                let c = cursor[ev.slot as usize];
+                                // SAFETY: Core 1 committed + published [c, c+delta).
+                                let piece = unsafe { slab.read_committed(ev.slot, c, delta as usize) }
+                                    .expect("committed range in bounds");
+                                outputs[req].extend_from_slice(piece);
+                                cursor[ev.slot as usize] = c + delta as usize;
                             }
                             EventKind::Finish(_) => {
                                 free.push(ev.slot);
                                 finished += 1;
                             }
-                            EventKind::New => {}
+                            EventKind::Token(_) | EventKind::New => {}
                         }
                     }
                 }
@@ -183,5 +196,109 @@ runtime:
         for (r, out) in outputs.iter().enumerate() {
             assert_eq!(out, CANNED_REPLY, "request {r} streamed the full canned reply");
         }
+    }
+
+    /// `max_tokens` truncation landing *inside* a multi-byte code point: the UTF-8
+    /// gate holds the incomplete lead byte, and only `flush_tail` (at Finish) can
+    /// emit it. Asserts the reassembled output is byte-exact `CANNED_REPLY[..N]` —
+    /// i.e. the held byte was flushed, not dropped. Pick N so byte N-1 is a lone
+    /// UTF-8 lead byte (the first byte of a 2+ byte char).
+    #[test]
+    fn truncation_mid_codepoint_flushes_the_held_lead_byte() {
+        // Find an N where CANNED_REPLY[N-1] is a lead byte (0b11xxxxxx) and
+        // CANNED_REPLY[N] is a continuation (0b10xxxxxx) — a split code point.
+        let n = (1..CANNED_REPLY.len())
+            .find(|&i| CANNED_REPLY[i - 1] & 0xC0 == 0xC0 && CANNED_REPLY[i] & 0xC0 == 0x80)
+            .expect("canned reply has a multi-byte char to split");
+
+        const CAP: u32 = 2;
+        let cfg = test_cfg(CAP, 1024);
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        // SAFETY: slot 0 came off no ring yet; test owns it.
+        unsafe {
+            let s = slab.slot_mut(0);
+            s.reset();
+            s.prompt.push_str("hi");
+            s.max_tokens = n as u32; // truncate exactly at the split
+        }
+        ingress.publish(|e| *e = RingEvent { slot: 0, kind: EventKind::New });
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut cursor = 0usize;
+        let mut done = false;
+        while !done {
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(delta) => {
+                                let piece = unsafe { slab.read_committed(0, cursor, delta as usize) }
+                                    .expect("committed range in bounds");
+                                out.extend_from_slice(piece);
+                                cursor += delta as usize;
+                            }
+                            EventKind::Finish(_) => done = true,
+                            _ => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        // The held lead byte at N-1 must be present → exactly N bytes, matching the prefix.
+        assert_eq!(out, &CANNED_REPLY[..n], "flush_tail emitted the held partial byte");
+    }
+
+    /// Output-buffer overflow must finish as `Error`, not `Eos`/`MaxTokens`: a
+    /// clipped reply is a failure, and the slot must still recycle. Uses an
+    /// `out_cap` far smaller than the reply so detok overflows. Also exercises the
+    /// backend-failure → Finish(Error) → slot-recycle path end to end.
+    #[test]
+    fn output_overflow_finishes_as_error_and_recycles() {
+        use crate::rings::FinishReason;
+        const CAP: u32 = 2;
+        let cfg = test_cfg(CAP, 1024);
+        // out_cap = 4 bytes, reply is ~37 → overflow part-way.
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 4));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        // SAFETY: slot 0 unused; test owns it.
+        unsafe {
+            let s = slab.slot_mut(0);
+            s.reset();
+            s.prompt.push_str("hi");
+            s.max_tokens = 200; // full reply → overflows the 4-byte out_bytes
+        }
+        ingress.publish(|e| *e = RingEvent { slot: 0, kind: EventKind::New });
+
+        let mut finish: Option<FinishReason> = None;
+        let mut freed = false;
+        while finish.is_none() {
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        if let EventKind::Finish(r) = ev.kind {
+                            finish = Some(r);
+                            freed = ev.slot == 0;
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert_eq!(finish, Some(FinishReason::Error), "overflow → Error, not success");
+        assert!(freed, "slot recycled after an errored stream");
     }
 }

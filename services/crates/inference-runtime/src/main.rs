@@ -5,6 +5,7 @@
 //! a stub filled in by later roadmap phases.
 
 mod affinity; // Thread → core pinning (no-op on macOS)
+mod backend; // Model backend seam: mock byte-codec | real llama.cpp (P2)
 mod config; // Runtime config, loaded from YAML
 mod core0; // Web I/O & SSE streaming     (P1)
 mod core1; // Tokenize / detokenize       (P1/P2)
@@ -19,6 +20,10 @@ use std::sync::Arc;
 /// ~78K-char trace prompts so steady-state append never reallocates.
 const PROMPT_CAP: usize = 96 * 1024;
 const TOKENS_CAP: usize = 96 * 1024;
+/// Detokenized output buffer per slot. Never reallocates (Core 0 reads it via a
+/// fixed base address), so size it above the largest expected output — max_tokens
+/// (capped 8192) × a few UTF-8 bytes each. Overflow drops trailing bytes.
+const OUT_CAP: usize = 64 * 1024;
 
 fn main() {
     // Default anchors to the repo-root `config/` at compile time so it resolves
@@ -38,6 +43,7 @@ fn main() {
         cfg.runtime.max_inflight as usize,
         PROMPT_CAP,
         TOKENS_CAP,
+        OUT_CAP,
     ));
     let pipe = pipeline::spawn(&cfg, Arc::clone(&slab));
     if let Err(e) = core0::serve(&cfg, slab, pipe) {

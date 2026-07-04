@@ -61,9 +61,10 @@ req/s                 …               …
 
 ## Fairness notes (must appear in the report)
 
-- **Weights/quantization differ**: vLLM serves the full/original format; we serve GGUF-quantized
-  Qwen3.5-2B. Note the quantization level — it affects both speed and output. For an
-  apples-to-apples quality check, compare a few outputs, not just latency.
+- **Weights format**: both sides run **BF16** Qwen3.5-2B — vLLM from the HF safetensors, us from
+  a lossless BF16 GGUF conversion of the same weights (no lower-bit quant). Precision matches, so
+  this is a fair comparison; still spot-check a few outputs (GGUF conversion + llama.cpp kernels
+  can differ numerically from vLLM), not just latency.
 - **Prefix caching**: vLLM has `--enable-prefix-caching`; our v1 (P4) has shared-prefix KV, so
   both compute the 39K system prompt once. If benchmarking before P4, flag that vLLM has the
   prefix-cache edge.
