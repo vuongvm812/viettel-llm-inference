@@ -97,6 +97,16 @@ pub fn run(
         }
 
         // Decode one step over the whole running set (this is the batching).
+        // `step` emits tokens/finishes with *blocking* R3 publishes. That's bounded
+        // backpressure, not a deadlock risk: the only cyclic wait would be Core 1
+        // blocked on an R2 publish while Core 2 is blocked on R3, but R2 can never fill
+        // — each slot has at most one outstanding R2 entry per lifecycle, so live R2
+        // entries <= max_inflight <= ring_size (config-enforced), and Core 1 never
+        // blocks publishing to R2. R3 pressure therefore only ever traces back to Core 0
+        // draining R4, which is independent and always makes progress. Batching the
+        // per-step emission into one `r3.batch_publish` (design note) is a target-box
+        // perf refinement, not a correctness fix — and must chunk to <= ring_size to
+        // avoid a batch that can never fit.
         if !decoder.is_idle() {
             decoder.step(&slab, &mut r3);
         }

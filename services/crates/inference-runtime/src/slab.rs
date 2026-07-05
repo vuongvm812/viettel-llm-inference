@@ -149,6 +149,7 @@ impl Slab {
     /// current pipeline stage. Core 2 does while the slot sits in its `pending`
     /// queue (arrived via R2, no R3 publish for it yet).
     pub unsafe fn prompt_len(&self, slot: u32) -> usize {
+        debug_assert!((slot as usize) < self.slots.len(), "prompt_len: slot {slot} out of range");
         (*self.slots[slot as usize].get()).tokens.len()
     }
 }

@@ -357,6 +357,7 @@ runtime:
     /// backlog drains as seqs retire). `limit_by_seqs` toggles whether the cap comes
     /// from `max_batch_seqs` or from the shared-KV reservation (`n_ctx`).
     fn assert_batch_cap(limit_by_seqs: bool) {
+        use crate::rings::FinishReason;
         const CAP: u32 = 4;
         const K: usize = 4;
         const EXPECT: usize = 2;
@@ -385,6 +386,99 @@ runtime:
         let mut cursor = vec![0usize; CAP as usize];
         let mut open: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut max_open = 0usize;
+        let mut finish: Vec<Option<FinishReason>> = vec![None; K];
+        let mut finished = 0usize;
+        while finished < K {
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(delta) => {
+                                open.insert(ev.slot);
+                                max_open = max_open.max(open.len());
+                                let c = cursor[ev.slot as usize];
+                                let piece = unsafe { slab.read_committed(ev.slot, c, delta as usize) }
+                                    .expect("committed range in bounds");
+                                outputs[ev.slot as usize].extend_from_slice(piece);
+                                cursor[ev.slot as usize] = c + delta as usize;
+                            }
+                            EventKind::Finish(r) => {
+                                open.remove(&ev.slot);
+                                finish[ev.slot as usize] = Some(r);
+                                finished += 1;
+                            }
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert_eq!(finished, K, "every request finished (backlog drained past the cap)");
+        assert_eq!(
+            max_open, EXPECT,
+            "peak concurrency should be capped at {EXPECT} (limit_by_seqs={limit_by_seqs})"
+        );
+        for out in &outputs {
+            assert_eq!(out, CANNED_REPLY, "each request streamed its full reply despite staging");
+        }
+        // max_tokens 200 > reply len → the full reply, so every seq ends at Eos (not
+        // MaxTokens/Error) even though admission was staged behind the cap.
+        for (r, f) in finish.iter().enumerate() {
+            assert_eq!(*f, Some(FinishReason::Eos), "request {r} finished with Eos");
+        }
+    }
+
+    /// `max_batch_seqs` caps how many sequences decode together; excess wait and drain.
+    #[test]
+    fn max_batch_seqs_caps_concurrency() {
+        assert_batch_cap(true);
+    }
+
+    /// The shared-KV reservation caps concurrency: with `max_batch_seqs` high but a
+    /// small `n_ctx`, admission defers once reserved cells would exceed `n_ctx`.
+    #[test]
+    fn kv_reservation_caps_concurrency() {
+        assert_batch_cap(false);
+    }
+
+    /// The per-iteration prompt-token budget (`max_batch_tokens`, the named P3 knob):
+    /// when a single prompt exceeds the whole budget, it's admitted only by the
+    /// idle-progress exception, and any *other* prompt then defers until the running
+    /// set drains to idle. So long prompts serialize — peak concurrency is exactly 1 —
+    /// even though `max_batch_seqs`/KV would allow more. This is the long-prompt
+    /// while-active case (the HOL guard chunked prefill/P7 later relaxes). Mock
+    /// tokenizes 1 token per prompt byte, so "hello" = 5 tokens > a budget of 4.
+    #[test]
+    fn max_batch_tokens_serializes_long_prompts() {
+        const CAP: u32 = 4;
+        const K: usize = 4;
+        // Budget 4 < prompt len 5, max_batch_seqs 8 and n_ctx huge → only the token
+        // budget can cap concurrency here.
+        let cfg = test_cfg_with(CAP, 1024, 8, 4, 1_000_000);
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        for slot in 0..CAP {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot);
+                s.reset();
+                s.prompt.push_str("hello"); // 5 mock tokens > max_batch_tokens = 4
+                s.max_tokens = 200; // > CANNED_REPLY.len() → full reply, Eos
+            }
+            ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
+        }
+
+        let mut open: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut max_open = 0usize;
+        let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); K];
+        let mut cursor = vec![0usize; CAP as usize];
         let mut finished = 0usize;
         while finished < K {
             match egress.poll() {
@@ -416,27 +510,14 @@ runtime:
         core1.join().expect("core1 join");
         core2.join().expect("core2 join");
 
-        assert_eq!(finished, K, "every request finished (backlog drained past the cap)");
+        assert_eq!(finished, K, "every request finished (backlog drained one at a time)");
         assert_eq!(
-            max_open, EXPECT,
-            "peak concurrency should be capped at {EXPECT} (limit_by_seqs={limit_by_seqs})"
+            max_open, 1,
+            "a prompt larger than the whole token budget serializes: peak concurrency 1, saw {max_open}"
         );
         for out in &outputs {
-            assert_eq!(out, CANNED_REPLY, "each request streamed its full reply despite staging");
+            assert_eq!(out, CANNED_REPLY, "each serialized request streamed its full reply");
         }
-    }
-
-    /// `max_batch_seqs` caps how many sequences decode together; excess wait and drain.
-    #[test]
-    fn max_batch_seqs_caps_concurrency() {
-        assert_batch_cap(true);
-    }
-
-    /// The shared-KV reservation caps concurrency: with `max_batch_seqs` high but a
-    /// small `n_ctx`, admission defers once reserved cells would exceed `n_ctx`.
-    #[test]
-    fn kv_reservation_caps_concurrency() {
-        assert_batch_cap(false);
     }
 
     /// `max_tokens` truncation landing *inside* a multi-byte code point: the UTF-8

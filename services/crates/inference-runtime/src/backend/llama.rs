@@ -241,9 +241,14 @@ impl Decoder {
         }
     }
 
-    /// Room in the running set for another sequence.
+    /// Room in the running set for another sequence *and* a free seq id to give it.
+    /// Gating on `seq_pool` too keeps [`Admit::Deferred`]'s contract: without it, an
+    /// empty pool (seq ids leaked by an "impossible" KV-clear failure) would make
+    /// `admit` return `Deferred` while idle, and Core 2 — seeing pending work but an
+    /// idle decoder — would spin forever. With this gate, admit is only called when a
+    /// seq id is available, so an idle pipeline never defers.
     pub fn has_capacity(&self) -> bool {
-        self.active.len() < self.max_batch_seqs
+        self.active.len() < self.max_batch_seqs && !self.seq_pool.is_empty()
     }
 
     /// No active sequences → nothing to step.

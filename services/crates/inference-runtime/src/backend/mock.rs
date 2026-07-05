@@ -117,7 +117,8 @@ impl Decoder {
             r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(FinishReason::MaxTokens) });
             return Admit::Admitted(prompt_len);
         }
-        let needed = prompt_len + max_tokens as usize;
+        // saturating_add mirrors the real backend's overflow-safe reservation math.
+        let needed = prompt_len.saturating_add(max_tokens as usize);
         if needed > self.n_ctx {
             // Can't fit even alone → permanent reject (parity with ContextOverflow).
             r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(FinishReason::Error) });

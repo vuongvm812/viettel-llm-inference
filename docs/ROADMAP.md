@@ -86,11 +86,25 @@ exact `llama-cpp-2` method names for KV/sampling must be confirmed against the c
 `decode()`; throughput (tok/s) scales above the P2 single-seq number.
 
 > **Proof status.** The mock pipeline tests prove the *scheduling* invariants
-> (interleaving, `max_batch_seqs`/KV caps, staggered retirement, over-`n_ctx` reject,
-> backlog drain) in the sandbox. The *performance* claim — ≥2 active seqs per real
-> `decode()` and tok/s scaling over P2 — is **not yet proven**: it needs the Linux/GPU
-> target (a decode-count assertion inside `Decoder::step` and a P2-vs-P3 tok/s run on the
-> 120-request trace). Track as a target-box, feature-gated (`--features llama`) benchmark.
+> (interleaving, `max_batch_seqs`/KV caps, per-iteration `max_batch_tokens` deferral,
+> staggered retirement, over-`n_ctx` reject, backlog drain) in the sandbox. The
+> *performance* claim — ≥2 active seqs per real `decode()` and tok/s scaling over P2 — is
+> **not yet proven**: it needs the Linux/GPU target. Concretely, on target add (a) a
+> decode-count assertion inside `Decoder::step` — exactly one `ctx.decode()` per step,
+> over `active.len()` seqs, so a regression that decodes each seq separately is caught
+> (the mock has no `decode()` to count, so this is target-only); and (b) a P2-vs-P3 tok/s
+> run on the 120-request trace. Track as a target-box, feature-gated (`--features llama`)
+> benchmark.
+>
+> **Long-prompt caveat (target trace).** The 120-request trace uses ~40K-token prompts.
+> With `max_batch_tokens` bounding prefill per iteration, a long prompt is admitted only
+> by the idle-progress exception and the *next* long prompt defers until the running set
+> drains to idle (the HOL guard — see `core2::run`). So for the long-prompt trace,
+> concurrency stays at **1 seq per `decode()`** regardless of hardware: the throughput win
+> materializes only once **P4** (shared-prefix KV drops effective prefill cost to
+> prompt-minus-shared-prefix) or **P7** (chunked prefill splits one prompt across
+> iterations) lands. P3's multi-seq concurrency is demonstrated on short/moderate prompts;
+> treat the long-prompt throughput number as a P4/P7 exit criterion, not a P3 one.
 
 **Risks.** Head-of-line blocking between prefill (long 40K prompt) and decode steps — may need
 chunked prefill or separate prefill/decode scheduling (note for P7).
