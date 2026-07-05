@@ -8,11 +8,14 @@
 //! installed crate's docs; the *mechanisms* (tokenize, prefill, greedy sample,
 //! KV clear) are stable. Confirm on target.
 //!
-//! Scope: **single sequence, greedy (temp=0)**. Continuous batching (P3) and
-//! shared-prefix KV (P4) are later phases; here each request prefills, decodes to
-//! EOS/`max_tokens`, then `clear_kv_cache()` reclaims all KV for the next one.
+//! Scope: **continuous batching (P3), greedy (temp=0)**. The [`Decoder`] runs a
+//! running set of sequences: each [`step`](Decoder::step) batches one token per
+//! active seq into a single `decode()`, samples per seq, emits, and retires
+//! finished seqs (freeing their KV so the seq id can be reused). Admission reserves
+//! `n_prompt + max_tokens` KV cells up front so a seq is never started that can't
+//! finish. Shared-prefix KV (P4) is a later phase.
 
-use super::{argmax, BackendError};
+use super::{argmax, Admit, BackendError};
 use crate::config::Config;
 use crate::rings::{EventKind, FinishReason, RingEvent};
 use crate::slab::Slab;
@@ -78,14 +81,18 @@ pub fn load(cfg: &Config) -> (TextBackend, DecoderInit) {
         .unwrap_or_else(|e| panic!("load GGUF `{}`: {e}", cfg.model.gguf_path));
     let model: &'static LlamaModel = Box::leak(Box::new(model));
 
+    // Continuous batching (P3): cap concurrent sequences (clamped to the slab).
+    let max_batch_seqs = cfg.runtime.effective_max_batch_seqs();
+    // Bound tokens per decode() call. Must hold both a prefill chunk and a full
+    // decode step (one token per active seq), so keep it >= max_batch_seqs.
+    let n_batch = cfg.model.n_ctx.min(2048).max(max_batch_seqs);
     let text = TextBackend { model: StaticRef(model) };
     let init = DecoderInit {
         model: StaticRef(model),
         backend: StaticRef(backend),
         n_ctx: cfg.model.n_ctx,
-        // Bound tokens per decode() call. Full context per batch is fine for
-        // single-seq prefill chunking; tune on the GPU.
-        n_batch: cfg.model.n_ctx.min(2048),
+        n_batch,
+        max_batch_seqs,
     };
     (text, init)
 }
@@ -143,11 +150,41 @@ pub struct DecoderInit {
     backend: StaticRef<LlamaBackend>,
     n_ctx: u32,
     n_batch: u32,
+    /// Max sequences decoded together per iteration (continuous batching, P3).
+    max_batch_seqs: u32,
 }
 
-/// Core 2 decoder (real). Owns the mutable `LlamaContext` (KV cache) and a reusable
-/// `LlamaBatch` (allocated once, cleared between chunks/steps — no per-request or
-/// per-token batch allocation on the fast loop).
+/// One sequence in the running set: its llama.cpp seq id, KV position, and the
+/// already-sampled token to feed on the next decode step (see [`Decoder::step`]).
+struct ActiveSeq {
+    slot: u32,
+    seq_id: i32,
+    /// KV position where `next_token` will be placed.
+    pos: i32,
+    /// Tokens emitted so far (bounded by `max_tokens`).
+    n_generated: u32,
+    max_tokens: u32,
+    /// Next token to feed — already sampled and confirmed non-EOG (so it will be
+    /// emitted). Seeded from the prefill sample in [`Decoder::admit`].
+    next_token: i32,
+    /// KV cells reserved for this seq at admit (`n_prompt + max_tokens`), released
+    /// back to the shared budget when it retires.
+    reserve: usize,
+}
+
+/// Result of prefilling a request's first token.
+enum FirstToken {
+    /// First generated token (non-EOG) — the seq joins the running set.
+    Token(i32),
+    /// Nothing to generate (`max_tokens == 0`) or an immediate EOS — finish now.
+    Done(FinishReason),
+}
+
+/// Core 2 decoder (real, P3 continuous batching). Owns the mutable `LlamaContext`
+/// (KV cache) and a reusable `LlamaBatch` (allocated once, cleared between
+/// chunks/steps — no per-request or per-token batch allocation on the fast loop).
+/// Runs a *running set* of sequences: each [`step`](Self::step) batches one token
+/// per active seq into a single `decode()`.
 pub struct Decoder {
     model: StaticRef<LlamaModel>,
     ctx: LlamaContext<'static>,
@@ -156,117 +193,339 @@ pub struct Decoder {
     /// KV context budget; a request whose prompt + generation exceeds it is
     /// rejected before any decode (no partial streaming).
     n_ctx: usize,
+    /// Running set of decoding sequences (the batch).
+    active: Vec<ActiveSeq>,
+    /// Free llama.cpp sequence ids (0..max_batch_seqs), used as a stack.
+    seq_pool: Vec<i32>,
+    max_batch_seqs: usize,
+    /// KV cells currently reserved across the running set. Admission keeps
+    /// `reserved <= n_ctx` so a sequence is never started that can't finish (the
+    /// design's rule) — this is the P3 stand-in for P4's dynamic free-cell monitor.
+    reserved: usize,
 }
 
 impl Decoder {
     pub fn new(init: DecoderInit) -> Self {
+        let max_batch_seqs = init.max_batch_seqs as usize;
         let cparams = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(init.n_ctx))
             .with_n_batch(init.n_batch)
+            // Allow up to `max_batch_seqs` concurrent sequences in the KV cache.
+            // (Confirm the method name against llama-cpp-2 on the target — the crate
+            // occasionally renames context-param setters between versions.)
+            .with_n_seq_max(init.max_batch_seqs)
             .with_n_threads(1); // full GPU offload → 1 CPU thread (don't fight the 3 cores)
         let ctx = init
             .model
             .0
             .new_context(init.backend.0, cparams)
             .expect("new llama context");
+        // Free-id stack: pop yields 0, 1, 2, … for readable seq ids.
+        let seq_pool: Vec<i32> = (0..max_batch_seqs as i32).rev().collect();
         Decoder {
             model: init.model,
             ctx,
+            // Second arg is `n_seq_max` = max sequence ids a *single token* may belong
+            // to, not the batch's sequence count. Every `add` here passes `&[seq_id]`
+            // (one seq per token), and P4 shared-prefix reuses cells via
+            // `kv_cache_seq_cp` rather than multi-seq tokens — so this stays 1. Token
+            // capacity (holding up to `max_batch_seqs` tokens per decode step) is the
+            // first arg, `n_batch`.
             batch: LlamaBatch::new(init.n_batch as usize, 1),
             n_batch: init.n_batch as usize,
             n_ctx: init.n_ctx as usize,
+            active: Vec::with_capacity(max_batch_seqs),
+            seq_pool,
+            max_batch_seqs,
+            reserved: 0,
         }
     }
 
-    /// Prefill + greedy-decode one sequence to completion, emitting each token on
-    /// R3 and a terminal `Finish`. KV is cleared afterward so the next request
-    /// starts from an empty cache (shared-prefix reuse is P4).
-    pub fn run_sequence<P: Producer<RingEvent>>(&mut self, slot: u32, slab: &Slab, r3: &mut P) {
-        let reason = match self.generate(slot, slab, r3) {
-            Ok(reason) => reason,
-            Err(e) => {
-                eprintln!("core2 decode error on slot {slot}: {e}");
-                FinishReason::Error
-            }
-        };
-        r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(reason) });
-        self.ctx.clear_kv_cache();
+    /// Room in the running set for another sequence *and* a free seq id to give it.
+    /// Gating on `seq_pool` too keeps [`Admit::Deferred`]'s contract: without it, an
+    /// empty pool (seq ids leaked by an "impossible" KV-clear failure) would make
+    /// `admit` return `Deferred` while idle, and Core 2 — seeing pending work but an
+    /// idle decoder — would spin forever. With this gate, admit is only called when a
+    /// seq id is available, so an idle pipeline never defers.
+    pub fn has_capacity(&self) -> bool {
+        self.active.len() < self.max_batch_seqs && !self.seq_pool.is_empty()
     }
 
-    fn generate<P: Producer<RingEvent>>(
+    /// No active sequences → nothing to step.
+    pub fn is_idle(&self) -> bool {
+        self.active.is_empty()
+    }
+
+    /// Admit a tokenized slot into the running set, honouring the shared KV budget:
+    /// reserve `n_prompt + max_tokens` cells up front so a sequence is never started
+    /// that can't finish. Returns [`Admit::Deferred`] when the running set is full
+    /// enough that this seq won't currently fit (Core 2 retries after a retire),
+    /// [`Admit::Rejected`] (having emitted `Finish(Error)`) when it can't fit `n_ctx`
+    /// even alone, else [`Admit::Admitted`] with the prompt-token count it prefilled.
+    ///
+    /// The reservation is conservative (it books `max_tokens` even though most seqs
+    /// stop early at EOS). P4 replaces it with a dynamic free-cell monitor + shared
+    /// prefix so effective capacity is higher.
+    pub fn admit<P: Producer<RingEvent>>(&mut self, slot: u32, slab: &Slab, r3: &mut P) -> Admit {
+        // SAFETY: slot is in Core 2's `pending` (arrived via R2, no R3 publish for it
+        // yet) → Core 2 solely owns it.
+        let (n_prompt, max_tokens) = {
+            let s = unsafe { slab.slot_mut(slot) };
+            (s.tokens.len(), s.max_tokens)
+        };
+        // Nothing to generate → finish immediately without a seq id or KV.
+        if n_prompt == 0 || max_tokens == 0 || self.n_batch == 0 {
+            r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(FinishReason::MaxTokens) });
+            return Admit::Admitted(n_prompt);
+        }
+        let needed = n_prompt.saturating_add(max_tokens as usize);
+        // Can never fit even alone → permanent reject (no partial streaming).
+        if needed > self.n_ctx {
+            eprintln!("core2 admit rejected slot {slot}: needs {needed} > n_ctx {}", self.n_ctx);
+            r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(FinishReason::Error) });
+            return Admit::Rejected;
+        }
+        // Fits alone but not alongside the current running set → wait for a retire.
+        // `reserved == 0` when the set is empty and `needed <= n_ctx`, so an idle
+        // pipeline never defers → always makes progress.
+        if self.reserved.saturating_add(needed) > self.n_ctx {
+            return Admit::Deferred;
+        }
+
+        // `has_capacity()` guarantees a free id, but don't rely on the caller: if the
+        // pool is somehow empty, defer (retry after a retire) rather than panic.
+        let Some(seq_id) = self.seq_pool.pop() else {
+            return Admit::Deferred;
+        };
+        match self.prefill(slot, slab, seq_id, n_prompt) {
+            Ok(FirstToken::Token(tok)) => {
+                self.reserved += needed;
+                self.active.push(ActiveSeq {
+                    slot,
+                    seq_id,
+                    pos: n_prompt as i32,
+                    n_generated: 0,
+                    max_tokens,
+                    next_token: tok,
+                    reserve: needed,
+                });
+                Admit::Admitted(n_prompt)
+            }
+            Ok(FirstToken::Done(reason)) => {
+                self.retire_seq(seq_id); // never reserved
+                r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(reason) });
+                Admit::Admitted(n_prompt)
+            }
+            Err(e) => {
+                eprintln!("core2 prefill error on slot {slot}: {e}");
+                self.retire_seq(seq_id);
+                r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(FinishReason::Error) });
+                Admit::Rejected
+            }
+        }
+    }
+
+    /// Prefill `slot`'s prompt (`n_prompt` tokens, > 0) into `seq_id`'s KV and sample
+    /// its first token. Reads prompt tokens straight from the slab (no copy); publishes
+    /// nothing on R3, so holding the `&mut` slot across prefill is sound (Core 2 still
+    /// owns the slot). Budget/overflow are already checked by [`admit`].
+    ///
+    /// ponytail / P3 limitation: prefill is **per-request** decode work — each admitted
+    /// request runs its own prompt through `decode()` before the batched generation
+    /// step, so a burst of long (40K-token) prompts still prefills serially and can
+    /// dominate TTFT. The upgrades are P4 (shared-prefix KV — prefill only the
+    /// non-shared suffix) and P7 (chunked prefill — split one prompt across iterations
+    /// so it interleaves with active decode). Tracked in ROADMAP's P3 long-prompt caveat.
+    /// SAFETY: slot arrived via R2 → Core 2 owns it here (no R3 publish in this fn).
+    fn prefill(
         &mut self,
         slot: u32,
         slab: &Slab,
-        r3: &mut P,
-    ) -> Result<FinishReason, BackendError> {
-        // Phase 1 — prefill, reading prompt tokens straight from the slab (no copy).
-        // Core 2 still exclusively owns the slot here: we publish nothing on R3 until
-        // Phase 2, so Core 1 cannot touch this slot's output, and holding the `&mut`
-        // across prefill is sound. The borrow ends with this block, before any R3
-        // publish. Returns (max_tokens, n_prompt, logit_idx of the last prompt token).
-        // SAFETY: slot arrived via R2 → Core 2 owns it until the first R3 publish below.
-        let (max_tokens, n_prompt, logit_idx) = {
-            let s = unsafe { slab.slot_mut(slot) };
-            let n_prompt = s.tokens.len();
-            let max_tokens = s.max_tokens;
-            if n_prompt == 0 || max_tokens == 0 || self.n_batch == 0 {
-                return Ok(FinishReason::MaxTokens);
-            }
-            // Preflight the context budget: reject *before* prefill so a too-large
-            // request never streams a partial reply it can't finish.
-            let needed = n_prompt.saturating_add(max_tokens as usize);
-            if needed > self.n_ctx {
-                return Err(BackendError::ContextOverflow { needed, n_ctx: self.n_ctx });
-            }
-
-            // Prefill in n_batch-sized chunks (a 40K-token prompt exceeds one decode).
-            // Only the final prompt token needs logits (that's what we sample from).
-            let mut logit_idx = 0i32;
-            let mut chunk_start = 0usize;
-            while chunk_start < n_prompt {
-                let chunk_end = (chunk_start + self.n_batch).min(n_prompt);
-                self.batch.clear();
-                for pos in chunk_start..chunk_end {
-                    let is_last = pos == n_prompt - 1;
-                    self.batch
-                        .add(LlamaToken(s.tokens[pos]), pos as i32, &[0], is_last)
-                        .map_err(|e| BackendError::Decode(e.to_string()))?;
-                }
-                self.ctx
-                    .decode(&mut self.batch)
-                    .map_err(|e| BackendError::Decode(e.to_string()))?;
-                if chunk_end == n_prompt {
-                    logit_idx = (chunk_end - chunk_start - 1) as i32;
-                }
-                chunk_start = chunk_end;
-            }
-            (max_tokens, n_prompt, logit_idx)
-        };
-
-        // Phase 2 — greedy decode loop. Publishes on R3, touches no slab state.
-        // Determinism is pure argmax (temp=0), so the request's `seed` is a no-op
-        // here — the spec's "seed=42" is satisfied vacuously; it would matter only
-        // on a stochastic sampler (P-general).
-        let mut logit_idx = logit_idx;
-        let mut pos = n_prompt as i32;
-        for _ in 0..max_tokens {
-            let next = LlamaToken(argmax(self.ctx.get_logits_ith(logit_idx)));
-            // Stop on EOS/EOG *before* publishing — the terminal token is a control
-            // token, not user-visible text; emitting it could leak a stray sentinel.
-            if self.model.0.is_eog_token(next) {
-                return Ok(FinishReason::Eos);
-            }
-            r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Token(next.0 as u32) });
+        seq_id: i32,
+        n_prompt: usize,
+    ) -> Result<FirstToken, BackendError> {
+        let s = unsafe { slab.slot_mut(slot) };
+        // Prefill in n_batch-sized chunks (a 40K-token prompt exceeds one decode),
+        // all under this seq's own id. Only the final prompt token needs logits.
+        let mut logit_idx = 0i32;
+        let mut chunk_start = 0usize;
+        while chunk_start < n_prompt {
+            let chunk_end = (chunk_start + self.n_batch).min(n_prompt);
             self.batch.clear();
-            self.batch
-                .add(next, pos, &[0], true)
-                .map_err(|e| BackendError::Decode(e.to_string()))?;
+            for pos in chunk_start..chunk_end {
+                let is_last = pos == n_prompt - 1;
+                self.batch
+                    .add(LlamaToken(s.tokens[pos]), pos as i32, &[seq_id], is_last)
+                    .map_err(|e| BackendError::Decode(e.to_string()))?;
+            }
             self.ctx
                 .decode(&mut self.batch)
                 .map_err(|e| BackendError::Decode(e.to_string()))?;
-            pos += 1;
-            logit_idx = 0; // single-token batch
+            if chunk_end == n_prompt {
+                logit_idx = (chunk_end - chunk_start - 1) as i32;
+            }
+            chunk_start = chunk_end;
         }
-        Ok(FinishReason::MaxTokens)
+
+        // Sample the first generated token from the last prompt position. Determinism
+        // is pure argmax (temp=0), so the request's `seed` is a no-op — "seed=42" is
+        // satisfied vacuously; it would matter only on a stochastic sampler.
+        let first = argmax(self.ctx.get_logits_ith(logit_idx));
+        // Stop before emitting an EOG sentinel (never user-visible text).
+        if self.model.0.is_eog_token(LlamaToken(first)) {
+            Ok(FirstToken::Done(FinishReason::Eos))
+        } else {
+            Ok(FirstToken::Token(first))
+        }
+    }
+
+    /// One decode step over the whole running set: feed each active seq's pending
+    /// token into a single batch, `decode()` once (the GPU forward for every sequence
+    /// at once — where continuous batching pays off), then per seq emit that token,
+    /// sample the next, and retire on `max_tokens`/EOS.
+    pub fn step<P: Producer<RingEvent>>(&mut self, _slab: &Slab, r3: &mut P) {
+        // Build one batch: one token per active seq, each at its own position/seq id.
+        // Batch index i == active[i], so get_logits_ith(i) reads seq i's logits below.
+        self.batch.clear();
+        let mut build_err: Option<String> = None;
+        for seq in &self.active {
+            if let Err(e) = self.batch.add(LlamaToken(seq.next_token), seq.pos, &[seq.seq_id], true) {
+                build_err = Some(e.to_string());
+                break;
+            }
+        }
+        if let Some(e) = build_err {
+            return self.fail_all(r3, &e);
+        }
+        if let Err(e) = self.ctx.decode(&mut self.batch) {
+            return self.fail_all(r3, &e.to_string());
+        }
+
+        // Emit the fed token for every active seq in ONE R3 burst — the design's
+        // batch-publish throughput path. Each token was confirmed non-EOG when sampled.
+        // The burst is `active.len()` events, which is <= max_batch_seqs <= max_inflight
+        // <= ring_size (config-enforced), so it always fits: never a batch larger than
+        // the ring, and Core 1 drains R3 independently, so the spin is bounded.
+        let n = self.active.len();
+        r3.batch_publish(n, |iter| {
+            for (e, seq) in iter.zip(self.active.iter()) {
+                *e = RingEvent { slot: seq.slot, kind: EventKind::Token(seq.next_token as u32) };
+            }
+        });
+
+        // Sample the next token per seq, retire finished ones, compact survivors in one
+        // pass. Fields (`active`, `ctx`, `model`, `seq_pool`) are disjoint, so the
+        // indexed borrows below don't overlap. Finishes (a minority) stay individual.
+        let mut w = 0;
+        // Set if a retiring seq's KV clear fails: its id can't be safely reused, so we
+        // wipe the whole cache and fail the survivors after this pass (below) rather
+        // than decode the next step on top of KV we couldn't clean.
+        let mut kv_clear_failed = false;
+        for r in 0..self.active.len() {
+            self.active[r].n_generated += 1;
+            self.active[r].pos += 1;
+
+            let finished = if self.active[r].n_generated >= self.active[r].max_tokens {
+                Some(FinishReason::MaxTokens)
+            } else {
+                let next = argmax(self.ctx.get_logits_ith(r as i32));
+                if self.model.0.is_eog_token(LlamaToken(next)) {
+                    Some(FinishReason::Eos) // stop before emitting the EOG sentinel
+                } else {
+                    self.active[r].next_token = next;
+                    None
+                }
+            };
+
+            match finished {
+                None => {
+                    // Keep: compact toward the front (order among seqs is irrelevant —
+                    // each slot's tokens stay in generation order across steps).
+                    if w != r {
+                        self.active.swap(w, r);
+                    }
+                    w += 1;
+                }
+                Some(reason) => {
+                    let slot = self.active[r].slot;
+                    let seq_id = self.active[r].seq_id;
+                    r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(reason) });
+                    self.reserved -= self.active[r].reserve; // give the KV budget back
+                    // Only hand the seq id back to the pool once its KV is actually
+                    // gone — a reused id on stale KV corrupts generation.
+                    match self.free_seq_kv(seq_id) {
+                        Ok(()) => self.seq_pool.push(seq_id),
+                        Err(e) => {
+                            eprintln!("core2 step: KV clear failed for seq {seq_id}: {e}");
+                            kv_clear_failed = true;
+                        }
+                    }
+                }
+            }
+        }
+        self.active.truncate(w);
+        // A retire couldn't free its KV: the cache is in an unknown state, so the
+        // survivors can't be trusted to keep decoding. Fail them, wipe the whole cache,
+        // and rebuild the id pool from scratch (baseline) — conservative but sound.
+        if kv_clear_failed {
+            self.fail_all(r3, "seq KV clear failed during retire; wiping cache");
+        }
+    }
+
+    /// Drop a sequence's KV cells so its id can be reused. `(None, None)` must map to
+    /// the FULL position range (llama.cpp `seq_rm(seq, -1, -1)`) — any cells left
+    /// behind would let a reused id prefill on top of stale KV → corrupt output and
+    /// eventual cache exhaustion. Seq ids are `0..max_batch_seqs` (always `>= 0` and
+    /// `< i32::MAX`), so the `u32` the crate wants is an exact cast and this *should*
+    /// never fail — but the result is propagated, not discarded, so callers gate seq-id
+    /// reuse on it. On the target, also assert free cells return to baseline after a
+    /// retire. (Confirm the exact `clear_kv_cache_seq` return type against the crate
+    /// version; propagated here as a `Result`.)
+    #[must_use = "a failed KV clear means the seq id is NOT safe to reuse"]
+    fn free_seq_kv(&mut self, seq_id: i32) -> Result<(), BackendError> {
+        self.ctx
+            .clear_kv_cache_seq(Some(seq_id as u32), None, None)
+            .map_err(|e| BackendError::Decode(e.to_string()))
+    }
+
+    /// Return a seq id to the free pool and drop its KV cells. Used on admit-time
+    /// finish/error, before the seq ever joins the running set (so it holds no
+    /// reservation to release). On a KV-clear failure (the "impossible" in-range-id
+    /// path) the id must not be handed back dirty — a reused id on stale KV corrupts
+    /// output. Recovery depends on what's decoding:
+    /// - **Cache idle** (no active seqs): safe to wipe the whole cache and rebuild the
+    ///   id pool from scratch — this recovers the just-failed id *and* any previously
+    ///   leaked one, so repeated admit-time failures while idle can't exhaust the pool.
+    /// - **Active seqs present**: can't wipe their live KV mid-flight, so leak just this
+    ///   one id (degrades capacity, never corrupts) until the running set drains.
+    fn retire_seq(&mut self, seq_id: i32) {
+        match self.free_seq_kv(seq_id) {
+            Ok(()) => self.seq_pool.push(seq_id),
+            Err(e) if self.active.is_empty() => {
+                eprintln!("core2 retire: KV clear failed for seq {seq_id} ({e}); cache idle → full wipe + pool reset");
+                self.ctx.clear_kv_cache();
+                self.seq_pool.clear();
+                self.seq_pool.extend((0..self.max_batch_seqs as i32).rev());
+                self.reserved = 0;
+            }
+            Err(e) => eprintln!("core2 retire: KV clear failed for seq {seq_id}, leaking id (active seqs present): {e}"),
+        }
+    }
+
+    /// A batch build/decode failure kills every active sequence (the forward pass is
+    /// shared): report `Error` for each, wipe the KV cache, and restore all seq ids +
+    /// the whole KV budget.
+    fn fail_all<P: Producer<RingEvent>>(&mut self, r3: &mut P, err: &str) {
+        eprintln!("core2 batch decode error ({} seqs): {err}", self.active.len());
+        for seq in &self.active {
+            let slot = seq.slot;
+            r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(FinishReason::Error) });
+        }
+        self.ctx.clear_kv_cache(); // all active seqs die → reclaim everything
+        // Restore the full free-id pool (these were the only checked-out ids).
+        self.seq_pool.clear();
+        self.seq_pool.extend((0..self.max_batch_seqs as i32).rev());
+        self.active.clear();
+        self.reserved = 0;
     }
 }

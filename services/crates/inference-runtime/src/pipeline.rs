@@ -73,10 +73,11 @@ pub fn spawn(cfg: &Config, slab: Arc<Slab>) -> Pipeline {
         .expect("spawn core1");
 
     let slab2 = slab;
+    let max_batch_tokens = cfg.runtime.max_batch_tokens;
     let core2 = std::thread::Builder::new()
         .name("core2-fastloop".into())
         .spawn(move || {
-            core2::run(c2_core, slab2, r2_poller, r3_producer, decoder_init);
+            core2::run(c2_core, slab2, r2_poller, r3_producer, decoder_init, max_batch_tokens);
         })
         .expect("spawn core2");
 
@@ -97,13 +98,29 @@ mod tests {
     use disruptor::{Polling, Producer};
 
     fn test_cfg(max_inflight: u32, ring_size: u32) -> Config {
+        // Defaults big enough not to constrain the older tests: cap == slots, budget
+        // and n_ctx generous.
+        test_cfg_with(max_inflight, ring_size, max_inflight, 100_000, 1_000_000)
+    }
+
+    /// Config with the P3 batching knobs (and `n_ctx`) exposed, so tests can force the
+    /// max-batch-seqs cap and the KV-reservation defer path.
+    fn test_cfg_with(
+        max_inflight: u32,
+        ring_size: u32,
+        max_batch_seqs: u32,
+        max_batch_tokens: u32,
+        n_ctx: u32,
+    ) -> Config {
         let yaml = format!(
             r#"
 server: {{ host: "127.0.0.1", port: 0 }}
-model: {{ gguf_path: "x", n_ctx: 1024, n_threads: 1, n_gpu_layers: -1 }}
+model: {{ gguf_path: "x", n_ctx: {n_ctx}, n_threads: 1, n_gpu_layers: -1 }}
 runtime:
   max_inflight: {max_inflight}
   ring_size: {ring_size}
+  max_batch_seqs: {max_batch_seqs}
+  max_batch_tokens: {max_batch_tokens}
   cores: {{ web_io: 0, text: 1, fast_loop: 2 }}
 "#
         );
@@ -195,6 +212,383 @@ runtime:
         assert_eq!(free.len(), CAP as usize, "every slot returned to free-list");
         for (r, out) in outputs.iter().enumerate() {
             assert_eq!(out, CANNED_REPLY, "request {r} streamed the full canned reply");
+        }
+    }
+
+    /// Continuous batching (P3): with several requests admitted at once, Core 2 must
+    /// interleave their decode steps — many sequences in flight per `decode()` — rather
+    /// than running each to completion before the next. Observed from Core 0's egress:
+    /// count how many slots are "open" (streamed a `Piece`, not yet `Finish`) at the
+    /// same time; the peak must exceed 1. Under the P2 single-shot loop the peak is
+    /// exactly 1 (slot N fully finishes before slot N+1 starts) → this fails until the
+    /// fast loop batches.
+    #[test]
+    fn continuous_batching_runs_multiple_seqs_concurrently() {
+        const CAP: u32 = 4;
+        const K: usize = 4;
+        let cfg = test_cfg(CAP, 1024);
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        // Admit all K at once (CAP == K, so no recycling) — full canned reply each.
+        for slot in 0..CAP {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot);
+                s.reset();
+                s.prompt.push_str("hello");
+                s.max_tokens = 200; // > CANNED_REPLY.len() → full reply, Eos
+            }
+            ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
+        }
+
+        let mut open: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut max_open = 0usize;
+        let mut finished = 0usize;
+        while finished < K {
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(_) => {
+                                open.insert(ev.slot);
+                                max_open = max_open.max(open.len());
+                            }
+                            EventKind::Finish(_) => {
+                                open.remove(&ev.slot);
+                                finished += 1;
+                            }
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert_eq!(finished, K, "every request finished");
+        assert!(
+            max_open >= 2,
+            "expected ≥2 sequences streaming concurrently (continuous batching), saw peak {max_open}"
+        );
+    }
+
+    /// The *continuous* half of continuous batching: sequences admitted together but
+    /// with different `max_tokens` must retire at different steps while the rest keep
+    /// decoding — a sequence still streams `Piece`s after another has already
+    /// `Finish`ed. Also pins that interleaving never corrupts a slot's output: each
+    /// request's bytes are exactly its truncated canned reply.
+    #[test]
+    fn heterogeneous_max_tokens_retire_mid_batch() {
+        const CAP: u32 = 4;
+        let max_toks = [4u32, 8, 16, 200]; // distinct targets → staggered retirement
+        let cfg = test_cfg(CAP, 1024);
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        let reply_len = CANNED_REPLY.len() as u32;
+        for slot in 0..CAP {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot);
+                s.reset();
+                s.prompt.push_str("hi");
+                s.max_tokens = max_toks[slot as usize];
+            }
+            ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
+        }
+
+        let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); CAP as usize];
+        let mut cursor = vec![0usize; CAP as usize];
+        let mut finished: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut retire_mid_batch = false;
+        while finished.len() < CAP as usize {
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(delta) => {
+                                // A still-open slot streaming after another already
+                                // finished = retirement happened mid-batch.
+                                if !finished.is_empty() && !finished.contains(&ev.slot) {
+                                    retire_mid_batch = true;
+                                }
+                                let c = cursor[ev.slot as usize];
+                                let piece = unsafe { slab.read_committed(ev.slot, c, delta as usize) }
+                                    .expect("committed range in bounds");
+                                outputs[ev.slot as usize].extend_from_slice(piece);
+                                cursor[ev.slot as usize] = c + delta as usize;
+                            }
+                            EventKind::Finish(_) => {
+                                finished.insert(ev.slot);
+                            }
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        for slot in 0..CAP as usize {
+            let target = max_toks[slot].min(reply_len) as usize;
+            assert_eq!(
+                outputs[slot], &CANNED_REPLY[..target],
+                "slot {slot} streamed exactly its truncated reply under batching"
+            );
+        }
+        assert!(
+            retire_mid_batch,
+            "a sequence kept streaming after another finished (staggered retirement)"
+        );
+    }
+
+    /// Drive K requests through a pipeline whose batch cap `< K` and assert the two
+    /// admission limits hold: peak concurrency never exceeds `cap` (excess requests
+    /// wait in `pending`), and every request still finishes with its full reply (the
+    /// backlog drains as seqs retire). `limit_by_seqs` toggles whether the cap comes
+    /// from `max_batch_seqs` or from the shared-KV reservation (`n_ctx`).
+    fn assert_batch_cap(limit_by_seqs: bool) {
+        use crate::rings::FinishReason;
+        const CAP: u32 = 4;
+        const K: usize = 4;
+        const EXPECT: usize = 2;
+        // Reservation per mock seq = prompt_len + max_tokens. Prompt "hello" = 5,
+        // max_tokens 200 → 205; n_ctx = 2*205 admits exactly 2 at a time.
+        let cfg = if limit_by_seqs {
+            test_cfg_with(CAP, 1024, EXPECT as u32, 100_000, 1_000_000)
+        } else {
+            test_cfg_with(CAP, 1024, 8, 100_000, 2 * (5 + 200))
+        };
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        for slot in 0..CAP {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot);
+                s.reset();
+                s.prompt.push_str("hello");
+                s.max_tokens = 200;
+            }
+            ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
+        }
+
+        let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); K];
+        let mut cursor = vec![0usize; CAP as usize];
+        let mut open: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut max_open = 0usize;
+        let mut finish: Vec<Option<FinishReason>> = vec![None; K];
+        let mut finished = 0usize;
+        while finished < K {
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(delta) => {
+                                open.insert(ev.slot);
+                                max_open = max_open.max(open.len());
+                                let c = cursor[ev.slot as usize];
+                                let piece = unsafe { slab.read_committed(ev.slot, c, delta as usize) }
+                                    .expect("committed range in bounds");
+                                outputs[ev.slot as usize].extend_from_slice(piece);
+                                cursor[ev.slot as usize] = c + delta as usize;
+                            }
+                            EventKind::Finish(r) => {
+                                open.remove(&ev.slot);
+                                finish[ev.slot as usize] = Some(r);
+                                finished += 1;
+                            }
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert_eq!(finished, K, "every request finished (backlog drained past the cap)");
+        assert_eq!(
+            max_open, EXPECT,
+            "peak concurrency should be capped at {EXPECT} (limit_by_seqs={limit_by_seqs})"
+        );
+        for out in &outputs {
+            assert_eq!(out, CANNED_REPLY, "each request streamed its full reply despite staging");
+        }
+        // max_tokens 200 > reply len → the full reply, so every seq ends at Eos (not
+        // MaxTokens/Error) even though admission was staged behind the cap.
+        for (r, f) in finish.iter().enumerate() {
+            assert_eq!(*f, Some(FinishReason::Eos), "request {r} finished with Eos");
+        }
+    }
+
+    /// `max_batch_seqs` caps how many sequences decode together; excess wait and drain.
+    #[test]
+    fn max_batch_seqs_caps_concurrency() {
+        assert_batch_cap(true);
+    }
+
+    /// The shared-KV reservation caps concurrency: with `max_batch_seqs` high but a
+    /// small `n_ctx`, admission defers once reserved cells would exceed `n_ctx`.
+    #[test]
+    fn kv_reservation_caps_concurrency() {
+        assert_batch_cap(false);
+    }
+
+    /// The per-iteration prompt-token budget (`max_batch_tokens`, the named P3 knob):
+    /// when a single prompt exceeds the whole budget, it's admitted only by the
+    /// idle-progress exception, and any *other* prompt then defers until the running
+    /// set drains to idle. So long prompts serialize — peak concurrency is exactly 1 —
+    /// even though `max_batch_seqs`/KV would allow more. This is the long-prompt
+    /// while-active case (the HOL guard chunked prefill/P7 later relaxes). Mock
+    /// tokenizes 1 token per prompt byte, so "hello" = 5 tokens > a budget of 4.
+    #[test]
+    fn max_batch_tokens_serializes_long_prompts() {
+        const CAP: u32 = 4;
+        const K: usize = 4;
+        // Budget 4 < prompt len 5, max_batch_seqs 8 and n_ctx huge → only the token
+        // budget can cap concurrency here.
+        let cfg = test_cfg_with(CAP, 1024, 8, 4, 1_000_000);
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        for slot in 0..CAP {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot);
+                s.reset();
+                s.prompt.push_str("hello"); // 5 mock tokens > max_batch_tokens = 4
+                s.max_tokens = 200; // > CANNED_REPLY.len() → full reply, Eos
+            }
+            ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
+        }
+
+        let mut open: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut max_open = 0usize;
+        let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); K];
+        let mut cursor = vec![0usize; CAP as usize];
+        let mut finished = 0usize;
+        while finished < K {
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(delta) => {
+                                open.insert(ev.slot);
+                                max_open = max_open.max(open.len());
+                                let c = cursor[ev.slot as usize];
+                                let piece = unsafe { slab.read_committed(ev.slot, c, delta as usize) }
+                                    .expect("committed range in bounds");
+                                outputs[ev.slot as usize].extend_from_slice(piece);
+                                cursor[ev.slot as usize] = c + delta as usize;
+                            }
+                            EventKind::Finish(_) => {
+                                open.remove(&ev.slot);
+                                finished += 1;
+                            }
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert_eq!(finished, K, "every request finished (backlog drained one at a time)");
+        assert_eq!(
+            max_open, 1,
+            "a prompt larger than the whole token budget serializes: peak concurrency 1, saw {max_open}"
+        );
+        for out in &outputs {
+            assert_eq!(out, CANNED_REPLY, "each serialized request streamed its full reply");
+        }
+    }
+
+    /// Regression for the batched R3 emission (`Decoder::step` → `r3.batch_publish`):
+    /// with the ring sized to the minimum (`ring_size == max_inflight`) and every slot
+    /// admitted at once, each step publishes a token burst of `active.len()` events —
+    /// which can equal `ring_size`. This proves the burst always fits (never a batch
+    /// larger than the ring → no deadlock) and streams correctly. A lagging egress
+    /// (Core 0 yields between polls, so Core 2 gets ahead and fills R3) forces
+    /// `batch_publish` to spin for a full drain, exercising the burst against a
+    /// nearly-full ring. A wall-clock deadline turns a regression (e.g. batching
+    /// Token+Finish into one 2N-event burst that can never fit a size-N ring) into a
+    /// clean failure, not a CI hang.
+    #[test]
+    fn batched_emission_never_exceeds_ring_under_lagging_egress() {
+        use std::time::{Duration, Instant};
+        const CAP: u32 = 64; // == ring_size below → a full burst equals the ring size
+        const K: usize = 64;
+        // ring_size == max_inflight == max_batch_seqs == 64 (the tight boundary);
+        // n_ctx + token budget generous so only the ring can bind the burst.
+        let cfg = test_cfg_with(CAP, 64, CAP, 100_000, 1_000_000);
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        for slot in 0..CAP {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot);
+                s.reset();
+                s.prompt.push_str("hi");
+                s.max_tokens = 200; // full canned reply, Eos
+            }
+            ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
+        }
+
+        let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); K];
+        let mut cursor = vec![0usize; CAP as usize];
+        let mut finished = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while finished < K {
+            assert!(Instant::now() < deadline, "batched emission stalled — a burst larger than the ring can't drain");
+            match egress.poll() {
+                // Drain the whole guard (the crate's guard commits `available` on drop,
+                // so a partial read would *lose* events, not requeue them). We induce lag
+                // by yielding between polls instead, letting R3/R4 fill under Core 2.
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(delta) => {
+                                let c = cursor[ev.slot as usize];
+                                let piece = unsafe { slab.read_committed(ev.slot, c, delta as usize) }
+                                    .expect("committed range in bounds");
+                                outputs[ev.slot as usize].extend_from_slice(piece);
+                                cursor[ev.slot as usize] = c + delta as usize;
+                            }
+                            EventKind::Finish(_) => finished += 1,
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+            std::thread::yield_now(); // lag the egress so the burst meets a full ring
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert_eq!(finished, K, "every request finished under the minimum-sized ring");
+        for (r, out) in outputs.iter().enumerate() {
+            assert_eq!(out, CANNED_REPLY, "request {r} streamed the full reply despite ring pressure");
         }
     }
 
@@ -300,5 +694,64 @@ runtime:
 
         assert_eq!(finish, Some(FinishReason::Error), "overflow → Error, not success");
         assert!(freed, "slot recycled after an errored stream");
+    }
+
+    /// A request that can *never* fit (`prompt_len + max_tokens > n_ctx`) must be
+    /// permanently rejected: `Finish(Error)`, no output, and the slot recycles —
+    /// while a fitting request behind it in the backlog still drains. This is the
+    /// permanent-reject counterpart to `kv_reservation_caps_concurrency` (which only
+    /// exercises the temporary defer path).
+    #[test]
+    fn over_n_ctx_request_rejects_and_backlog_drains() {
+        use crate::rings::FinishReason;
+        const CAP: u32 = 2;
+        // n_ctx = 20. slot 0: prompt "hello"(5) + max_tokens 100 = 105 > 20 → reject.
+        // slot 1: prompt "hi"(2) + max_tokens 5 = 7 <= 20 → fits and finishes.
+        let cfg = test_cfg_with(CAP, 1024, 8, 100_000, 20);
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        let specs = [("hello", 100u32), ("hi", 5u32)];
+        for (slot, (prompt, max_tokens)) in specs.iter().enumerate() {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot as u32);
+                s.reset();
+                s.prompt.push_str(prompt);
+                s.max_tokens = *max_tokens;
+            }
+            ingress.publish(|e| *e = RingEvent { slot: slot as u32, kind: EventKind::New });
+        }
+
+        let mut finish: Vec<Option<FinishReason>> = vec![None; CAP as usize];
+        let mut pieces: Vec<usize> = vec![0; CAP as usize];
+        let mut finished = 0usize;
+        while finished < CAP as usize {
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(_) => pieces[ev.slot as usize] += 1,
+                            EventKind::Finish(r) => {
+                                finish[ev.slot as usize] = Some(r);
+                                finished += 1;
+                            }
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert_eq!(finish[0], Some(FinishReason::Error), "over-n_ctx request rejected as Error");
+        assert_eq!(pieces[0], 0, "rejected request streamed no output");
+        // max_tokens 5 < reply len → truncated, so MaxTokens (not Eos).
+        assert_eq!(finish[1], Some(FinishReason::MaxTokens), "fitting request behind it still drained");
+        assert!(pieces[1] > 0, "fitting request streamed its reply");
     }
 }

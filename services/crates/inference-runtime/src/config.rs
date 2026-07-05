@@ -41,8 +41,36 @@ pub struct Runtime {
     pub max_inflight: u32,
     /// Ring buffer size; power of two, R1 (multi-producer) needs >= 64.
     pub ring_size: u32,
+    /// Continuous-batching cap (P3): max sequences decoded together per iteration.
+    /// The effective cap is clamped to `max_inflight` at load. Defaulted so existing
+    /// configs parse unchanged.
+    #[serde(default = "default_max_batch_seqs")]
+    pub max_batch_seqs: u32,
+    /// Continuous-batching cap (P3): per-iteration prompt-token budget for admission —
+    /// stop admitting new sequences once this many prompt tokens have been prefilled in
+    /// one loop iteration, so a long prefill doesn't starve decode. The full fix for
+    /// prefill/decode head-of-line blocking is chunked prefill (P7).
+    #[serde(default = "default_max_batch_tokens")]
+    pub max_batch_tokens: u32,
     /// Pinned core ids (no-op on macOS).
     pub cores: Cores,
+}
+
+fn default_max_batch_seqs() -> u32 {
+    256
+}
+
+fn default_max_batch_tokens() -> u32 {
+    2048
+}
+
+impl Runtime {
+    /// Continuous-batching concurrency cap actually used by Core 2: the configured
+    /// `max_batch_seqs` can't exceed the slab (in-flight slots) and is at least 1.
+    /// Single source of truth so the mock and llama backends don't clamp differently.
+    pub fn effective_max_batch_seqs(&self) -> u32 {
+        self.max_batch_seqs.min(self.max_inflight).max(1)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +120,26 @@ impl Config {
                 r.ring_size, r.max_inflight
             )));
         }
+        if r.max_batch_seqs == 0 {
+            return Err(ConfigError::Invalid("runtime.max_batch_seqs must be > 0".into()));
+        }
+        // Upper bound: seq ids are handed to llama.cpp as `i32` (`0..max_batch_seqs`),
+        // so a value past `i32::MAX` truncates. The effective cap is clamped to
+        // `max_inflight` at load, so anything larger is already pointless — reject it
+        // at the boundary rather than silently wrapping a seq id.
+        if r.max_batch_seqs > i32::MAX as u32 {
+            return Err(ConfigError::Invalid(format!(
+                "runtime.max_batch_seqs ({}) must be <= {} (used as an i32 llama seq id)",
+                r.max_batch_seqs,
+                i32::MAX
+            )));
+        }
+        // A zero token budget would make Core 2's admit loop (`admitted_tokens <
+        // max_batch_tokens`) never run — nothing is ever admitted, `pending` never
+        // drains, and the loop hangs. Reject at the boundary, like the other knobs.
+        if r.max_batch_tokens == 0 {
+            return Err(ConfigError::Invalid("runtime.max_batch_tokens must be > 0".into()));
+        }
 
         // Model invariants — P2 mandates full GPU offload + a single CPU thread, and
         // the context builder needs a non-zero n_ctx (it becomes a NonZeroU32, which
@@ -100,6 +148,17 @@ impl Config {
         let m = &self.model;
         if m.n_ctx == 0 {
             return Err(ConfigError::Invalid("model.n_ctx must be > 0".into()));
+        }
+        // KV positions are handed to llama.cpp's batch API as `i32` (prompt/decode
+        // positions run 0..n_ctx). A context past i32::MAX would wrap a position
+        // before the first decode — reject it at the boundary so the `pos as i32`
+        // casts in the decoder are always exact.
+        if m.n_ctx > i32::MAX as u32 {
+            return Err(ConfigError::Invalid(format!(
+                "model.n_ctx ({}) must be <= {} (used as i32 KV positions)",
+                m.n_ctx,
+                i32::MAX
+            )));
         }
         if m.n_threads != 1 {
             return Err(ConfigError::Invalid(format!(
@@ -166,6 +225,9 @@ runtime:
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../config/default-config.yaml");
         let cfg = Config::from_yaml_file(path).expect("load canonical config");
         assert_eq!(cfg.runtime.cores.web_io, 0);
+        // Pin the shipped P3 batching defaults so a drift in the file is caught here.
+        assert_eq!(cfg.runtime.max_batch_seqs, 256);
+        assert_eq!(cfg.runtime.max_batch_tokens, 2048);
     }
 
     #[test]
@@ -173,6 +235,8 @@ runtime:
         let base = |mi: u32, rs: u32| Runtime {
             max_inflight: mi,
             ring_size: rs,
+            max_batch_seqs: 256,
+            max_batch_tokens: 2048,
             cores: Cores { web_io: 0, text: 1, fast_loop: 2 },
         };
         let with = |rt| Config {
@@ -185,6 +249,17 @@ runtime:
         assert!(with(base(256, 32)).validate().is_err(), "ring_size < 64");
         assert!(with(base(2048, 1024)).validate().is_err(), "ring_size < max_inflight");
         assert!(with(base(256, 1024)).validate().is_ok(), "valid");
+
+        // Continuous-batching knobs: a zero cap on either would stall Core 2.
+        let mut z = base(256, 1024);
+        z.max_batch_seqs = 0;
+        assert!(with(z).validate().is_err(), "max_batch_seqs 0");
+        let mut z = base(256, 1024);
+        z.max_batch_tokens = 0;
+        assert!(with(z).validate().is_err(), "max_batch_tokens 0 would hang admit");
+        let mut z = base(256, 1024);
+        z.max_batch_seqs = i32::MAX as u32 + 1;
+        assert!(with(z).validate().is_err(), "max_batch_seqs > i32::MAX truncates a seq id");
     }
 
     #[test]
@@ -192,6 +267,8 @@ runtime:
         let rt = || Runtime {
             max_inflight: 256,
             ring_size: 1024,
+            max_batch_seqs: 256,
+            max_batch_tokens: 2048,
             cores: Cores { web_io: 0, text: 1, fast_loop: 2 },
         };
         let with = |n_ctx, n_threads, n_gpu_layers| Config {
@@ -200,6 +277,7 @@ runtime:
             runtime: rt(),
         };
         assert!(with(0, 1, -1).validate().is_err(), "n_ctx 0");
+        assert!(with(i32::MAX as u32 + 1, 1, -1).validate().is_err(), "n_ctx > i32::MAX wraps positions");
         assert!(with(1024, 4, -1).validate().is_err(), "n_threads != 1");
         assert!(with(1024, 1, 20).validate().is_err(), "partial GPU offload");
         assert!(with(1024, 1, -1).validate().is_ok(), "full offload, 1 thread, n_ctx>0");

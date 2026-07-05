@@ -19,6 +19,8 @@ model:
 runtime:
   max_inflight: 256     # RequestSlab size = max concurrent requests
   ring_size: 1024       # power of two; R1 (multi-producer) needs >= 64
+  max_batch_seqs: 256   # P3: max sequences decoded together per iteration (clamped to max_inflight)
+  max_batch_tokens: 2048 # P3: per-iteration prompt-token budget for admission (HOL guard; chunked prefill is P7)
   cores:                # pinned core ids (no-op on macOS)
     web_io: 0
     text: 1
