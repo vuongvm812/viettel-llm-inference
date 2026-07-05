@@ -124,7 +124,7 @@ impl Decoder {
             r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(FinishReason::Error) });
             return Admit::Rejected;
         }
-        if self.reserved + needed > self.n_ctx {
+        if self.reserved.saturating_add(needed) > self.n_ctx {
             // Fits alone but not alongside the current running set → wait for a retire.
             return Admit::Deferred;
         }
@@ -137,11 +137,22 @@ impl Decoder {
     /// byte-token, then retire any that reached its target (with the same
     /// `MaxTokens`/`Eos` reason as P2), releasing its KV reservation.
     pub fn step<P: Producer<RingEvent>>(&mut self, _slab: &Slab, r3: &mut P) {
+        let n = self.active.len();
+        if n == 0 {
+            return;
+        }
+        // Emit the whole per-step token burst in one R3 batch (the design's throughput
+        // path). `n == active.len() <= max_batch_seqs <= ring_size`, so it always fits.
+        r3.batch_publish(n, |iter| {
+            for (e, seq) in iter.zip(self.active.iter()) {
+                let byte = CANNED_REPLY[seq.cursor as usize];
+                *e = RingEvent { slot: seq.slot, kind: EventKind::Token(byte as u32) };
+            }
+        });
+        // Advance + retire. Finishes (a minority) stay individual publishes.
         let reply_len = CANNED_REPLY.len() as u32;
         let reserved = &mut self.reserved;
         self.active.retain_mut(|seq| {
-            let byte = CANNED_REPLY[seq.cursor as usize];
-            r3.publish(|e| *e = RingEvent { slot: seq.slot, kind: EventKind::Token(byte as u32) });
             seq.cursor += 1;
             if seq.cursor < seq.target {
                 return true; // keep decoding

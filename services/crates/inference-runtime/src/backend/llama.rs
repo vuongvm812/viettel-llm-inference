@@ -288,7 +288,7 @@ impl Decoder {
         // Fits alone but not alongside the current running set → wait for a retire.
         // `reserved == 0` when the set is empty and `needed <= n_ctx`, so an idle
         // pipeline never defers → always makes progress.
-        if self.reserved + needed > self.n_ctx {
+        if self.reserved.saturating_add(needed) > self.n_ctx {
             return Admit::Deferred;
         }
 
@@ -329,6 +329,13 @@ impl Decoder {
     /// its first token. Reads prompt tokens straight from the slab (no copy); publishes
     /// nothing on R3, so holding the `&mut` slot across prefill is sound (Core 2 still
     /// owns the slot). Budget/overflow are already checked by [`admit`].
+    ///
+    /// ponytail / P3 limitation: prefill is **per-request** decode work — each admitted
+    /// request runs its own prompt through `decode()` before the batched generation
+    /// step, so a burst of long (40K-token) prompts still prefills serially and can
+    /// dominate TTFT. The upgrades are P4 (shared-prefix KV — prefill only the
+    /// non-shared suffix) and P7 (chunked prefill — split one prompt across iterations
+    /// so it interleaves with active decode). Tracked in ROADMAP's P3 long-prompt caveat.
     /// SAFETY: slot arrived via R2 → Core 2 owns it here (no R3 publish in this fn).
     fn prefill(
         &mut self,
@@ -394,18 +401,27 @@ impl Decoder {
             return self.fail_all(r3, &e.to_string());
         }
 
-        // Emit + sample + compact in one pass. Fields (`active`, `ctx`, `model`,
-        // `seq_pool`) are disjoint, so the indexed borrows below don't overlap.
+        // Emit the fed token for every active seq in ONE R3 burst — the design's
+        // batch-publish throughput path. Each token was confirmed non-EOG when sampled.
+        // The burst is `active.len()` events, which is <= max_batch_seqs <= max_inflight
+        // <= ring_size (config-enforced), so it always fits: never a batch larger than
+        // the ring, and Core 1 drains R3 independently, so the spin is bounded.
+        let n = self.active.len();
+        r3.batch_publish(n, |iter| {
+            for (e, seq) in iter.zip(self.active.iter()) {
+                *e = RingEvent { slot: seq.slot, kind: EventKind::Token(seq.next_token as u32) };
+            }
+        });
+
+        // Sample the next token per seq, retire finished ones, compact survivors in one
+        // pass. Fields (`active`, `ctx`, `model`, `seq_pool`) are disjoint, so the
+        // indexed borrows below don't overlap. Finishes (a minority) stay individual.
         let mut w = 0;
         // Set if a retiring seq's KV clear fails: its id can't be safely reused, so we
         // wipe the whole cache and fail the survivors after this pass (below) rather
         // than decode the next step on top of KV we couldn't clean.
         let mut kv_clear_failed = false;
         for r in 0..self.active.len() {
-            let slot = self.active[r].slot;
-            let tok = self.active[r].next_token;
-            // Emit the fed token — it was confirmed non-EOG when sampled.
-            r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Token(tok as u32) });
             self.active[r].n_generated += 1;
             self.active[r].pos += 1;
 
@@ -431,6 +447,7 @@ impl Decoder {
                     w += 1;
                 }
                 Some(reason) => {
+                    let slot = self.active[r].slot;
                     let seq_id = self.active[r].seq_id;
                     r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(reason) });
                     self.reserved -= self.active[r].reserve; // give the KV budget back
@@ -473,15 +490,25 @@ impl Decoder {
 
     /// Return a seq id to the free pool and drop its KV cells. Used on admit-time
     /// finish/error, before the seq ever joins the running set (so it holds no
-    /// reservation to release). If the KV clear fails the id is *leaked* (not reused)
-    /// rather than handed back dirty — a reused id on stale KV corrupts output. This is
-    /// the "impossible" path (valid in-range id); leaking one id degrades capacity but
-    /// never corrupts. ponytail: leak-not-reuse on the impossible failure; a full-cache
-    /// resync path would be the upgrade if it ever actually fires on target.
+    /// reservation to release). On a KV-clear failure (the "impossible" in-range-id
+    /// path) the id must not be handed back dirty — a reused id on stale KV corrupts
+    /// output. Recovery depends on what's decoding:
+    /// - **Cache idle** (no active seqs): safe to wipe the whole cache and rebuild the
+    ///   id pool from scratch — this recovers the just-failed id *and* any previously
+    ///   leaked one, so repeated admit-time failures while idle can't exhaust the pool.
+    /// - **Active seqs present**: can't wipe their live KV mid-flight, so leak just this
+    ///   one id (degrades capacity, never corrupts) until the running set drains.
     fn retire_seq(&mut self, seq_id: i32) {
         match self.free_seq_kv(seq_id) {
             Ok(()) => self.seq_pool.push(seq_id),
-            Err(e) => eprintln!("core2 retire: KV clear failed for seq {seq_id}, leaking id: {e}"),
+            Err(e) if self.active.is_empty() => {
+                eprintln!("core2 retire: KV clear failed for seq {seq_id} ({e}); cache idle → full wipe + pool reset");
+                self.ctx.clear_kv_cache();
+                self.seq_pool.clear();
+                self.seq_pool.extend((0..self.max_batch_seqs as i32).rev());
+                self.reserved = 0;
+            }
+            Err(e) => eprintln!("core2 retire: KV clear failed for seq {seq_id}, leaking id (active seqs present): {e}"),
         }
     }
 

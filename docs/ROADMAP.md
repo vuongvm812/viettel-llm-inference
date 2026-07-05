@@ -93,8 +93,15 @@ exact `llama-cpp-2` method names for KV/sampling must be confirmed against the c
 > decode-count assertion inside `Decoder::step` — exactly one `ctx.decode()` per step,
 > over `active.len()` seqs, so a regression that decodes each seq separately is caught
 > (the mock has no `decode()` to count, so this is target-only); and (b) a P2-vs-P3 tok/s
-> run on the 120-request trace. Track as a target-box, feature-gated (`--features llama`)
-> benchmark.
+> run on the 120-request trace.
+>
+> **Deferred deliverable (target box only).** This instrumentation cannot run in the
+> CPU/macOS dev sandbox (no `cmake`/`libllama`/GPU/GGUF — see the P2 build constraint),
+> so it is an explicit open task, not shippable here:
+> - [ ] `--features llama` bench: assert exactly one `ctx.decode()` per `Decoder::step`
+>   over `active.len()` seqs (guards against per-seq decode regression).
+> - [ ] `--features llama` bench: P2 vs P3 tok/s on the 120-request trace (short/moderate
+>   prompts — the long-prompt trace stays 1 seq/decode until P4/P7, see the caveat below).
 >
 > **Long-prompt caveat (target trace).** The 120-request trace uses ~40K-token prompts.
 > With `max_batch_tokens` bounding prefill per iteration, a long prompt is admitted only

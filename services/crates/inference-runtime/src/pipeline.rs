@@ -520,6 +520,78 @@ runtime:
         }
     }
 
+    /// Regression for the batched R3 emission (`Decoder::step` → `r3.batch_publish`):
+    /// with the ring sized to the minimum (`ring_size == max_inflight`) and every slot
+    /// admitted at once, each step publishes a token burst of `active.len()` events —
+    /// which can equal `ring_size`. This proves the burst always fits (never a batch
+    /// larger than the ring → no deadlock) and streams correctly. A lagging egress
+    /// (Core 0 yields between polls, so Core 2 gets ahead and fills R3) forces
+    /// `batch_publish` to spin for a full drain, exercising the burst against a
+    /// nearly-full ring. A wall-clock deadline turns a regression (e.g. batching
+    /// Token+Finish into one 2N-event burst that can never fit a size-N ring) into a
+    /// clean failure, not a CI hang.
+    #[test]
+    fn batched_emission_never_exceeds_ring_under_lagging_egress() {
+        use std::time::{Duration, Instant};
+        const CAP: u32 = 64; // == ring_size below → a full burst equals the ring size
+        const K: usize = 64;
+        // ring_size == max_inflight == max_batch_seqs == 64 (the tight boundary);
+        // n_ctx + token budget generous so only the ring can bind the burst.
+        let cfg = test_cfg_with(CAP, 64, CAP, 100_000, 1_000_000);
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        for slot in 0..CAP {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot);
+                s.reset();
+                s.prompt.push_str("hi");
+                s.max_tokens = 200; // full canned reply, Eos
+            }
+            ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
+        }
+
+        let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); K];
+        let mut cursor = vec![0usize; CAP as usize];
+        let mut finished = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while finished < K {
+            assert!(Instant::now() < deadline, "batched emission stalled — a burst larger than the ring can't drain");
+            match egress.poll() {
+                // Drain the whole guard (the crate's guard commits `available` on drop,
+                // so a partial read would *lose* events, not requeue them). We induce lag
+                // by yielding between polls instead, letting R3/R4 fill under Core 2.
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(delta) => {
+                                let c = cursor[ev.slot as usize];
+                                let piece = unsafe { slab.read_committed(ev.slot, c, delta as usize) }
+                                    .expect("committed range in bounds");
+                                outputs[ev.slot as usize].extend_from_slice(piece);
+                                cursor[ev.slot as usize] = c + delta as usize;
+                            }
+                            EventKind::Finish(_) => finished += 1,
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+            std::thread::yield_now(); // lag the egress so the burst meets a full ring
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert_eq!(finished, K, "every request finished under the minimum-sized ring");
+        for (r, out) in outputs.iter().enumerate() {
+            assert_eq!(out, CANNED_REPLY, "request {r} streamed the full reply despite ring pressure");
+        }
+    }
+
     /// `max_tokens` truncation landing *inside* a multi-byte code point: the UTF-8
     /// gate holds the incomplete lead byte, and only `flush_tail` (at Finish) can
     /// emit it. Asserts the reassembled output is byte-exact `CANNED_REPLY[..N]` —

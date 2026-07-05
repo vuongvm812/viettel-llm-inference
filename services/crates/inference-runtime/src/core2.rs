@@ -66,13 +66,15 @@ pub fn run(
         // (defers to a later iteration) instead of blocking active decode with a full
         // prefill. It admits once the set drains to idle. Splitting one prefill across
         // iterations (chunked prefill) is the P7 fix that removes even the idle stall.
-        let mut admitted_tokens = 0u32;
+        // usize so an extreme prompt length can't wrap the running budget total.
+        let budget = max_batch_tokens as usize;
+        let mut admitted_tokens = 0usize;
         while decoder.has_capacity() {
             let Some(&slot) = pending.front() else { break };
             // SAFETY: `slot` sits in Core 2's `pending` (arrived via R2, no R3 publish
             // yet) → Core 2 solely owns it.
-            let plen = unsafe { slab.prompt_len(slot) } as u32;
-            let over_budget = admitted_tokens.saturating_add(plen) > max_batch_tokens;
+            let plen = unsafe { slab.prompt_len(slot) };
+            let over_budget = admitted_tokens.saturating_add(plen) > budget;
             let idle_progress = decoder.is_idle() && admitted_tokens == 0;
             if over_budget && !idle_progress {
                 break; // budget spent (or a long prefill deferred) — decode first
@@ -80,7 +82,7 @@ pub fn run(
             match decoder.admit(slot, &slab, &mut r3) {
                 Admit::Admitted(n_prompt) => {
                     pending.pop_front();
-                    admitted_tokens = admitted_tokens.saturating_add(n_prompt as u32);
+                    admitted_tokens = admitted_tokens.saturating_add(n_prompt);
                 }
                 // KV budget full right now: leave it queued and let the decode step
                 // below retire a seq and free cells, then retry next iteration.
@@ -97,16 +99,17 @@ pub fn run(
         }
 
         // Decode one step over the whole running set (this is the batching).
-        // `step` emits tokens/finishes with *blocking* R3 publishes. That's bounded
+        // `step` emits the whole per-step token burst in one `r3.batch_publish` (the
+        // design's R3 throughput sweet spot) — the burst is `active.len()` events,
+        // which is <= max_batch_seqs <= max_inflight <= ring_size (config-enforced),
+        // so it always fits and can never be a batch larger than the ring. Retire
+        // `Finish`es (a minority) are published individually. This is bounded
         // backpressure, not a deadlock risk: the only cyclic wait would be Core 1
         // blocked on an R2 publish while Core 2 is blocked on R3, but R2 can never fill
         // — each slot has at most one outstanding R2 entry per lifecycle, so live R2
-        // entries <= max_inflight <= ring_size (config-enforced), and Core 1 never
-        // blocks publishing to R2. R3 pressure therefore only ever traces back to Core 0
-        // draining R4, which is independent and always makes progress. Batching the
-        // per-step emission into one `r3.batch_publish` (design note) is a target-box
-        // perf refinement, not a correctness fix — and must chunk to <= ring_size to
-        // avoid a batch that can never fit.
+        // entries <= max_inflight <= ring_size, and Core 1 never blocks publishing to
+        // R2. R3 pressure therefore only ever traces back to Core 0 draining R4, which
+        // is independent and always makes progress.
         if !decoder.is_idle() {
             decoder.step(&slab, &mut r3);
         }

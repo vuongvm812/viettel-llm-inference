@@ -149,6 +149,17 @@ impl Config {
         if m.n_ctx == 0 {
             return Err(ConfigError::Invalid("model.n_ctx must be > 0".into()));
         }
+        // KV positions are handed to llama.cpp's batch API as `i32` (prompt/decode
+        // positions run 0..n_ctx). A context past i32::MAX would wrap a position
+        // before the first decode — reject it at the boundary so the `pos as i32`
+        // casts in the decoder are always exact.
+        if m.n_ctx > i32::MAX as u32 {
+            return Err(ConfigError::Invalid(format!(
+                "model.n_ctx ({}) must be <= {} (used as i32 KV positions)",
+                m.n_ctx,
+                i32::MAX
+            )));
+        }
         if m.n_threads != 1 {
             return Err(ConfigError::Invalid(format!(
                 "model.n_threads ({}) must be 1 — full GPU offload keeps CPU for the 3 pinned cores",
@@ -266,6 +277,7 @@ runtime:
             runtime: rt(),
         };
         assert!(with(0, 1, -1).validate().is_err(), "n_ctx 0");
+        assert!(with(i32::MAX as u32 + 1, 1, -1).validate().is_err(), "n_ctx > i32::MAX wraps positions");
         assert!(with(1024, 4, -1).validate().is_err(), "n_threads != 1");
         assert!(with(1024, 1, 20).validate().is_err(), "partial GPU offload");
         assert!(with(1024, 1, -1).validate().is_ok(), "full offload, 1 thread, n_ctx>0");
