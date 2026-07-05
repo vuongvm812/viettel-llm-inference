@@ -15,11 +15,12 @@ use crate::config::Config;
 use crate::pipeline::{EgressPoller, IngressProducer, Pipeline};
 use crate::rings::{EventKind, RingEvent};
 use crate::slab::Slab;
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Router;
 use disruptor::{Polling, Producer};
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -202,7 +203,15 @@ async fn egress_loop(slab: Arc<Slab>, conns: Conns, free: Free, cursor: Cursors,
     }
 }
 
-async fn chat(State(app): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
+async fn chat(State(app): State<AppState>, body: Bytes) -> Response {
+    // Parse the request body with sonic-rs (SIMD JSON) rather than the serde_json-backed
+    // axum `Json` extractor. `Bytes` still honours `DefaultBodyLimit`; a malformed body
+    // is a 400 at the trust boundary.
+    let req: ChatRequest = match sonic_rs::from_slice(body.as_ref()) {
+        Ok(req) => req,
+        Err(_) => return bad_request("invalid JSON body"),
+    };
+
     // Validate at the trust boundary before burning a slot.
     if req.model.trim().is_empty() {
         return bad_request("`model` is required");
@@ -276,7 +285,7 @@ async fn chat(State(app): State<AppState>, Json(req): Json<ChatRequest>) -> Resp
 
 /// Minimal OpenAI-shaped streaming delta so `curl` output reads as chat completions.
 fn sse_chunk(text: &str) -> String {
-    let content = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+    let content = sonic_rs::to_string(text).unwrap_or_else(|_| "\"\"".into());
     format!(
         r#"{{"object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"content":{content}}}}}]}}"#
     )
@@ -297,6 +306,7 @@ mod tests {
     use crate::pipeline;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use sonic_rs::JsonValueTrait; // `.as_str()` on sonic_rs::Value
     use tower::ServiceExt; // oneshot
 
     fn test_cfg(cap: u32) -> Config {
@@ -330,9 +340,9 @@ runtime:
     fn sse_chunk_is_a_valid_openai_delta() {
         // Content with a quote must be JSON-escaped, not corrupt the frame.
         let frame = sse_chunk("a\"b");
-        let v: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
-        assert_eq!(v["object"], "chat.completion.chunk");
-        assert_eq!(v["choices"][0]["delta"]["content"], "a\"b");
+        let v: sonic_rs::Value = sonic_rs::from_str(&frame).expect("valid json frame");
+        assert_eq!(v["object"].as_str(), Some("chat.completion.chunk"));
+        assert_eq!(v["choices"][0]["delta"]["content"].as_str(), Some("a\"b"));
     }
 
     /// End-to-end HTTP: a real OpenAI request streams SSE `chat.completion.chunk`
@@ -396,6 +406,9 @@ runtime:
                 status_of(&state, r#"{"model":"m","messages":[{"role":"u","content":"x"}],"max_tokens":0}"#).await,
                 StatusCode::BAD_REQUEST
             );
+            // Syntactically invalid JSON → 400 (the sonic-rs parse-error branch that
+            // replaced axum's Json extractor).
+            assert_eq!(status_of(&state, "{not valid json").await, StatusCode::BAD_REQUEST);
 
             // 503: exhaust the free-list, next request is rejected without a slot.
             lock(&state.free).clear();
@@ -418,7 +431,7 @@ runtime:
     fn sse_content(body: &str) -> String {
         body.lines()
             .filter_map(|l| l.strip_prefix("data:").map(str::trim))
-            .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .filter_map(|d| sonic_rs::from_str::<sonic_rs::Value>(d).ok())
             .filter_map(|v| v["choices"][0]["delta"]["content"].as_str().map(str::to_owned))
             .collect()
     }

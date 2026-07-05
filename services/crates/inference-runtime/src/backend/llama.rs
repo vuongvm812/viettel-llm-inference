@@ -8,14 +8,17 @@
 //! installed crate's docs; the *mechanisms* (tokenize, prefill, greedy sample,
 //! KV clear) are stable. Confirm on target.
 //!
-//! Scope: **continuous batching (P3), greedy (temp=0)**. The [`Decoder`] runs a
-//! running set of sequences: each [`step`](Decoder::step) batches one token per
-//! active seq into a single `decode()`, samples per seq, emits, and retires
-//! finished seqs (freeing their KV so the seq id can be reused). Admission reserves
-//! `n_prompt + max_tokens` KV cells up front so a seq is never started that can't
-//! finish. Shared-prefix KV (P4) is a later phase.
+//! Scope: **continuous batching (P3) + shared-prefix KV caching (P4), greedy
+//! (temp=0)**. The [`Decoder`] runs a running set of sequences: each
+//! [`step`](Decoder::step) batches one token per active seq into a single
+//! `decode()`, samples per seq, emits, and retires finished seqs (freeing their KV
+//! so the seq id can be reused). Admission reserves `suffix + max_tokens` KV cells
+//! per request plus the shared prefix's K cells once, so the ~39K-token system
+//! prompt is prefilled a single time and `kv_cache_seq_cp`'d into each request
+//! ([`admit`](Decoder::admit) / [`prefill`](Decoder::prefill)). The per-target
+//! prefill-once/TTFT verification is deferred to the GPU box (see ROADMAP P4).
 
-use super::{argmax, Admit, BackendError};
+use super::{admission_plan, argmax, shared_reuse_len, Admit, BackendError, Verdict};
 use crate::config::Config;
 use crate::rings::{EventKind, FinishReason, RingEvent};
 use crate::slab::Slab;
@@ -93,6 +96,7 @@ pub fn load(cfg: &Config) -> (TextBackend, DecoderInit) {
         n_ctx: cfg.model.n_ctx,
         n_batch,
         max_batch_seqs,
+        shared_prefix_tokens: cfg.runtime.shared_prefix_tokens,
     };
     (text, init)
 }
@@ -152,6 +156,8 @@ pub struct DecoderInit {
     n_batch: u32,
     /// Max sequences decoded together per iteration (continuous batching, P3).
     max_batch_seqs: u32,
+    /// Shared-prefix window K (P4); `0` disables (P3 behavior).
+    shared_prefix_tokens: u32,
 }
 
 /// One sequence in the running set: its llama.cpp seq id, KV position, and the
@@ -198,22 +204,37 @@ pub struct Decoder {
     /// Free llama.cpp sequence ids (0..max_batch_seqs), used as a stack.
     seq_pool: Vec<i32>,
     max_batch_seqs: usize,
-    /// KV cells currently reserved across the running set. Admission keeps
-    /// `reserved <= n_ctx` so a sequence is never started that can't finish (the
-    /// design's rule) — this is the P3 stand-in for P4's dynamic free-cell monitor.
+    /// KV cells currently reserved across the running set (per-seq suffix+generation
+    /// plus the shared prefix's K cells, counted once). Admission keeps
+    /// `reserved <= n_ctx` so a sequence is never started that can't finish.
     reserved: usize,
+    /// Shared-prefix window K (P4); `0` disables sharing (P3 behavior).
+    prefix_k: usize,
+    /// The established shared-prefix tokens (first `prefix_k`), or `None` until the
+    /// first eligible request prefills them into `prefix_seq_id`. Single entry (v1):
+    /// a non-matching / short prompt falls back to a full prefill. Multi-prefix +
+    /// eviction (radix tree) is P7. Cleared on a full KV wipe so it re-establishes.
+    prefix: Option<Vec<i32>>,
+    /// Reserved llama seq id holding the shared prefix's KV cells (id
+    /// `max_batch_seqs`, outside the request `seq_pool`). Never retired while the
+    /// prefix is established. Unused when `prefix_k == 0`.
+    prefix_seq_id: i32,
 }
 
 impl Decoder {
     pub fn new(init: DecoderInit) -> Self {
         let max_batch_seqs = init.max_batch_seqs as usize;
+        let prefix_k = init.shared_prefix_tokens as usize;
+        // Shared-prefix caching (P4) needs one extra sequence id beyond the request
+        // pool to hold the prefix's KV cells (id `max_batch_seqs`).
+        let prefix_extra = if prefix_k > 0 { 1 } else { 0 };
         let cparams = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(init.n_ctx))
             .with_n_batch(init.n_batch)
-            // Allow up to `max_batch_seqs` concurrent sequences in the KV cache.
-            // (Confirm the method name against llama-cpp-2 on the target — the crate
-            // occasionally renames context-param setters between versions.)
-            .with_n_seq_max(init.max_batch_seqs)
+            // Allow up to `max_batch_seqs` concurrent request sequences plus the
+            // reserved prefix seq in the KV cache. (Confirm the method name against
+            // llama-cpp-2 on the target — the crate occasionally renames setters.)
+            .with_n_seq_max(init.max_batch_seqs + prefix_extra)
             .with_n_threads(1); // full GPU offload → 1 CPU thread (don't fight the 3 cores)
         let ctx = init
             .model
@@ -238,6 +259,10 @@ impl Decoder {
             seq_pool,
             max_batch_seqs,
             reserved: 0,
+            prefix_k,
+            prefix: None,
+            // The prefix seq id sits just past the request ids (`0..max_batch_seqs`).
+            prefix_seq_id: max_batch_seqs as i32,
         }
     }
 
@@ -256,16 +281,58 @@ impl Decoder {
         self.active.is_empty()
     }
 
-    /// Admit a tokenized slot into the running set, honouring the shared KV budget:
-    /// reserve `n_prompt + max_tokens` cells up front so a sequence is never started
-    /// that can't finish. Returns [`Admit::Deferred`] when the running set is full
-    /// enough that this seq won't currently fit (Core 2 retries after a retire),
-    /// [`Admit::Rejected`] (having emitted `Finish(Error)`) when it can't fit `n_ctx`
-    /// even alone, else [`Admit::Admitted`] with the prompt-token count it prefilled.
+    /// Tokens [`admit`](Self::admit) would actually decode for `slot`: the full prompt,
+    /// unless it *shares an already-established* prefix, in which case only the unshared
+    /// suffix (the K prefix cells are `kv_cache_seq_cp`'d, not re-decoded). Read-only;
+    /// the establishing request still reports the full prompt (it pays the prefix cost).
+    /// Core 2 peeks this for the per-iteration prefill-token budget, so shared-prefix
+    /// requests batch instead of serializing behind the HOL guard.
+    pub fn effective_prefill_len(&self, slot: u32, slab: &Slab) -> usize {
+        // SAFETY: `slot` sits in Core 2's `pending` → Core 2 solely owns it (read only).
+        let tokens = unsafe { slab.slot_tokens(slot) };
+        tokens.len() - shared_reuse_len(self.prefix_k, self.prefix.as_deref(), tokens)
+    }
+
+    /// Wipe the entire KV cache and reset the decoder to its baseline (empty running
+    /// set, full seq-id pool, zero reservation, no resident prefix). The single place
+    /// that resets `prefix = None` on a full clear, so no recovery path can forget it.
+    fn wipe_all_kv(&mut self) {
+        self.ctx.clear_kv_cache();
+        self.seq_pool.clear();
+        self.seq_pool.extend((0..self.max_batch_seqs as i32).rev());
+        self.active.clear();
+        self.reserved = 0;
+        self.prefix = None;
+    }
+
+    /// Drop the resident shared prefix, freeing its K reserved cells (and the prefix
+    /// seq's KV). Called only when the decoder is idle and a fallback request can't fit
+    /// alongside the prefix — v1 has no eviction, so without this the never-reclaimed
+    /// prefix would wedge the fittable request. No-op if none is resident.
+    fn evict_prefix(&mut self) {
+        if self.prefix.take().is_none() {
+            return;
+        }
+        self.reserved = self.reserved.saturating_sub(self.prefix_k);
+        // Idle here (the sole caller guarantees `active.is_empty()`), so on the
+        // "impossible" in-range-id clear failure a full wipe is safe and reclaims all.
+        if let Err(e) = self.free_seq_kv(self.prefix_seq_id) {
+            eprintln!("core2 evict_prefix: KV clear failed for prefix seq ({e}); full wipe");
+            self.wipe_all_kv();
+        }
+    }
+
+    /// Admit a tokenized slot into the running set, honouring the shared KV budget.
+    /// With shared-prefix caching (P4) the first K tokens are shared: the prefix is
+    /// prefilled once and `kv_cache_seq_cp`'d into each matching request, so only the
+    /// suffix + generation is reserved per request (the K prefix cells are counted
+    /// once). Returns [`Admit::Deferred`] when the seq won't currently fit (Core 2
+    /// retries after a retire), [`Admit::Rejected`] (having emitted `Finish(Error)`)
+    /// when it can't fit `n_ctx` even alone, else [`Admit::Admitted`] with the
+    /// *effective* prefill-token count (suffix only when the prefix was shared).
     ///
-    /// The reservation is conservative (it books `max_tokens` even though most seqs
-    /// stop early at EOS). P4 replaces it with a dynamic free-cell monitor + shared
-    /// prefix so effective capacity is higher.
+    /// The per-seq reservation is still conservative (books `max_tokens` even though
+    /// most seqs stop early at EOS); shared-prefix lowers effective per-request KV.
     pub fn admit<P: Producer<RingEvent>>(&mut self, slot: u32, slab: &Slab, r3: &mut P) -> Admit {
         // SAFETY: slot is in Core 2's `pending` (arrived via R2, no R3 publish for it
         // yet) → Core 2 solely owns it.
@@ -276,20 +343,34 @@ impl Decoder {
         // Nothing to generate → finish immediately without a seq id or KV.
         if n_prompt == 0 || max_tokens == 0 || self.n_batch == 0 {
             r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(FinishReason::MaxTokens) });
-            return Admit::Admitted(n_prompt);
+            return Admit::Admitted(0);
         }
-        let needed = n_prompt.saturating_add(max_tokens as usize);
-        // Can never fit even alone → permanent reject (no partial streaming).
-        if needed > self.n_ctx {
-            eprintln!("core2 admit rejected slot {slot}: needs {needed} > n_ctx {}", self.n_ctx);
-            r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(FinishReason::Error) });
-            return Admit::Rejected;
+        // The KV/share accounting is the shared `admission_plan` oracle (identical to the
+        // mock, which is its sandbox test); this fn owns only the real KV side effects.
+        let plan = {
+            // SAFETY: slot owned by Core 2 here (read-only peek of the prompt tokens).
+            let tokens = unsafe { slab.slot_tokens(slot) };
+            admission_plan(
+                self.prefix_k,
+                self.prefix.as_deref(),
+                self.reserved,
+                self.n_ctx,
+                self.active.is_empty(),
+                tokens,
+                max_tokens,
+            )
+        };
+        match plan.verdict {
+            Verdict::Reject => {
+                eprintln!("core2 admit rejected slot {slot}: needs {} > n_ctx {}", n_prompt + max_tokens as usize, self.n_ctx);
+                r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(FinishReason::Error) });
+                return Admit::Rejected;
+            }
+            Verdict::Defer => return Admit::Deferred,
+            Verdict::Admit => {}
         }
-        // Fits alone but not alongside the current running set → wait for a retire.
-        // `reserved == 0` when the set is empty and `needed <= n_ctx`, so an idle
-        // pipeline never defers → always makes progress.
-        if self.reserved.saturating_add(needed) > self.n_ctx {
-            return Admit::Deferred;
+        if plan.evict_prefix {
+            self.evict_prefix();
         }
 
         // `has_capacity()` guarantees a free id, but don't rely on the caller: if the
@@ -297,9 +378,16 @@ impl Decoder {
         let Some(seq_id) = self.seq_pool.pop() else {
             return Admit::Deferred;
         };
-        match self.prefill(slot, slab, seq_id, n_prompt) {
+        match self.prefill(slot, slab, seq_id, n_prompt, plan.reused, plan.establishing) {
             Ok(FirstToken::Token(tok)) => {
-                self.reserved += needed;
+                if plan.establishing {
+                    // Prefill already donated this seq's prefix cells to `prefix_seq`
+                    // (only reached on a non-EOG first token), so record the prefix now.
+                    // SAFETY: slot owned by Core 2 here (no R3 publish in prefill).
+                    let tokens = unsafe { slab.slot_tokens(slot) };
+                    self.prefix = Some(tokens[..self.prefix_k].to_vec());
+                }
+                self.reserved += plan.inc;
                 self.active.push(ActiveSeq {
                     slot,
                     seq_id,
@@ -307,14 +395,14 @@ impl Decoder {
                     n_generated: 0,
                     max_tokens,
                     next_token: tok,
-                    reserve: needed,
+                    reserve: plan.reserve,
                 });
-                Admit::Admitted(n_prompt)
+                Admit::Admitted(plan.effective)
             }
             Ok(FirstToken::Done(reason)) => {
                 self.retire_seq(seq_id); // never reserved
                 r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(reason) });
-                Admit::Admitted(n_prompt)
+                Admit::Admitted(plan.effective)
             }
             Err(e) => {
                 eprintln!("core2 prefill error on slot {slot}: {e}");
@@ -325,17 +413,22 @@ impl Decoder {
         }
     }
 
-    /// Prefill `slot`'s prompt (`n_prompt` tokens, > 0) into `seq_id`'s KV and sample
-    /// its first token. Reads prompt tokens straight from the slab (no copy); publishes
-    /// nothing on R3, so holding the `&mut` slot across prefill is sound (Core 2 still
-    /// owns the slot). Budget/overflow are already checked by [`admit`].
+    /// Prefill `slot`'s prompt into `seq_id`'s KV and sample its first token, reusing
+    /// `reused` leading cells from the shared prefix when `reused > 0` (P4):
     ///
-    /// ponytail / P3 limitation: prefill is **per-request** decode work — each admitted
-    /// request runs its own prompt through `decode()` before the batched generation
-    /// step, so a burst of long (40K-token) prompts still prefills serially and can
-    /// dominate TTFT. The upgrades are P4 (shared-prefix KV — prefill only the
-    /// non-shared suffix) and P7 (chunked prefill — split one prompt across iterations
-    /// so it interleaves with active decode). Tracked in ROADMAP's P3 long-prompt caveat.
+    /// - **sharing** (`reused > 0`): `kv_cache_seq_cp` the prefix's `0..reused` cells
+    ///   into `seq_id` (no recompute of the 39K system prompt), then decode only the
+    ///   suffix `tokens[reused..n_prompt]` at `pos = reused`.
+    /// - **establishing** (`reused == 0`, first eligible request): decode the full
+    ///   prompt, then donate `seq_id`'s `0..K` cells to the reserved prefix seq so later
+    ///   requests can copy them — the prefix is computed exactly once, here.
+    /// - **fallback** (`reused == 0`, not establishing): decode the full prompt as in P3.
+    ///
+    /// `reused`/`establishing` come from [`admission_plan`] (`reused` is already capped
+    /// so ≥1 token is decoded, and is 0 whenever establishing). Reads prompt tokens
+    /// straight from the slab (no copy); publishes nothing on R3, so holding the `&mut`
+    /// slot across prefill is sound. P7 adds chunked prefill (split one prompt across
+    /// iterations) to also interleave a long establisher with decode.
     /// SAFETY: slot arrived via R2 → Core 2 owns it here (no R3 publish in this fn).
     fn prefill(
         &mut self,
@@ -343,12 +436,27 @@ impl Decoder {
         slab: &Slab,
         seq_id: i32,
         n_prompt: usize,
+        reused: usize,
+        establishing: bool,
     ) -> Result<FirstToken, BackendError> {
         let s = unsafe { slab.slot_mut(slot) };
-        // Prefill in n_batch-sized chunks (a 40K-token prompt exceeds one decode),
-        // all under this seq's own id. Only the final prompt token needs logits.
+        // Sharing an established prefix: copy its `0..reused` cells into this seq and skip
+        // straight to the suffix (`reused > 0` only when sharing — 0 for establish /
+        // fallback). Confirm the exact llama-cpp-2 spelling on target — recent llama.cpp
+        // renamed `llama_kv_cache_seq_cp` toward a `kv_self`/memory API; the copy/remove
+        // semantics are what we depend on (see module note).
+        let start = if reused > 0 {
+            self.ctx
+                .copy_kv_cache_seq(self.prefix_seq_id, seq_id, 0, reused as i32)
+                .map_err(|e| BackendError::Decode(e.to_string()))?;
+            reused
+        } else {
+            0
+        };
+        // Decode `tokens[start..n_prompt]` in n_batch-sized chunks (a 40K-token prompt
+        // exceeds one decode). Only the final prompt token needs logits.
         let mut logit_idx = 0i32;
-        let mut chunk_start = 0usize;
+        let mut chunk_start = start;
         while chunk_start < n_prompt {
             let chunk_end = (chunk_start + self.n_batch).min(n_prompt);
             self.batch.clear();
@@ -373,8 +481,22 @@ impl Decoder {
         let first = argmax(self.ctx.get_logits_ith(logit_idx));
         // Stop before emitting an EOG sentinel (never user-visible text).
         if self.model.0.is_eog_token(LlamaToken(first)) {
+            // Immediate EOS: the seq won't join and `admit` won't record the prefix, so
+            // donate NOTHING to `prefix_seq` — otherwise it would hold orphaned cells and
+            // the next request would re-establish on top of them (KV corruption).
             Ok(FirstToken::Done(FinishReason::Eos))
         } else {
+            // The seq will join. If establishing, donate its first K cells to the
+            // reserved prefix seq now (once) so future matching requests copy them
+            // instead of recomputing. The cells are shared, so this seq retiring later
+            // (`seq_rm`) leaves the prefix resident. Paired with `admit` recording
+            // `self.prefix` on this same `Token` arm — donation and bookkeeping stay
+            // atomic (nothing is left behind on the Done/Err paths).
+            if establishing {
+                self.ctx
+                    .copy_kv_cache_seq(seq_id, self.prefix_seq_id, 0, self.prefix_k as i32)
+                    .map_err(|e| BackendError::Decode(e.to_string()))?;
+            }
             Ok(FirstToken::Token(first))
         }
     }
@@ -503,10 +625,7 @@ impl Decoder {
             Ok(()) => self.seq_pool.push(seq_id),
             Err(e) if self.active.is_empty() => {
                 eprintln!("core2 retire: KV clear failed for seq {seq_id} ({e}); cache idle → full wipe + pool reset");
-                self.ctx.clear_kv_cache();
-                self.seq_pool.clear();
-                self.seq_pool.extend((0..self.max_batch_seqs as i32).rev());
-                self.reserved = 0;
+                self.wipe_all_kv();
             }
             Err(e) => eprintln!("core2 retire: KV clear failed for seq {seq_id}, leaking id (active seqs present): {e}"),
         }
@@ -521,11 +640,7 @@ impl Decoder {
             let slot = seq.slot;
             r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(FinishReason::Error) });
         }
-        self.ctx.clear_kv_cache(); // all active seqs die → reclaim everything
-        // Restore the full free-id pool (these were the only checked-out ids).
-        self.seq_pool.clear();
-        self.seq_pool.extend((0..self.max_batch_seqs as i32).rev());
-        self.active.clear();
-        self.reserved = 0;
+        // All active seqs die → reclaim everything (KV, seq ids, reservation, prefix).
+        self.wipe_all_kv();
     }
 }

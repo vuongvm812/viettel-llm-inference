@@ -134,8 +134,31 @@ chunked prefill or separate prefill/decode scheduling (note for P7).
 **Exit criteria.** On the trace, the system prompt is prefilled once (verified by prefill token
 count); TTFT for requests 2..120 drops sharply vs P3.
 
-**Risks.** KV cell accounting for shared cells; eviction when the prefix seq must be reclaimed
-under memory pressure.
+> **Proof status.** The mock pipeline tests prove the *accounting* invariant in the
+> sandbox: the shared prefix is charged **once**, so more requests batch than independent
+> prompts under the same limits — both the `max_batch_tokens` head-of-line guard
+> (`shared_prefix_relaxes_token_budget_hol`, the P3 long-prompt caveat this phase relaxes)
+> and the KV-reservation cap (`shared_prefix_admits_more_under_kv_pressure`), plus
+> single-entry fallback correctness (`distinct_or_short_prompts_fall_back`) and the pure
+> `shared_prefix_len` match logic. Detection is a **fixed-K window** (`runtime.shared_prefix_tokens`,
+> on by default) matched by exact token-slice compare — one cached prefix (v1); hashing +
+> multi-prefix radix tree is P7.
+>
+> **Deferred deliverable (target box only).** The real `kv_cache_seq_cp` path lives in
+> `--features llama`, which the CPU/macOS dev sandbox cannot build (no `cmake`/`libllama`/
+> GPU/GGUF — see the P2 build constraint). So these are explicit open tasks, not shippable
+> here:
+> - [ ] `--features llama` bench: assert the system prompt is prefilled **exactly once**
+>   (prefill token count == `prefix_len + Σ suffix` over the trace).
+> - [ ] `--features llama` bench: TTFT for requests 2..120 drops sharply vs P3 on the trace.
+> - [ ] Confirm the exact `llama-cpp-2` KV-copy spelling (`kv_cache_seq_cp` vs a
+>   `kv_self_*`/memory API) and that it shares cell references (so a request's `seq_rm`
+>   leaves the shared prefix resident).
+
+**Risks.** KV cell accounting for shared cells (handled: prefix reserved once, per-seq
+reservation excludes it); eviction when the prefix seq must be reclaimed under memory pressure
+(out of scope in v1 — single held prefix, re-established after any full KV wipe; multi-prefix
+eviction is P7).
 
 ---
 

@@ -99,18 +99,20 @@ mod tests {
 
     fn test_cfg(max_inflight: u32, ring_size: u32) -> Config {
         // Defaults big enough not to constrain the older tests: cap == slots, budget
-        // and n_ctx generous.
-        test_cfg_with(max_inflight, ring_size, max_inflight, 100_000, 1_000_000)
+        // and n_ctx generous, shared-prefix off (P3 behavior).
+        test_cfg_with(max_inflight, ring_size, max_inflight, 100_000, 1_000_000, 0)
     }
 
     /// Config with the P3 batching knobs (and `n_ctx`) exposed, so tests can force the
-    /// max-batch-seqs cap and the KV-reservation defer path.
+    /// max-batch-seqs cap and the KV-reservation defer path. `shared_prefix_tokens`
+    /// (P4) is the last knob: `0` keeps byte-for-byte P3 behavior.
     fn test_cfg_with(
         max_inflight: u32,
         ring_size: u32,
         max_batch_seqs: u32,
         max_batch_tokens: u32,
         n_ctx: u32,
+        shared_prefix_tokens: u32,
     ) -> Config {
         let yaml = format!(
             r#"
@@ -121,6 +123,7 @@ runtime:
   ring_size: {ring_size}
   max_batch_seqs: {max_batch_seqs}
   max_batch_tokens: {max_batch_tokens}
+  shared_prefix_tokens: {shared_prefix_tokens}
   cores: {{ web_io: 0, text: 1, fast_loop: 2 }}
 "#
         );
@@ -364,9 +367,9 @@ runtime:
         // Reservation per mock seq = prompt_len + max_tokens. Prompt "hello" = 5,
         // max_tokens 200 → 205; n_ctx = 2*205 admits exactly 2 at a time.
         let cfg = if limit_by_seqs {
-            test_cfg_with(CAP, 1024, EXPECT as u32, 100_000, 1_000_000)
+            test_cfg_with(CAP, 1024, EXPECT as u32, 100_000, 1_000_000, 0)
         } else {
-            test_cfg_with(CAP, 1024, 8, 100_000, 2 * (5 + 200))
+            test_cfg_with(CAP, 1024, 8, 100_000, 2 * (5 + 200), 0)
         };
         let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
         let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
@@ -460,7 +463,7 @@ runtime:
         const K: usize = 4;
         // Budget 4 < prompt len 5, max_batch_seqs 8 and n_ctx huge → only the token
         // budget can cap concurrency here.
-        let cfg = test_cfg_with(CAP, 1024, 8, 4, 1_000_000);
+        let cfg = test_cfg_with(CAP, 1024, 8, 4, 1_000_000, 0);
         let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
         let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
 
@@ -537,7 +540,7 @@ runtime:
         const K: usize = 64;
         // ring_size == max_inflight == max_batch_seqs == 64 (the tight boundary);
         // n_ctx + token budget generous so only the ring can bind the burst.
-        let cfg = test_cfg_with(CAP, 64, CAP, 100_000, 1_000_000);
+        let cfg = test_cfg_with(CAP, 64, CAP, 100_000, 1_000_000, 0);
         let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
         let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
 
@@ -707,7 +710,7 @@ runtime:
         const CAP: u32 = 2;
         // n_ctx = 20. slot 0: prompt "hello"(5) + max_tokens 100 = 105 > 20 → reject.
         // slot 1: prompt "hi"(2) + max_tokens 5 = 7 <= 20 → fits and finishes.
-        let cfg = test_cfg_with(CAP, 1024, 8, 100_000, 20);
+        let cfg = test_cfg_with(CAP, 1024, 8, 100_000, 20, 0);
         let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
         let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
 
@@ -753,5 +756,223 @@ runtime:
         // max_tokens 5 < reply len → truncated, so MaxTokens (not Eos).
         assert_eq!(finish[1], Some(FinishReason::MaxTokens), "fitting request behind it still drained");
         assert!(pieces[1] > 0, "fitting request streamed its reply");
+    }
+
+    /// Drive an over-subscribed batch of requests that share a K-token prefix and
+    /// return the *peak* number of slots streaming concurrently. `N > ` the expected
+    /// concurrency deliberately: the backlog keeps the running set saturated (and the
+    /// prefix stays resident after the establisher retires, since P4 never evicts under
+    /// no pressure), so the peak is a stable plateau — not the timing-fragile
+    /// establisher-vs-sharer window a bare N=concurrency would measure. Shared-prefix
+    /// admission (P4) lets more of them batch than independent prompts under the same
+    /// token-budget / KV limits, because the K prefix is charged once, not per request.
+    fn shared_prefix_max_open(
+        max_batch_seqs: u32,
+        max_batch_tokens: u32,
+        n_ctx: u32,
+        shared_prefix_tokens: u32,
+    ) -> usize {
+        const CAP: u32 = 6; // > the expected concurrency (≤3) → backlog saturates the set
+        const K: usize = 100;
+        let cfg = test_cfg_with(CAP, 1024, max_batch_seqs, max_batch_tokens, n_ctx, shared_prefix_tokens);
+        let slab = Arc::new(Slab::new(CAP as usize, 256, 256, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        let prefix = "P".repeat(K); // identical first K tokens across all requests
+        for slot in 0..CAP {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot);
+                s.reset();
+                s.prompt.push_str(&prefix);
+                s.prompt.push_str(&format!("s{slot:03}")); // 4-byte unique suffix
+                s.max_tokens = 50; // >= reply len → full reply, Eos
+            }
+            ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut open: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut max_open = 0usize;
+        let mut finished = 0u32;
+        while finished < CAP {
+            assert!(std::time::Instant::now() < deadline, "pipeline stalled (possible admission wedge)");
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(_) => {
+                                open.insert(ev.slot);
+                                max_open = max_open.max(open.len());
+                            }
+                            EventKind::Finish(_) => {
+                                open.remove(&ev.slot);
+                                finished += 1;
+                            }
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+        max_open
+    }
+
+    /// P4 headline: shared-prefix caching relaxes the `max_batch_tokens` head-of-line
+    /// guard for long shared-prefix prompts (the P3 long-prompt caveat). With a budget
+    /// (10) far below the prompt (104 tokens) but above the unshared suffix (4), sharing
+    /// lets requests batch (only the suffix is charged) up to `max_batch_seqs`=3; without
+    /// it, each 104-token prompt blows the budget and serializes to 1-at-a-time.
+    #[test]
+    fn shared_prefix_relaxes_token_budget_hol() {
+        let shared = shared_prefix_max_open(3, 10, 1_000_000, 100);
+        let independent = shared_prefix_max_open(3, 10, 1_000_000, 0);
+        assert_eq!(independent, 1, "without sharing, long prompts serialize behind the token budget");
+        assert_eq!(shared, 3, "with sharing, only the suffix is charged → batch fills to max_batch_seqs");
+    }
+
+    /// P4 also relaxes the KV-reservation cap: the shared prefix's cells are reserved
+    /// once, not per request. `n_ctx=280` fits only one independent 154-cell request, but
+    /// three 54-cell suffixes atop one 100-cell prefix (100+3·54=262 ≤ 280 < 100+4·54).
+    /// The exact `== 3` pins the accounting both ways: charging the prefix per-request
+    /// (154 each) would admit only 1, and charging it as *zero* would admit 5.
+    #[test]
+    fn shared_prefix_admits_more_under_kv_pressure() {
+        let shared = shared_prefix_max_open(8, 100_000, 280, 100);
+        let independent = shared_prefix_max_open(8, 100_000, 280, 0);
+        assert_eq!(independent, 1, "without sharing, only one request fits n_ctx at a time");
+        assert_eq!(shared, 3, "with sharing, prefix charged exactly once → exactly three fit");
+    }
+
+    /// Fallback liveness (single-entry v1): a prompt whose first K tokens differ from the
+    /// established prefix, and one shorter than K, must still stream to completion
+    /// alongside two that share — i.e. the mismatch/short paths (`l == 0`) don't
+    /// deadlock or mis-admit. (The mock replays `CANNED_REPLY` independent of the prompt,
+    /// so this asserts liveness + clean finish, not byte-level share-vs-fallback output;
+    /// the `l == 0` branch itself is unit-tested in `shared_prefix_len`.)
+    #[test]
+    fn distinct_or_short_prompts_fall_back() {
+        use crate::rings::FinishReason;
+        const CAP: u32 = 4;
+        const K: usize = 100;
+        let cfg = test_cfg_with(CAP, 1024, 8, 100_000, 1_000_000, K as u32);
+        let slab = Arc::new(Slab::new(CAP as usize, 256, 256, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        // slot 0,1 share "P"*100; slot 2 has a different prefix ("Q"*100); slot 3 is
+        // shorter than K. Publish 0 first so it establishes the "P" prefix.
+        let prompts = [
+            format!("{}aaa", "P".repeat(K)), // establishes + shares
+            format!("{}bbb", "P".repeat(K)), // shares
+            format!("{}ccc", "Q".repeat(K)), // distinct first-K → fallback
+            "P".repeat(K / 2),               // shorter than K → fallback
+        ];
+        for (slot, prompt) in prompts.iter().enumerate() {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot as u32);
+                s.reset();
+                s.prompt.push_str(prompt);
+                s.max_tokens = 50; // >= reply len → Eos
+            }
+            ingress.publish(|e| *e = RingEvent { slot: slot as u32, kind: EventKind::New });
+        }
+
+        let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); CAP as usize];
+        let mut cursor = vec![0usize; CAP as usize];
+        let mut finish: Vec<Option<FinishReason>> = vec![None; CAP as usize];
+        let mut finished = 0usize;
+        while finished < CAP as usize {
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(delta) => {
+                                let c = cursor[ev.slot as usize];
+                                let piece = unsafe { slab.read_committed(ev.slot, c, delta as usize) }
+                                    .expect("committed range in bounds");
+                                outputs[ev.slot as usize].extend_from_slice(piece);
+                                cursor[ev.slot as usize] = c + delta as usize;
+                            }
+                            EventKind::Finish(r) => {
+                                finish[ev.slot as usize] = Some(r);
+                                finished += 1;
+                            }
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        for slot in 0..CAP as usize {
+            assert_eq!(finish[slot], Some(FinishReason::Eos), "slot {slot} finished cleanly");
+            assert_eq!(outputs[slot], CANNED_REPLY, "slot {slot} streamed its full reply");
+        }
+    }
+
+    /// Liveness: once a prefix is resident, a later *fallback* request that fits `n_ctx`
+    /// alone but not alongside the (never-evicted, v1) prefix must still admit — the
+    /// decoder evicts the idle prefix rather than deferring forever. Without the
+    /// idle-eviction guard this wedges (front slot defers every iteration while idle),
+    /// caught here by the 30s deadline. Staggered: slot 0 establishes + retires first so
+    /// the decoder is idle-with-prefix when slot 1 arrives.
+    #[test]
+    fn resident_prefix_is_evicted_for_a_fitting_fallback_when_idle() {
+        use crate::rings::FinishReason;
+        const CAP: u32 = 2;
+        const K: usize = 100;
+        // n_ctx=200, prefix=100: footprint 152 fits alone (≤200) but not atop the resident
+        // prefix (100+152=252>200) → only eviction lets slot 1 in.
+        let cfg = test_cfg_with(CAP, 1024, 8, 100_000, 200, K as u32);
+        let slab = Arc::new(Slab::new(CAP as usize, 256, 256, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        // slot 0 "P"×100 + suffix establishes the prefix; slot 1 "Q"×100 + suffix is a
+        // distinct-prefix fallback (footprint 152).
+        let prompts = [format!("{}aa", "P".repeat(K)), format!("{}bb", "Q".repeat(K))];
+
+        let mut finish: Vec<Option<FinishReason>> = vec![None; CAP as usize];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        for slot in 0..CAP {
+            // SAFETY: slot owned by the test until published.
+            unsafe {
+                let s = slab.slot_mut(slot);
+                s.reset();
+                s.prompt.push_str(&prompts[slot as usize]);
+                s.max_tokens = 50; // >= reply len → Eos
+            }
+            ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
+            // Drain this request to completion before publishing the next, so slot 1
+            // arrives with the decoder idle and the prefix still resident.
+            while finish[slot as usize].is_none() {
+                assert!(std::time::Instant::now() < deadline, "slot {slot} never finished (admission wedge)");
+                if let Ok(mut guard) = egress.poll() {
+                    for ev in &mut guard {
+                        if let EventKind::Finish(r) = ev.kind {
+                            finish[ev.slot as usize] = Some(r);
+                        }
+                    }
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert_eq!(finish[0], Some(FinishReason::Eos), "establisher finished");
+        assert_eq!(finish[1], Some(FinishReason::Eos), "fallback admitted after prefix eviction");
     }
 }
