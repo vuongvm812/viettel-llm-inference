@@ -140,17 +140,17 @@ impl Slab {
         &mut *self.slots[slot as usize].get()
     }
 
-    /// Prompt-token count of `slot` (its `tokens`, written by Core 1 during
-    /// tokenize). Read-only accessor for Core 2's admission token budget, so the
-    /// scheduler doesn't reach through `slot_mut` for a length.
+    /// Read-only view of a slot's prompt tokens (written by Core 1 tokenize). Lets
+    /// Core 2's admission peek the length + shared-prefix window without reaching
+    /// through `slot_mut` for a pure read (keeps the slab's read/write seam).
     ///
     /// # Safety
     /// Same as [`slot_mut`](Self::slot_mut): the caller must own `slot` at its
     /// current pipeline stage. Core 2 does while the slot sits in its `pending`
     /// queue (arrived via R2, no R3 publish for it yet).
-    pub unsafe fn prompt_len(&self, slot: u32) -> usize {
-        debug_assert!((slot as usize) < self.slots.len(), "prompt_len: slot {slot} out of range");
-        (*self.slots[slot as usize].get()).tokens.len()
+    pub unsafe fn slot_tokens(&self, slot: u32) -> &[i32] {
+        debug_assert!((slot as usize) < self.slots.len(), "slot_tokens: slot {slot} out of range");
+        &(*self.slots[slot as usize].get()).tokens
     }
 }
 

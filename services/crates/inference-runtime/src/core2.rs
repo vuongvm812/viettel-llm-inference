@@ -71,18 +71,27 @@ pub fn run(
         let mut admitted_tokens = 0usize;
         while decoder.has_capacity() {
             let Some(&slot) = pending.front() else { break };
-            // SAFETY: `slot` sits in Core 2's `pending` (arrived via R2, no R3 publish
-            // yet) → Core 2 solely owns it.
-            let plen = unsafe { slab.prompt_len(slot) };
+            // Effective prefill tokens = what admit would actually decode: the full
+            // prompt normally, but only the *unshared suffix* when this request shares
+            // an already-established prefix (P4). Charging the suffix — not the full
+            // 40K-token prompt — against the budget is what lets long shared-prefix
+            // requests batch instead of serializing behind the HOL guard (the P3
+            // long-prompt caveat this phase relaxes). Peek matches the admit below (same
+            // decoder state, single-threaded Core 2), give or take a 1-token slack only
+            // when a prompt is *exactly* K tokens (admit caps the share at K-1 to keep a
+            // token for logits); immaterial for real prompts (prompt ≫ K).
+            let plen = decoder.effective_prefill_len(slot, &slab);
             let over_budget = admitted_tokens.saturating_add(plen) > budget;
             let idle_progress = decoder.is_idle() && admitted_tokens == 0;
             if over_budget && !idle_progress {
                 break; // budget spent (or a long prefill deferred) — decode first
             }
             match decoder.admit(slot, &slab, &mut r3) {
-                Admit::Admitted(n_prompt) => {
+                Admit::Admitted(n_prefill) => {
                     pending.pop_front();
-                    admitted_tokens = admitted_tokens.saturating_add(n_prompt);
+                    // `n_prefill` is the effective prefill count (suffix only when the
+                    // prefix was shared), matching the peek above.
+                    admitted_tokens = admitted_tokens.saturating_add(n_prefill);
                 }
                 // KV budget full right now: leave it queued and let the decode step
                 // below retire a seq and free cells, then retry next iteration.

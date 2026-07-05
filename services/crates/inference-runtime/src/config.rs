@@ -52,6 +52,15 @@ pub struct Runtime {
     /// prefill/decode head-of-line blocking is chunked prefill (P7).
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: u32,
+    /// Shared-prefix KV caching window (P4): the first `shared_prefix_tokens` (K)
+    /// prompt tokens are treated as a shareable prefix — prefilled once into a
+    /// reserved sequence and `kv_cache_seq_cp`'d into every request whose first K
+    /// tokens match, so the ~39K-token system prompt is computed once, not per
+    /// request. Tune to the deployment's shared system-prompt token length; `0`
+    /// disables (byte-for-byte P3 behavior). Defaulted so existing configs parse
+    /// unchanged and gain the feature.
+    #[serde(default = "default_shared_prefix_tokens")]
+    pub shared_prefix_tokens: u32,
     /// Pinned core ids (no-op on macOS).
     pub cores: Cores,
 }
@@ -62,6 +71,13 @@ fn default_max_batch_seqs() -> u32 {
 
 fn default_max_batch_tokens() -> u32 {
     2048
+}
+
+fn default_shared_prefix_tokens() -> u32 {
+    // Safely below the trace's ~39K-char (~10K-token) shared system prompt: a value
+    // <= the true shared length still shares that many cells; a value larger than a
+    // prompt just falls back to a full prefill for that request (no harm).
+    8192
 }
 
 impl Runtime {
@@ -140,6 +156,19 @@ impl Config {
         if r.max_batch_tokens == 0 {
             return Err(ConfigError::Invalid("runtime.max_batch_tokens must be > 0".into()));
         }
+        // Shared-prefix window is used as an i32 KV position (`0..K` in
+        // `kv_cache_seq_cp` and the suffix prefill `pos`), so past i32::MAX it would
+        // wrap. When > 0 the decoder also reserves one extra llama seq id (the prefix
+        // seq, id `max_batch_seqs`); that id fits i32 because `max_batch_seqs <=
+        // i32::MAX` is enforced above and the effective cap is clamped to
+        // `max_inflight`, so `max_batch_seqs + 1` never overflows in practice.
+        if r.shared_prefix_tokens > i32::MAX as u32 {
+            return Err(ConfigError::Invalid(format!(
+                "runtime.shared_prefix_tokens ({}) must be <= {} (used as an i32 KV position)",
+                r.shared_prefix_tokens,
+                i32::MAX
+            )));
+        }
 
         // Model invariants — P2 mandates full GPU offload + a single CPU thread, and
         // the context builder needs a non-zero n_ctx (it becomes a NonZeroU32, which
@@ -170,6 +199,15 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "model.n_gpu_layers ({}) must be -1 (offload all layers to the GPU; P2 requires full offload)",
                 m.n_gpu_layers
+            )));
+        }
+        // A shared prefix that meets or exceeds the whole context leaves no room for a
+        // request's own generation — every eligible request would reject (footprint >
+        // n_ctx), silently disabling the feature. Reject the misconfig at the boundary.
+        if r.shared_prefix_tokens > 0 && r.shared_prefix_tokens >= m.n_ctx {
+            return Err(ConfigError::Invalid(format!(
+                "runtime.shared_prefix_tokens ({}) must be < model.n_ctx ({})",
+                r.shared_prefix_tokens, m.n_ctx
             )));
         }
         Ok(())
@@ -215,6 +253,8 @@ runtime:
         assert_eq!(cfg.model.n_threads, 1);
         assert_eq!(cfg.runtime.max_inflight, 256);
         assert_eq!(cfg.runtime.cores.fast_loop, 2);
+        // Omitted from the YAML → serde default gives the shared-prefix feature on.
+        assert_eq!(cfg.runtime.shared_prefix_tokens, 8192);
         cfg.validate().expect("default shape is valid");
     }
 
@@ -228,6 +268,7 @@ runtime:
         // Pin the shipped P3 batching defaults so a drift in the file is caught here.
         assert_eq!(cfg.runtime.max_batch_seqs, 256);
         assert_eq!(cfg.runtime.max_batch_tokens, 2048);
+        assert_eq!(cfg.runtime.shared_prefix_tokens, 8192);
     }
 
     #[test]
@@ -237,6 +278,7 @@ runtime:
             ring_size: rs,
             max_batch_seqs: 256,
             max_batch_tokens: 2048,
+            shared_prefix_tokens: 0, // neutral here; exercised in its own cases below
             cores: Cores { web_io: 0, text: 1, fast_loop: 2 },
         };
         let with = |rt| Config {
@@ -260,6 +302,19 @@ runtime:
         let mut z = base(256, 1024);
         z.max_batch_seqs = i32::MAX as u32 + 1;
         assert!(with(z).validate().is_err(), "max_batch_seqs > i32::MAX truncates a seq id");
+
+        // Shared-prefix window is an i32 KV position: 0 (disabled) is valid, past
+        // i32::MAX wraps a position.
+        let mut z = base(256, 1024);
+        z.shared_prefix_tokens = 0;
+        assert!(with(z).validate().is_ok(), "shared_prefix_tokens 0 disables the feature");
+        let mut z = base(256, 1024);
+        z.shared_prefix_tokens = i32::MAX as u32 + 1;
+        assert!(with(z).validate().is_err(), "shared_prefix_tokens > i32::MAX wraps a KV position");
+        // `with` pins n_ctx = 1, so any prefix >= 1 must be rejected (no room to generate).
+        let mut z = base(256, 1024);
+        z.shared_prefix_tokens = 1;
+        assert!(with(z).validate().is_err(), "shared_prefix_tokens >= n_ctx leaves no room to generate");
     }
 
     #[test]
@@ -269,6 +324,7 @@ runtime:
             ring_size: 1024,
             max_batch_seqs: 256,
             max_batch_tokens: 2048,
+            shared_prefix_tokens: 0, // keep the model-field cases independent of the prefix<n_ctx check
             cores: Cores { web_io: 0, text: 1, fast_loop: 2 },
         };
         let with = |n_ctx, n_threads, n_gpu_layers| Config {
