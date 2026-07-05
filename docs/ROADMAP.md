@@ -206,8 +206,27 @@ eviction is P7).
 **Exit criteria.** Optimized binary beats the plain `--release` build on the P5 metrics
 (measure, don't assume). BOLT step documented as Linux-only.
 
+> **Proof status.** Built and runnable in the sandbox: `[profile.release]` (fat LTO,
+> `codegen-units=1`, `panic="abort"`) in `services/Cargo.toml`; `services/.cargo/config.toml`
+> (`target-cpu=native`); the graceful-shutdown seam (`core0::serve_until` + `shutdown_signal`,
+> tokio `signal` feature) that makes a *clean* process exit possible — LLVM flushes PGO
+> `*.profraw` only via a libc `atexit` handler a killed process never runs, so without it PGO
+> produces **zero** data (`serve_until_returns_on_shutdown` guards the wiring). `build-pgo-bolt.sh`
+> orchestrates the full two-pass PGO build, replays the trace to train it, merges, rebuilds with
+> `profile-use`, and prints the `bench/compare.py` baseline-vs-optimized table; `make build/pgo`.
+>
+> **Deferred deliverable (target box only).** Two things cannot be proven in the CPU/macOS dev
+> sandbox running the P1 **mock** backend (synthetic latency/tokens — see the P5 caveat):
+> - [ ] BOLT stage (`-Wl,--emit-relocs` → `perf record` → `perf2bolt` → `llvm-bolt`). **ELF/Linux
+>   only** (Mach-O unsupported); the script auto-skips it on macOS / when `perf`+`llvm-bolt` are
+>   absent. Needs the Linux deploy box.
+> - [ ] A *meaningful* perf delta: rerun `build-pgo-bolt.sh` against a `--features llama` real-model
+>   build on Linux+GPU and confirm the optimized binary beats plain `--release` on the P5 metrics.
+>   The sandbox comparison table exercises the pipeline but is not a real signal.
+
 **Risks.** BOLT needs a representative profile — the 120-request trace may under-cover cold
-paths; note coverage limits. Optimizes our code only, not `libllama`.
+paths; the script loops the trace (`PGO_REPLAY_LOOPS`, default 3) to densify coverage — note
+coverage limits. Optimizes our code only, not `libllama`.
 
 ---
 

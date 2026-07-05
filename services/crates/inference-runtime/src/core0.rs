@@ -103,9 +103,24 @@ struct ChatMessage {
     content: String,
 }
 
-/// Run Core 0: the HTTP server plus the R4 egress drain. Blocks forever serving
-/// (or until a socket error / shutdown), propagating I/O errors to `main`.
+/// Run Core 0: the HTTP server plus the R4 egress drain. Serves until Ctrl-C /
+/// SIGINT, then shuts down cleanly, propagating I/O errors to `main`.
 pub fn serve(cfg: &Config, slab: Arc<Slab>, pipeline: Pipeline) -> std::io::Result<()> {
+    serve_until(cfg, slab, pipeline, shutdown_signal())
+}
+
+/// Like `serve`, but stops when `shutdown` resolves: axum stops accepting, drains
+/// in-flight connections, and returns `Ok`. The seam is load-bearing for P6 —
+/// LLVM writes PGO `*.profraw` only via a libc `atexit` handler that a killed
+/// process never runs, so the build must reach a clean exit. It also lets tests
+/// trigger shutdown deterministically. `shutdown` is `Send + 'static` per axum.
+/// Crate-internal (bin crate has no public API) — `pub(crate)` states the intent.
+pub(crate) fn serve_until(
+    cfg: &Config,
+    slab: Arc<Slab>,
+    pipeline: Pipeline,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     affinity::pin(cfg.runtime.cores.web_io); // no-op on macOS
 
     let Pipeline {
@@ -132,9 +147,38 @@ pub fn serve(cfg: &Config, slab: Arc<Slab>, pipeline: Pipeline) -> std::io::Resu
             Arc::clone(&state.cursor),
             egress,
         ));
-        axum::serve(listener, build_app(state)).await?;
+        axum::serve(listener, build_app(state))
+            .with_graceful_shutdown(shutdown)
+            .await?;
         Ok(())
     })
+}
+
+/// Resolve on Ctrl-C / SIGINT (what the PGO script sends) or SIGTERM (systemd's
+/// default stop signal on the deploy box) so `serve` returns and `main` exits
+/// cleanly — required for the PGO profile flush (see `serve_until`) and for a
+/// graceful production stop.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            // No SIGTERM stream (should not happen on unix) → fall back to SIGINT only.
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
 }
 
 /// Build the router. Shared by `serve` and the HTTP tests.
@@ -478,5 +522,34 @@ runtime:
         drop(state);
         core1.join().expect("core1 join");
         core2.join().expect("core2 join");
+    }
+
+    /// Graceful shutdown: once the shutdown future resolves, `serve_until` stops
+    /// accepting, drains in-flight, and returns `Ok` instead of blocking forever.
+    /// This is the clean-exit path the PGO build depends on — LLVM flushes
+    /// `*.profraw` only via a libc `atexit` handler, which a signal-killed process
+    /// never runs. Run on a thread so a regression that drops
+    /// `.with_graceful_shutdown` (which blocks forever) fails as a clean timeout,
+    /// not a hung test that burns the whole CI budget.
+    #[test]
+    fn serve_until_returns_on_shutdown() {
+        let cfg = test_cfg(2); // port 0 → ephemeral bind
+        let slab = Arc::new(Slab::new(2, 128, 128, 256));
+        let pipe = pipeline::spawn(&cfg, Arc::clone(&slab));
+        // serve_until consumes the Pipeline; when it returns it drops the ingress
+        // producer, which cascades R1→R4 Shutdown and lets Core 1/Core 2 exit on
+        // their own (same cascade pipeline.rs's tests join on) — the busy-spin
+        // workers wind down here, they don't leak for the rest of the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = serve_until(&cfg, slab, pipe, async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            });
+            let _ = tx.send(res.is_ok());
+        });
+        let ok = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("serve_until must return after graceful shutdown, not hang");
+        assert!(ok, "serve_until must return Ok after graceful shutdown");
     }
 }
