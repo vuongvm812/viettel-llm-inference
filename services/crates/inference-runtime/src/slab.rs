@@ -139,6 +139,18 @@ impl Slab {
     pub unsafe fn slot_mut(&self, slot: u32) -> &mut RequestState {
         &mut *self.slots[slot as usize].get()
     }
+
+    /// Prompt-token count of `slot` (its `tokens`, written by Core 1 during
+    /// tokenize). Read-only accessor for Core 2's admission token budget, so the
+    /// scheduler doesn't reach through `slot_mut` for a length.
+    ///
+    /// # Safety
+    /// Same as [`slot_mut`](Self::slot_mut): the caller must own `slot` at its
+    /// current pipeline stage. Core 2 does while the slot sits in its `pending`
+    /// queue (arrived via R2, no R3 publish for it yet).
+    pub unsafe fn prompt_len(&self, slot: u32) -> usize {
+        (*self.slots[slot as usize].get()).tokens.len()
+    }
 }
 
 /// Bounds failure from [`Slab::read_committed`] — a logic bug, returned rather

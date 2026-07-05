@@ -8,9 +8,12 @@
 //! installed crate's docs; the *mechanisms* (tokenize, prefill, greedy sample,
 //! KV clear) are stable. Confirm on target.
 //!
-//! Scope: **single sequence, greedy (temp=0)**. Continuous batching (P3) and
-//! shared-prefix KV (P4) are later phases; here each request prefills, decodes to
-//! EOS/`max_tokens`, then `clear_kv_cache()` reclaims all KV for the next one.
+//! Scope: **continuous batching (P3), greedy (temp=0)**. The [`Decoder`] runs a
+//! running set of sequences: each [`step`](Decoder::step) batches one token per
+//! active seq into a single `decode()`, samples per seq, emits, and retires
+//! finished seqs (freeing their KV so the seq id can be reused). Admission reserves
+//! `n_prompt + max_tokens` KV cells up front so a seq is never started that can't
+//! finish. Shared-prefix KV (P4) is a later phase.
 
 use super::{argmax, Admit, BackendError};
 use crate::config::Config;
@@ -284,7 +287,11 @@ impl Decoder {
             return Admit::Deferred;
         }
 
-        let seq_id = self.seq_pool.pop().expect("has_capacity() checked by caller");
+        // `has_capacity()` guarantees a free id, but don't rely on the caller: if the
+        // pool is somehow empty, defer (retry after a retire) rather than panic.
+        let Some(seq_id) = self.seq_pool.pop() else {
+            return Admit::Deferred;
+        };
         match self.prefill(slot, slab, seq_id, n_prompt) {
             Ok(FirstToken::Token(tok)) => {
                 self.reserved += needed;
@@ -385,6 +392,10 @@ impl Decoder {
         // Emit + sample + compact in one pass. Fields (`active`, `ctx`, `model`,
         // `seq_pool`) are disjoint, so the indexed borrows below don't overlap.
         let mut w = 0;
+        // Set if a retiring seq's KV clear fails: its id can't be safely reused, so we
+        // wipe the whole cache and fail the survivors after this pass (below) rather
+        // than decode the next step on top of KV we couldn't clean.
+        let mut kv_clear_failed = false;
         for r in 0..self.active.len() {
             let slot = self.active[r].slot;
             let tok = self.active[r].next_token;
@@ -418,31 +429,55 @@ impl Decoder {
                     let seq_id = self.active[r].seq_id;
                     r3.publish(|e| *e = RingEvent { slot, kind: EventKind::Finish(reason) });
                     self.reserved -= self.active[r].reserve; // give the KV budget back
-                    self.free_seq_kv(seq_id);
-                    self.seq_pool.push(seq_id);
+                    // Only hand the seq id back to the pool once its KV is actually
+                    // gone — a reused id on stale KV corrupts generation.
+                    match self.free_seq_kv(seq_id) {
+                        Ok(()) => self.seq_pool.push(seq_id),
+                        Err(e) => {
+                            eprintln!("core2 step: KV clear failed for seq {seq_id}: {e}");
+                            kv_clear_failed = true;
+                        }
+                    }
                 }
             }
         }
         self.active.truncate(w);
+        // A retire couldn't free its KV: the cache is in an unknown state, so the
+        // survivors can't be trusted to keep decoding. Fail them, wipe the whole cache,
+        // and rebuild the id pool from scratch (baseline) — conservative but sound.
+        if kv_clear_failed {
+            self.fail_all(r3, "seq KV clear failed during retire; wiping cache");
+        }
     }
 
     /// Drop a sequence's KV cells so its id can be reused. `(None, None)` must map to
     /// the FULL position range (llama.cpp `seq_rm(seq, -1, -1)`) — any cells left
     /// behind would let a reused id prefill on top of stale KV → corrupt output and
     /// eventual cache exhaustion. Seq ids are `0..max_batch_seqs` (always `>= 0` and
-    /// `< i32::MAX`), so the `u32` the crate wants is an exact cast and the returned
-    /// `Result` can't be `Err`; verify on the target with a free-cell-returns-to-
-    /// baseline check after a retire.
-    fn free_seq_kv(&mut self, seq_id: i32) {
-        let _ = self.ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+    /// `< i32::MAX`), so the `u32` the crate wants is an exact cast and this *should*
+    /// never fail — but the result is propagated, not discarded, so callers gate seq-id
+    /// reuse on it. On the target, also assert free cells return to baseline after a
+    /// retire. (Confirm the exact `clear_kv_cache_seq` return type against the crate
+    /// version; propagated here as a `Result`.)
+    #[must_use = "a failed KV clear means the seq id is NOT safe to reuse"]
+    fn free_seq_kv(&mut self, seq_id: i32) -> Result<(), BackendError> {
+        self.ctx
+            .clear_kv_cache_seq(Some(seq_id as u32), None, None)
+            .map_err(|e| BackendError::Decode(e.to_string()))
     }
 
     /// Return a seq id to the free pool and drop its KV cells. Used on admit-time
     /// finish/error, before the seq ever joins the running set (so it holds no
-    /// reservation to release).
+    /// reservation to release). If the KV clear fails the id is *leaked* (not reused)
+    /// rather than handed back dirty — a reused id on stale KV corrupts output. This is
+    /// the "impossible" path (valid in-range id); leaking one id degrades capacity but
+    /// never corrupts. ponytail: leak-not-reuse on the impossible failure; a full-cache
+    /// resync path would be the upgrade if it ever actually fires on target.
     fn retire_seq(&mut self, seq_id: i32) {
-        self.free_seq_kv(seq_id);
-        self.seq_pool.push(seq_id);
+        match self.free_seq_kv(seq_id) {
+            Ok(()) => self.seq_pool.push(seq_id),
+            Err(e) => eprintln!("core2 retire: KV clear failed for seq {seq_id}, leaking id: {e}"),
+        }
     }
 
     /// A batch build/decode failure kills every active sequence (the forward pass is

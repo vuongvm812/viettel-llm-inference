@@ -85,6 +85,13 @@ exact `llama-cpp-2` method names for KV/sampling must be confirmed against the c
 **Exit criteria.** Replaying the 120-request trace, multiple requests are in-flight per
 `decode()`; throughput (tok/s) scales above the P2 single-seq number.
 
+> **Proof status.** The mock pipeline tests prove the *scheduling* invariants
+> (interleaving, `max_batch_seqs`/KV caps, staggered retirement, over-`n_ctx` reject,
+> backlog drain) in the sandbox. The *performance* claim — ≥2 active seqs per real
+> `decode()` and tok/s scaling over P2 — is **not yet proven**: it needs the Linux/GPU
+> target (a decode-count assertion inside `Decoder::step` and a P2-vs-P3 tok/s run on the
+> 120-request trace). Track as a target-box, feature-gated (`--features llama`) benchmark.
+
 **Risks.** Head-of-line blocking between prefill (long 40K prompt) and decode steps — may need
 chunked prefill or separate prefill/decode scheduling (note for P7).
 

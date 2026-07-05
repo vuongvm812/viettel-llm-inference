@@ -10,7 +10,7 @@
 //! backend-independent. See `design/fast-loop/`.
 
 use crate::affinity;
-use crate::backend::{prompt_len, Admit, Decoder, DecoderInit};
+use crate::backend::{Admit, Decoder, DecoderInit};
 use crate::rings::RingEvent;
 use crate::slab::Slab;
 use disruptor::{EventPoller, Polling, Producer, SingleProducerBarrier};
@@ -50,19 +50,32 @@ pub fn run(
 
         // Admit: fill the running set while it has room, the shared KV budget allows
         // it (the decoder's reservation), and this iteration's prefill-token budget
-        // isn't spent. Bounding prefill tokens per iteration keeps a burst of long
-        // prompts from starving the decode of already-active seqs — we peek the next
-        // prompt's length *before* prefilling it, and stop once the budget is spent.
-        // ponytail: a single prompt bigger than the whole budget still admits when
-        // nothing's been admitted yet — one long prefill still blocks decode for its
-        // duration (head-of-line blocking). Splitting one prefill across iterations
-        // (chunked prefill) is P7.
+        // isn't spent.
+        //
+        // Invariant: `max_batch_tokens` is a *per-iteration prefill-token budget* — it
+        // caps how many prompt tokens Core 2 prefills before running the next decode
+        // step, so a burst of long prompts can't starve the decode of already-active
+        // seqs. It is NOT a total batch-token budget (active decode tokens aren't
+        // charged against it). We peek the next prompt's length *before* prefilling and
+        // stop once admitting it would blow the budget.
+        //
+        // Idle-progress exception: when the running set is empty and we've admitted
+        // nothing yet this iteration, admit the first prompt even if it exceeds the
+        // budget — otherwise a prompt larger than the whole budget could never start.
+        // A long prompt that arrives *while sequences are already decoding* now waits
+        // (defers to a later iteration) instead of blocking active decode with a full
+        // prefill. It admits once the set drains to idle. Splitting one prefill across
+        // iterations (chunked prefill) is the P7 fix that removes even the idle stall.
         let mut admitted_tokens = 0u32;
         while decoder.has_capacity() {
             let Some(&slot) = pending.front() else { break };
-            let plen = prompt_len(&slab, slot) as u32;
-            if admitted_tokens > 0 && admitted_tokens.saturating_add(plen) > max_batch_tokens {
-                break; // budget spent — run a decode step before prefilling more
+            // SAFETY: `slot` sits in Core 2's `pending` (arrived via R2, no R3 publish
+            // yet) → Core 2 solely owns it.
+            let plen = unsafe { slab.prompt_len(slot) } as u32;
+            let over_budget = admitted_tokens.saturating_add(plen) > max_batch_tokens;
+            let idle_progress = decoder.is_idle() && admitted_tokens == 0;
+            if over_budget && !idle_progress {
+                break; // budget spent (or a long prefill deferred) — decode first
             }
             match decoder.admit(slot, &slab, &mut r3) {
                 Admit::Admitted(n_prompt) => {
@@ -71,6 +84,10 @@ pub fn run(
                 }
                 // KV budget full right now: leave it queued and let the decode step
                 // below retire a seq and free cells, then retry next iteration.
+                // ponytail: strict FIFO — a large front request that can't fit blocks
+                // smaller later ones that could, underfilling the batch. Upgrade path is
+                // a bounded scan over `pending` (admit fitting ones) with an age/scan
+                // limit to keep the front from starving; deferred until fill-rate bites.
                 Admit::Deferred => break,
                 // Can never fit (backend already published Finish(Error)): drop it.
                 Admit::Rejected => {

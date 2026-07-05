@@ -123,6 +123,17 @@ impl Config {
         if r.max_batch_seqs == 0 {
             return Err(ConfigError::Invalid("runtime.max_batch_seqs must be > 0".into()));
         }
+        // Upper bound: seq ids are handed to llama.cpp as `i32` (`0..max_batch_seqs`),
+        // so a value past `i32::MAX` truncates. The effective cap is clamped to
+        // `max_inflight` at load, so anything larger is already pointless — reject it
+        // at the boundary rather than silently wrapping a seq id.
+        if r.max_batch_seqs > i32::MAX as u32 {
+            return Err(ConfigError::Invalid(format!(
+                "runtime.max_batch_seqs ({}) must be <= {} (used as an i32 llama seq id)",
+                r.max_batch_seqs,
+                i32::MAX
+            )));
+        }
         // A zero token budget would make Core 2's admit loop (`admitted_tokens <
         // max_batch_tokens`) never run — nothing is ever admitted, `pending` never
         // drains, and the loop hangs. Reject at the boundary, like the other knobs.
@@ -235,6 +246,9 @@ runtime:
         let mut z = base(256, 1024);
         z.max_batch_tokens = 0;
         assert!(with(z).validate().is_err(), "max_batch_tokens 0 would hang admit");
+        let mut z = base(256, 1024);
+        z.max_batch_seqs = i32::MAX as u32 + 1;
+        assert!(with(z).validate().is_err(), "max_batch_seqs > i32::MAX truncates a seq id");
     }
 
     #[test]

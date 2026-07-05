@@ -542,4 +542,63 @@ runtime:
         assert_eq!(finish, Some(FinishReason::Error), "overflow → Error, not success");
         assert!(freed, "slot recycled after an errored stream");
     }
+
+    /// A request that can *never* fit (`prompt_len + max_tokens > n_ctx`) must be
+    /// permanently rejected: `Finish(Error)`, no output, and the slot recycles —
+    /// while a fitting request behind it in the backlog still drains. This is the
+    /// permanent-reject counterpart to `kv_reservation_caps_concurrency` (which only
+    /// exercises the temporary defer path).
+    #[test]
+    fn over_n_ctx_request_rejects_and_backlog_drains() {
+        use crate::rings::FinishReason;
+        const CAP: u32 = 2;
+        // n_ctx = 20. slot 0: prompt "hello"(5) + max_tokens 100 = 105 > 20 → reject.
+        // slot 1: prompt "hi"(2) + max_tokens 5 = 7 <= 20 → fits and finishes.
+        let cfg = test_cfg_with(CAP, 1024, 8, 100_000, 20);
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        let specs = [("hello", 100u32), ("hi", 5u32)];
+        for (slot, (prompt, max_tokens)) in specs.iter().enumerate() {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot as u32);
+                s.reset();
+                s.prompt.push_str(prompt);
+                s.max_tokens = *max_tokens;
+            }
+            ingress.publish(|e| *e = RingEvent { slot: slot as u32, kind: EventKind::New });
+        }
+
+        let mut finish: Vec<Option<FinishReason>> = vec![None; CAP as usize];
+        let mut pieces: Vec<usize> = vec![0; CAP as usize];
+        let mut finished = 0usize;
+        while finished < CAP as usize {
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(_) => pieces[ev.slot as usize] += 1,
+                            EventKind::Finish(r) => {
+                                finish[ev.slot as usize] = Some(r);
+                                finished += 1;
+                            }
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert_eq!(finish[0], Some(FinishReason::Error), "over-n_ctx request rejected as Error");
+        assert_eq!(pieces[0], 0, "rejected request streamed no output");
+        // max_tokens 5 < reply len → truncated, so MaxTokens (not Eos).
+        assert_eq!(finish[1], Some(FinishReason::MaxTokens), "fitting request behind it still drained");
+        assert!(pieces[1] > 0, "fitting request streamed its reply");
+    }
 }
