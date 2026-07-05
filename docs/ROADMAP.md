@@ -175,6 +175,19 @@ eviction is P7).
 
 **Exit criteria.** One command produces a side-by-side table (ours vs vLLM) on `trace-round1.jsonl`.
 
+> **Proof status.** The harness is built and verified end-to-end in the sandbox against the
+> live local runtime (`bench/`): `bench/metrics.py` self-check passes; `bench/replay.py`
+> replays all 120 trace requests open-loop (and `--closed-loop N`) against `:8001` with
+> 0 errors and populated TTFT/ITL/E2E/tok-s; `bench/compare.py` prints the side-by-side table
+> + fairness notes. The comparison is target-agnostic — only the vLLM side needs the target box.
+>
+> **Deferred deliverable (target box only, Linux+GPU).** vLLM cannot run in the CPU/macOS dev
+> sandbox (needs a GPU), and our `:8001` is still the P1 mock (placeholder latency/tokens until
+> P2+), so the actual head-to-head is an explicit open task:
+> - [ ] `docker-compose up` the vLLM baseline; `bench/replay.py --target :8000 --out vllm.json`.
+> - [ ] Replay against a P2+ real-model `:8001`; `bench/compare.py vllm.json ours.json`.
+> - [ ] Capture the report and note quantization/prefix-cache fairness caveats (compare.py prints them).
+
 **Risks.** Fairness — same model quantization matters (GGUF vs vLLM's format); note in the report.
 
 ---
