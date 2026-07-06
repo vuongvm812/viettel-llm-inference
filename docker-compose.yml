@@ -24,3 +24,20 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  # Our optimized inference-runtime (PGO+LTO+BOLT). Build the binary first:
+  # `make dist/optimized`, then `docker compose build inference` / `up`.
+  inference:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: inference-runtime:optimized
+    ports:
+      - "8001:8001"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

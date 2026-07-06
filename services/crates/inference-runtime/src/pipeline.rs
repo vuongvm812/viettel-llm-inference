@@ -73,11 +73,12 @@ pub fn spawn(cfg: &Config, slab: Arc<Slab>) -> Pipeline {
         .expect("spawn core1");
 
     let slab2 = slab;
-    let max_batch_tokens = cfg.runtime.max_batch_tokens;
+    // `max_batch_tokens` now travels inside `decoder_init` (P7: it's the per-step prefill
+    // budget consumed in `Decoder::step`, not a Core 2 admission gate).
     let core2 = std::thread::Builder::new()
         .name("core2-fastloop".into())
         .spawn(move || {
-            core2::run(c2_core, slab2, r2_poller, r3_producer, decoder_init, max_batch_tokens);
+            core2::run(c2_core, slab2, r2_poller, r3_producer, decoder_init);
         })
         .expect("spawn core2");
 
@@ -452,17 +453,83 @@ runtime:
 
     /// The per-iteration prompt-token budget (`max_batch_tokens`, the named P3 knob):
     /// when a single prompt exceeds the whole budget, it's admitted only by the
-    /// idle-progress exception, and any *other* prompt then defers until the running
-    /// set drains to idle. So long prompts serialize — peak concurrency is exactly 1 —
-    /// even though `max_batch_seqs`/KV would allow more. This is the long-prompt
-    /// while-active case (the HOL guard chunked prefill/P7 later relaxes). Mock
-    /// tokenizes 1 token per prompt byte, so "hello" = 5 tokens > a budget of 4.
+    /// P7's core claim: within a single `step`, a Decoding seq emits tokens *while* another
+    /// seq is still Prefilling — decode never stalls behind a long prefill. A short prompt
+    /// finishes prefill in one step and starts decoding; a long prompt (12 tokens, budget 2)
+    /// takes ~6 steps to prefill. We assert the short prompt has already streamed pieces by
+    /// the time the long prompt emits its first — i.e. they were interleaved in mixed steps
+    /// (pre-P7 the long prompt would have fully prefilled before the short one ran).
     #[test]
-    fn max_batch_tokens_serializes_long_prompts() {
+    fn decode_streams_while_a_long_prompt_is_still_prefilling() {
+        const CAP: u32 = 2;
+        let cfg = test_cfg_with(CAP, 1024, 8, 2, 1_000_000, 0); // per-step prefill budget = 2
+        let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        // slot 0: 2-token prompt (prefills in 1 step). slot 1: 12-token prompt (~6 prefill steps).
+        let prompts = ["ab", "abcdefghijkl"];
+        for slot in 0..CAP {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot);
+                s.reset();
+                s.prompt.push_str(prompts[slot as usize]);
+                s.max_tokens = 200; // full reply → keeps decoding well past the long prefill
+            }
+            ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
+        }
+
+        let mut pieces = [0usize; CAP as usize];
+        let mut short_pieces_when_long_started: Option<usize> = None;
+        let mut finished = 0usize;
+        while finished < CAP as usize {
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(_) => {
+                                // The moment the long prompt (slot 1) emits its first piece,
+                                // record how many the short prompt (slot 0) has already sent.
+                                if ev.slot == 1 && short_pieces_when_long_started.is_none() {
+                                    short_pieces_when_long_started = Some(pieces[0]);
+                                }
+                                pieces[ev.slot as usize] += 1;
+                            }
+                            EventKind::Finish(_) => finished += 1,
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+
+        assert!(
+            short_pieces_when_long_started.unwrap_or(0) > 0,
+            "the short prompt must decode (stream pieces) while the long prompt is still prefilling; \
+             saw {short_pieces_when_long_started:?} short pieces when the long prompt began emitting"
+        );
+    }
+
+    /// P7 chunked prefill (unified batching): the exact inversion of the old
+    /// `max_batch_tokens_serializes_long_prompts` test (which asserted peak == 1).
+    /// `max_batch_tokens` is now a *per-step prefill-chunk budget*, not an admission
+    /// gate: a long prompt is admitted immediately as a Prefilling seq and consumes a
+    /// chunk of its prompt per decode step, interleaved with the decode of already-active
+    /// seqs — so long prompts no longer serialize behind the head-of-line guard. Four
+    /// *distinct* prompts each longer than the budget must reach a peak concurrency > 1
+    /// (up from the pre-P7 peak of 1). Mock tokenizes 1 token per prompt byte, so each
+    /// "longpromptNN" (~12 tokens) exceeds a budget of 4.
+    #[test]
+    fn chunked_prefill_batches_long_prompts_concurrently() {
         const CAP: u32 = 4;
         const K: usize = 4;
-        // Budget 4 < prompt len 5, max_batch_seqs 8 and n_ctx huge → only the token
-        // budget can cap concurrency here.
+        // Budget 4 < each prompt's length, max_batch_seqs 8 and n_ctx huge, sharing off →
+        // only chunked prefill (not prefix sharing) can lift concurrency above 1.
         let cfg = test_cfg_with(CAP, 1024, 8, 4, 1_000_000, 0);
         let slab = Arc::new(Slab::new(CAP as usize, 128, 128, 256));
         let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
@@ -472,7 +539,7 @@ runtime:
             unsafe {
                 let s = slab.slot_mut(slot);
                 s.reset();
-                s.prompt.push_str("hello"); // 5 mock tokens > max_batch_tokens = 4
+                s.prompt.push_str(&format!("longprompt{slot:02}")); // ~12 mock tokens > budget 4
                 s.max_tokens = 200; // > CANNED_REPLY.len() → full reply, Eos
             }
             ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
@@ -513,13 +580,13 @@ runtime:
         core1.join().expect("core1 join");
         core2.join().expect("core2 join");
 
-        assert_eq!(finished, K, "every request finished (backlog drained one at a time)");
-        assert_eq!(
-            max_open, 1,
-            "a prompt larger than the whole token budget serializes: peak concurrency 1, saw {max_open}"
+        assert_eq!(finished, K, "every request finished");
+        assert!(
+            max_open >= 2,
+            "chunked prefill interleaves long prompts with decode: peak concurrency > 1, saw {max_open}"
         );
         for out in &outputs {
-            assert_eq!(out, CANNED_REPLY, "each serialized request streamed its full reply");
+            assert_eq!(out, CANNED_REPLY, "each request streamed its full reply");
         }
     }
 
@@ -823,17 +890,18 @@ runtime:
         max_open
     }
 
-    /// P4 headline: shared-prefix caching relaxes the `max_batch_tokens` head-of-line
-    /// guard for long shared-prefix prompts (the P3 long-prompt caveat). With a budget
-    /// (10) far below the prompt (104 tokens) but above the unshared suffix (4), sharing
-    /// lets requests batch (only the suffix is charged) up to `max_batch_seqs`=3; without
-    /// it, each 104-token prompt blows the budget and serializes to 1-at-a-time.
+    /// P7 supersedes P4's token-budget relaxation: with chunked prefill, `max_batch_tokens`
+    /// is a per-*step* prefill budget, so long prompts prefill incrementally and batch to
+    /// `max_batch_seqs`=3 **whether or not they share a prefix** — the pre-P7 HOL guard
+    /// that serialized independent long prompts to 1 is gone. (Sharing still uniquely wins
+    /// in the KV-reservation dimension — see `shared_prefix_admits_more_under_kv_pressure`.)
+    /// Budget 10 ≪ prompt 104 tokens, yet both reach 3.
     #[test]
-    fn shared_prefix_relaxes_token_budget_hol() {
+    fn chunked_prefill_lifts_token_budget_with_or_without_sharing() {
         let shared = shared_prefix_max_open(3, 10, 1_000_000, 100);
         let independent = shared_prefix_max_open(3, 10, 1_000_000, 0);
-        assert_eq!(independent, 1, "without sharing, long prompts serialize behind the token budget");
-        assert_eq!(shared, 3, "with sharing, only the suffix is charged → batch fills to max_batch_seqs");
+        assert_eq!(shared, 3, "shared long prompts batch to max_batch_seqs under chunked prefill");
+        assert_eq!(independent, 3, "chunked prefill also lets independent long prompts batch (was 1 pre-P7)");
     }
 
     /// P4 also relaxes the KV-reservation cap: the shared prefix's cells are reserved
@@ -849,12 +917,83 @@ runtime:
         assert_eq!(shared, 3, "with sharing, prefix charged exactly once → exactly three fit");
     }
 
-    /// Fallback liveness (single-entry v1): a prompt whose first K tokens differ from the
-    /// established prefix, and one shorter than K, must still stream to completion
-    /// alongside two that share — i.e. the mismatch/short paths (`l == 0`) don't
-    /// deadlock or mis-admit. (The mock replays `CANNED_REPLY` independent of the prompt,
-    /// so this asserts liveness + clean finish, not byte-level share-vs-fallback output;
-    /// the `l == 0` branch itself is unit-tested in `shared_prefix_len`.)
+    /// P7 radix cache: peak concurrent slots when `CAP` oversubscribed requests are split
+    /// across `n_prefixes` distinct K-token prefixes (round-robin by slot). Oversubscribed so
+    /// the peak is a stable plateau (same rationale as `shared_prefix_max_open`). With caching
+    /// on, each distinct prefix is charged once (not per request), so more batch under the same
+    /// `n_ctx` than with caching off.
+    fn multi_prefix_max_open(n_prefixes: usize, n_ctx: u32, shared_prefix_tokens: u32) -> usize {
+        const CAP: u32 = 8;
+        const K: usize = 100;
+        let cfg = test_cfg_with(CAP, 1024, 8, 100_000, n_ctx, shared_prefix_tokens);
+        let slab = Arc::new(Slab::new(CAP as usize, 256, 256, 256));
+        let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
+
+        let heads: Vec<String> = (0..n_prefixes).map(|i| (b'A' + i as u8) as char).map(|c| c.to_string().repeat(K)).collect();
+        for slot in 0..CAP {
+            // SAFETY: each slot came off no ring yet; test owns it.
+            unsafe {
+                let s = slab.slot_mut(slot);
+                s.reset();
+                s.prompt.push_str(&heads[slot as usize % n_prefixes]); // round-robin prefixes
+                s.prompt.push_str(&format!("s{slot:03}"));
+                s.max_tokens = 50;
+            }
+            ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut open: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut max_open = 0usize;
+        let mut finished = 0u32;
+        while finished < CAP {
+            assert!(std::time::Instant::now() < deadline, "multi-prefix pipeline stalled");
+            match egress.poll() {
+                Ok(mut guard) => {
+                    for ev in &mut guard {
+                        match ev.kind {
+                            EventKind::Piece(_) => {
+                                open.insert(ev.slot);
+                                max_open = max_open.max(open.len());
+                            }
+                            EventKind::Finish(_) => {
+                                open.remove(&ev.slot);
+                                finished += 1;
+                            }
+                            EventKind::Token(_) | EventKind::New => {}
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => std::hint::spin_loop(),
+                Err(Polling::Shutdown) => break,
+            }
+        }
+        drop(ingress);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+        max_open
+    }
+
+    /// The radix cache generalizes P4 to *multiple* distinct prefixes: two system prompts,
+    /// each cached once, let more requests batch under KV pressure than caching off (where
+    /// every request pays its full prefix). Inequality (not an exact count) so the assertion
+    /// is robust to the cache warm-up (the first request of each prefix pays full before the
+    /// fork is materialized). n_ctx sized to bite: prompt 103 + gen 50 = 153 cells each.
+    #[test]
+    fn multiple_distinct_prefixes_admit_more_than_caching_off() {
+        let cached = multi_prefix_max_open(2, 420, 100);
+        let off = multi_prefix_max_open(2, 420, 0);
+        assert!(
+            cached > off,
+            "two cached prefixes batch more than caching off: cached={cached} off={off}"
+        );
+    }
+
+    /// Fallback liveness: a prompt whose first K tokens differ from an established prefix,
+    /// and one shorter than K, must still stream to completion alongside two that share —
+    /// the mismatch/short paths don't deadlock or mis-admit. (The mock replays `CANNED_REPLY`
+    /// independent of the prompt, so this asserts liveness + clean finish; the trie's match
+    /// logic itself is unit-tested in `backend::prefix_trie`.)
     #[test]
     fn distinct_or_short_prompts_fall_back() {
         use crate::rings::FinishReason;
@@ -922,25 +1061,30 @@ runtime:
     }
 
     /// Liveness: once a prefix is resident, a later *fallback* request that fits `n_ctx`
-    /// alone but not alongside the (never-evicted, v1) prefix must still admit — the
-    /// decoder evicts the idle prefix rather than deferring forever. Without the
-    /// idle-eviction guard this wedges (front slot defers every iteration while idle),
-    /// caught here by the 30s deadline. Staggered: slot 0 establishes + retires first so
-    /// the decoder is idle-with-prefix when slot 1 arrives.
+    /// alone but not alongside a resident radix prefix must still admit — the decoder evicts
+    /// the idle prefix (LRU) rather than deferring forever. Without the idle-eviction guard
+    /// this wedges (front slot defers every iteration while idle), caught by the 30s deadline.
+    /// Staggered full draining: slots 0,1 share "P"×100 so slot 1 *establishes* the fork
+    /// (a fork needs two matching requests); by the time the distinct slot 2 arrives idle, the
+    /// fork is resident and must be evicted for it to fit.
     #[test]
     fn resident_prefix_is_evicted_for_a_fitting_fallback_when_idle() {
         use crate::rings::FinishReason;
-        const CAP: u32 = 2;
+        const CAP: u32 = 3;
         const K: usize = 100;
-        // n_ctx=200, prefix=100: footprint 152 fits alone (≤200) but not atop the resident
-        // prefix (100+152=252>200) → only eviction lets slot 1 in.
+        // n_ctx=200, fork=100: a 152-cell fallback fits alone (≤200) but not atop the resident
+        // fork (100+152=252>200) → only eviction lets slot 2 in.
         let cfg = test_cfg_with(CAP, 1024, 8, 100_000, 200, K as u32);
         let slab = Arc::new(Slab::new(CAP as usize, 256, 256, 256));
         let Pipeline { mut ingress, mut egress, core1, core2 } = spawn(&cfg, Arc::clone(&slab));
 
-        // slot 0 "P"×100 + suffix establishes the prefix; slot 1 "Q"×100 + suffix is a
-        // distinct-prefix fallback (footprint 152).
-        let prompts = [format!("{}aa", "P".repeat(K)), format!("{}bb", "Q".repeat(K))];
+        // slots 0,1 share "P"×100 (slot 1 materializes the fork); slot 2 "Q"×100 is a
+        // distinct-prefix fallback (footprint 152) that only fits after the fork is evicted.
+        let prompts = [
+            format!("{}aa", "P".repeat(K)),
+            format!("{}bb", "P".repeat(K)),
+            format!("{}cc", "Q".repeat(K)),
+        ];
 
         let mut finish: Vec<Option<FinishReason>> = vec![None; CAP as usize];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -953,8 +1097,8 @@ runtime:
                 s.max_tokens = 50; // >= reply len → Eos
             }
             ingress.publish(|e| *e = RingEvent { slot, kind: EventKind::New });
-            // Drain this request to completion before publishing the next, so slot 1
-            // arrives with the decoder idle and the prefix still resident.
+            // Drain this request to completion before publishing the next, so the decoder is
+            // idle (with the fork resident from slots 0,1) when slot 2 arrives.
             while finish[slot as usize].is_none() {
                 assert!(std::time::Instant::now() < deadline, "slot {slot} never finished (admission wedge)");
                 if let Ok(mut guard) = egress.poll() {
@@ -972,7 +1116,8 @@ runtime:
         core1.join().expect("core1 join");
         core2.join().expect("core2 join");
 
-        assert_eq!(finish[0], Some(FinishReason::Eos), "establisher finished");
-        assert_eq!(finish[1], Some(FinishReason::Eos), "fallback admitted after prefix eviction");
+        assert_eq!(finish[0], Some(FinishReason::Eos), "first shared request finished");
+        assert_eq!(finish[1], Some(FinishReason::Eos), "second shared request (fork establisher) finished");
+        assert_eq!(finish[2], Some(FinishReason::Eos), "distinct fallback admitted after fork eviction");
     }
 }

@@ -11,7 +11,7 @@
 # -Ctarget-cpu=native in RUSTFLAGS because an env RUSTFLAGS overrides that config.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"  # script lives in scripts/
 SERVICES="$REPO/services"
 BIN="$SERVICES/target/release/inference-runtime"
 CONFIG="$REPO/config/default-config.yaml"
@@ -21,6 +21,7 @@ PROFDATA="$PGO_DIR/merged.profdata"
 OUT_DIR="${OUT_DIR:-$REPO/target-pgo}"        # baseline/optimized json + report land here
 NATIVE="-Ctarget-cpu=native"
 REPLAY_LOOPS="${PGO_REPLAY_LOOPS:-3}"         # loop the 120-req trace for denser PGO coverage (design §5)
+FEATURES="${FEATURES:-}"                       # e.g. FEATURES=llama for the real llama.cpp+CUDA backend (default: mock)
 PY="$(command -v python3 || command -v python)" || { echo "python not found" >&2; exit 1; }
 
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -49,7 +50,7 @@ log "llvm-profdata: $LLVM_PROFDATA"
 # baseline vs PGO comparison isolates PGO — a set-but-empty `RUSTFLAGS=""` overrides
 # (does not merge with) .cargo/config.toml's build.rustflags, so target-cpu must be
 # passed here, not relied upon from config, whenever RUSTFLAGS is set. $1 = extra flags.
-build() { ( cd "$SERVICES" && RUSTFLAGS="$NATIVE ${1:-}" cargo build --release -p inference-runtime ); }
+build() { ( cd "$SERVICES" && RUSTFLAGS="$NATIVE ${1:-}" cargo build --release -p inference-runtime ${FEATURES:+--features "$FEATURES"} ); }
 
 # Start the server, poll /health, replay the trace REPLAY_LOOPS times to drive load,
 # then SIGINT so the graceful-shutdown path runs atexit → PGO flushes *.profraw.

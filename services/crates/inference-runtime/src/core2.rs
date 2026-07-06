@@ -24,7 +24,6 @@ pub fn run(
     mut r2: EventPoller<RingEvent, SingleProducerBarrier>,
     mut r3: impl Producer<RingEvent>,
     init: DecoderInit,
-    max_batch_tokens: u32,
 ) {
     affinity::pin(core); // no-op on macOS
     // Build the decoder here, on Core 2's own thread: the real `LlamaContext` is
@@ -48,53 +47,23 @@ pub fn run(
             Err(Polling::Shutdown) => r2_shutdown = true,
         }
 
-        // Admit: fill the running set while it has room, the shared KV budget allows
-        // it (the decoder's reservation), and this iteration's prefill-token budget
-        // isn't spent.
+        // Admit: fill the running set while it has room and the shared KV budget allows.
         //
-        // Invariant: `max_batch_tokens` is a *per-iteration prefill-token budget* — it
-        // caps how many prompt tokens Core 2 prefills before running the next decode
-        // step, so a burst of long prompts can't starve the decode of already-active
-        // seqs. It is NOT a total batch-token budget (active decode tokens aren't
-        // charged against it). We peek the next prompt's length *before* prefilling and
-        // stop once admitting it would blow the budget.
-        //
-        // Idle-progress exception: when the running set is empty and we've admitted
-        // nothing yet this iteration, admit the first prompt even if it exceeds the
-        // budget — otherwise a prompt larger than the whole budget could never start.
-        // A long prompt that arrives *while sequences are already decoding* now waits
-        // (defers to a later iteration) instead of blocking active decode with a full
-        // prefill. It admits once the set drains to idle. Splitting one prefill across
-        // iterations (chunked prefill) is the P7 fix that removes even the idle stall.
-        // usize so an extreme prompt length can't wrap the running budget total.
-        let budget = max_batch_tokens as usize;
-        let mut admitted_tokens = 0usize;
+        // P7 chunked prefill removed the per-iteration prefill-token admission gate: a
+        // long prompt is admitted immediately as a Prefilling seq and consumes a chunk of
+        // its prompt per decode step (the `max_batch_tokens` budget now lives *inside*
+        // `step`, bounding prompt tokens prefilled per unified batch — not whether to
+        // admit). So admission is purely capacity + KV reservation; no prompt ever
+        // serializes the running set behind a head-of-line prefill.
         while decoder.has_capacity() {
             let Some(&slot) = pending.front() else { break };
-            // Effective prefill tokens = what admit would actually decode: the full
-            // prompt normally, but only the *unshared suffix* when this request shares
-            // an already-established prefix (P4). Charging the suffix — not the full
-            // 40K-token prompt — against the budget is what lets long shared-prefix
-            // requests batch instead of serializing behind the HOL guard (the P3
-            // long-prompt caveat this phase relaxes). Peek matches the admit below (same
-            // decoder state, single-threaded Core 2), give or take a 1-token slack only
-            // when a prompt is *exactly* K tokens (admit caps the share at K-1 to keep a
-            // token for logits); immaterial for real prompts (prompt ≫ K).
-            let plen = decoder.effective_prefill_len(slot, &slab);
-            let over_budget = admitted_tokens.saturating_add(plen) > budget;
-            let idle_progress = decoder.is_idle() && admitted_tokens == 0;
-            if over_budget && !idle_progress {
-                break; // budget spent (or a long prefill deferred) — decode first
-            }
             match decoder.admit(slot, &slab, &mut r3) {
-                Admit::Admitted(n_prefill) => {
+                Admit::Admitted(_) => {
                     pending.pop_front();
-                    // `n_prefill` is the effective prefill count (suffix only when the
-                    // prefix was shared), matching the peek above.
-                    admitted_tokens = admitted_tokens.saturating_add(n_prefill);
                 }
-                // KV budget full right now: leave it queued and let the decode step
-                // below retire a seq and free cells, then retry next iteration.
+                // KV budget full right now (or the matching prefix is still mid-establish):
+                // leave it queued and let the decode step below make progress (retire a
+                // seq / finish an establisher's prefill), then retry next iteration.
                 // ponytail: strict FIFO — a large front request that can't fit blocks
                 // smaller later ones that could, underfilling the batch. Upgrade path is
                 // a bounded scan over `pending` (admit fitting ones) with an age/scan

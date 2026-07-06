@@ -185,6 +185,7 @@ async fn shutdown_signal() {
 fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/ws", get(ws_upgrade)) // P7: WebSocket streaming alongside SSE
         .route("/health", get(|| async { "ok" }))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
@@ -247,32 +248,53 @@ async fn egress_loop(slab: Arc<Slab>, conns: Conns, free: Free, cursor: Cursors,
     }
 }
 
-async fn chat(State(app): State<AppState>, body: Bytes) -> Response {
-    // Parse the request body with sonic-rs (SIMD JSON) rather than the serde_json-backed
-    // axum `Json` extractor. `Bytes` still honours `DefaultBodyLimit`; a malformed body
-    // is a 400 at the trust boundary.
-    let req: ChatRequest = match sonic_rs::from_slice(body.as_ref()) {
-        Ok(req) => req,
-        Err(_) => return bad_request("invalid JSON body"),
-    };
+/// A rejected ingress at the trust boundary — the caller renders it in its own transport
+/// (an HTTP status for SSE, a WS text frame + close for WebSocket).
+struct IngestError {
+    status: axum::http::StatusCode,
+    msg: &'static str,
+}
 
-    // Validate at the trust boundary before burning a slot.
+/// Shared ingress for both SSE and WebSocket (P7): parse + validate the OpenAI request,
+/// claim a slab slot, write the prompt once, register the egress sender, and publish
+/// `{slot, New}` on R1. Returns the egress stream to forward to the client, or an
+/// [`IngestError`] for the caller to surface. Both streaming transports ride the identical
+/// path — only the framing of the returned stream differs.
+fn start_request(app: &AppState, body: &[u8]) -> Result<UnboundedReceiverStream<Egress>, IngestError> {
+    // Body-size cap at the shared choke point. The SSE path is already bounded by axum's
+    // `DefaultBodyLimit`, but that's an HTTP-body limit — it does NOT apply to a WebSocket
+    // frame. Enforcing it here covers both transports (a WS client can otherwise submit a
+    // ~64 MiB first frame — 16× the intended cap — to amplify parse + slab-realloc cost).
+    if body.len() > MAX_BODY_BYTES {
+        return Err(IngestError {
+            status: axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            msg: "request body too large",
+        });
+    }
+    // Parse with sonic-rs (SIMD JSON) rather than the serde_json-backed axum `Json`
+    // extractor. A malformed body is a 400 at the trust boundary.
+    let req: ChatRequest = sonic_rs::from_slice(body).map_err(|_| IngestError {
+        status: axum::http::StatusCode::BAD_REQUEST,
+        msg: "invalid JSON body",
+    })?;
+
+    let bad = |msg| IngestError { status: axum::http::StatusCode::BAD_REQUEST, msg };
     if req.model.trim().is_empty() {
-        return bad_request("`model` is required");
+        return Err(bad("`model` is required"));
     }
     if req.messages.is_empty() {
-        return bad_request("`messages` must not be empty");
+        return Err(bad("`messages` must not be empty"));
     }
     let max_tokens = req.max_tokens.unwrap_or(128);
     if max_tokens == 0 || max_tokens > MAX_TOKENS_CAP {
-        return bad_request("`max_tokens` out of range");
+        return Err(bad("`max_tokens` out of range"));
     }
 
     // Claim a slot (admission cap = slab capacity).
-    let slot = match lock(&app.free).pop() {
-        Some(s) => s,
-        None => return capacity_503("server at capacity"),
-    };
+    let slot = lock(&app.free).pop().ok_or(IngestError {
+        status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        msg: "server at capacity",
+    })?;
 
     let (tx, rx) = unbounded_channel::<Egress>();
 
@@ -293,32 +315,35 @@ async fn chat(State(app): State<AppState>, body: Bytes) -> Response {
     }
     // Reset the egress read cursor for the reused slot: `s.reset()` cleared
     // out_bytes/out_committed, so Core 0 must stream this request from offset 0.
-    // Without this the cursor keeps a prior request's byte count → stale reads and,
-    // once it exceeds out_bytes capacity, an out-of-bounds read.
     lock(&app.cursor)[slot as usize] = 0;
     lock(&app.conns)[slot as usize] = Some(tx);
 
-    // `try_publish`, never a blocking `publish`: this runs on Core 0's single
-    // async thread, and a full-ring spin would starve the egress drain (and every
-    // other connection) → deadlock. With `ring_size >= max_inflight` (enforced in
-    // pipeline::spawn) R1 can't fill, so this is belt-and-suspenders.
+    // `try_publish`, never a blocking `publish`: this runs on Core 0's single async
+    // thread, and a full-ring spin would starve the egress drain → deadlock. With
+    // `ring_size >= max_inflight` (enforced in pipeline::spawn) R1 can't fill.
     let published = lock(&app.ingress)
-        .try_publish(|e| {
-            *e = RingEvent {
-                slot,
-                kind: EventKind::New,
-            }
-        })
+        .try_publish(|e| *e = RingEvent { slot, kind: EventKind::New })
         .is_ok();
     if !published {
         lock(&app.conns)[slot as usize] = None; // drop tx
         lock(&app.free).push(slot);
-        return capacity_503("ingress ring full");
+        return Err(IngestError {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            msg: "ingress ring full",
+        });
     }
+    Ok(UnboundedReceiverStream::new(rx))
+}
 
-    // ponytail: always SSE for P1 (the exit criterion). `stream:false` buffering
-    // lands when the benchmark harness needs it (P5).
-    let stream = UnboundedReceiverStream::new(rx).map(|egress| {
+/// SSE endpoint (OpenAI `stream: true`). Thin wrapper over the shared [`start_request`].
+///
+/// ponytail: always SSE (no `stream:false` buffering yet — lands with the benchmark harness).
+async fn chat(State(app): State<AppState>, body: Bytes) -> Response {
+    let rx = match start_request(&app, body.as_ref()) {
+        Ok(rx) => rx,
+        Err(e) => return (e.status, e.msg).into_response(),
+    };
+    let stream = rx.map(|egress| {
         Ok::<Event, Infallible>(match egress {
             Egress::Chunk(text) => Event::default().data(sse_chunk(&text)),
             Egress::Done => Event::default().data("[DONE]"),
@@ -327,20 +352,75 @@ async fn chat(State(app): State<AppState>, body: Bytes) -> Response {
     Sse::new(stream).into_response()
 }
 
+/// WebSocket endpoint (P7) — streams the same OpenAI delta chunks as SSE over a socket.
+/// The request JSON arrives as the first inbound Text frame (the upgrade is a GET, so
+/// there's no body); each generated piece is sent as a Text frame carrying the same
+/// [`sse_chunk`] payload, and the stream ends with a Close frame.
+/// ponytail: request JSON = first text frame; no query-param / sub-protocol handshake.
+async fn ws_upgrade(ws: axum::extract::ws::WebSocketUpgrade, State(app): State<AppState>) -> Response {
+    // Reject an oversized frame at the protocol layer too (belt-and-suspenders with the
+    // `start_request` body cap), so a huge first frame never fully buffers.
+    ws.max_message_size(MAX_BODY_BYTES)
+        .on_upgrade(move |socket| ws_conn(socket, app))
+}
+
+/// How long to wait for the client's first (request) frame before dropping the connection —
+/// bounds an idle/slow-loris upgrade that would otherwise pin a task + socket forever (the
+/// slot-based admission cap doesn't cover this pre-request window).
+const WS_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn ws_conn(mut socket: axum::extract::ws::WebSocket, app: AppState) {
+    use axum::extract::ws::Message;
+    // First inbound Text frame is the OpenAI request body — bounded by an ABSOLUTE deadline
+    // (not a per-recv timeout, which a client could reset forever by dribbling a ping every
+    // <30s) so a stalled/slow-loris upgrade can't hold the task/socket. A cap on non-Text
+    // frames before the request bounds a ping flood within the window too.
+    let deadline = tokio::time::Instant::now() + WS_FIRST_FRAME_TIMEOUT;
+    let mut noise_budget = 64u32; // ping/pong/binary frames tolerated before the request frame
+    let body = loop {
+        match tokio::time::timeout_at(deadline, socket.recv()).await {
+            Ok(Some(Ok(Message::Text(t)))) => break t.into_bytes(),
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => return, // client hung up before requesting
+            Ok(Some(Ok(_))) => {
+                // ping/pong/binary → keep waiting for text, but bounded.
+                noise_budget = match noise_budget.checked_sub(1) {
+                    Some(n) => n,
+                    None => return, // too many non-request frames → drop
+                };
+            }
+            Ok(Some(Err(_))) | Err(_) => return, // socket error or first-frame deadline
+        }
+    };
+    let mut rx = match start_request(&app, &body) {
+        Ok(rx) => rx,
+        Err(e) => {
+            // Already upgraded → surface the rejection as a text frame + close (not an HTTP
+            // status). `sse_chunk`'s escaper (sonic_rs) also produces a JSON-safe string.
+            let err = sonic_rs::to_string(e.msg).unwrap_or_else(|_| "\"error\"".into());
+            let _ = socket.send(Message::Text(format!(r#"{{"error":{err}}}"#))).await;
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    while let Some(egress) = rx.next().await {
+        match egress {
+            Egress::Chunk(text) => {
+                if socket.send(Message::Text(sse_chunk(&text))).await.is_err() {
+                    return; // client disconnected; the slot still recycles on Finish via egress_loop
+                }
+            }
+            Egress::Done => break,
+        }
+    }
+    let _ = socket.close().await;
+}
+
 /// Minimal OpenAI-shaped streaming delta so `curl` output reads as chat completions.
 fn sse_chunk(text: &str) -> String {
     let content = sonic_rs::to_string(text).unwrap_or_else(|_| "\"\"".into());
     format!(
         r#"{{"object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"content":{content}}}}}]}}"#
     )
-}
-
-fn bad_request(msg: &'static str) -> Response {
-    (axum::http::StatusCode::BAD_REQUEST, msg).into_response()
-}
-
-fn capacity_503(msg: &'static str) -> Response {
-    (axum::http::StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
 }
 
 #[cfg(test)]
@@ -551,5 +631,158 @@ runtime:
             .recv_timeout(Duration::from_secs(5))
             .expect("serve_until must return after graceful shutdown, not hang");
         assert!(ok, "serve_until must return Ok after graceful shutdown");
+    }
+
+    /// P7 WebSocket: the request JSON arrives as the first Text frame; each generated
+    /// piece comes back as a `chat.completion.chunk` Text frame (identical OpenAI delta to
+    /// SSE), then the server closes. Reconstructing the reply proves WS rides the same
+    /// egress path as SSE. Real ephemeral-port bind + a `tokio-tungstenite` client, mirroring
+    /// `serve_until_returns_on_shutdown`'s real-socket pattern.
+    #[test]
+    fn ws_streams_content_frames_and_closes() {
+        use futures_util::SinkExt; // ws.send(); `next` is fully-qualified (tokio_stream also in scope)
+        use tokio_tungstenite::tungstenite::Message as TMessage;
+
+        let expected = std::str::from_utf8(CANNED_REPLY).expect("canned reply is valid utf8");
+        let cfg = test_cfg(2);
+        let slab = Arc::new(Slab::new(2, 128, 512, 256));
+        let Pipeline { ingress, egress, core1, core2 } = pipeline::spawn(&cfg, Arc::clone(&slab));
+        let state = AppState::new(slab, ingress);
+
+        // Multi-thread runtime (dev-dependency feature): the server accept loop, the egress
+        // drain, and the client must run concurrently — a single cooperative thread stalls.
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async {
+            let egress_task = tokio::spawn(egress_loop(
+                Arc::clone(&state.slab),
+                Arc::clone(&state.conns),
+                Arc::clone(&state.free),
+                Arc::clone(&state.cursor),
+                egress,
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = build_app(state.clone());
+            let serve_task = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/ws"))
+                .await
+                .expect("ws connect");
+            // First text frame = the OpenAI request. max_tokens 5 → 5 ASCII bytes ("Hello").
+            let body = r#"{"model":"m","messages":[{"role":"u","content":"hi"}],"max_tokens":5}"#;
+            ws.send(TMessage::Text(body.into())).await.unwrap();
+
+            let mut content = String::new();
+            let mut frames = 0usize;
+            let mut closed = false;
+            while let Some(msg) = futures_util::StreamExt::next(&mut ws).await {
+                match msg.expect("ws frame") {
+                    TMessage::Text(t) => {
+                        frames += 1;
+                        let v: sonic_rs::Value = sonic_rs::from_str(&t).expect("delta json");
+                        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+                            content.push_str(c);
+                        }
+                    }
+                    TMessage::Close(_) => {
+                        closed = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(frames, 5, "one content frame per token (max_tokens=5)");
+            assert_eq!(content, &expected[..5], "WS reconstructs the reply prefix (\"Hello\")");
+            assert!(closed, "server closed the WS stream on finish");
+
+            // Abort the server + egress tasks so they drop their `AppState` clone (which holds
+            // the R1 ingress producer). Otherwise the clone below keeps R1 alive and the
+            // core1/core2 join hangs forever.
+            serve_task.abort();
+            egress_task.abort();
+        });
+
+        drop(state); // last ingress holder → cascades R1→R4 Shutdown so the workers exit
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
+    }
+
+    /// P7 WebSocket trust boundary: an invalid first frame (bad JSON) is rejected *after* the
+    /// upgrade as a `{"error":..}` Text frame + Close — not an HTTP status — and claims no
+    /// slot, so a subsequent valid connection on the same (capacity-1) server still streams.
+    #[test]
+    fn ws_rejects_invalid_request_then_serves_a_valid_one() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as TMessage;
+
+        let expected = std::str::from_utf8(CANNED_REPLY).expect("canned reply is valid utf8");
+        let cfg = test_cfg(1); // single slot → a leaked slot would wedge the 2nd request
+        let slab = Arc::new(Slab::new(1, 128, 512, 256));
+        let Pipeline { ingress, egress, core1, core2 } = pipeline::spawn(&cfg, Arc::clone(&slab));
+        let state = AppState::new(slab, ingress);
+
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async {
+            let egress_task = tokio::spawn(egress_loop(
+                Arc::clone(&state.slab),
+                Arc::clone(&state.conns),
+                Arc::clone(&state.free),
+                Arc::clone(&state.cursor),
+                egress,
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = build_app(state.clone());
+            let serve_task = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let url = format!("ws://{addr}/v1/ws");
+
+            // 1) Invalid first frame → one Text frame mentioning "error", then a Close.
+            let (mut bad, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+            bad.send(TMessage::Text("not json".into())).await.unwrap();
+            let mut saw_error = false;
+            let mut closed = false;
+            while let Some(msg) = futures_util::StreamExt::next(&mut bad).await {
+                match msg.expect("frame") {
+                    TMessage::Text(t) => {
+                        assert!(t.contains("error"), "rejection frame carries an error: {t}");
+                        saw_error = true;
+                    }
+                    TMessage::Close(_) => { closed = true; break; }
+                    _ => {}
+                }
+            }
+            assert!(saw_error && closed, "invalid request → error frame + close");
+
+            // 2) A valid connection on the same capacity-1 server still streams (no slot leak).
+            let (mut good, _) = tokio_tungstenite::connect_async(&url).await.expect("connect 2");
+            good.send(TMessage::Text(
+                r#"{"model":"m","messages":[{"role":"u","content":"hi"}],"max_tokens":5}"#.into(),
+            )).await.unwrap();
+            let mut content = String::new();
+            while let Some(msg) = futures_util::StreamExt::next(&mut good).await {
+                match msg.expect("frame") {
+                    TMessage::Text(t) => {
+                        let v: sonic_rs::Value = sonic_rs::from_str(&t).expect("delta json");
+                        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+                            content.push_str(c);
+                        }
+                    }
+                    TMessage::Close(_) => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(content, &expected[..5], "valid request streams after the rejection (slot not leaked)");
+
+            serve_task.abort();
+            egress_task.abort();
+        });
+
+        drop(state);
+        core1.join().expect("core1 join");
+        core2.join().expect("core2 join");
     }
 }

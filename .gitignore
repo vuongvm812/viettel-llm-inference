@@ -27,3 +27,8 @@ venv/
 .idea/
 .vscode/
 .serena/
+
+# Local build/setup artifacts (script/setup.sh output: weights, llama.cpp, venv, HF cache)
+/models/
+# Optimized binary staged for the Docker image (make dist/optimized)
+/dist/

@@ -46,19 +46,21 @@ pub struct Runtime {
     /// configs parse unchanged.
     #[serde(default = "default_max_batch_seqs")]
     pub max_batch_seqs: u32,
-    /// Continuous-batching cap (P3): per-iteration prompt-token budget for admission —
-    /// stop admitting new sequences once this many prompt tokens have been prefilled in
-    /// one loop iteration, so a long prefill doesn't starve decode. The full fix for
-    /// prefill/decode head-of-line blocking is chunked prefill (P7).
+    /// Per-**step** prefill-chunk budget (P7 chunked prefill): how many prompt tokens are
+    /// prefilled per unified `decode()` batch, on top of one decode token per active
+    /// sequence. A long prompt is admitted immediately as a Prefilling sequence and consumes
+    /// a chunk of this budget each step — interleaved with decode — so it never head-of-line
+    /// blocks the running set. (Pre-P7 this was a per-iteration *admission* gate.)
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: u32,
-    /// Shared-prefix KV caching window (P4): the first `shared_prefix_tokens` (K)
-    /// prompt tokens are treated as a shareable prefix — prefilled once into a
-    /// reserved sequence and `kv_cache_seq_cp`'d into every request whose first K
-    /// tokens match, so the ~39K-token system prompt is computed once, not per
-    /// request. Tune to the deployment's shared system-prompt token length; `0`
-    /// disables (byte-for-byte P3 behavior). Defaulted so existing configs parse
-    /// unchanged and gain the feature.
+    /// Shared-prefix radix cache (P7, generalizes P4): the **minimum prefix length worth
+    /// caching**. When two or more requests share at least this many leading tokens, that
+    /// shared prefix is prefilled once and `copy_kv_cache_seq`'d into each matching request,
+    /// so a shared ~39K-token system prompt is computed once, not per request. The cache is a
+    /// token radix trie (variable-length longest match, multiple + nested prefixes, LRU
+    /// eviction) — not a single fixed-K window. Tune to the shortest shared prefix worth
+    /// caching; `0` disables (byte-for-byte P3 behavior). Defaulted so existing configs gain
+    /// the feature.
     #[serde(default = "default_shared_prefix_tokens")]
     pub shared_prefix_tokens: u32,
     /// Pinned core ids (no-op on macOS).
@@ -139,15 +141,17 @@ impl Config {
         if r.max_batch_seqs == 0 {
             return Err(ConfigError::Invalid("runtime.max_batch_seqs must be > 0".into()));
         }
-        // Upper bound: seq ids are handed to llama.cpp as `i32` (`0..max_batch_seqs`),
-        // so a value past `i32::MAX` truncates. The effective cap is clamped to
-        // `max_inflight` at load, so anything larger is already pointless — reject it
-        // at the boundary rather than silently wrapping a seq id.
-        if r.max_batch_seqs > i32::MAX as u32 {
+        // Upper bound: seq ids are handed to llama.cpp as `i32` (`0..max_batch_seqs`), so a
+        // value past `i32::MAX` truncates. Leave headroom for the radix cache's prefix seq
+        // ids (`max_batch_seqs .. max_batch_seqs + MAX_PREFIX_SEQS`, a small constant) so
+        // `max_batch_seqs + MAX_PREFIX_SEQS` can't wrap `i32` either. The effective cap is
+        // clamped to `max_inflight` at load, so anything this large is already pointless.
+        const SEQ_ID_HEADROOM: u32 = 64; // > MAX_PREFIX_SEQS
+        if r.max_batch_seqs > i32::MAX as u32 - SEQ_ID_HEADROOM {
             return Err(ConfigError::Invalid(format!(
-                "runtime.max_batch_seqs ({}) must be <= {} (used as an i32 llama seq id)",
+                "runtime.max_batch_seqs ({}) must be <= {} (i32 llama seq id, minus prefix-cache headroom)",
                 r.max_batch_seqs,
-                i32::MAX
+                i32::MAX as u32 - SEQ_ID_HEADROOM
             )));
         }
         // A zero token budget would make Core 2's admit loop (`admitted_tokens <
@@ -156,12 +160,13 @@ impl Config {
         if r.max_batch_tokens == 0 {
             return Err(ConfigError::Invalid("runtime.max_batch_tokens must be > 0".into()));
         }
-        // Shared-prefix window is used as an i32 KV position (`0..K` in
-        // `kv_cache_seq_cp` and the suffix prefill `pos`), so past i32::MAX it would
-        // wrap. When > 0 the decoder also reserves one extra llama seq id (the prefix
-        // seq, id `max_batch_seqs`); that id fits i32 because `max_batch_seqs <=
-        // i32::MAX` is enforced above and the effective cap is clamped to
-        // `max_inflight`, so `max_batch_seqs + 1` never overflows in practice.
+        // Shared-prefix length is used as an i32 KV position (`0..depth` in
+        // `copy_kv_cache_seq` and the suffix prefill `pos`), so past i32::MAX it would
+        // wrap. When > 0 the decoder also reserves up to `MAX_PREFIX_SEQS` extra llama seq
+        // ids (the radix cache's prefix seqs, ids `max_batch_seqs .. max_batch_seqs +
+        // MAX_PREFIX_SEQS`); those fit i32 because `max_batch_seqs <= i32::MAX` is enforced
+        // above, the effective cap is clamped to `max_inflight`, and MAX_PREFIX_SEQS is a
+        // small constant, so the sum never overflows in practice.
         if r.shared_prefix_tokens > i32::MAX as u32 {
             return Err(ConfigError::Invalid(format!(
                 "runtime.shared_prefix_tokens ({}) must be <= {} (used as an i32 KV position)",

@@ -14,8 +14,20 @@ never busy-spin** — spinning here would starve the async runtime.
 
 - `tokio` **current-thread** runtime (single OS thread, pinned to Core 0 via `core_affinity`)
   + `hyper`/`axum`. One core, one reactor; concurrency is via async tasks, not threads.
-- Rust equivalent of the user's "Netty + SSE/WebSocket streamer". SSE is the v1 protocol
-  (matches OpenAI/vLLM `stream: true`); WebSocket is a P7 stretch.
+- Rust equivalent of the user's "Netty + SSE/WebSocket streamer". SSE (`POST /v1/chat/completions`,
+  matches OpenAI/vLLM `stream: true`) is the v1 protocol; **WebSocket (`GET /v1/ws`, P7)** streams
+  the same OpenAI delta chunks over a socket.
+
+## WebSocket (P7)
+
+Additive to Core 0, no backend/ring changes. The ingress (validate → claim slot → write prompt →
+publish `{slot, New}` on R1) is factored into `start_request`, shared by both transports. `/v1/ws`
+upgrades a GET, reads the OpenAI request JSON as the **first inbound Text frame** (the upgrade has
+no body), then forwards the same `Egress { Chunk, Done }` stream the SSE handler uses: each
+`Chunk` → a Text frame carrying the identical `sse_chunk` delta payload, `Done` → a Close frame.
+A rejected request (already upgraded) is surfaced as a Text error frame + Close, not an HTTP status.
+Client disconnect mid-stream drops the socket; the slot still recycles on `Finish` via the egress
+drain. // ponytail: request JSON = first text frame; no query-param / sub-protocol handshake.
 
 ## Ingress path
 
