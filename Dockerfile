@@ -15,11 +15,14 @@ ARG UBUNTU_VERSION=22.04
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
-# Runtime libs the llama.cpp+CUDA binary links beyond the CUDA base: OpenMP (ggml)
-# and the C++ runtime (libllama).
+# Runtime libs the llama.cpp+CUDA binary links beyond the CUDA base: OpenMP (ggml),
+# the C++ runtime (libllama), and jemalloc (LD_PRELOAD allocator — setup.sh step 3).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libgomp1 libstdc++6 \
+      libgomp1 libstdc++6 libjemalloc2 \
  && rm -rf /var/lib/apt/lists/*
+
+# Lower fragmentation / faster alloc — same allocator setup.sh wires via runtime-env.sh.
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 
 WORKDIR /app
 COPY dist/inference-runtime /usr/local/bin/inference-runtime

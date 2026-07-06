@@ -34,6 +34,13 @@ services:
     image: inference-runtime:optimized
     ports:
       - "8001:8001"
+    # CPU pinning + NUMA locality. Bind the container to the 3 cores the runtime pins
+    # web_io/text/fast_loop to (config runtime.cores = 0/1/2) so they share local L3 and
+    # first-touch keeps the disruptor ring on node-local memory (no cross-node coherency
+    # traffic). Target is a 3-core / 1-node instance, so default = all 3 cores. On a
+    # bigger multi-node host, override with a single node's CPUs that includes 0/1/2,
+    # e.g. INFERENCE_CPUSET=0-15 (verify with `numactl -H` / `lscpu`).
+    cpuset: "${INFERENCE_CPUSET:-0-2}"
     deploy:
       resources:
         reservations:

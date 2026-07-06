@@ -23,7 +23,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${REPO_ROOT}/script/runtime-env.sh"
 OS="$(uname -s)"
 
-log()  { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
+log() { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -63,41 +63,42 @@ MODEL_SHA256="${MODEL_SHA256:-}"
 setup_llama_toolchain() {
   log "llama.cpp build toolchain"
   case "$OS" in
-    Darwin)
-      if ! xcode-select -p >/dev/null 2>&1; then
-        warn "  Xcode Command Line Tools missing — installing (provides clang + Metal)"
-        xcode-select --install || warn "  run 'xcode-select --install' manually, then re-run"
-      else
-        log "  Xcode CLT present (clang + Metal framework)"
-      fi
-      if have cmake; then
-        log "  cmake present ($(cmake --version | head -1))"
-      elif have brew; then
-        log "  installing cmake via Homebrew"; brew install cmake
-      else
-        warn "  cmake missing and Homebrew not found — install Homebrew (brew.sh) then 'brew install cmake'"
-      fi
-      ;;
-    Linux)
-      local pkgs=()
-      have cmake   || pkgs+=(cmake)
-      have cc      || pkgs+=(build-essential)
-      have clang   || pkgs+=(clang libclang-dev)
-      if ((${#pkgs[@]})); then
-        log "  apt install: ${pkgs[*]}"
-        sudo apt-get update -qq && sudo apt-get install -y "${pkgs[@]}"
-      else
-        log "  cmake + compiler + clang already present"
-      fi
-      # CUDA is required for the `cuda` feature but too heavy/box-specific to auto-install.
-      if have nvcc; then
-        log "  CUDA toolkit present ($(nvcc --version | grep -o 'release [0-9.]*' | head -1))"
-      else
-        warn "  nvcc not found — install the CUDA toolkit to build with --features llama on Linux:"
-        warn "    https://developer.nvidia.com/cuda-downloads  (then ensure nvcc is on PATH)"
-      fi
-      ;;
-    *) warn "  unknown OS '$OS' — install cmake + a C/C++ toolchain + libclang manually" ;;
+  Darwin)
+    if ! xcode-select -p >/dev/null 2>&1; then
+      warn "  Xcode Command Line Tools missing — installing (provides clang + Metal)"
+      xcode-select --install || warn "  run 'xcode-select --install' manually, then re-run"
+    else
+      log "  Xcode CLT present (clang + Metal framework)"
+    fi
+    if have cmake; then
+      log "  cmake present ($(cmake --version | head -1))"
+    elif have brew; then
+      log "  installing cmake via Homebrew"
+      brew install cmake
+    else
+      warn "  cmake missing and Homebrew not found — install Homebrew (brew.sh) then 'brew install cmake'"
+    fi
+    ;;
+  Linux)
+    local pkgs=()
+    have cmake || pkgs+=(cmake)
+    have cc || pkgs+=(build-essential)
+    have clang || pkgs+=(clang libclang-dev)
+    if ((${#pkgs[@]})); then
+      log "  apt install: ${pkgs[*]}"
+      sudo apt-get update -qq && sudo apt-get install -y "${pkgs[@]}"
+    else
+      log "  cmake + compiler + clang already present"
+    fi
+    # CUDA is required for the `cuda` feature but too heavy/box-specific to auto-install.
+    if have nvcc; then
+      log "  CUDA toolkit present ($(nvcc --version | grep -o 'release [0-9.]*' | head -1))"
+    else
+      warn "  nvcc not found — install the CUDA toolkit to build with --features llama on Linux:"
+      warn "    https://developer.nvidia.com/cuda-downloads  (then ensure nvcc is on PATH)"
+    fi
+    ;;
+  *) warn "  unknown OS '$OS' — install cmake + a C/C++ toolchain + libclang manually" ;;
   esac
 }
 
@@ -151,21 +152,31 @@ PY
 download_verified() {
   local url="$1"
   local tmp="${MODEL_DEST}.part"
-  curl -fL --progress-bar "$url" -o "$tmp" || { rm -f "$tmp"; return 1; }
+  curl -fL --progress-bar "$url" -o "$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
 
   if [[ -n "$MODEL_SHA256" ]]; then
     local got
-    if have sha256sum; then got="$(sha256sum "$tmp" | cut -d' ' -f1)"
-    elif have shasum;    then got="$(shasum -a 256 "$tmp" | cut -d' ' -f1)"
-    else warn "  no sha256sum/shasum — cannot verify MODEL_SHA256"; rm -f "$tmp"; return 1; fi
+    if have sha256sum; then
+      got="$(sha256sum "$tmp" | cut -d' ' -f1)"
+    elif have shasum; then
+      got="$(shasum -a 256 "$tmp" | cut -d' ' -f1)"
+    else
+      warn "  no sha256sum/shasum — cannot verify MODEL_SHA256"
+      rm -f "$tmp"
+      return 1
+    fi
     if [[ "$got" != "$MODEL_SHA256" ]]; then
       warn "  SHA-256 mismatch! expected ${MODEL_SHA256}, got ${got} — refusing to install"
-      rm -f "$tmp"; return 1
+      rm -f "$tmp"
+      return 1
     fi
     log "  SHA-256 verified"
   else
     warn "  MODEL_SHA256 not set — installing UNVERIFIED native-library input. Pin it:"
-    warn "    MODEL_SHA256=$( { have sha256sum && sha256sum "$tmp" || shasum -a 256 "$tmp"; } | cut -d' ' -f1)"
+    warn "    MODEL_SHA256=$({ have sha256sum && sha256sum "$tmp" || shasum -a 256 "$tmp"; } | cut -d' ' -f1)"
   fi
   mv "$tmp" "$MODEL_DEST"
 }
@@ -205,11 +216,12 @@ setup_model() {
 
 # Print how to build + run against the real backend once the toolchain + model are in place.
 print_llama_usage() {
-  local accel; [[ "$OS" == "Darwin" ]] && accel="Metal" || accel="CUDA"
+  local accel
+  [[ "$OS" == "Darwin" ]] && accel="Metal" || accel="CUDA"
   cat <<EOF
   [next] Build + run real inference (${accel}):
            cargo build --manifest-path services/Cargo.toml -p inference-runtime --features llama
-           make run/inference        # config model.gguf_path must point at ${MODEL_DEST#${REPO_ROOT}/}
+           make run/inference        # config model.gguf_path must point at ${MODEL_DEST#"${REPO_ROOT}"/}
          The default build (no --features llama) keeps the mock backend for dev/tests.
 EOF
 }
@@ -223,9 +235,9 @@ setup_cpu_pinning() {
   # Lock the pinned cores to the performance governor so the busy-spin loops
   # (core1/core2) don't get down-clocked mid-flight.
   if have cpupower; then
-    sudo cpupower frequency-set -g performance >/dev/null 2>&1 \
-      && log "  scaling governor → performance" \
-      || warn "  cpupower failed (VM / no cpufreq?) — skipping governor"
+    sudo cpupower frequency-set -g performance >/dev/null 2>&1 &&
+      log "  scaling governor → performance" ||
+      warn "  cpupower failed (VM / no cpufreq?) — skipping governor"
   else
     for core in "$WEB_IO_CORE" "$TEXT_CORE" "$FAST_LOOP_CORE"; do
       gov="/sys/devices/system/cpu/cpu${core}/cpufreq/scaling_governor"
@@ -300,7 +312,7 @@ setup_jemalloc() {
 
   # libjemalloc2 ships libjemalloc.so.2; the unversioned .so comes from -dev.
   # Prefer the exact path if present, else the newest match.
-  local so="/usr/lib/x86_64-linux-gnu/libjemalloc.so"
+  local so="/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
   if [[ ! -e "$so" ]]; then
     so="$(find /usr/lib /lib -name 'libjemalloc.so*' 2>/dev/null | sort -V | tail -1 || true)"
   fi
@@ -312,7 +324,7 @@ setup_jemalloc() {
   # A child process can't mutate the parent shell, so persist the export into a
   # sourceable env file (and print it). `make run/inference` / your launcher can
   # `source script/runtime-env.sh` before starting the binary.
-  cat > "$ENV_FILE" <<EOF
+  cat >"$ENV_FILE" <<EOF
 # Generated by script/setup.sh — source before launching inference-runtime.
 export LD_PRELOAD="${so}"
 EOF
