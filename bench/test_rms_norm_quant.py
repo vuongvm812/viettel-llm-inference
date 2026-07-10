@@ -183,6 +183,12 @@ def test_row_stride_larger_than_hidden(dtype, with_residual):
     _assert_fp8_equivalent(got_out, exp_out, dtype)
 
 
+@pytest.mark.skipif(
+    USE_STOCK,
+    reason="stock has no alignment guard: it takes the vectorised path unconditionally "
+    "and faults (cudaErrorMisalignedAddress), poisoning the context for later tests. The "
+    "generic fallback is a vtl-only property, so this asserts our kernel, not stock's.",
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_misaligned_input_falls_back_to_generic(dtype):
     """A one-element storage offset breaks the 16-byte alignment the vectorised loads
