@@ -5,7 +5,7 @@ TARGET ?= http://localhost:8000
 # host pick: an arm64 Mac would otherwise produce an image the GPU box can't run.
 PLATFORM ?= linux/amd64
 TRACE := data/input/trace-round1.jsonl
-LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml
+LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 
 .PHONY: check stats build up down warm push bench
 
