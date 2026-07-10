@@ -105,6 +105,34 @@ def _mismatch_fraction(a, b):
     return (ca != cb).float().mean().item()
 
 
+# Relative spacing of adjacent representable values (2**-mantissa_bits).
+_DTYPE_ULP = {torch.float16: 2.0**-10, torch.bfloat16: 2.0**-7, torch.float32: 2.0**-23}
+
+
+def _scale_rtol(dtype):
+    """scale = amax(|y|)/448, and y is rounded to `dtype`. Our fp32 block reduction and
+    torch's differ in summation order, so `rms` differs at the last fp32 bits; that can
+    push the amax element across at most one `dtype` rounding boundary, moving scale by up
+    to one dtype ULP. (Verified separately that the fp8 converters themselves agree
+    bit-for-bit, so this is the whole story.) The 2x is headroom; the 1e-5 floor covers
+    fp32, where reduction-accumulation error (~log2(H)*2**-24) dominates over the ULP."""
+    return max(2.0 * _DTYPE_ULP[dtype], 1e-5)
+
+
+def _assert_fp8_equivalent(got, exp, dtype):
+    """The rigorous bound is on MAGNITUDE, not count: every code differs from the
+    reference by at most one e4m3 step (3-bit mantissa -> <=1/8 relative; smallest
+    subnormal 2**-9). A stride or indexing bug surfaces here as many-step errors.
+
+    The fraction bound is separate and only guards against a SYSTEMATIC rounding bias:
+    reduction-order noise flips a handful of near-boundary codes (<~0.2% even for bf16 on
+    small samples), whereas a wrong rounding rule flips ~half. 1% sits ~5x above the noise
+    and ~50x below a bug -- a separation, not a fit to make the suite pass."""
+    torch.testing.assert_close(got.float(), exp.float(), rtol=0.13, atol=2.0**-9)
+    frac = _mismatch_fraction(got, exp)
+    assert frac < 1e-2, f"{frac:.2%} of fp8 codes differ -- systematic, not reduction noise"
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("num_tokens", [1, 7, 256, 1000, 8192])
 @pytest.mark.parametrize(
@@ -128,16 +156,11 @@ def test_matches_reference(dtype, num_tokens, hidden, with_residual):
     got_out, got_scale, got_res = run(x, w, eps, res)
     exp_out, exp_scale, exp_res = reference(x, w, eps, res)
 
-    torch.testing.assert_close(got_scale, exp_scale, rtol=1e-5, atol=0)
+    torch.testing.assert_close(got_scale, exp_scale, rtol=_scale_rtol(dtype), atol=0)
     if with_residual:
         # residual is just (input + residual) rounded: no reduction, must be bit-exact
         torch.testing.assert_close(got_res, exp_res, rtol=0, atol=0)
-
-    frac = _mismatch_fraction(got_out, exp_out)
-    assert frac < 1e-3, f"{frac:.2%} of fp8 codes differ"
-    # Where they do differ it must be by one representable step: e4m3 has a 3-bit
-    # mantissa (1/8 relative) and its smallest subnormal is 2**-9.
-    torch.testing.assert_close(got_out.float(), exp_out.float(), rtol=0.13, atol=2.0**-9)
+    _assert_fp8_equivalent(got_out, exp_out, dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -154,10 +177,10 @@ def test_row_stride_larger_than_hidden(dtype, with_residual):
     got_out, got_scale, got_res = run(x, w, 1e-6, res)
     exp_out, exp_scale, exp_res = reference(x, w, 1e-6, res)
 
-    torch.testing.assert_close(got_scale, exp_scale, rtol=1e-5, atol=0)
+    torch.testing.assert_close(got_scale, exp_scale, rtol=_scale_rtol(dtype), atol=0)
     if with_residual:
         torch.testing.assert_close(got_res, exp_res, rtol=0, atol=0)
-    assert _mismatch_fraction(got_out, exp_out) < 1e-3
+    _assert_fp8_equivalent(got_out, exp_out, dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -173,8 +196,46 @@ def test_misaligned_input_falls_back_to_generic(dtype):
 
     got_out, got_scale, _ = run(x, w, 1e-6, None)
     exp_out, exp_scale, _ = reference(x, w, 1e-6, None)
-    torch.testing.assert_close(got_scale, exp_scale, rtol=1e-5, atol=0)
-    assert _mismatch_fraction(got_out, exp_out) < 1e-3
+    torch.testing.assert_close(got_scale, exp_scale, rtol=_scale_rtol(dtype), atol=0)
+    _assert_fp8_equivalent(got_out, exp_out, dtype)
+
+
+def test_weight_product_is_narrowed_not_widened():
+    """Pins the numerics contract the oracle encodes, independent of the ULP-scale
+    tolerances above: stock forms the weight product IN scalar_t (bf16*bf16 -> bf16), it
+    does not keep it in fp32. Both are ~1-ulp effects, so a scalar tolerance can't
+    distinguish them -- this test does it directly.
+
+    Construct two references, `narrow` (correct) and `wide` (the fp32-product bug); they
+    differ systematically in a few percent of fp8 codes. The kernel must land on `narrow`.
+    Reduction-order noise only flips <~0.2% of codes, far below that gap, so the verdict
+    is unambiguous."""
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    x = torch.randn(1, 2048, dtype=dtype, device="cuda")
+    w = torch.randn(2048, dtype=dtype, device="cuda")
+
+    xf = x.float()
+    rms = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)
+    xr = (xf * rms).to(dtype)
+    y_narrow = (xr * w).float()  # scalar_t * scalar_t, as stock does
+    y_wide = xr.float() * w.float()  # the bug: fp32 product
+
+    def quant(y):
+        s = torch.clamp(y.abs().amax(-1, keepdim=True) / FP8_MAX, min=MIN_SCALE)
+        return torch.clamp(y / s, -FP8_MAX, FP8_MAX).to(FP8)
+
+    o_narrow, o_wide = quant(y_narrow), quant(y_wide)
+    gap = _mismatch_fraction(o_narrow, o_wide)
+    assert gap > 0.01, f"crafted case too weak to distinguish narrow/wide ({gap:.2%})"
+
+    got_out, _, _ = run(x, w, 1e-6, None)
+    d_narrow = _mismatch_fraction(got_out, o_narrow)
+    d_wide = _mismatch_fraction(got_out, o_wide)
+    assert d_narrow < d_wide / 4, (
+        f"kernel is {d_narrow:.2%} from the narrowed product but {d_wide:.2%} from the "
+        f"fp32-widened one -- the weight multiply is not narrowing to {dtype}"
+    )
 
 
 def test_scale_ub_is_honoured():
