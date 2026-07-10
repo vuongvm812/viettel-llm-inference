@@ -3,6 +3,7 @@
 # build context matters.
 *
 !pyproject.toml
+!setup.py
 !README.md
 !vtl/
 !docker/cache/
