@@ -1,19 +1,21 @@
 # syntax=docker/dockerfile:1.7
+# The constant --platform below is deliberate, not a mistake to be linted away:
+# it is what stops `docker build .` on an arm64 Mac from producing an unrunnable image.
+# check=skip=FromPlatformFlagConstDisallowed
 #
 # The plugin must be pip-installed, not bind-mounted: vLLM finds register() through
 # the `vllm.general_plugins` entry point, which lives in the .dist-info that only a
 # real install produces. A mounted `vtl/` is importable but silently never loads.
+#
+# vllm/vllm-openai is multi-arch. Without the explicit --platform, building on an
+# arm64 machine silently yields an arm64 image that the amd64 H200 box cannot run.
 ARG VLLM_IMAGE=vllm/vllm-openai:v0.22.1
 
-FROM ${VLLM_IMAGE} AS builder
-WORKDIR /src
-COPY pyproject.toml README.md ./
-COPY vtl ./vtl
-RUN pip install --no-cache-dir build && python3 -m build --wheel -o /dist
+FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 
-FROM ${VLLM_IMAGE} AS runtime
-COPY --from=builder /dist/*.whl /tmp/
-RUN pip install --no-cache-dir --no-deps /tmp/*.whl && rm -f /tmp/*.whl
+COPY pyproject.toml README.md /src/
+COPY vtl /src/vtl
+RUN pip install --no-cache-dir --no-deps /src && rm -rf /src
 
 # Fail the build, not the judge's run.
 RUN python3 -c "import importlib.metadata as m; \

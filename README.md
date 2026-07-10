@@ -54,3 +54,8 @@ make push       # push and print the digest to pin in the compose file
 ```
 
 Everything except `make check` needs a Linux box with the H200.
+
+**Build on the GPU box.** `vllm/vllm-openai` is multi-arch, so an unpinned `docker build` on an
+arm64 Mac silently produces an arm64 image that the amd64 H200 host refuses to run. The
+Dockerfile, compose, and `make build/push` all pin `linux/amd64`, so a Mac build is *correct* —
+but it runs every `RUN` under qemu emulation and pulls a ~10 GB foreign base. Native is faster.

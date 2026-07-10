@@ -7,5 +7,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
     volumes:
       - ./hf-model:/model:ro # HF safetensors dir (config.json + *.safetensors)
