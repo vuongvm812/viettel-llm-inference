@@ -29,7 +29,7 @@ services:
       # 16384 (baseline) rejects most of the trace; 262144 exceeds the model's
       # derived limit and vLLM refuses to start without VLLM_ALLOW_LONG_MAX_MODEL_LEN.
       - --max-model-len=32768
-      - --gpu-memory-utilization=0.92 # 0.95 leaves no headroom for CUDA graph pools
+      - --gpu-memory-utilization=0.8 # 0.95 leaves no headroom for CUDA graph pools
       - --tensor-parallel-size=1
 
       # The 6,388-token shared system prompt makes this the single biggest win:
