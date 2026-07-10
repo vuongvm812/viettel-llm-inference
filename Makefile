@@ -43,6 +43,22 @@ bench-kernel: build
 	$(KRUN) 'python3 /bench/test_rms_norm_quant.py && \
 	  VTL_SKIP_EXT=1 python3 /bench/test_rms_norm_quant.py'
 
+## Pinpoint a memory fault. VTL_KERNEL_SYNC makes the kernel synchronise after every launch
+## and, on a fault, raise with the exact shape and path (fast/generic, dtype, stride,
+## pointer alignments) -- so it is attributed to its own launch instead of cascading into a
+## later test. Runs each test in its own process (-p no:randomly, --forked-ish via -x stop)
+## so the first raise is the culprit. compute-sanitizer is not in the runtime image; this
+## needs no extra tooling.
+##   make debug-kernel                          # whole suite, stops at first fault
+##   make debug-kernel T=test_misaligned        # one test
+T ?=
+DBG_KRUN := docker run --rm --gpus all -e VTL_KERNEL_SYNC=1 -e CUDA_LAUNCH_BLOCKING=1 \
+              -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
+debug-kernel: build
+	$(DBG_KRUN) 'pip install -q pytest && \
+	  python3 -m pytest -q -p no:cacheprovider -x /bench/test_rms_norm_quant.py \
+	  $(if $(T),-k $(T),)'
+
 stats:
 	python3 bench/trace_stats.py
 

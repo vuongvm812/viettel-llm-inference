@@ -37,6 +37,7 @@
 #include <c10/util/Float8_e4m3fn.h>
 #include <c10/util/Half.h>
 #include <cuda_fp8.h>
+#include <cstdlib>
 #include <torch/all.h>
 
 namespace vtl {
@@ -282,6 +283,18 @@ __global__ void fused_rms_norm_quant_generic_kernel(
 
 bool aligned16(void const* p) { return reinterpret_cast<uintptr_t>(p) % 16 == 0; }
 
+// Diagnostic, off unless VTL_KERNEL_SYNC is set (read once). When on, launch() synchronises
+// right after the kernel and, on a CUDA error, throws with the exact shape and path -- so a
+// fault is attributed to its own launch instead of surfacing at some later sync in another
+// test. Zero cost when off (one predicted branch per call).
+bool kernel_sync_enabled() {
+  static bool const v = [] {
+    char const* e = std::getenv("VTL_KERNEL_SYNC");
+    return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'y');
+  }();
+  return v;
+}
+
 template <typename scalar_t>
 void launch(torch::Tensor const& out, torch::Tensor const& input,
             torch::Tensor const& weight, torch::Tensor const& scales, double epsilon,
@@ -335,6 +348,17 @@ void launch(torch::Tensor const& out, torch::Tensor const& input,
   }
 #undef VTL_DISPATCH_RESIDUAL
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  if (kernel_sync_enabled()) {
+    cudaError_t const err = cudaStreamSynchronize(stream);
+    TORCH_CHECK(
+        err == cudaSuccess, "vtl kernel faulted: ", cudaGetErrorString(err),
+        " | path=", (fast ? "fast" : "generic"), " dtype=", input.scalar_type(),
+        " num_tokens=", num_tokens, " hidden=", hidden_size, " stride=", input_stride,
+        " kVec=", kVec, " residual=", (res_p != nullptr),
+        " aligned16(in,out,w,res)=", aligned16(in_p), aligned16(out_p), aligned16(w_p),
+        (res_p ? aligned16(res_p) : true));
+  }
 }
 
 }  // namespace
