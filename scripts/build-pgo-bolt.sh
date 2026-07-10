@@ -22,6 +22,7 @@ OUT_DIR="${OUT_DIR:-$REPO/target-pgo}"        # baseline/optimized json + report
 NATIVE="-Ctarget-cpu=native"
 REPLAY_LOOPS="${PGO_REPLAY_LOOPS:-3}"         # loop the 120-req trace for denser PGO coverage (design §5)
 FEATURES="${FEATURES:-}"                       # e.g. FEATURES=llama for the real llama.cpp+CUDA backend (default: mock)
+READY_POLLS="${PGO_READY_POLLS:-1200}"         # /health poll attempts × 0.1s (real llama model load is slow; crash still fails fast via kill -0)
 PY="$(command -v python3 || command -v python)" || { echo "python not found" >&2; exit 1; }
 
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -58,7 +59,7 @@ build() { ( cd "$SERVICES" && RUSTFLAGS="$NATIVE ${1:-}" cargo build --release -
 run_and_replay() {
   local out="$1"
   ( cd "$REPO" && "$BIN" "$CONFIG" ) & SERVER_PID=$!
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 "$READY_POLLS"); do
     curl -fsS "$TARGET_URL/health" >/dev/null 2>&1 && break
     kill -0 "$SERVER_PID" 2>/dev/null || die "server exited before becoming ready"
     sleep 0.1
@@ -119,7 +120,7 @@ if [ "$(uname -s)" = "Linux" ] && command -v perf >/dev/null && command -v llvm-
   # already-written perf.data, not a graceful server exit. Linux-only, deferred —
   # exercise on the target box (see ROADMAP P6).
   ( cd "$REPO" && perf record -e cycles:u -j any,u -o /tmp/perf.data -- "$BIN" "$CONFIG" ) & SERVER_PID=$!
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 "$READY_POLLS"); do
     curl -fsS "$TARGET_URL/health" >/dev/null 2>&1 && break
     kill -0 "$SERVER_PID" 2>/dev/null || die "perf/server exited before becoming ready"
     sleep 0.1

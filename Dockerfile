@@ -1,6 +1,7 @@
 # Runtime-only image for publishing to a public registry. Ships ONLY the pre-built,
-# optimized (PGO+LTO+BOLT, --features llama, native), stripped binary + the model +
-# config. No source, no scripts, no toolchain — so publishing can't leak our code.
+# optimized (PGO+LTO+BOLT, --features llama, native), stripped binary + config. The
+# model is bind-mounted at /model (docker-compose), NOT baked in — keeps the image
+# small. No source, no scripts, no toolchain — so publishing can't leak our code.
 #
 # The binary is built OUTSIDE Docker on a GPU host (needs GPU + CUDA + model to train
 # PGO/BOLT). Build + strip it first, then build this image:
@@ -26,9 +27,8 @@ ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 
 WORKDIR /app
 COPY dist/inference-runtime /usr/local/bin/inference-runtime
-COPY models/qwen3.5-2b-bf16.gguf /app/models/qwen3.5-2b-bf16.gguf
 COPY config/default-config.yaml /app/config/default-config.yaml
 
-EXPOSE 8001
-# Run with GPU:  docker run --gpus all -p 8001:8001 <image>
+EXPOSE 8000
+# Run with GPU + model mount:  docker run --gpus all -p 8000:8000 -v ./models/qwen3.5-2b-bf16.gguf:/model:ro <image>
 ENTRYPOINT ["inference-runtime", "/app/config/default-config.yaml"]

@@ -773,6 +773,7 @@ dependencies = [
  "core_affinity",
  "disruptor",
  "futures-util",
+ "libc",
  "llama-cpp-2",
  "serde",
  "serde_yaml",

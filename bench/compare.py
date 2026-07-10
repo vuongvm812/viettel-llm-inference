@@ -51,7 +51,8 @@ def print_table(runs):
     print()
     print(_row("", headers))
     print("  " + "-" * (20 + 18 * len(runs)))
-    for name, key in (("TTFT", "ttft_ms"), ("ITL", "itl_ms"), ("E2E", "e2e_ms")):
+    # TPOT (time-per-output-token) == mean inter-token latency (itl_ms); E2E == end-to-end latency.
+    for name, key in (("TTFT", "ttft_ms"), ("TPOT", "itl_ms"), ("E2E", "e2e_ms")):
         for pct in ("p50", "p99"):
             cells = [_fmt(a[key][pct], "ms") for a in aggs]
             print(_row(f"{name} {pct}", cells))

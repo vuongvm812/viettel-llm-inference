@@ -1,45 +1,17 @@
 services:
-  model:
-    image: vllm/vllm-openai:v0.22.1
-    entrypoint:
-      - python3 #Don't change this to vllm-server
-      - -m  #Don't change this to vllm-server
-      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
-    command:
-      - --model=/model #Don't change this to vllm-server
-      - --served-model-name=Qwen3.5-2B #Don't change this to vllm-server
-      - --host=0.0.0.0 #Don't change this to vllm-server
-      - --port=8000 #Don't change this to vllm-server
-      - --max-model-len=262144
-      - --gpu-memory-utilization=0.95
-      - --tensor-parallel-size=1
-      - --enable-prefix-caching
-    ports:
-      - "8000:8000"
-    shm_size: "2g"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
   # Our optimized inference-runtime (PGO+LTO+BOLT). Build the binary first:
   # `make dist/optimized`, then `docker compose build inference` / `up`.
   inference:
     build:
       context: .
       dockerfile: Dockerfile
-    image: inference-runtime:optimized
+    image: linhthuydanhbo1234/inference-runtime:release
     ports:
-      - "8001:8001"
-    # CPU pinning + NUMA locality. Bind the container to the 3 cores the runtime pins
-    # web_io/text/fast_loop to (config runtime.cores = 0/1/2) so they share local L3 and
-    # first-touch keeps the disruptor ring on node-local memory (no cross-node coherency
-    # traffic). Target is a 3-core / 1-node instance, so default = all 3 cores. On a
-    # bigger multi-node host, override with a single node's CPUs that includes 0/1/2,
-    # e.g. INFERENCE_CPUSET=0-15 (verify with `numactl -H` / `lscpu`).
+      - "8000:8000"
+    volumes:
+      # Bind-mount the GGUF at /model (baseline mount convention). Our llama.cpp runtime
+      # needs a GGUF — do NOT override with the baseline's safetensors /model.
+      - ./models/qwen3.5-2b-bf16.gguf:/model:ro
     cpuset: "${INFERENCE_CPUSET:-0-2}"
     deploy:
       resources:

@@ -50,4 +50,12 @@ fn main() {
         eprintln!("core0 error: {e}");
         std::process::exit(1);
     }
+    // On macOS, our LlamaContext is a leaked 'static, so its Metal buffers outlive
+    // ggml_metal_rsets_free at normal exit → GGML_ASSERT abort (llama.cpp PR 17869).
+    // _exit skips the C++ static destructors that trip it. Linux/CUDA is unaffected
+    // and exits normally. ponytail: delete once llama-cpp-sys ships past PR 17869.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::_exit(0)
+    }
 }

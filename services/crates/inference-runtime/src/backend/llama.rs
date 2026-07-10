@@ -39,6 +39,14 @@ use std::num::NonZeroU32;
 /// (Metal/CUDA). Avoids the `u32::MAX`→`i32` wrap the C API would see.
 const ALL_GPU_LAYERS: u32 = 1_000_000;
 
+// `llama.cpp`'s `llama_flash_attn_type` is a bindgen alias to `c_int`; these are its two
+// explicit values (the crate's `with_flash_attention_policy` takes that type). Naming them
+// here avoids a whole `llama-cpp-sys-2` dependency just for two integers.
+// ponytail: hard-coded ABI enum values — if upstream ever renumbers them, `make parity-flash`
+// (which forces the policy on) fails loudly rather than silently mis-setting it.
+const FLASH_ATTN_DISABLED: i32 = 0;
+const FLASH_ATTN_ENABLED: i32 = 1;
+
 /// `&'static` handle to a process-lifetime llama object, made `Send + Sync` for
 /// our pinned worker threads. The `Send`/`Sync` assertions are scoped to the two
 /// concrete types we actually share (below), not blanket over all `T`, so the
@@ -100,12 +108,22 @@ pub fn load(cfg: &Config) -> (TextBackend, DecoderInit) {
     // Bound tokens per decode() call. Must hold both a prefill chunk and a full
     // decode step (one token per active seq), so keep it >= max_batch_seqs.
     let n_batch = cfg.model.n_ctx.min(2048).max(max_batch_seqs);
+    // `0` = one ubatch per decode step (= n_batch); a smaller configured value splits the
+    // forward pass. llama.cpp requires n_ubatch <= n_batch, so clamp.
+    let n_ubatch = if cfg.runtime.n_ubatch == 0 {
+        n_batch
+    } else {
+        cfg.runtime.n_ubatch.min(n_batch)
+    };
     let text = TextBackend { model: StaticRef(model) };
     let init = DecoderInit {
         model: StaticRef(model),
         backend: StaticRef(backend),
         n_ctx: cfg.model.n_ctx,
         n_batch,
+        n_ubatch,
+        kv_defrag_thold: cfg.runtime.kv_defrag_thold,
+        flash_attention: cfg.runtime.flash_attn(),
         max_batch_seqs,
         shared_prefix_tokens: cfg.runtime.shared_prefix_tokens,
         max_batch_tokens: cfg.runtime.max_batch_tokens as usize,
@@ -166,6 +184,13 @@ pub struct DecoderInit {
     backend: StaticRef<LlamaBackend>,
     n_ctx: u32,
     n_batch: u32,
+    /// Physical micro-batch (`with_n_ubatch`); already resolved (`0` → `n_batch`) and
+    /// clamped to `n_batch` in [`load`].
+    n_ubatch: u32,
+    /// KV-cache defragmentation threshold (`with_defrag_thold`); `<= 0` disables.
+    kv_defrag_thold: f32,
+    /// Flash-attention policy; `Auto` leaves llama.cpp's default (byte-parity preserved).
+    flash_attention: crate::config::FlashAttn,
     /// Max sequences decoded together per iteration (continuous batching, P3).
     max_batch_seqs: u32,
     /// Shared-prefix window K (P4); `0` disables (P3 behavior).
@@ -261,11 +286,29 @@ impl Decoder {
         let cparams = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(init.n_ctx))
             .with_n_batch(init.n_batch)
+            // Physical micro-batch: how many tokens one forward pass computes. A larger
+            // value prefills long prompts in fewer passes (lower TTFT) and keeps the batch
+            // shape stable for CUDA-graph capture. Resolved/clamped to n_batch in load().
+            .with_n_ubatch(init.n_ubatch)
             // Allow up to `max_batch_seqs` concurrent request sequences plus the reserved
             // prefix seqs in the KV cache. (Confirm the method name against llama-cpp-2 on
             // the target — the crate occasionally renames setters.)
             .with_n_seq_max(init.max_batch_seqs + prefix_extra as u32)
-            .with_n_threads(1); // full GPU offload → 1 CPU thread (don't fight the 3 cores)
+            .with_n_threads(1) // full GPU offload → 1 CPU thread (don't fight the 3 cores)
+            // Compact the copy-based KV cache once fragmentation passes this fraction, so a
+            // long-running server keeps reclaiming cells retired by continuous batching.
+            .with_defrag_thold(init.kv_defrag_thold);
+        // Flash attention: `Auto` leaves llama.cpp's own default untouched (byte-parity
+        // preserved). `On`/`Off` force the policy — validate byte-parity on the GPU target
+        // (`make parity-flash`) before forcing it on; some hybrid/recurrent layers don't
+        // support it and it can change the attention reduction order.
+        let cparams = match init.flash_attention {
+            crate::config::FlashAttn::Auto => cparams,
+            crate::config::FlashAttn::On => cparams.with_flash_attention_policy(FLASH_ATTN_ENABLED),
+            crate::config::FlashAttn::Off => {
+                cparams.with_flash_attention_policy(FLASH_ATTN_DISABLED)
+            }
+        };
         let ctx = init
             .model
             .0

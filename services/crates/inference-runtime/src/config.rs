@@ -63,8 +63,41 @@ pub struct Runtime {
     /// the feature.
     #[serde(default = "default_shared_prefix_tokens")]
     pub shared_prefix_tokens: u32,
+    /// KV-cache defragmentation threshold (`llama.cpp with_defrag_thold`). Continuous
+    /// batching retires sequences mid-context, fragmenting the copy-based KV cache;
+    /// llama.cpp compacts it once the free-cell fraction exceeds this, so a long-running
+    /// server keeps reclaiming cells instead of drifting toward slot exhaustion. Pure cell
+    /// relocation → byte-identical outputs. `<= 0` disables (llama.cpp default).
+    #[serde(default = "default_kv_defrag_thold")]
+    pub kv_defrag_thold: f32,
+    /// Physical micro-batch (`with_n_ubatch`): the largest token count computed in one
+    /// forward pass. Prefill is split into ubatches, so a larger value lowers TTFT for long
+    /// prompts (fewer passes) at the cost of a bigger compute buffer. `0` = match the derived
+    /// `n_batch` (one ubatch per step, which also keeps the batch shape stable for CUDA-graph
+    /// capture). Clamped to `n_batch` at load. Output-preserving.
+    // Consumed only by the real llama context builder; the mock has no ubatch concept.
+    #[cfg_attr(not(feature = "llama"), allow(dead_code))]
+    #[serde(default = "default_n_ubatch")]
+    pub n_ubatch: u32,
+    /// Flash-attention policy: `"auto"` (default) leaves llama.cpp's own default untouched —
+    /// byte-identical to today; `"on"`/`"off"` force it. Flash attention changes the attention
+    /// reduction order (may break byte-parity with llama-cli) and some hybrid/recurrent layers
+    /// don't support it — validate parity on the GPU target (`make parity-flash`) before `"on"`.
+    #[serde(default = "default_flash_attention")]
+    pub flash_attention: String,
     /// Pinned core ids (no-op on macOS).
     pub cores: Cores,
+}
+
+/// Parsed [`Runtime::flash_attention`] policy. `Auto` leaves llama.cpp's default in place
+/// (no setter call) so byte-parity is preserved unless a policy is explicitly forced.
+// Consumed only by the real llama backend's context builder.
+#[cfg_attr(not(feature = "llama"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashAttn {
+    Auto,
+    On,
+    Off,
 }
 
 fn default_max_batch_seqs() -> u32 {
@@ -82,7 +115,34 @@ fn default_shared_prefix_tokens() -> u32 {
     8192
 }
 
+fn default_kv_defrag_thold() -> f32 {
+    // Compact once ~10% of cells are stale holes — cheap enough to run often, high
+    // enough not to churn every step. Output-preserving, so safe to default on.
+    0.1
+}
+
+fn default_n_ubatch() -> u32 {
+    // 0 = match the derived n_batch (resolved in backend::load).
+    0
+}
+
+fn default_flash_attention() -> String {
+    // Leave llama.cpp's own default in place → byte-identical to today.
+    "auto".into()
+}
+
 impl Runtime {
+    /// Parse [`Runtime::flash_attention`] into a policy. Validated at the config boundary,
+    /// so an unknown string is rejected before this is called; defaults to `Auto`.
+    #[cfg_attr(not(feature = "llama"), allow(dead_code))]
+    pub fn flash_attn(&self) -> FlashAttn {
+        match self.flash_attention.as_str() {
+            "on" => FlashAttn::On,
+            "off" => FlashAttn::Off,
+            _ => FlashAttn::Auto,
+        }
+    }
+
     /// Continuous-batching concurrency cap actually used by Core 2: the configured
     /// `max_batch_seqs` can't exceed the slab (in-flight slots) and is at least 1.
     /// Single source of truth so the mock and llama backends don't clamp differently.
@@ -154,6 +214,26 @@ impl Config {
                 i32::MAX as u32 - SEQ_ID_HEADROOM
             )));
         }
+        // llama.cpp caps a context at LLAMA_MAX_SEQ (256) distinct sequence ids. The
+        // decoder builds n_seq_max = max_batch_seqs + (MAX_PREFIX_SEQS when sharing is on),
+        // so their sum must fit — else llama_init_from_model fails with a bare NullReturn
+        // panic (backend/llama.rs). Guard at the config boundary with an actionable error.
+        // llama backend only; the pure-Rust mock has no such cap.
+        #[cfg(feature = "llama")]
+        {
+            const LLAMA_MAX_SEQ: u32 = 256;
+            let prefix_extra =
+                if r.shared_prefix_tokens > 0 { crate::backend::MAX_PREFIX_SEQS as u32 } else { 0 };
+            let n_seq_max = r.max_batch_seqs + prefix_extra;
+            if n_seq_max > LLAMA_MAX_SEQ {
+                return Err(ConfigError::Invalid(format!(
+                    "runtime.max_batch_seqs ({}) + prefix-cache seqs ({}) = {} exceeds llama.cpp's \
+                     LLAMA_MAX_SEQ ({}); lower max_batch_seqs to <= {}",
+                    r.max_batch_seqs, prefix_extra, n_seq_max, LLAMA_MAX_SEQ,
+                    LLAMA_MAX_SEQ - prefix_extra
+                )));
+            }
+        }
         // A zero token budget would make Core 2's admit loop (`admitted_tokens <
         // max_batch_tokens`) never run — nothing is ever admitted, `pending` never
         // drains, and the loop hangs. Reject at the boundary, like the other knobs.
@@ -173,6 +253,25 @@ impl Config {
                 r.shared_prefix_tokens,
                 i32::MAX
             )));
+        }
+
+        // Defrag threshold is a free-cell fraction; > 1.0 is meaningless. `<= 0` is
+        // allowed and disables defrag (llama.cpp semantics), so only cap the top.
+        if r.kv_defrag_thold > 1.0 {
+            return Err(ConfigError::Invalid(format!(
+                "runtime.kv_defrag_thold ({}) must be <= 1.0 (a free-cell fraction; <= 0 disables)",
+                r.kv_defrag_thold
+            )));
+        }
+        // n_ubatch is clamped to n_batch at load, so any value parses. The flash-attention
+        // policy is a fixed string set — reject anything else at the boundary.
+        match r.flash_attention.as_str() {
+            "auto" | "on" | "off" => {}
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "runtime.flash_attention (\"{other}\") must be \"auto\", \"on\", or \"off\""
+                )));
+            }
         }
 
         // Model invariants — P2 mandates full GPU offload + a single CPU thread, and
@@ -284,6 +383,9 @@ runtime:
             max_batch_seqs: 256,
             max_batch_tokens: 2048,
             shared_prefix_tokens: 0, // neutral here; exercised in its own cases below
+            kv_defrag_thold: 0.1,
+            n_ubatch: 0,
+            flash_attention: "auto".into(),
             cores: Cores { web_io: 0, text: 1, fast_loop: 2 },
         };
         let with = |rt| Config {
@@ -330,6 +432,9 @@ runtime:
             max_batch_seqs: 256,
             max_batch_tokens: 2048,
             shared_prefix_tokens: 0, // keep the model-field cases independent of the prefix<n_ctx check
+            kv_defrag_thold: 0.1,
+            n_ubatch: 0,
+            flash_attention: "auto".into(),
             cores: Cores { web_io: 0, text: 1, fast_loop: 2 },
         };
         let with = |n_ctx, n_threads, n_gpu_layers| Config {
