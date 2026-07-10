@@ -5,4 +5,4 @@
 services:
   model:
     volumes:
-      - ./model:/model:ro   # HF safetensors dir (config.json + *.safetensors), NOT the .gguf
+      - ./hf-model:/model:ro   # HF safetensors dir (config.json + *.safetensors), NOT the .gguf
