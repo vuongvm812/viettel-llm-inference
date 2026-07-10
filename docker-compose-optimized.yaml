@@ -45,6 +45,16 @@ services:
       # startup -- use VTL_FP8_CHANNELWISE=0 to get stock behaviour instead.
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3 # halves decode KV bandwidth at 18.7K context
+
+      # Turns on RMSNormQuantFusionPass, which rewrites all 72 of Qwen2's
+      # fused_add_rms_norm -> per-token-fp8-quant pairs into a single
+      # _C::rms_norm_dynamic_per_token_quant node. vtl/patches/rms_norm_quant.py replaces
+      # that op's CUDA kernel with a single-pass one. Off by default because
+      # enable_norm_fusion() (vllm/config/vllm.py:99) otherwise leaves the fusion to
+      # Inductor -- so this swaps Inductor's Triton norm+quant for our hand-written kernel.
+      # A user-set pass_config survives the -O2 defaults: _set_config_default only fills
+      # fields still None (vllm/config/vllm.py:702).
+      - '--compilation-config={"pass_config": {"fuse_norm_quant": true}}'
     ports:
       - "8000:8000" # judge hits this -- MUST be :8000
     environment:
@@ -52,6 +62,13 @@ services:
       # server; FA3 is auto-selected on SM90 (H200).
       VLLM_PLUGINS: vtl
       VTL_FP8_IGNORE: "lm_head" # keep the output head in bf16
+      # DEBUG makes rms_quant_fusion.py emit `fusion pass matches: {...}`, the only direct
+      # evidence of how many nodes our kernel backs. `make verify` greps it. DEBUG logging
+      # is not free -- leave at INFO when benchmarking or submitting.
+      VLLM_LOGGING_LEVEL: ${VLLM_LOGGING_LEVEL:-INFO}
+      # Set to 0 to keep vLLM's stock fused kernel. The FX graph is identical either way,
+      # so this toggle isolates the kernel from the fusion-pass change above.
+      VTL_ENABLE_RMS_NORM_QUANT: ${VTL_ENABLE_RMS_NORM_QUANT:-1}
     shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]

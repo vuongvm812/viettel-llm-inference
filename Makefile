@@ -7,15 +7,33 @@ PLATFORM ?= linux/amd64
 TRACE := data/input/trace-round1.jsonl
 LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 
-.PHONY: check stats build up down warm push bench
+.PHONY: check stats build up down warm push bench test-kernel bench-kernel verify
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server.
 check:
 	python3 vtl/registry.py
 	PYTHONPATH=. python3 vtl/patches/quant_fp8.py
+	PYTHONPATH=. python3 vtl/patches/rms_norm_quant.py
 	python3 bench/trace_stats.py --self-check
 	python3 bench/metrics.py
 	@python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
+
+# No compose, no server, no model: the kernel tests just need the image and a GPU.
+# --entrypoint bash because the vLLM base image starts the API server otherwise.
+KRUN := docker run --rm --gpus all -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
+
+## Kernel correctness. Needs a GPU. Runs one oracle against our kernel AND against the
+## stock one -- importing vtl._C overrides _C process-wide, so they cannot coexist and
+## agreeing with the same reference is what proves ours matches stock.
+test-kernel:
+	$(KRUN) 'pip install -q pytest && \
+	  echo "--- vtl kernel"  && pytest /bench/test_rms_norm_quant.py -q && \
+	  echo "--- stock kernel" && VTL_SKIP_EXT=1 pytest /bench/test_rms_norm_quant.py -q'
+
+## Kernel microbenchmark at the trace's real shapes. Needs a GPU.
+bench-kernel:
+	$(KRUN) 'python3 /bench/test_rms_norm_quant.py && \
+	  VTL_SKIP_EXT=1 python3 /bench/test_rms_norm_quant.py'
 
 stats:
 	python3 bench/trace_stats.py
@@ -41,6 +59,23 @@ verify:
 	@grep -q "channelwise fp8 unavailable" /tmp/vtl-verify.log \
 	  && echo "WARN channelwise fp8 fell back to stock per-tensor" \
 	  || echo "OK   channelwise fp8 active"
+	@# Expected to fail when you deliberately A/B with VTL_ENABLE_RMS_NORM_QUANT=0.
+	@grep -q "fused rms_norm+fp8-quant CUDA kernel installed" /tmp/vtl-verify.log \
+	  && echo "OK   vtl fused norm+quant kernel installed" \
+	  || { echo "FAIL vtl kernel not installed -- stock _C kernel is running"; exit 1; }
+	@# RMSNormQuantFusionPass.__call__ overrides VllmPatternMatcherPass.__call__ and never
+	@# touches match_table, so it never appears in "fusion pass matches:". The only line it
+	@# emits is `Replaced N patterns` (rms_quant_fusion.py:671, DEBUG). N is how many nodes
+	@# were rewritten into the op our kernel backs; N=0 means the kernel never runs.
+	@n=$$(grep "rms_quant_fusion.py.*Replaced" /tmp/vtl-verify.log | tail -1 \
+	      | sed -n 's/.*Replaced \([0-9]*\) patterns.*/\1/p'); \
+	 if [ -z "$$n" ]; then \
+	   echo "WARN fusion match count unknown -- rerun with VLLM_LOGGING_LEVEL=DEBUG"; \
+	 elif [ "$$n" -eq 0 ]; then \
+	   echo "FAIL rms_norm+quant fusion replaced 0 patterns -- the kernel is never reached"; exit 1; \
+	 else \
+	   echo "OK   rms_norm+quant fusion replaced $$n patterns (each one calls our kernel)"; \
+	 fi
 
 build:
 	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE):$(TAG) .

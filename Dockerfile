@@ -13,15 +13,29 @@ ARG VLLM_IMAGE=vllm/vllm-openai:v0.22.1
 
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 
-COPY pyproject.toml README.md /src/
+COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
-RUN pip install --no-cache-dir --no-deps /src && rm -rf /src
+
+# H200 is SM90. Without this nvcc probes the build host (which has no GPU) and then
+# compiles every arch it knows. Scoped to the RUN, not ENV: it is a build input and has no
+# business in the served image. No +PTX, so vtl._C only loads on SM90 -- elsewhere its
+# import raises, apply_all() isolates it, and we serve stock (see rms_norm_quant.py).
+# --no-build-isolation so setup.py sees the image's torch.
+RUN TORCH_CUDA_ARCH_LIST=9.0 pip install --no-cache-dir --no-build-isolation --no-deps /src \
+    && rm -rf /src
 
 # Fail the build, not the judge's run.
 RUN python3 -c "import importlib.metadata as m; \
 eps = {e.name: e.value for e in m.entry_points(group='vllm.general_plugins')}; \
 assert eps.get('vtl') == 'vtl.plugin:register', f'plugin NOT registered: {eps}'; \
 print('plugin entry point ok:', eps)"
+
+# The CUDA kernel must be in the wheel. Importing it needs a driver, so only check the
+# .so landed -- vtl/patches/rms_norm_quant.py imports it for real at server start.
+RUN python3 -c "import importlib.util as u; \
+s = u.find_spec('vtl._C'); \
+assert s is not None, 'vtl._C did not build'; \
+print('vtl._C built:', s.origin)"
 
 ENV VLLM_PLUGINS=vtl \
     VLLM_USE_AOT_COMPILE=1 \
