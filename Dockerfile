@@ -38,12 +38,6 @@ ENV VLLM_PLUGINS=vtl \
 # Warm torch.compile / Triton / FlashInfer caches, produced by `make warm` on a GPU
 # box. Empty on a cold build -- the server still boots, it just pays the compile
 # stall on the first request.
-#
-# Re-run `make warm` on the H200 after any change to --speculative-config or
-# --compilation-config: ngram_gpu adds a @support_torch_compile module and
-# fuse_attn_quant changes the compiled graph, so an older cache silently misses and
-# the judge pays that stall inside the 180 s healthcheck start_period. Cache keys also
-# include device capability, so a cache warmed on a non-Hopper card is dead weight.
 COPY docker/cache/ /opt/vtl/cache/
 
 # No ENTRYPOINT: the compose file pins

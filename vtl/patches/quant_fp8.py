@@ -41,18 +41,7 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 def parse_ignored_layers(raw: str | None) -> list[str]:
-    """Comma-separated linear layers to keep in bf16.
-
-    Values must be **exact** fully-qualified names of ``LinearBase`` modules, e.g.
-    ``model.layers.0.mlp.down_proj``. vLLM matches with ``prefix in ignored_layers``
-    (``is_layer_skipped``, ``skip_with_substr=False``), so a prefix like
-    ``model.layers.0`` matches nothing.
-
-    ``lm_head`` can never match: ``Fp8Config.get_quant_method`` only dispatches on
-    ``LinearBase``/``RoutedExperts``/``Attention``, and ``ParallelLMHead`` is a
-    ``VocabParallelEmbedding``. With ``tie_word_embeddings=true`` (this checkpoint)
-    no ``lm_head`` module is built at all.
-    """
+    """Comma-separated layer names to keep in bf16, e.g. ``lm_head,model.layers.0``."""
     if not raw:
         return []
     return [name.strip() for name in raw.split(",") if name.strip()]
@@ -64,29 +53,8 @@ def channelwise_enabled(raw: str | None) -> bool:
     return raw.strip().lower() in _TRUTHY
 
 
-# get_quant_method() is called once per layer (~250x for 36 layers), so the imports,
-# the capability probe and the class body below are built once and reused. Both outcomes
-# are cached: on Ampere the probe fails every time and we do not want 250 retries.
-_METHOD_CLS: type | None = None
-_METHOD_ERR: Exception | None = None
-
-
-def _channelwise_method_cls() -> type:
-    """Cache ``_make_channelwise_cls()``, success or failure."""
-    global _METHOD_CLS, _METHOD_ERR
-    if _METHOD_ERR is not None:
-        raise _METHOD_ERR
-    if _METHOD_CLS is None:
-        try:
-            _METHOD_CLS = _make_channelwise_cls()
-        except Exception as exc:
-            _METHOD_ERR = exc
-            raise
-    return _METHOD_CLS
-
-
-def _make_channelwise_cls() -> type:
-    """Build a per-channel-weight subclass of ``Fp8OnlineLinearMethod``, or raise.
+def _build_channelwise_method(quant_config, stock_method):
+    """Return a per-channel-weight variant of ``stock_method``, or raise.
 
     Kept separate so every import that could drift across vLLM versions is inside
     one try/except at the call site.
@@ -129,12 +97,7 @@ def _make_channelwise_cls() -> type:
             self.fp8_linear.process_weights_after_loading(layer)
             layer._already_called_process_weights_after_loading = True
 
-    return ChannelwiseFp8OnlineLinearMethod
-
-
-def _build_channelwise_method(quant_config, stock_method):
-    """Return a per-channel-weight variant of ``stock_method``, or raise."""
-    upgraded = _channelwise_method_cls()(quant_config)
+    upgraded = ChannelwiseFp8OnlineLinearMethod(quant_config)
     upgraded.marlin_input_dtype = stock_method.marlin_input_dtype
     return upgraded
 
@@ -211,50 +174,16 @@ def apply() -> None:
 def _self_check() -> None:
     assert parse_ignored_layers(None) == []
     assert parse_ignored_layers("") == []
-    # Values are exact LinearBase FQNs -- vLLM matches with `prefix in ignored_layers`.
-    assert parse_ignored_layers("model.layers.0.mlp.down_proj") == [
-        "model.layers.0.mlp.down_proj"
-    ]
-    assert parse_ignored_layers(" model.layers.0.mlp.down_proj , model.layers.1.mlp.gate_up_proj ,") == [
-        "model.layers.0.mlp.down_proj",
-        "model.layers.1.mlp.gate_up_proj",
+    assert parse_ignored_layers("lm_head") == ["lm_head"]
+    assert parse_ignored_layers(" lm_head , model.layers.0 ,") == [
+        "lm_head",
+        "model.layers.0",
     ]
 
     assert channelwise_enabled(None) is True  # on unless explicitly disabled
     assert channelwise_enabled("1") is True
     assert channelwise_enabled("0") is False
     assert channelwise_enabled("off") is False
-
-    # _channelwise_method_cls() runs once per linear layer (~250x). Both outcomes must be
-    # cached: without this, Ampere re-probes cutlass_fp8_supported() on every layer.
-    global _METHOD_CLS, _METHOD_ERR, _make_channelwise_cls
-    saved = (_METHOD_CLS, _METHOD_ERR, _make_channelwise_cls)
-    try:
-        calls = []
-
-        _METHOD_CLS = _METHOD_ERR = None
-        _make_channelwise_cls = lambda: (calls.append(1), str)[1]  # noqa: E731
-        assert _channelwise_method_cls() is str
-        assert _channelwise_method_cls() is str
-        assert len(calls) == 1, f"success not cached: {len(calls)} builds"
-
-        calls.clear()
-        _METHOD_CLS = _METHOD_ERR = None
-
-        def _boom():
-            calls.append(1)
-            raise RuntimeError("CUTLASS FP8 unavailable")
-
-        _make_channelwise_cls = _boom
-        for _ in range(3):
-            try:
-                _channelwise_method_cls()
-            except RuntimeError:
-                pass
-        assert len(calls) == 1, f"failure not cached: {len(calls)} probes"
-    finally:
-        _METHOD_CLS, _METHOD_ERR, _make_channelwise_cls = saved
-
     print("quant_fp8 self-check ok")
 
 

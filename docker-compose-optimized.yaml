@@ -5,18 +5,11 @@ name: viettel-llm-optimized
 #
 # Trace-derived sizing (regenerate with `python bench/trace_stats.py`):
 #   prompt tokens   min=12,919  p50=18,707  p90=27,299  max=27,331
-#   max_tokens=200, temperature=0, seed=42  ->  prefill:decode = 101:1 by TOKEN count
+#   max_tokens=200, temperature=0, seed=42  ->  prefill:decode = 101:1
 #   6,388-token system prompt shared by all 120 requests (32% of the mean prompt)
 #
-# Arrival pattern: timestamp_ms = turn*5000 + conv*25, i.e. 20 conversations x 6 turns
-# = six bursts of 20 requests, 5 s apart, 25.5 s total. Peak concurrency is 20 and the
-# GPU idles ~80% of wall clock, so trace throughput is ARRIVAL-bound: only the tail
-# moves it. Latency is the lever; never trade latency for batch size here.
-#
-# 101:1 is a token ratio, not a time ratio. Roofline per burst on H200: prefill ~1.0 s,
-# decode 200 steps x ~2.14 ms = ~0.43 s, of which KV reads are 1.44 ms of every step.
-# Decode is ~30% of GPU time and is KV-bandwidth-bound -- which is why speculative
-# decoding earns its keep here: extra draft query rows ride along nearly free.
+# This workload is prefill-bound. Prefix caching and prefill throughput are the
+# levers; speculative decoding touches only ~1% of the tokens.
 
 services:
   model:
@@ -36,25 +29,14 @@ services:
       # 16384 (baseline) rejects most of the trace; 262144 exceeds the model's
       # derived limit and vLLM refuses to start without VLLM_ALLOW_LONG_MAX_MODEL_LEN.
       - --max-model-len=32768
+      - --gpu-memory-utilization=0.92 # 0.95 leaves no headroom for CUDA graph pools
       - --tensor-parallel-size=1
-
-      # These three are the only box-specific knobs. Unset => the H200 submission values
-      # below, so the judge gets exactly what we tuned. `make up` exports smaller values
-      # to fit a 12 GB dev card. Compose REPLACES `command:` rather than merging it, so an
-      # overlay file cannot append a flag -- interpolation is the only way to vary these
-      # without duplicating this whole list. Do not add a .env file: Compose auto-loads it
-      # and it would silently follow the submission.
-      - --gpu-memory-utilization=${VTL_GPU_MEM_UTIL:-0.85} # 0.95 leaves no headroom for CUDA graph pools
-      - --kv-cache-dtype=${VTL_KV_DTYPE:-fp8_e4m3} # halves decode KV bandwidth at 18.7K context
-      # Dead for this trace (peak concurrency is 20), kept as insurance in case the judge
-      # replays closed-loop at high concurrency. Also sizes ngram_gpu's startup scratch
-      # buffer, [max_num_seqs, max_model_len] int32 = 32 MB at 256x32768.
-      - --max-num-seqs=${VTL_MAX_NUM_SEQS:-256}
 
       # The 6,388-token shared system prompt makes this the single biggest win:
       # ~31% of all prefill work disappears after the first request.
       - --enable-prefix-caching
       - --enable-chunked-prefill
+      - --max-num-seqs=256 # KV @p50 is 0.69 GB/req -> ~174 fit in bf16; sweep this
       - --max-num-batched-tokens=8192 # prefill chunk size: TTFT vs prefill throughput
 
       # vtl_fp8 is registered by vtl/patches/quant_fp8.py: online FP8 W8A8 with
@@ -62,50 +44,14 @@ services:
       # disabled with VTL_ENABLE_FP8=0 the name stops resolving and vLLM aborts at
       # startup -- use VTL_FP8_CHANNELWISE=0 to get stock behaviour instead.
       - --quantization=vtl_fp8
-
-      # Decode is ~30% of GPU wall clock and KV-bandwidth-bound, so the extra draft query
-      # rows cost almost nothing. Greedy (temperature=0) + standard rejection sampling
-      # means an accepted draft must equal the argmax token, so output is bit-identical
-      # to non-speculative decode.
-      #
-      # MUST be ngram_gpu, never "ngram": the CPU proposer silently disables async
-      # scheduling (vllm/config/vllm.py:946-957 warns and moves on), which is exactly what
-      # hides per-step Python overhead on the judge's 3-core box. ngram_gpu is exempt via
-      # NgramGPUTypes (vllm/config/speculative.py:54). `make verify` asserts this.
-      - '--speculative-config={"method":"ngram_gpu","num_speculative_tokens":3,"prompt_lookup_min":5,"prompt_lookup_max":5}'
-
-      # vLLM hardcodes IS_QUANTIZED=False (vllm/config/vllm.py:89, upstream #25689), which
-      # force-disables attention+fp8-quant fusion for EVERY model, including fp8 ones like
-      # ours. Re-enable it. This merges per-field with the -O2 defaults (_set_config_default
-      # only writes when the current value is None), so fuse_norm_quant, fuse_act_quant and
-      # cudagraph_mode keep their resolved values.
-      - '--compilation-config={"pass_config":{"fuse_attn_quant":true}}'
-
-      # Do NOT set cudagraph_mode: optimization_level defaults to -O2, which already
-      # resolves it to FULL_AND_PIECEWISE. Passing it explicitly measures as a no-op.
-      #
-      # Frontend CPU is a plausible bottleneck: the chat-template render + tokenization of
-      # an 18.7K-token, 12-message prompt runs synchronously in the API server's asyncio
-      # loop, and 20 of them land within 500 ms, so the last request in a burst queues
-      # behind all twenty. DISABLED, and uncommenting this line alone does NOTHING:
-      # api_server_count is read only by vllm/entrypoints/cli/serve.py:62-107. This compose
-      # pins `python3 -m vllm.entrypoints.openai.api_server`, whose __main__ calls
-      # setup_server() exactly once -- the arg parses (cli_args.py defines it) and is then
-      # ignored. To get N frontends you must switch to the `vllm serve` entrypoint, which
-      # the "Don't change this" pins above forbid. Measure accept->add_request first.
-      # - --api-server-count=2
+      - --kv-cache-dtype=fp8_e4m3 # halves decode KV bandwidth at 18.7K context
     ports:
       - "8000:8000" # judge hits this -- MUST be :8000
     environment:
-      # There is no VLLM_ATTENTION_BACKEND in vLLM 0.22.1 -- it is absent from vllm/envs.py.
-      # The knob is now the --attention-backend CLI arg. Leave it unset: FA3 is auto-selected
-      # on SM90 (H200), and forcing FLASHINFER crashed the server.
+      # VLLM_ATTENTION_BACKEND is deliberately unset. Forcing FLASHINFER crashed the
+      # server; FA3 is auto-selected on SM90 (H200).
       VLLM_PLUGINS: vtl
-      # VTL_FP8_IGNORE is deliberately unset. Its old value "lm_head" was a no-op:
-      # Fp8Config.get_quant_method only quantizes LinearBase/RoutedExperts/Attention, and
-      # ParallelLMHead is a VocabParallelEmbedding -- and with tie_word_embeddings=true
-      # qwen2.py never builds an lm_head module at all. Values must be exact linear FQNs
-      # (e.g. model.layers.0.mlp.down_proj); vLLM matches them with `prefix in ignored`.
+      VTL_FP8_IGNORE: "lm_head" # keep the output head in bf16
     shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
