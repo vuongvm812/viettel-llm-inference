@@ -1,8 +1,11 @@
-# LOCAL boot-test overlay — do NOT submit this. The judge populates /model itself;
-# this just bind-mounts a stand-in HF model so the vLLM compose can start on your box.
+# LOCAL boot-test overlay -- do NOT submit this. The judge populates /model itself
+# and pulls the image from the registry; this builds locally and mounts a stand-in.
 # Usage:
 #   docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml up
 services:
   model:
+    build:
+      context: .
+      dockerfile: Dockerfile
     volumes:
-      - ./hf-model:/model:ro   # HF safetensors dir (config.json + *.safetensors), NOT the .gguf
+      - ./hf-model:/model:ro # HF safetensors dir (config.json + *.safetensors)

@@ -1,15 +1,19 @@
 name: viettel-llm-optimized
 
-# Registry-only deploy: this compose + public/pushed images. No build contexts,
-# no local file mounts (the judge host provides the model at /model, as in baseline).
+# Registry-only deploy: this compose + a pushed image. No build context, no local
+# mounts -- the judge host provides the model at /model and scrapes :8000.
 #
-# Clients hit :8000 directly on vLLM — this is the scored server. (The
-# semantic-cache proxy under semantic-cache/ is intentionally NOT wired here.)
+# Trace-derived sizing (regenerate with `python bench/trace_stats.py`):
+#   prompt tokens   min=12,919  p50=18,707  p90=27,299  max=27,331
+#   max_tokens=200, temperature=0, seed=42  ->  prefill:decode = 101:1
+#   6,388-token system prompt shared by all 120 requests (32% of the mean prompt)
+#
+# This workload is prefill-bound. Prefix caching and prefill throughput are the
+# levers; speculative decoding touches only ~1% of the tokens.
 
 services:
-  # ---- vLLM: Tier 1 flags + online fp8 quantization (flag only, no artifact) ----
   model:
-    image: vllm/vllm-openai:v0.22.1
+    image: linhthuydanhbo1234/vtl-vllm:dev # submission: pin by @sha256:<digest>
     entrypoint:
       - python3 #Don't change this to vllm-server
       - -m  #Don't change this to vllm-server
@@ -19,19 +23,32 @@ services:
       - --served-model-name=Qwen3.5-2B #Don't change this to vllm-server
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
-      - --max-model-len=262144              
-      - --gpu-memory-utilization=0.95
+
+      # Longest prompt is 27,331 tokens + 200 generated = 27,531 required.
+      # 16384 (baseline) rejects most of the trace; 262144 exceeds the model's
+      # derived limit and vLLM refuses to start without VLLM_ALLOW_LONG_MAX_MODEL_LEN.
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.92 # 0.95 leaves no headroom for CUDA graph pools
       - --tensor-parallel-size=1
-      - --enable-prefix-caching            # Tier 1
-      - --enable-chunked-prefill           # Tier 1: smooths decode latency under load
-      - --max-num-seqs=256                 # Tier 1: larger concurrent batch
-      - --max-num-batched-tokens=8192      # Tier 1: TTFT vs throughput knob
-      - --quantization=fp8                 # H200 (Hopper SM90) has fp8 tensor cores → faster compute
-      - --kv-cache-dtype=fp8               # supported on Hopper; frees KV bandwidth/batch room
+
+      # The 6,388-token shared system prompt makes this the single biggest win:
+      # ~31% of all prefill work disappears after the first request.
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-seqs=256 # KV @p50 is 0.69 GB/req -> ~174 fit in bf16; sweep this
+      - --max-num-batched-tokens=8192 # prefill chunk size: TTFT vs prefill throughput
+
+      # --- pending benchmark, see plan steps 4-5 ---
+      # - --quantization=vtl_fp8         # after vtl/patches/quant_fp8.py + quality gate
+      # - --kv-cache-dtype=fp8_e4m3      # halves decode KV bandwidth at 18K context
+      # - --async-scheduling             # mutually exclusive with --speculative-config
+
     ports:
-      - "8000:8000"                        # judge hits this — MUST be :8000
+      - "8000:8000" # judge hits this -- MUST be :8000
     environment:
-      - VLLM_ATTENTION_BACKEND=FLASHINFER  # Tier 1: fused attn kernel (drop if image lacks it)
+      # VLLM_ATTENTION_BACKEND is deliberately unset. Forcing FLASHINFER crashed the
+      # server; FA3 is auto-selected on SM90 (H200).
+      VLLM_PLUGINS: vtl
     shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -46,4 +63,3 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-

@@ -29,6 +29,15 @@ venv/
 .serena/
 
 # Local build/setup artifacts (script/setup.sh output: weights, llama.cpp, venv, HF cache)
-/model/
+/hf-model/
 # Optimized binary staged for the Docker image (make dist/optimized)
 /dist/
+
+# python build artifacts
+build/
+*.egg-info/
+__pycache__/
+docker/cache/*
+!docker/cache/.gitkeep
+bench-*.json
+sndr_core_engine/

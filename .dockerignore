@@ -1,6 +1,8 @@
-# Only the pre-built binary and config are COPYed into the image (the model is
-# bind-mounted at /model, not baked in). Send nothing else to the daemon — keeps
-# the context tiny and source out of the build.
+# Deny-all, then allow exactly what the image needs. The model is bind-mounted at
+# /model by the judge, never baked in -- keeping hf-model/ (5.9 GB) out of the
+# build context matters.
 *
-!dist/inference-runtime
-!config/default-config.yaml
+!pyproject.toml
+!README.md
+!vtl/
+!docker/cache/

@@ -1,52 +1,56 @@
 # viettel-llm-inference
 
-A custom LLM inference runtime in Rust, built on an **LMAX Disruptor** (lock-free ring
-buffer) serving fabric. Goal: match or beat **vLLM** on latency/throughput under a tight
-**3 CPU cores + 1 GPU** budget, serving an OpenAI-compatible API.
+An OpenAI-compatible inference server that beats the stock vLLM baseline on a 120-request
+trace, scored on **both** latency (TTFT / ITL / E2E percentiles) and throughput (tok/s, req/s).
 
-The transformer forward pass runs in **llama.cpp** (via `llama-cpp-2` FFI, GGUF-quantized
-Qwen3.5-2B); this project is the serving, scheduling, and continuous-batching layer around it.
+Rather than reimplementing an engine, we run stock `vllm/vllm-openai` and patch it in-process
+through vLLM's [plugin system](https://docs.vllm.ai/en/latest/design/plugin_system/). The
+`vtl` package registers a `vllm.general_plugins` entry point; vLLM calls `vtl.plugin:register`
+in every process before it does any work.
 
-> Status: **design phase.** The architecture and roadmap are documented under `docs/`;
-> implementation has not started (see `docs/ROADMAP.md`, phase P0).
-
-## Architecture at a glance
-
-Three pinned cores connected by four one-directional Disruptor rings, passing zero-copy slot
-handles (payloads live in a pre-allocated slab, never crossing a ring):
-
-| Core | Role | Wait strategy |
-|------|------|---------------|
-| 0 | Web I/O & SSE streaming (`tokio` + `hyper`) | event-driven (epoll) |
-| 1 | Tokenize / detokenize (llama.cpp vocab) | spin-with-hint |
-| 2 | Fast loop: scheduler + dynamic batcher + KV monitor, drives GPU `decode()` | busy-spin |
-
-Full write-up: **`docs/GENERAL_ARCHITECTURE.md`**.
-
-## Repository layout
+## Know the workload before tuning it
 
 ```
-docs/
-  GENERAL_ARCHITECTURE.md    architecture, core mapping, ring topology, request flow
-  ROADMAP.md                 phased delivery plan (P0–P7)
-  design/                    per-component design docs
-    web-io/            fast-loop/          disruptor-pipeline/   benchmark/
-    text-processing/   inference-backend/  build-optimization/
-services/
-  crates/
-    disruptor-rs/            vendored LMAX Disruptor port (the serving fabric)
-data/
-  input/trace-round1.jsonl   120 OpenAI requests; benchmark trace + PGO/BOLT training data
-docker-compose.yml           vLLM baseline (Qwen3.5-2B, OpenAI API, port 8000)
+python bench/trace_stats.py
 ```
 
-## Baseline
+The trace is **prefill-bound, 101:1** — 2,414,302 prefill tokens against 24,000 decode tokens,
+median prompt 18,707 tokens, `max_tokens=200`, greedy. All 120 requests share a byte-identical
+**6,388-token system prompt**, so prefix caching alone removes ~31% of all prefill work.
 
-`docker-compose up` starts the vLLM baseline (vLLM `v0.22.1`, OpenAI-compatible,
-`Qwen3.5-2B`, 256K context, prefix caching, single GPU) on port `8000` — the target to beat.
+This is why the flags look the way they do:
 
-## Next steps
+- `--max-model-len=32768` — the longest prompt is 27,331 tokens and needs 27,531 with its
+  completion. `16384` rejects most of the trace; `262144` exceeds the model's derived limit and
+  vLLM refuses to boot.
+- `--enable-prefix-caching` — the single biggest win, and it is lossless.
+- Speculative decoding and `--async-scheduling` act only on the decode phase, i.e. ~1% of the
+  tokens. They are measured, not assumed.
 
-See `docs/ROADMAP.md`. **P0** sets up the `services/` Cargo workspace, unblocks the
-`disruptor-rs` build (resolve the missing `ring-core` / feature-gate `lossy`), and scaffolds
-the `inference-runtime` crate.
+## Layout
+
+| Path | What |
+|---|---|
+| `vtl/` | The plugin. `plugin.py` is the entry point, `registry.py` the patch registry, `patches/` the patches. |
+| `bench/` | `trace_stats.py` (workload characterization), `replay.py` (open/closed-loop replay), `metrics.py`, `compare.py`. |
+| `Dockerfile` | Bakes the plugin **wheel** into the vLLM image. A bind-mount would not register the entry point. |
+| `docker-compose-optimized.yaml` | The submission. Registry-only: no build context, judge provides `/model`, serves `:8000`. |
+| `docker-compose.localtest.yaml` | Local overlay — builds the image and mounts `hf-model/`. Not submitted. |
+
+## Patches
+
+Each patch registers into `PATCH_REGISTRY` under a name and is gated by `VTL_ENABLE_<NAME>`.
+`register()` never raises: a patch that fails is logged and skipped, degrading to stock vLLM.
+`VTL_DISABLE=1` turns the whole overlay off without rebuilding.
+
+## Develop
+
+```
+make check      # self-checks; no GPU, no vLLM, no server needed
+make up         # build + run locally against hf-model/ (Linux + GPU)
+make warm       # warm the torch.compile/Triton caches on a GPU, bake into the image
+make bench      # open-loop replay + closed-loop sweep at 1/8/32/128
+make push       # push and print the digest to pin in the compose file
+```
+
+Everything except `make check` needs a Linux box with the H200.
