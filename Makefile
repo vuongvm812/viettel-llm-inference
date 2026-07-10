@@ -20,18 +20,23 @@ check:
 
 # No compose, no server, no model: the kernel tests just need the image and a GPU.
 # --entrypoint bash because the vLLM base image starts the API server otherwise.
+# -p no:cacheprovider because /bench is mounted read-only.
+# Both targets depend on `build`: $(IMAGE):$(TAG) also names a registry repo, so without it
+# docker silently pulls a stale published image and the tests run against whatever kernel
+# it happens to contain.
 KRUN := docker run --rm --gpus all -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
+PYTEST := pytest -q -p no:cacheprovider /bench/test_rms_norm_quant.py
 
 ## Kernel correctness. Needs a GPU. Runs one oracle against our kernel AND against the
 ## stock one -- importing vtl._C overrides _C process-wide, so they cannot coexist and
 ## agreeing with the same reference is what proves ours matches stock.
-test-kernel:
+test-kernel: build
 	$(KRUN) 'pip install -q pytest && \
-	  echo "--- vtl kernel"  && pytest /bench/test_rms_norm_quant.py -q && \
-	  echo "--- stock kernel" && VTL_SKIP_EXT=1 pytest /bench/test_rms_norm_quant.py -q'
+	  echo "--- vtl kernel"  && $(PYTEST) && \
+	  echo "--- stock kernel" && VTL_SKIP_EXT=1 $(PYTEST)'
 
 ## Kernel microbenchmark at the trace's real shapes. Needs a GPU.
-bench-kernel:
+bench-kernel: build
 	$(KRUN) 'python3 /bench/test_rms_norm_quant.py && \
 	  VTL_SKIP_EXT=1 python3 /bench/test_rms_norm_quant.py'
 

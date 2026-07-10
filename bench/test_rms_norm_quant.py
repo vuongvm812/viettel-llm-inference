@@ -34,7 +34,16 @@ def _op():
 
     if USE_STOCK:
         return torch.ops._C.rms_norm_dynamic_per_token_quant
-    import vtl._C  # noqa: F401  -- overrides _C's CUDA kernel; also defines vllm_cuda::
+
+    try:
+        import vtl._C  # noqa: F401  -- overrides _C's CUDA kernel; defines vllm_cuda::
+    except ModuleNotFoundError as exc:  # pragma: no cover - environment problem
+        raise RuntimeError(
+            "vtl._C is missing from this image. $(IMAGE):$(TAG) also names a Docker Hub "
+            "repo, so an un-rebuilt tag silently pulls a published image without the "
+            "extension. Run `make build` (the Makefile targets now depend on it), or set "
+            "VTL_SKIP_EXT=1 to test vLLM's stock kernel instead."
+        ) from exc
 
     return torch.ops.vllm_cuda.rms_norm_dynamic_per_token_quant
 
