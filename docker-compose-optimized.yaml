@@ -54,7 +54,16 @@ services:
       # Inductor -- so this swaps Inductor's Triton norm+quant for our hand-written kernel.
       # A user-set pass_config survives the -O2 defaults: _set_config_default only fills
       # fields still None (vllm/config/vllm.py:702).
-      - '--compilation-config={"pass_config": {"fuse_norm_quant": true}}'
+      #
+      # cudagraph_mode=FULL_AND_PIECEWISE: full-graph capture for pure-decode batches,
+      # piecewise for prefill/mixed (required with chunked prefill + async scheduling;
+      # plain FULL would fall back or error). Governs graph CAPTURE only, not FX rewriting,
+      # so RMSNormQuantFusionPass and the vtl._C kernel binding are unchanged. EXPERIMENT:
+      # decode is ~1% of this 101:1 trace, so upside is bounded -- keep only if ITL p50/p90
+      # drops with no TTFT/throughput regression, else revert this to PIECEWISE default.
+      # Re-warm (docker/cache/ was baked under PIECEWISE) and confirm the enum spelling:
+      #   python3 -c "from vllm.config import CUDAGraphMode; print(list(CUDAGraphMode))"
+      - '--compilation-config={"pass_config": {"fuse_norm_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
     ports:
       - "8000:8000" # judge hits this -- MUST be :8000
     environment:
