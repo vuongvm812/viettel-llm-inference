@@ -4,18 +4,60 @@ TARGET ?= http://localhost:8000
 # The H200 box is amd64 and the vLLM base image is multi-arch. Never let the build
 # host pick: an arm64 Mac would otherwise produce an image the GPU box can't run.
 PLATFORM ?= linux/amd64
+# SM archs baked into vtl._C. A wrong arch fails at the first kernel launch, not at import.
+# Narrow to '9.0+PTX' for the submission build. See the ARG in Dockerfile.
+CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 TRACE := data/input/trace-round1.jsonl
 LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 
-.PHONY: check stats build up down warm push bench
+.PHONY: check stats build up down warm push bench test-kernel bench-kernel verify
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server.
 check:
 	python3 vtl/registry.py
 	PYTHONPATH=. python3 vtl/patches/quant_fp8.py
+	PYTHONPATH=. python3 vtl/patches/rms_norm_quant.py
 	python3 bench/trace_stats.py --self-check
 	python3 bench/metrics.py
 	@python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
+
+# No compose, no server, no model: the kernel tests just need the image and a GPU.
+# --entrypoint bash because the vLLM base image starts the API server otherwise.
+# -p no:cacheprovider because /bench is mounted read-only.
+# Both targets depend on `build`: $(IMAGE):$(TAG) also names a registry repo, so without it
+# docker silently pulls a stale published image and the tests run against whatever kernel
+# it happens to contain.
+KRUN := docker run --rm --gpus all -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
+PYTEST := pytest -q -p no:cacheprovider /bench/test_rms_norm_quant.py
+
+## Kernel correctness. Needs a GPU. Runs one oracle against our kernel AND against the
+## stock one -- importing vtl._C overrides _C process-wide, so they cannot coexist and
+## agreeing with the same reference is what proves ours matches stock.
+test-kernel: build
+	$(KRUN) 'pip install -q pytest && \
+	  echo "--- vtl kernel"  && $(PYTEST) && \
+	  echo "--- stock kernel" && VTL_SKIP_EXT=1 $(PYTEST)'
+
+## Kernel microbenchmark at the trace's real shapes. Needs a GPU.
+bench-kernel: build
+	$(KRUN) 'python3 /bench/test_rms_norm_quant.py && \
+	  VTL_SKIP_EXT=1 python3 /bench/test_rms_norm_quant.py'
+
+## Pinpoint a memory fault. VTL_KERNEL_SYNC makes the kernel synchronise after every launch
+## and, on a fault, raise with the exact shape and path (fast/generic, dtype, stride,
+## pointer alignments) -- so it is attributed to its own launch instead of cascading into a
+## later test. Runs each test in its own process (-p no:randomly, --forked-ish via -x stop)
+## so the first raise is the culprit. compute-sanitizer is not in the runtime image; this
+## needs no extra tooling.
+##   make debug-kernel                          # whole suite, stops at first fault
+##   make debug-kernel T=test_misaligned        # one test
+T ?=
+DBG_KRUN := docker run --rm --gpus all -e VTL_KERNEL_SYNC=1 -e CUDA_LAUNCH_BLOCKING=1 \
+              -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
+debug-kernel: build
+	$(DBG_KRUN) 'pip install -q pytest && \
+	  python3 -m pytest -q -p no:cacheprovider -x /bench/test_rms_norm_quant.py \
+	  $(if $(T),-k $(T),)'
 
 stats:
 	python3 bench/trace_stats.py
@@ -41,9 +83,26 @@ verify:
 	@grep -q "channelwise fp8 unavailable" /tmp/vtl-verify.log \
 	  && echo "WARN channelwise fp8 fell back to stock per-tensor" \
 	  || echo "OK   channelwise fp8 active"
+	@# Expected to fail when you deliberately A/B with VTL_ENABLE_RMS_NORM_QUANT=0.
+	@grep -q "fused rms_norm+fp8-quant CUDA kernel installed" /tmp/vtl-verify.log \
+	  && echo "OK   vtl fused norm+quant kernel installed" \
+	  || { echo "FAIL vtl kernel not installed -- stock _C kernel is running"; exit 1; }
+	@# RMSNormQuantFusionPass.__call__ overrides VllmPatternMatcherPass.__call__ and never
+	@# touches match_table, so it never appears in "fusion pass matches:". The only line it
+	@# emits is `Replaced N patterns` (rms_quant_fusion.py:671, DEBUG). N is how many nodes
+	@# were rewritten into the op our kernel backs; N=0 means the kernel never runs.
+	@n=$$(grep "rms_quant_fusion.py.*Replaced" /tmp/vtl-verify.log | tail -1 \
+	      | sed -n 's/.*Replaced \([0-9]*\) patterns.*/\1/p'); \
+	 if [ -z "$$n" ]; then \
+	   echo "WARN fusion match count unknown -- rerun with VLLM_LOGGING_LEVEL=DEBUG"; \
+	 elif [ "$$n" -eq 0 ]; then \
+	   echo "FAIL rms_norm+quant fusion replaced 0 patterns -- the kernel is never reached"; exit 1; \
+	 else \
+	   echo "OK   rms_norm+quant fusion replaced $$n patterns (each one calls our kernel)"; \
+	 fi
 
 build:
-	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE):$(TAG) .
+	docker buildx build --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --load -t $(IMAGE):$(TAG) .
 	@docker inspect $(IMAGE):$(TAG) --format 'built {{.Os}}/{{.Architecture}}'
 
 up:
@@ -65,7 +124,7 @@ warm:
 ## buildx --push writes the manifest straight to the registry, so the pushed image
 ## is $(PLATFORM) regardless of what this machine is.
 push:
-	docker buildx build --platform $(PLATFORM) --push -t $(IMAGE):$(TAG) .
+	docker buildx build --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --push -t $(IMAGE):$(TAG) .
 	@echo "pin this digest in docker-compose-optimized.yaml:"
 	@docker buildx imagetools inspect $(IMAGE):$(TAG) --format '{{.Manifest.Digest}}'
 

@@ -13,15 +13,44 @@ ARG VLLM_IMAGE=vllm/vllm-openai:v0.22.1
 
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 
-COPY pyproject.toml README.md /src/
+COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
-RUN pip install --no-cache-dir --no-deps /src && rm -rf /src
+
+# Which SM cubins go into vtl._C. Without this, nvcc probes the build host -- which has no
+# GPU -- and guesses. A mismatch does NOT degrade gracefully: dlopen succeeds, the override
+# installs, and the first kernel launch dies with cudaErrorNoKernelImageForDevice. So build
+# for every device you intend to run on.
+#
+# The judge box is an H200 (sm_90); the trailing +PTX embeds compute_90 PTX so newer
+# devices (Blackwell) can JIT. Ampere entries let the same image run on a dev box. Narrow
+# this to just "9.0+PTX" for the submission build to cut image size and build time:
+#   make build CUDA_ARCHS='9.0+PTX'
+ARG CUDA_ARCHS="8.0;8.6;8.9;9.0+PTX"
+
+# Scoped to the RUN, not ENV: it is a build input and has no business in the served image.
+# --no-build-isolation so setup.py sees the image's torch.
+RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" \
+    pip install --no-cache-dir --no-build-isolation --no-deps /src \
+    && rm -rf /src
 
 # Fail the build, not the judge's run.
 RUN python3 -c "import importlib.metadata as m; \
 eps = {e.name: e.value for e in m.entry_points(group='vllm.general_plugins')}; \
 assert eps.get('vtl') == 'vtl.plugin:register', f'plugin NOT registered: {eps}'; \
 print('plugin entry point ok:', eps)"
+
+# The CUDA kernel must be in the wheel. Importing it needs a driver, so only check the
+# .so landed -- vtl/patches/rms_norm_quant.py imports it for real at server start.
+# Also print the embedded cubins/PTX: a .so with the wrong SM builds and imports fine and
+# only fails at the first kernel launch, so this is the last place to catch it.
+RUN python3 -c "import importlib.util as u; \
+s = u.find_spec('vtl._C'); \
+assert s is not None, 'vtl._C did not build'; \
+print('vtl._C built:', s.origin)" \
+ && SO=$(python3 -c "import importlib.util as u; print(u.find_spec('vtl._C').origin)") \
+ && echo "vtl._C device code:" \
+ && cuobjdump --list-elf "$SO" | sed 's/^/  /' \
+ && { cuobjdump --list-ptx "$SO" | sed 's/^/  /' || echo "  (no PTX: no JIT fallback)"; }
 
 ENV VLLM_PLUGINS=vtl \
     VLLM_USE_AOT_COMPILE=1 \
