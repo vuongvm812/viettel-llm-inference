@@ -12,11 +12,35 @@ LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.local
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server.
 check:
 	python3 vtl/registry.py
+	PYTHONPATH=. python3 vtl/patches/quant_fp8.py
 	python3 bench/trace_stats.py --self-check
 	python3 bench/metrics.py
+	@python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
 
 stats:
 	python3 bench/trace_stats.py
+
+## Post-boot assertions. We rely on vLLM's defaults rather than passing risky flags,
+## so prove the defaults actually resolved our way. Run against a live container.
+verify:
+	@$(LOCAL) logs model 2>/dev/null > /tmp/vtl-verify.log || true
+	@# vLLM always logs this line once config is resolved, enabled or not. Its absence
+	@# means the server died before that -- do not report it as "async disabled".
+	@grep -q "Asynchronous scheduling is" /tmp/vtl-verify.log \
+	  || { echo "FAIL server never reached config resolution. Last lines:"; \
+	       tail -5 /tmp/vtl-verify.log; exit 1; }
+	@grep -q "Asynchronous scheduling is enabled" /tmp/vtl-verify.log \
+	  && echo "OK   async scheduling (zero-overhead batch scheduler) enabled" \
+	  || { echo "FAIL async scheduling is DISABLED -- an incompatible option is set"; exit 1; }
+	@grep -q "vtl: applied" /tmp/vtl-verify.log \
+	  && echo "OK   vtl plugin loaded" \
+	  || { echo "FAIL vtl plugin never ran -- you are benchmarking stock vLLM"; exit 1; }
+	@grep -q "registered quantization method 'vtl_fp8'" /tmp/vtl-verify.log \
+	  && echo "OK   vtl_fp8 registered" \
+	  || { echo "FAIL vtl_fp8 not registered"; exit 1; }
+	@grep -q "channelwise fp8 unavailable" /tmp/vtl-verify.log \
+	  && echo "WARN channelwise fp8 fell back to stock per-tensor" \
+	  || echo "OK   channelwise fp8 active"
 
 build:
 	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE):$(TAG) .

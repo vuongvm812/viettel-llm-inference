@@ -12,7 +12,7 @@ import logging
 log = logging.getLogger("vtl")
 
 # Patch modules, in apply order. Add names here as they land.
-_MODULES: tuple[str, ...] = ()
+_MODULES: tuple[str, ...] = ("quant_fp8",)
 
 for _name in _MODULES:
     try:

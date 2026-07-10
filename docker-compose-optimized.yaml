@@ -39,17 +39,19 @@ services:
       - --max-num-seqs=256 # KV @p50 is 0.69 GB/req -> ~174 fit in bf16; sweep this
       - --max-num-batched-tokens=8192 # prefill chunk size: TTFT vs prefill throughput
 
-      # --- pending benchmark, see plan steps 4-5 ---
-      - --quantization=vtl_fp8         # after vtl/patches/quant_fp8.py + quality gate
-      - --kv-cache-dtype=fp8_e4m3      # halves decode KV bandwidth at 18K context
-      - --async-scheduling             # mutually exclusive with --speculative-config
-
+      # vtl_fp8 is registered by vtl/patches/quant_fp8.py: online FP8 W8A8 with
+      # per-CHANNEL weight scales (stock fp8 is per-tensor). If that patch is
+      # disabled with VTL_ENABLE_FP8=0 the name stops resolving and vLLM aborts at
+      # startup -- use VTL_FP8_CHANNELWISE=0 to get stock behaviour instead.
+      - --quantization=vtl_fp8
+      - --kv-cache-dtype=fp8_e4m3 # halves decode KV bandwidth at 18.7K context
     ports:
       - "8000:8000" # judge hits this -- MUST be :8000
     environment:
       # VLLM_ATTENTION_BACKEND is deliberately unset. Forcing FLASHINFER crashed the
       # server; FA3 is auto-selected on SM90 (H200).
       VLLM_PLUGINS: vtl
+      VTL_FP8_IGNORE: "lm_head" # keep the output head in bf16
     shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
