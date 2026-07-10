@@ -4,6 +4,9 @@ TARGET ?= http://localhost:8000
 # The H200 box is amd64 and the vLLM base image is multi-arch. Never let the build
 # host pick: an arm64 Mac would otherwise produce an image the GPU box can't run.
 PLATFORM ?= linux/amd64
+# SM archs baked into vtl._C. A wrong arch fails at the first kernel launch, not at import.
+# Narrow to '9.0+PTX' for the submission build. See the ARG in Dockerfile.
+CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 TRACE := data/input/trace-round1.jsonl
 LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 
@@ -83,7 +86,7 @@ verify:
 	 fi
 
 build:
-	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE):$(TAG) .
+	docker buildx build --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --load -t $(IMAGE):$(TAG) .
 	@docker inspect $(IMAGE):$(TAG) --format 'built {{.Os}}/{{.Architecture}}'
 
 up:
@@ -105,7 +108,7 @@ warm:
 ## buildx --push writes the manifest straight to the registry, so the pushed image
 ## is $(PLATFORM) regardless of what this machine is.
 push:
-	docker buildx build --platform $(PLATFORM) --push -t $(IMAGE):$(TAG) .
+	docker buildx build --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --push -t $(IMAGE):$(TAG) .
 	@echo "pin this digest in docker-compose-optimized.yaml:"
 	@docker buildx imagetools inspect $(IMAGE):$(TAG) --format '{{.Manifest.Digest}}'
 

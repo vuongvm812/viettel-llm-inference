@@ -27,11 +27,14 @@ Two things must be true for the kernel to run at all:
 Set ``VTL_ENABLE_RMS_NORM_QUANT=0`` to keep the stock kernel: the .so is then never
 imported, so the override is never installed.
 
-``vtl._C`` is built for ``TORCH_CUDA_ARCH_LIST=9.0`` with no ``+PTX``, so on anything but
-an SM90 device the import below raises, ``registry.apply_all()`` isolates it, and the
-server comes up on vLLM's stock kernel. The only signal is the absence of the log line at
-the bottom of ``apply()`` -- which is what ``make verify`` greps for. Fine while the judge
-box is a known H200; add ``9.0+PTX`` if that ever stops being true.
+``vtl._C`` only contains cubins for the SM archs it was built for (``CUDA_ARCHS`` in the
+Dockerfile). A mismatch does **not** degrade gracefully: dlopen succeeds, the override
+below installs, and the first kernel launch dies with
+``cudaErrorNoKernelImageForDevice`` -- mid-request, not at startup. ``apply()`` cannot
+guard against this, because the override is installed by the .so's static initialiser and
+probing the device here would create a CUDA context in every process that loads the
+plugin, including the API server. Build for the arch you will run on; the build log prints
+the embedded cubins.
 """
 
 from __future__ import annotations
