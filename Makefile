@@ -18,6 +18,7 @@ check:
 	PYTHONPATH=. python3 vtl/patches/quant_fp8.py
 	PYTHONPATH=. python3 vtl/patches/rms_norm_quant.py
 	PYTHONPATH=. python3 vtl/patches/sched_policy.py
+	PYTHONPATH=. python3 vtl/patches/inputs_embeds_optional.py
 	python3 bench/trace_stats.py --self-check
 	python3 bench/metrics.py
 	@python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
