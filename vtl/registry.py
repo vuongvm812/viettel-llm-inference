@@ -42,16 +42,6 @@ def is_enabled(patch: Patch) -> bool:
     return raw.strip().lower() in _TRUTHY
 
 
-def already_patched(obj: object, attr: str) -> bool:
-    """True if ``obj.attr`` is one of our wrappers, so re-applying is a no-op."""
-    return hasattr(getattr(obj, attr, None), "__vtl_wrapped__")
-
-
-def mark_patched(wrapper: Callable, original: Callable) -> Callable:
-    wrapper.__vtl_wrapped__ = original
-    return wrapper
-
-
 def apply_all() -> tuple[int, int]:
     """Apply every enabled patch. Returns ``(applied, selected)``."""
     selected = [p for p in PATCH_REGISTRY if is_enabled(p)]
@@ -100,13 +90,6 @@ def _self_check() -> None:
         os.environ["VTL_ENABLE_GOOD"] = "0"
         assert is_enabled(PATCH_REGISTRY[2]) is True
         assert is_enabled(PATCH_REGISTRY[0]) is False
-
-        class Target:
-            def method(self) -> None: ...
-
-        assert not already_patched(Target, "method")
-        Target.method = mark_patched(lambda self: None, Target.method)
-        assert already_patched(Target, "method")
 
         print("registry self-check ok")
     finally:
