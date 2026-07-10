@@ -26,6 +26,15 @@ from vtl.registry import already_patched, mark_patched, register_patch
 log = logging.getLogger("vtl")
 
 _HUGE = 1 << 60  # push un-keyable requests to the back, never crash the sort
+_USAGE_TIGHT = 0.90  # KV usage above which we prefer requests that fit over pure SJF
+_mem_aware_engaged = 0  # how many schedule() calls hit the memory-aware branch
+
+
+def _safe_usage(kv_cache_manager) -> float:
+    try:
+        return float(kv_cache_manager.usage)
+    except Exception:
+        return 0.0  # unknown pressure -> treat as slack, stay pure cache-aware
 
 
 def _remaining_prefill(request, kv_cache_manager) -> int:
@@ -54,16 +63,45 @@ def _remaining_prefill(request, kv_cache_manager) -> int:
 
 
 def _reorder_waiting(waiting, kv_cache_manager) -> None:
-    """In-place stable reorder of a deque waiting queue, fewest-uncached first.
+    """In-place stable reorder of a deque waiting queue.
 
-    Non-deque queues (``PriorityRequestQueue``, unknown shapes) are left untouched.
-    Stable sort keeps FCFS order among ties. deque index 0 is the front
-    (``peek_request``/``popleft``), so ascending key = shortest remaining prefill
-    admitted first.
+    Cache-aware when memory is slack (fewest-uncached first, pure SJF); memory-aware when
+    tight (requests that won't fit the free block pool are demoted below ones that do, so
+    we don't admit a prompt that immediately forces a preempt/recompute). This is the
+    single-node analog of SGLang's "cache-aware if balanced, else shortest-queue."
+
+    Signals come from our custom ``VtlKVCacheManager`` (``plan_request``/``free_blocks``).
+    If that patch is disabled, we fall back to the standalone cache-aware key so the two
+    patches stay independent. Non-deque queues are left untouched; stable sort keeps FCFS
+    among ties. deque index 0 is the front, so ascending key = admitted first.
     """
     if not isinstance(waiting, deque) or len(waiting) < 2:
         return
-    ordered = sorted(waiting, key=lambda r: _remaining_prefill(r, kv_cache_manager))
+
+    plan = getattr(kv_cache_manager, "plan_request", None)
+    if plan is None:
+        # kv_cache_manager patch off: pure cache-aware SJF, no memory signal available.
+        key = lambda r: (0, _remaining_prefill(r, kv_cache_manager))  # noqa: E731
+    else:
+        free = getattr(kv_cache_manager, "free_blocks", _HUGE)
+        tight = _safe_usage(kv_cache_manager) >= _USAGE_TIGHT
+        if tight:
+            global _mem_aware_engaged
+            _mem_aware_engaged += 1
+            if _mem_aware_engaged == 1:
+                log.info("vtl: sched_policy memory-aware branch engaged (KV under pressure)")
+
+        def key(r):
+            remaining, blocks_needed = plan(r)
+            # ponytail: `free` is a single snapshot -- it shrinks as we admit, but the
+            # sort keys off it once. Good enough for ordering; exact per-step accounting
+            # is what the base allocate_slots loop already does. Fit-flag first, so a
+            # too-big request sinks below every fitting one without disturbing SJF order
+            # among peers. When slack, tight=False -> flag is always 0 -> pure SJF.
+            fits = 0 if not tight or blocks_needed <= free else 1
+            return (fits, remaining)
+
+    ordered = sorted(waiting, key=key)
     waiting.clear()
     waiting.extend(ordered)
 
@@ -86,7 +124,7 @@ def apply() -> None:
 
     Scheduler.schedule = mark_patched(schedule, original)
     log.info(
-        "vtl: sched_policy installed (cache-aware shortest-remaining-prefill-first)"
+        "vtl: sched_policy installed (cache-aware SJF, memory-aware when KV tight)"
     )
 
 
@@ -151,6 +189,31 @@ def _self_check() -> None:
 
     # Resumed request keys off its own progress, no lookup.
     assert _remaining_prefill(FakeReq("w", 100, computed=70), None) == 30
+
+    # Memory-aware path: a manager exposing plan_request/free_blocks/usage.
+    class FakeVtlKVM:
+        def __init__(self, plans, free, usage):
+            self._plans = plans  # rid -> (remaining, blocks_needed)
+            self.free_blocks = free
+            self.usage = usage
+
+        def plan_request(self, r):
+            return self._plans[r.request_id]
+
+    plans = {"big": (5, 100), "small": (10, 1)}  # big: smaller SJF key but won't fit
+    big, small = FakeReq("big", 0), FakeReq("small", 0)
+
+    # Slack (usage below threshold): pure cache-aware SJF -> big (remaining 5) first.
+    slack = FakeVtlKVM(plans, free=10, usage=0.50)
+    q3 = deque([big, small])
+    _reorder_waiting(q3, slack)
+    assert [r.request_id for r in q3] == ["big", "small"], [r.request_id for r in q3]
+
+    # Tight (usage >= threshold): big needs 100 blocks > 10 free -> demoted below small.
+    tight = FakeVtlKVM(plans, free=10, usage=0.95)
+    q4 = deque([big, small])
+    _reorder_waiting(q4, tight)
+    assert [r.request_id for r in q4] == ["small", "big"], [r.request_id for r in q4]
 
     print("sched_policy self-check ok")
 
