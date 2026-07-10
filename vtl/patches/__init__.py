@@ -15,6 +15,7 @@ log = logging.getLogger("vtl")
 _MODULES: tuple[str, ...] = (
     "quant_fp8",
     "rms_norm_quant",
+    "kv_cache_manager",
     "sched_policy",
     "inputs_embeds_optional",
 )
