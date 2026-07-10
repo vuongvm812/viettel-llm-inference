@@ -85,6 +85,18 @@ def run(x_in, weight, eps, residual=None, scale_ub=None):
     return out, scale, res
 
 
+def _skip_if_it_will_not_fit(num_tokens, hidden, dtype):
+    """The big shapes are sized for an H200. reference() materialises several fp32
+    temporaries, so the worst case (8192 x 12288 fp32) wants ~4 GiB. Skip rather than OOM
+    on a dev GPU."""
+    itemsize = torch.tensor([], dtype=dtype).element_size()
+    # x + residual + clone (itemsize each), fp8 out (1), ~6 fp32 temporaries in reference()
+    est = num_tokens * hidden * (3 * itemsize + 1 + 6 * 4)
+    free = torch.cuda.mem_get_info()[0]
+    if est > 0.7 * free:
+        pytest.skip(f"needs ~{est / 2**30:.1f} GiB, only {free / 2**30:.1f} GiB free")
+
+
 def _mismatch_fraction(a, b):
     """Fraction of differing fp8 codes. Block-reduction order differs from torch's
     pairwise sum, so `rms` can land a ulp away and flip the odd fp8 code."""
@@ -105,6 +117,7 @@ def _mismatch_fraction(a, b):
 )
 @pytest.mark.parametrize("with_residual", [False, True])
 def test_matches_reference(dtype, num_tokens, hidden, with_residual):
+    _skip_if_it_will_not_fit(num_tokens, hidden, dtype)
     torch.manual_seed(0)
     dev = "cuda"
     eps = 1e-6
@@ -197,8 +210,16 @@ def _bench():
     import time
 
     label = "stock _C" if USE_STOCK else "vtl"
-    print(f"impl: {label}\n")
-    print(f"{'shape':>16} {'us/call':>10} {'GB/s':>8}")
+    major, minor = torch.cuda.get_device_capability()
+    print(f"impl: {label}   device: {torch.cuda.get_device_name()} (sm_{major}{minor})")
+    if (major, minor) < (8, 9):
+        print(
+            "\nWARNING: sm_89 is the first arch with a hardware fp8 converter\n"
+            "  (cvt.rn.satfinite.e4m3x2.f32). Below it, CUDA's header emits a software\n"
+            "  conversion, so the quantise epilogue is ALU-bound rather than free and\n"
+            "  these numbers do not transfer to the H200. Correctness still holds."
+        )
+    print(f"\n{'shape':>16} {'us/call':>10} {'GB/s':>8}")
     for num_tokens in (256, 8192):  # decode (max-num-seqs), prefill (max-num-batched)
         hidden = 2048
         # The kernel does residual := input + residual, so a full-size input would double
