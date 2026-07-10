@@ -1,0 +1,26 @@
+# Local serving config: default-config.yaml's runtime knobs with a local GGUF path.
+# Use for `make run/inference CONFIG=config/local-serve.yaml` + `make bench`.
+# (recurrent-test.yaml is a DIAGNOSTIC throttle — max_batch_seqs:1/max_inflight:8 — not for benching.)
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+model:
+  gguf_path: "model/qwen3.5-2b-bf16.gguf"
+  n_ctx: 262144
+  n_threads: 1
+  n_gpu_layers: -1
+
+runtime:
+  max_inflight: 256
+  ring_size: 1024
+  max_batch_seqs: 4
+  max_batch_tokens: 2048
+  shared_prefix_tokens: 0
+  kv_defrag_thold: 0.1
+  n_ubatch: 0
+  flash_attention: auto
+  cores:
+    web_io: 0
+    text: 1
+    fast_loop: 2

@@ -152,6 +152,7 @@ impl Slab {
     /// lifetime**, which the compiler cannot see: the caller must NOT hold it across —
     /// or alongside — any [`slot_mut`] on the *same* slot (e.g. don't cache the slice
     /// across a prefill), or it is instant UB even single-threaded.
+    #[cfg_attr(not(feature = "llama"), allow(dead_code))] // real decoder's admit peek; mock reads s.tokens directly
     pub unsafe fn slot_tokens(&self, slot: u32) -> &[i32] {
         debug_assert!((slot as usize) < self.slots.len(), "slot_tokens: slot {slot} out of range");
         &(*self.slots[slot as usize].get()).tokens

@@ -1,0 +1,50 @@
+name: viettel-llm-optimized
+
+# Registry-only deploy: this compose + public/pushed images. No build contexts,
+# no local file mounts (the judge host provides the model at /model, as in baseline).
+#
+# Clients hit :8000 directly on vLLM — this is the scored server. (The
+# semantic-cache proxy under semantic-cache/ is intentionally NOT wired here.)
+
+services:
+  # ---- vLLM: Tier 1 flags + online fp8 quantization (flag only, no artifact) ----
+  model:
+    image: vllm/vllm-openai:v0.22.1
+    entrypoint:
+      - python3 #Don't change this to vllm-server
+      - -m  #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=Qwen3.5-2B #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=16384              # match real workload, not 256K
+      - --gpu-memory-utilization=0.95
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching            # Tier 1
+      - --enable-chunked-prefill           # Tier 1: smooths decode latency under load
+      - --max-num-seqs=256                 # Tier 1: larger concurrent batch
+      - --max-num-batched-tokens=8192      # Tier 1: TTFT vs throughput knob
+      - --quantization=fp8                 # H200 (Hopper SM90) has fp8 tensor cores → faster compute
+      - --kv-cache-dtype=fp8               # supported on Hopper; frees KV bandwidth/batch room
+      # Do NOT force VLLM_ATTENTION_BACKEND=FLASHINFER — the prior crash-at-load ("transport
+      # errors") was this: flashinfer isn't guaranteed in the image / crashes with fp8-KV under
+      # load. Let vLLM auto-pick a Hopper backend. Re-add only after `docker logs` proves it loads.
+    ports:
+      - "8000:8000"                        # judge hits this — MUST be :8000
+    shm_size: "2g"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 180s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+

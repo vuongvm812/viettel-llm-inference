@@ -80,9 +80,25 @@ loop {
 
 - **Continuous batching**: new seqs join the very next `decode()`; finished seqs leave
   immediately. No static batch window — this is the vLLM-style throughput win (P3).
-- **Dynamic batcher**: cap the batch by `MAX_BATCH_SEQS` and a per-iteration token budget;
-  when prefill (long 40K prompt) and decode compete, bound prefill tokens per step (chunked
-  prefill is a P7 refinement for head-of-line blocking).
+- **Dynamic batcher**: cap the batch by `MAX_BATCH_SEQS`; prefill and decode share one
+  `decode()` batch (**chunked prefill**, P7 — below).
+
+## Chunked prefill / unified batching (P7)
+
+P3 prefilled a whole prompt inside `admit()` before the sequence joined the running set, so a
+long 40K-token prompt head-of-line blocked every active decode — the trace stayed at 1 seq per
+`decode()`. P7 splits a sequence into two phases:
+
+- **Prefilling** (`prefill_pos < n_prompt`): `admit()` reserves KV + copies any shared-prefix
+  cells but does **not** run the prompt. Each `step()` prefills a chunk of `tokens[prefill_pos..]`.
+- **Decoding** (`prefill_pos == n_prompt`): generates one token per step.
+
+Each `step()` builds **one** `llama_batch` mixing one decode token per Decoding seq with up to
+`step_prefill_budget(n_decode, n_batch, max_batch_tokens)` prompt tokens drawn from Prefilling
+seqs, then a single `decode()`. `max_batch_tokens` is the **per-step prefill budget** (not an
+admission gate). A Prefilling seq that completes its prompt this step samples its first token and
+becomes Decoding next step. Decode never stalls behind a long prefill, and many prompts prefill
+concurrently — the throughput win the long-prompt trace needed.
 
 ## Admission = GPU/KV monitor
 
@@ -92,20 +108,27 @@ This is admission control: never start a seq we can't finish → no mid-generati
 and `MAX_IN_FLIGHT`/`MAX_BATCH_SEQS` are the tuning knobs (KV memory bounds batch size, exactly
 as in vLLM).
 
-## Shared-prefix KV (v1)
+## Shared-prefix radix cache (P7, generalizes P4)
 
-On `admit(slot)`:
+A **token radix trie** (`backend/prefix_trie.rs`) caches arbitrary, variable-length, nested
+shared prefixes — the generalization of P4's single fixed-K prefix. On `admit(slot)`:
 
-1. `hash = hash(first K prompt tokens)`. If `prefix` has a cached seq for `hash` with length
-   `L`, reuse it; else prefill the prefix into a reserved `prefix_seq` **once** and cache it.
-2. `ctx.kv_cache_seq_cp(prefix_seq, new_seq, 0..L)` — share the prefix's KV cells with the new
-   sequence (llama.cpp copies cell references; no recompute of the 39K system prompt).
-3. Prefill only the **suffix** (user content) for `new_seq` at `pos = L`.
-4. Set `ActiveSeq.pos = prompt_len`, ready for the decode loop.
+1. `trie.insert_structural(tokens)` records the request's path so future requests can fork
+   against it. `trie.longest_match(tokens)` returns the deepest *ready* materialized prefix node
+   → `reused` cells; `trie.deepest_unmaterialized_fork(tokens)` is the shared-prefix boundary
+   (a trie fork of ≥ 2 requests) worth caching next.
+2. Share: `ctx.copy_kv_cache_seq(match_node.seq, new_seq, 0..reused)` — copy the matched prefix's
+   cells into the new sequence (no recompute of the shared system prompt).
+3. Establish: if a fork deeper than `reused` is worth caching (≥ `shared_prefix_tokens` and the
+   cache has room), materialize it; when this request's prefill completes it donates its
+   `0..depth` cells to the fork's prefix seq and marks the node `ready` (deferred matching
+   requests then share it — the readiness gate prevents copying an unmaterialized prefix).
+4. Prefill only the **suffix** `tokens[reused..]` (chunked, above).
 
-For the trace, all 120 requests share one system prompt → one prefix entry, prefilled once.
-Arbitrary/nested prefixes (radix tree) is P7. See `inference-backend/design.md` for the exact
-llama.cpp KV ops.
+Bounded to `MAX_PREFIX_SEQS` materialized nodes; idle LRU eviction reclaims cold prefixes. For the
+trace, all requests share one system prompt → one fork node, prefilled once. Ceiling: llama's KV is
+copy-based (not block-ref-counted), so nested nodes don't physically dedup — see the module doc.
+See `inference-backend/design.md` for the exact llama.cpp KV ops.
 
 ## Determinism
 

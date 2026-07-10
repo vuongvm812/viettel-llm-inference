@@ -232,12 +232,49 @@ coverage limits. Optimizes our code only, not `libllama`.
 
 ## P7 — Stretch
 
-- Radix/prefix-tree cache for arbitrary shared prefixes (generalize P4).
-- WebSocket streaming alongside SSE.
-- Chunked prefill / prefill-decode disaggregation to fix P3 head-of-line blocking.
-- `libllama` build tuning (its own PGO, CUDA graph capture, quantization sweep).
-- Multi-GPU / tensor-parallel (out of scope at 1 GPU).
+**Goal.** The performance stretch: kill the P3 head-of-line block that pins the 40K-token
+trace at **1 sequence per `decode()`**, and generalize P4's single shared prefix.
+
+- **Chunked prefill / unified batching (delivered).** A long prompt is admitted immediately as a
+  *Prefilling* sequence and consumes a per-step chunk of `max_batch_tokens` prompt tokens, mixed
+  into the same `decode()` batch as the decode tokens of active sequences (vLLM-style). Decode
+  never stalls behind a long prefill; multiple prompts prefill concurrently. `max_batch_tokens`
+  is repurposed from an admission gate to the per-step prefill budget, and the HOL/idle-progress
+  guard in `core2::run` is removed.
+- **Radix/token-trie prefix cache (delivered).** `backend/prefix_trie.rs` — an edge-compressed
+  token radix trie with variable-length longest-prefix match, split-on-insert fork discovery,
+  multiple + nested prefixes, and idle LRU eviction. Generalizes P4's single fixed-K prefix
+  (`shared_prefix_tokens` is now the *minimum shared depth worth caching*). Bounded to
+  `MAX_PREFIX_SEQS` materialized nodes.
+- **WebSocket streaming (delivered).** `/v1/ws` streams the same OpenAI delta chunks as SSE over a
+  socket, sharing the ingress (`start_request`) and egress (`Egress`) path with the SSE handler.
+- `libllama` build tuning (its own PGO, CUDA graph capture, quantization sweep) — **not done**
+  (out of scope; optimizes the C++ dep, not our runtime).
+- Multi-GPU / tensor-parallel — **out of scope at 1 GPU**.
 
 **Design refs.** [Core 2: The Fast Loop](design/fast-loop/design.md) (radix cache, chunked prefill),
 [Core 0: Web I/O & Streaming](design/web-io/design.md) (WebSocket),
 [Inference Backend (llama.cpp via FFI)](design/inference-backend/design.md) (`libllama` tuning).
+
+**Exit criteria.** In the sandbox: `chunked_prefill_batches_long_prompts_concurrently` (long
+distinct prompts reach peak concurrency > 1, was 1); `backend::prefix_trie` unit tests (match /
+split / nested / fork / evict) + `multiple_distinct_prefixes_admit_more_than_caching_off`;
+`ws_streams_content_frames_and_closes`. All P3/P4 scheduling tests stay green (the trie is a strict
+generalization; chunked prefill preserves byte-exact output).
+
+> **Proof status.** The *scheduling* invariants are proven on the mock in the sandbox (chunked
+> prefill lifts long-prompt concurrency; the radix accounting admits more; WS streams end-to-end).
+> The pure trie logic is exhaustively unit-tested in the default build. `--features llama` (the real
+> KV path — `copy_kv_cache_seq` from a matched node, unified prefill+decode `decode()`, LRU seq-id
+> recycling) **type-checks** in the sandbox but the *performance* claim needs the Linux/GPU target.
+>
+> **Deferred deliverable (target box only, Linux+GPU).** As with P3/P4, the real perf numbers need
+> the GPU + GGUF:
+> - [ ] `--features llama` bench: chunked prefill gives **≥ 2 active seqs per `decode()`** on the
+>   40K-token long-prompt trace (the P3/P4 long-prompt caveat this phase finally resolves), and
+>   assert exactly **one** `ctx.decode()` per `Decoder::step` mixing prefill + decode tokens.
+> - [ ] `--features llama` bench: radix cache prefills each distinct shared prefix **once** across
+>   the trace (prefill token count == Σ over cached prefixes + Σ suffixes); TTFT for repeat-prefix
+>   requests drops vs a full prefill.
+> - [ ] Confirm the exact `llama-cpp-2` KV spelling on target (`copy_kv_cache_seq` p0/p1 are
+>   `Option<u32>`; `clear_kv_cache_seq` returns `Result<bool>` — already adapted for 0.1.150).
