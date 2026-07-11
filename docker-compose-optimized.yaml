@@ -87,10 +87,12 @@ services:
       # Register the vtl FlashInfer backend override (ENABLED; pairs with the
       # --attention-backend=FLASHINFER flag above). VTL_FI_WORKSPACE_MB floors the FlashInfer
       # workspace (SGLang uses 512). VTL_FI_FORCE_SELECT=1 forces selection via a platform
-      # wrap instead of the CLI flag. VTL_FI_RAGGED_PREFILL is H200-validation-gated (falls
-      # back to base paged prefill until byte-checked).
+      # wrap instead of the CLI flag. VTL_FI_RAGGED_PREFILL enables SGLang's ragged + merge
+      # extend split (pure-prefill batches only; OFF here -- silent-corruption risk, byte-
+      # validate on the H200 before enabling).
       VTL_ENABLE_FLASHINFER_BACKEND: "1"
       VTL_FI_WORKSPACE_MB: "512"
+      VTL_FI_RAGGED_PREFILL: "1"
     shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
