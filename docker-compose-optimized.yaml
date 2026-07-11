@@ -67,6 +67,8 @@ services:
     ports:
       - "8000:8000" # judge hits this -- MUST be :8000
     environment:
+      # VLLM_ATTENTION_BACKEND is deliberately unset. Forcing FLASHINFER crashed the
+      # server; FA3 is auto-selected on SM90 (H200).
       VLLM_PLUGINS: vtl
       VTL_FP8_IGNORE: "lm_head" # keep the output head in bf16
       # DEBUG makes rms_quant_fusion.py emit `fusion pass matches: {...}`, the only direct
@@ -76,12 +78,6 @@ services:
       # Set to 0 to keep vLLM's stock fused kernel. The FX graph is identical either way,
       # so this toggle isolates the kernel from the fusion-pass change above.
       VTL_ENABLE_RMS_NORM_QUANT: ${VTL_ENABLE_RMS_NORM_QUANT:-1}
-      # XGrammar jump-forward decoding for round-2 JSON: skips decode steps for grammar-forced
-      # tokens (keys, punctuation). No CLI flag needed -- xgrammar is already vLLM's default V1
-      # structured-output backend. OFF by default: jumps only under the SYNC scheduler, but this
-      # deployment runs AsyncScheduler (on by default), so async-safe accounting must be proven
-      # on the H200 first (byte-parity + no scheduler desync). Do NOT flip to 1 before that spike.
-      # VTL_ENABLE_XGRAMMAR_JUMP_FORWARD: "1"
     shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]

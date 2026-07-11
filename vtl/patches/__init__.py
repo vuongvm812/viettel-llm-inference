@@ -18,8 +18,6 @@ _MODULES: tuple[str, ...] = (
     "kv_cache_manager",
     "sched_policy",
     "inputs_embeds_optional",
-    "reject_degenerate_structured_outputs",
-    "xgrammar_jump_forward",
 )
 
 for _name in _MODULES:
