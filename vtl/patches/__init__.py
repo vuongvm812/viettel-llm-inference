@@ -18,6 +18,7 @@ _MODULES: tuple[str, ...] = (
     "kv_cache_manager",
     "sched_policy",
     "inputs_embeds_optional",
+    "flashinfer_backend",
 )
 
 for _name in _MODULES:
