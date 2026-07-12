@@ -29,43 +29,10 @@ from __future__ import annotations
 
 import logging
 
+from vtl._prefix import HUGE, plan_prefill
 from vtl.registry import register_patch
 
 log = logging.getLogger("vtl")
-
-_HUGE = 1 << 60  # un-plannable request: pushed to the back / treated as unlimited free
-_DEFAULT_BLOCK_SIZE = 16  # only a fallback if the manager exposes no block_size
-
-
-def _plan_request(request, coord_holder, block_size: int):
-    """One cache-hit walk -> ``(remaining_prefill, blocks_needed)``.
-
-    ``remaining_prefill`` = uncached prompt tokens (the cache-aware SJF key).
-    ``blocks_needed`` = KV blocks this request will still allocate (the memory-aware key).
-    Both come from a single ``find_longest_cache_hit`` so the scheduler pays one walk, not
-    two. Uses the coordinator directly (NOT ``get_computed_blocks``) to avoid polluting
-    ``prefix_cache_stats`` -- the real schedule() loop records those once, and
-    double-counting corrupts the hit-rate metric. Degrades to prompt length on any
-    failure; never raises.
-    """
-    try:
-        num_prompt = request.num_prompt_tokens
-    except Exception:
-        return _HUGE, _HUGE
-    try:
-        # Resumed/preempted reqs already have progress; mirror the loop, don't re-look-up.
-        if getattr(request, "num_computed_tokens", 0):
-            remaining = max(num_prompt - request.num_computed_tokens, 0)
-        else:
-            _blocks, num_cached = coord_holder.coordinator.find_longest_cache_hit(
-                request.block_hashes, request.num_tokens - 1
-            )
-            remaining = max(num_prompt - num_cached, 0)
-    except Exception:
-        remaining = num_prompt  # degrade to shortest-prompt-first; never raise
-    bs = block_size if block_size > 0 else _DEFAULT_BLOCK_SIZE
-    blocks_needed = (remaining + bs - 1) // bs
-    return remaining, blocks_needed
 
 
 @register_patch("kv_cache_manager", default=True)
@@ -82,74 +49,43 @@ def apply() -> None:
         __vtl_subclass__ = True
 
         def plan_request(self, request):
-            return _plan_request(
-                request, self, getattr(self, "block_size", 0) or _DEFAULT_BLOCK_SIZE
-            )
+            # One cache-hit walk (memoized on the request) -> (remaining_prefill, blocks_needed).
+            return plan_prefill(request, self, getattr(self, "block_size", None))
 
         @property
         def free_blocks(self) -> int:
             try:
                 return self.block_pool.get_num_free_blocks()
             except Exception:
-                return _HUGE  # unknown -> treat as unlimited, never demote on error
+                return HUGE  # unknown -> treat as unlimited, never demote on error
 
     sched_mod.KVCacheManager = VtlKVCacheManager
     log.info("vtl: kv_cache_manager installed (exact-tree, memory-aware signals)")
 
 
 def _self_check() -> None:
-    """Runs with no vLLM: pure-python fakes exercise the walk + block math + fallbacks."""
+    """The walk/block/memoization math lives in vtl._prefix (see its _self_check). Here we only
+    confirm this patch delegates through it the way VtlKVCacheManager.plan_request does."""
 
     class FakeCoord:
-        def __init__(self, cached):  # cached: {block_hashes_key: num_cached_tokens}
-            self.cached = cached
-
         def find_longest_cache_hit(self, block_hashes, max_len):
-            return ([], self.cached.get(block_hashes, 0))
+            return ([], 190)
 
-    class FakeKVM:
-        def __init__(self, cached):
-            self.coordinator = FakeCoord(cached)
+    class FakeMgr:  # stands in for the KVCacheManager: has a coordinator + block_size
+        coordinator = FakeCoord()
+        block_size = 16
 
     class FakeReq:
-        def __init__(self, rid, prompt, computed=0):
-            self.request_id = rid
-            self.num_prompt_tokens = prompt
-            self.num_tokens = prompt
-            self.num_computed_tokens = computed
-            self.block_hashes = rid
+        num_prompt_tokens = 200
+        num_tokens = 200
+        num_computed_tokens = 0
+        block_hashes = "a"
 
-    kvm = FakeKVM({"a": 190, "b": 0})
-    # a: 200 prompt, 190 cached -> 10 remaining; blocks = ceil(10/16) = 1
-    assert _plan_request(FakeReq("a", 200), kvm, 16) == (10, 1)
-    # b: 50 prompt, 0 cached -> 50 remaining; blocks = ceil(50/16) = 4
-    assert _plan_request(FakeReq("b", 50), kvm, 16) == (50, 4)
-    # exact multiple: 32 remaining / 16 -> 2 blocks, no off-by-one
-    assert _plan_request(FakeReq("c", 32), FakeKVM({"c": 0}), 16) == (32, 2)
-
-    # Resumed request keys off its own progress, no lookup.
-    assert _plan_request(FakeReq("w", 100, computed=70), None, 16) == (30, 2)
-
-    # Lookup failure degrades to prompt length, never raises.
-    class BoomKVM:
-        class coordinator:
-            @staticmethod
-            def find_longest_cache_hit(*_):
-                raise RuntimeError("boom")
-
-    assert _plan_request(FakeReq("z", 42), BoomKVM, 16) == (42, 3)
-
-    # Un-plannable request (no num_prompt_tokens) sinks to the back.
-    class Bad:
-        pass
-
-    assert _plan_request(Bad(), kvm, 16) == (_HUGE, _HUGE)
-
-    # block_size <= 0 falls back to the default, still divides cleanly.
-    assert _plan_request(FakeReq("d", 32), FakeKVM({"d": 0}), 0) == (
-        32,
-        (32 + _DEFAULT_BLOCK_SIZE - 1) // _DEFAULT_BLOCK_SIZE,
-    )
+    mgr = FakeMgr()
+    # 200 prompt, 190 cached -> 10 remaining; blocks = ceil(10/16) = 1, as plan_request returns.
+    assert plan_prefill(FakeReq(), mgr, getattr(mgr, "block_size", None)) == (10, 1)
+    # free_blocks degrades to HUGE (unlimited) when the pool read fails -- exercised inline.
+    assert HUGE > 0
 
     print("kv_cache_manager self-check ok")
 

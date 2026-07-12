@@ -27,11 +27,11 @@ from __future__ import annotations
 import logging
 from collections import deque
 
+from vtl._prefix import HUGE, plan_prefill
 from vtl.registry import already_patched, mark_patched, register_patch
 
 log = logging.getLogger("vtl")
 
-_HUGE = 1 << 60  # push un-keyable requests to the back, never crash the sort
 _USAGE_TIGHT = 0.90  # KV usage above which we prefer requests that fit over pure SJF
 _mem_aware_engaged = 0  # how many schedule() calls hit the memory-aware branch
 
@@ -44,28 +44,39 @@ def _safe_usage(kv_cache_manager) -> float:
 
 
 def _remaining_prefill(request, kv_cache_manager) -> int:
-    """Uncached prompt tokens for ``request``.
+    """Uncached prompt tokens for ``request`` (the cache-aware SJF key).
 
-    Falls back to prompt length on any failure. Uses the coordinator directly (NOT
-    ``get_computed_blocks``) so we do not pollute ``prefix_cache_stats`` -- the real
-    ``schedule()`` loop records those once, and double-counting corrupts the hit-rate
-    metric we care about.
+    Delegates to the shared ``plan_prefill`` walk, which memoizes the cold-start lookup on the
+    request so it is not re-walked every ``schedule()`` step. Block count is unused on this path.
+    """
+    return plan_prefill(request, kv_cache_manager)[0]
+
+
+def _can_admit(scheduler) -> bool:
+    """Cheap gate: could ``schedule()`` admit anything from ``waiting`` this step? If not, the
+    reorder cannot change any outcome, so we skip the sort entirely. Conservative -- only
+    returns False on a *confident* no-admit signal; anything unknown -> True (reorder anyway).
+
+    Two confident signals: the running set is already at ``max_num_seqs`` (no new sequence can
+    start), or the KV block pool is empty (no prefill can allocate). Both read defensively.
     """
     try:
-        num_prompt = request.num_prompt_tokens
+        running = getattr(scheduler, "running", None)
+        max_seqs = getattr(scheduler, "max_num_running_reqs", None)
+        if max_seqs is None:
+            cfg = getattr(scheduler, "scheduler_config", None)
+            max_seqs = getattr(cfg, "max_num_seqs", None)
+        if running is not None and max_seqs and len(running) >= max_seqs:
+            return False
     except Exception:
-        return _HUGE
+        pass
     try:
-        # Resumed/preempted reqs already have progress; the loop uses that, not a
-        # fresh lookup. Mirror it so the key matches the work actually left.
-        if getattr(request, "num_computed_tokens", 0):
-            return max(num_prompt - request.num_computed_tokens, 0)
-        _blocks, num_cached = kv_cache_manager.coordinator.find_longest_cache_hit(
-            request.block_hashes, request.num_tokens - 1
-        )
-        return max(num_prompt - num_cached, 0)
+        free = getattr(scheduler.kv_cache_manager, "free_blocks", None)
+        if free is not None and free <= 0:
+            return False
     except Exception:
-        return num_prompt  # degrade to shortest-prompt-first; never raise
+        pass
+    return True
 
 
 def _reorder_waiting(waiting, kv_cache_manager) -> None:
@@ -89,7 +100,7 @@ def _reorder_waiting(waiting, kv_cache_manager) -> None:
         # kv_cache_manager patch off: pure cache-aware SJF, no memory signal available.
         key = lambda r: (0, _remaining_prefill(r, kv_cache_manager))  # noqa: E731
     else:
-        free = getattr(kv_cache_manager, "free_blocks", _HUGE)
+        free = getattr(kv_cache_manager, "free_blocks", HUGE)
         tight = _safe_usage(kv_cache_manager) >= _USAGE_TIGHT
         if tight:
             global _mem_aware_engaged
@@ -126,7 +137,10 @@ def apply() -> None:
     # the call convention; we only reorder the waiting queue first.
     def schedule(self, *args, **kwargs):
         try:
-            _reorder_waiting(self.waiting, self.kv_cache_manager)
+            # Skip the sort (and its per-request cache walks) on steps that can't admit
+            # anything from waiting -- the order is irrelevant then.
+            if _can_admit(self):
+                _reorder_waiting(self.waiting, self.kv_cache_manager)
         except Exception:
             log.exception("vtl: sched_policy reorder failed, using stock order")
         return original(self, *args, **kwargs)
@@ -223,6 +237,19 @@ def _self_check() -> None:
     q4 = deque([big, small])
     _reorder_waiting(q4, tight)
     assert [r.request_id for r in q4] == ["small", "big"], [r.request_id for r in q4]
+
+    # _can_admit gate: skip the sort only on a confident no-admit signal.
+    class FakeSched:
+        def __init__(self, running, max_seqs, free):
+            self.running = list(range(running))
+            self.max_num_running_reqs = max_seqs
+            self.kv_cache_manager = type("M", (), {"free_blocks": free})()
+
+    assert _can_admit(FakeSched(running=2, max_seqs=20, free=100)) is True  # slack -> reorder
+    assert _can_admit(FakeSched(running=20, max_seqs=20, free=100)) is False  # seqs full
+    assert _can_admit(FakeSched(running=2, max_seqs=20, free=0)) is False  # KV empty
+    # Unknown scheduler shape -> assume we might admit (never wrongly skip the reorder).
+    assert _can_admit(object()) is True
 
     print("sched_policy self-check ok")
 

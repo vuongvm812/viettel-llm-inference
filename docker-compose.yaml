@@ -51,6 +51,9 @@ services:
       VLLM_LOGGING_LEVEL: INFO
       VTL_ENABLE_RMS_NORM_QUANT: 1
       VTL_ENABLE_GDN_KERNELS: 1
+      VTL_GDN_CONV1D: 1
+      VTL_GDN_RECURRENT: 0
+      VTL_GDN_CHUNK_SCAN: 0
     shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
