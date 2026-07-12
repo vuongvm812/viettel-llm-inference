@@ -37,7 +37,7 @@ services:
       # ~31% of all prefill work disappears after the first request.
       - --enable-prefix-caching
       - --enable-chunked-prefill
-      - --max-num-seqs=64 # KV @p50 is 0.69 GB/req -> ~174 fit in bf16; sweep this
+      - --max-num-seqs=48 # 256->64 raised score by cutting TBT; keep walking down (next: 32)
       - --max-num-batched-tokens=16384 # prefill chunk size: TTFT vs prefill throughput
 
       # vtl_fp8 is registered by vtl/patches/quant_fp8.py: online FP8 W8A8 with
@@ -45,13 +45,11 @@ services:
       # disabled with VTL_ENABLE_FP8=0 the name stops resolving and vLLM aborts at
       # startup -- use VTL_FP8_CHANNELWISE=0 to get stock behaviour instead.
       - --quantization=vtl_fp8
-      - --kv-cache-dtype=fp8_e4m3 # halves decode KV bandwidth at 18.7K context
-
-      # FlashInfer attention: vtl/flashinfer/backend.py (VtlFlashInferBackend) forced onto
-      # H200 (sm_90), registered by vtl/patches/flashinfer_backend.py. vLLM auto-ranks
-      # FLASH_ATTN ahead of FLASHINFER on sm_90, so it must be selected explicitly. ENABLED
-      # (paired with VTL_ENABLE_FLASHINFER_BACKEND=1 below).
-      - --attention-backend=FLASHINFER
+      - --kv-cache-dtype=fp8
+      # fp8 KV cache DROPPED: KV working set is 15.7 GB against ~120 GB (8x headroom), so its
+      # only benefit -- bandwidth -- is not needed, while per-token fp8->bf16 dequant adds TBT.
+      # bf16 KV is also safer for the GPQA accuracy gate. Re-add if TBT does NOT improve.
+      # - --kv-cache-dtype=fp8_e4m3
 
       # Turns on RMSNormQuantFusionPass, which rewrites all 72 of Qwen2's
       # fused_add_rms_norm -> per-token-fp8-quant pairs into a single
@@ -74,8 +72,8 @@ services:
     ports:
       - "8000:8000" # judge hits this -- MUST be :8000
     environment:
-      # VLLM_ATTENTION_BACKEND does not exist in vLLM v0.22.1 -- selection is the
-      # --attention-backend=FLASHINFER flag above (which forces the vtl FlashInfer backend).
+      # VLLM_ATTENTION_BACKEND is deliberately unset. Forcing FLASHINFER crashed the
+      # server; FA3 is auto-selected on SM90 (H200).
       VLLM_PLUGINS: vtl
       VTL_FP8_IGNORE: "lm_head" # keep the output head in bf16
       # DEBUG makes rms_quant_fusion.py emit `fusion pass matches: {...}`, the only direct
@@ -85,15 +83,6 @@ services:
       # Set to 0 to keep vLLM's stock fused kernel. The FX graph is identical either way,
       # so this toggle isolates the kernel from the fusion-pass change above.
       VTL_ENABLE_RMS_NORM_QUANT: ${VTL_ENABLE_RMS_NORM_QUANT:-1}
-      # Register the vtl FlashInfer backend override (ENABLED; pairs with the
-      # --attention-backend=FLASHINFER flag above). VTL_FI_WORKSPACE_MB floors the FlashInfer
-      # workspace (SGLang uses 512). VTL_FI_FORCE_SELECT=1 forces selection via a platform
-      # wrap instead of the CLI flag. VTL_FI_RAGGED_PREFILL enables SGLang's ragged + merge
-      # extend split (pure-prefill batches only; OFF here -- silent-corruption risk, byte-
-      # validate on the H200 before enabling).
-      VTL_ENABLE_FLASHINFER_BACKEND: "1"
-      VTL_FI_WORKSPACE_MB: "512"
-      VTL_FI_RAGGED_PREFILL: "1"
     shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]

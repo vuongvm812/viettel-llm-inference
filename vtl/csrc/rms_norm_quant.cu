@@ -47,6 +47,13 @@ namespace {
 constexpr float kFp8Max = 448.0f;                      // quant_type_max_v<Float8_e4m3fn>
 constexpr float kMinScale = 1.0f / (kFp8Max * 512.0f); // min_scaling_factor<fp8>::val()
 
+// Fast-path block cap. Qwen2 (hidden=2048) launches 256 threads at bf16/fp16 (kVec=8) and
+// 512 at fp32 (kVec=4), so 512 covers every shape the fast path currently takes; wider hidden
+// falls to the generic kernel exactly as before. Given as an explicit __launch_bounds__ so the
+// SM90 register allocator sizes for a <=512-thread block instead of the default 1024 worst
+// case, keeping more blocks resident to hide HBM3e latency in the low-occupancy decode regime.
+constexpr int kFastMaxThreads = 512;
+
 // 16-byte loads: the widest a single thread can issue.
 template <typename scalar_t>
 struct VecTraits;
@@ -141,7 +148,7 @@ __device__ __forceinline__ float block_reduce(float v, Op op, float ident, float
 // Fast path. Requires hidden_size % kVec == 0 and hidden_size / kVec <= 1024, so a
 // thread's slice fits in registers and no element is visited twice.
 template <typename scalar_t, bool kHasResidual>
-__global__ void fused_rms_norm_quant_kernel(
+__global__ void __launch_bounds__(kFastMaxThreads) fused_rms_norm_quant_kernel(
     c10::Float8_e4m3fn* __restrict__ out,   // [num_tokens, hidden_size]
     float* __restrict__ scales,             // [num_tokens]
     scalar_t const* __restrict__ input,     // [num_tokens, hidden_size]
@@ -318,9 +325,11 @@ void launch(torch::Tensor const& out, torch::Tensor const& input,
   auto const* ub_p = scale_ub.has_value() ? scale_ub->const_data_ptr<float>() : nullptr;
 
   int const nthreads = (hidden_size + kVec - 1) / kVec;
-  bool const fast = hidden_size % kVec == 0 && nthreads <= 1024 &&
+  // out_p feeds an aligned VecOut store, so it must be gated too -- torch's allocator returns
+  // 256-byte-aligned storage today, but demote to the generic path rather than assume it.
+  bool const fast = hidden_size % kVec == 0 && nthreads <= kFastMaxThreads &&
                     input_stride % kVec == 0 && aligned16(in_p) && aligned16(w_p) &&
-                    (res_p == nullptr || aligned16(res_p));
+                    aligned16(out_p) && (res_p == nullptr || aligned16(res_p));
 
   dim3 const grid(num_tokens);
 #define VTL_DISPATCH_RESIDUAL(KERNEL, BLOCK)                                          \
