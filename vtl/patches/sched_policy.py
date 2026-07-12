@@ -121,12 +121,15 @@ def apply() -> None:
 
     original = Scheduler.schedule
 
-    def schedule(self):
+    # *args/**kwargs passthrough: schedule()'s signature drifts across versions -- v0.25.0
+    # passes should_throttle_prefills. Forward whatever vLLM gives so the wrapper never breaks
+    # the call convention; we only reorder the waiting queue first.
+    def schedule(self, *args, **kwargs):
         try:
             _reorder_waiting(self.waiting, self.kv_cache_manager)
         except Exception:
             log.exception("vtl: sched_policy reorder failed, using stock order")
-        return original(self)
+        return original(self, *args, **kwargs)
 
     Scheduler.schedule = mark_patched(schedule, original)
     log.info(
