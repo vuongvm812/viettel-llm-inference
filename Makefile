@@ -116,7 +116,12 @@ verify:
 # layers still dominate a first push; that is a one-time cost (Docker Hub dedups by digest, so
 # later pushes upload only the changed vtl layer). For code iteration prefer `make build`
 # (local --load, no registry round-trip) and only `make push` for the submission.
-BUILDX_FLAGS := --provenance=false --sbom=false
+# NOCACHE=--no-cache forces a full rebuild: re-runs pip/nvcc so the CURRENT kernels are
+# recompiled and every COPY is redone, instead of reusing cached layers. The base FROM image
+# stays cached (pulled, not built). Use when you must be sure the latest vtl code is baked in:
+#   make push NOCACHE=--no-cache
+NOCACHE ?=
+BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 
 build:
 	docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --load -t $(IMAGE):$(TAG) .
