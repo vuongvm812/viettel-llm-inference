@@ -4,11 +4,9 @@ TARGET ?= http://localhost:8000
 # The H200 box is amd64 and the vLLM base image is multi-arch. Never let the build
 # host pick: an arm64 Mac would otherwise produce an image the GPU box can't run.
 PLATFORM ?= linux/amd64
-# SM archs baked into vtl._C. H200-only (sm_90) by design -- the kernels only need to run well
-# on the judge's H200, so a single Hopper cubin is smaller/faster and lets nvcc tune for sm_90.
-# A wrong arch fails at the first kernel launch; a non-Hopper dev box must override, e.g.
-# CUDA_ARCHS='8.9;9.0+PTX'. See the ARG in Dockerfile.
-CUDA_ARCHS ?= 9.0+PTX
+# SM archs baked into vtl._C. A wrong arch fails at the first kernel launch, not at import.
+# Narrow to '9.0+PTX' for the submission build. See the ARG in Dockerfile.
+CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 TRACE := data/input/trace-round1.jsonl
 LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 
