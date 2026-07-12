@@ -42,3 +42,4 @@ docker/cache/*
 bench-*.json
 sndr_core_engine/
 sglang/
+model/
