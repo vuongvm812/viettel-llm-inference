@@ -110,8 +110,16 @@ verify:
 	   echo "OK   rms_norm+quant fusion replaced $$n patterns (each one calls our kernel)"; \
 	 fi
 
+# --provenance=false --sbom=false: skip the SBOM/provenance attestation manifest and the
+# single-entry manifest LIST buildx would otherwise wrap a one-platform image in -- pure export
+# overhead here, and the manifest-list form makes some `docker pull`s slower. The base image
+# layers still dominate a first push; that is a one-time cost (Docker Hub dedups by digest, so
+# later pushes upload only the changed vtl layer). For code iteration prefer `make build`
+# (local --load, no registry round-trip) and only `make push` for the submission.
+BUILDX_FLAGS := --provenance=false --sbom=false
+
 build:
-	docker buildx build --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --load -t $(IMAGE):$(TAG) .
+	docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --load -t $(IMAGE):$(TAG) .
 	@docker inspect $(IMAGE):$(TAG) --format 'built {{.Os}}/{{.Architecture}}'
 
 up:
@@ -133,7 +141,7 @@ warm:
 ## buildx --push writes the manifest straight to the registry, so the pushed image
 ## is $(PLATFORM) regardless of what this machine is.
 push:
-	docker buildx build --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --push -t $(IMAGE):$(TAG) .
+	docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --push -t $(IMAGE):$(TAG) .
 	@echo "pin this digest in docker-compose-optimized.yaml:"
 	@docker buildx imagetools inspect $(IMAGE):$(TAG) --format '{{.Manifest.Digest}}'
 
