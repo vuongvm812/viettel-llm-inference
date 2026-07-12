@@ -22,14 +22,15 @@ COPY vtl /src/vtl
 
 # Which SM cubins go into vtl._C. Without this, nvcc probes the build host -- which has no
 # GPU -- and guesses. A mismatch does NOT degrade gracefully: dlopen succeeds, the override
-# installs, and the first kernel launch dies with cudaErrorNoKernelImageForDevice. So build
-# for every device you intend to run on.
+# installs, and the first kernel launch dies with cudaErrorNoKernelImageForDevice.
 #
-# The judge box is an H200 (sm_90); the trailing +PTX embeds compute_90 PTX so newer
-# devices (Blackwell) can JIT. Ampere entries let the same image run on a dev box. Narrow
-# this to just "9.0+PTX" for the submission build to cut image size and build time:
-#   make build CUDA_ARCHS='9.0+PTX'
-ARG CUDA_ARCHS="8.0;8.6;8.9;9.0+PTX"
+# H200-ONLY by design: the judge box is an H200 (sm_90) and the kernels only need to run well
+# there, so we build a single sm_90 cubin -- smaller image, faster build, and nvcc is free to
+# schedule/allocate for Hopper alone. The trailing +PTX embeds compute_90 PTX as a forward-JIT
+# hedge (Blackwell); it does not affect the sm_90 cubin used on the H200. A mismatch fails at
+# the first launch, so a non-Hopper dev box must override, e.g.:
+#   make build CUDA_ARCHS='8.9;9.0+PTX'
+ARG CUDA_ARCHS="9.0+PTX"
 
 # Scoped to the RUN, not ENV: it is a build input and has no business in the served image.
 # --no-build-isolation so setup.py sees the image's torch.
