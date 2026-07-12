@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger:dev # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:acdab1c391d58cb6561bf0405c3fc0ddec3086ab495cd47c06b6590be0d723ea # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -46,8 +46,7 @@ services:
       # startup -- use VTL_FP8_CHANNELWISE=0 to get stock behaviour instead.
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
-      # NOTE: --attention-backend FLASHINFER removed -- forcing it crashed the server; FA3 is
-      # auto-selected on SM90 (H200). Kept in sync with docker-compose-optimized.yaml.
+      - --attention-backend FLASHINFER
 
       # Turns on RMSNormQuantFusionPass, which rewrites the [2048]-wide
       # fused_add_rms_norm -> per-token-fp8-quant pairs (input_layernorm->in_proj/qkv and
