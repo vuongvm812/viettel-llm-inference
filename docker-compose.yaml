@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: linhthuydanhbo1234/vtl-vllm@sha256:d915157d8edcfbe554c29a76b2b95672751442cf31ace22a538c630d8493303e # submission: pin by @sha256:<digest>
+    image: linhthuydanhbo1234/vtl-vllm@sha256:c7debda55e934674e08d447bdca648c8351314f4f9b7e7d959218b441373609d # submission: pin by @sha256:<digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -46,6 +46,7 @@ services:
       # startup -- use VTL_FP8_CHANNELWISE=0 to get stock behaviour instead.
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
+      - --attention-backend FLASHINFER
 
       # Turns on RMSNormQuantFusionPass, which rewrites all 72 of Qwen2's
       # fused_add_rms_norm -> per-token-fp8-quant pairs into a single
