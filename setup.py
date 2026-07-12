@@ -19,7 +19,13 @@ def _cuda_ext():
 
     ext = CUDAExtension(
         name="vtl._C",
-        sources=["vtl/csrc/rms_norm_quant.cu", "vtl/csrc/torch_bindings.cpp"],
+        sources=[
+            "vtl/csrc/rms_norm_quant.cu",
+            "vtl/csrc/dynamic_per_token_quant.cu",
+            "vtl/csrc/silu_mul_quant.cu",
+            "vtl/csrc/gdn_gated_rmsnorm.cu",
+            "vtl/csrc/torch_bindings.cpp",
+        ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
             # No --use_fast_math: it would turn `y / scale` into a reciprocal

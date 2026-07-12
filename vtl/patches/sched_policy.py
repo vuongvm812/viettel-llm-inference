@@ -13,6 +13,12 @@ Output-preserving: same requests, same per-request sampling; only admission orde
 TTFT changes. Base ``Scheduler.schedule()`` is inherited unchanged by ``AsyncScheduler``,
 so one patch covers both sync and async scheduling.
 
+Hybrid-KV note (qwen3_5): with multiple KV cache groups (full-attention + GDN state), the
+``find_longest_cache_hit`` / ``usage`` / ``free_blocks`` reads may mis-estimate. Because this
+patch ONLY reorders the waiting queue (output is identical), a mis-estimate can only produce a
+suboptimal order, never a wrong result -- and every read degrades on failure (to prompt-length /
+slack). Re-validate the ordering win on the box; the env flag reverts to stock FCFS.
+
 Set ``VTL_ENABLE_SCHED_POLICY=0`` to serve stock FCFS.
 """
 

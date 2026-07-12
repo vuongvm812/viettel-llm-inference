@@ -9,7 +9,11 @@
 #
 # vllm/vllm-openai is multi-arch. Without the explicit --platform, building on an
 # arm64 machine silently yields an arm64 image that the amd64 H200 box cannot run.
-ARG VLLM_IMAGE=vllm/vllm-openai:v0.22.1
+# v0.25.0: first base that registers Qwen3_5ForConditionalGeneration (the served
+# Qwen3.5-2B is a qwen3_5 VL hybrid — linear-attn/GDN + full-attn + MTP + vision).
+# v0.22.1 could not load it. The fp8 _C ops + _C_stable_libtorch registration our
+# override depends on are byte-identical in v0.25.0 (verified against tag v0.25.0).
+ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.0
 
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 

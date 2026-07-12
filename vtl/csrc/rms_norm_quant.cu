@@ -2,8 +2,10 @@
 //
 // Replaces vLLM's `_C::rms_norm_dynamic_per_token_quant` (see
 // csrc/libtorch_stable/quantization/fused_kernels/), which the RMSNormQuantFusionPass
-// emits for every `input_layernorm -> qkv_proj` and `post_attention_layernorm ->
-// gate_up_proj` in Qwen2. Stock does three passes over input+residual
+// emits for the [2048]-wide `input_layernorm -> in_proj/qkv` and
+// `post_attention_layernorm -> gate_up` pairs -- on both the GDN (linear-attn) and the
+// full-attention layers of the served qwen3_5 model (hidden=2048; the [16]/[128]/[256] F32
+// per-head norms are a different op and not fused here). Stock does three passes over input+residual
 // (compute_rms -> compute_dynamic_per_token_scales -> norm_and_quant), loads 8 bytes
 // at a time (`vec4_t<bf16>`), and launches min(hidden_size, 1024) threads -- at
 // hidden_size=2048 that is 1024 threads of which only 512 ever enter the vectorized
@@ -27,123 +29,16 @@
 // accurate, but it shifts amax -- and hence the per-token scale -- by up to ~6e-5
 // relative, so it is not the same kernel. Hold `weight` as scalar_t, not float.
 
-// Deliberately NOT <ATen/cuda/CUDAContext.h>: it drags in cusparse.h, which in the
-// vllm-openai image lives only under the pip nvidia/cu13 tree, off the include path.
-// The stream and the device guard both live in c10/cuda.
-#include <c10/cuda/CUDAException.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
-#include <c10/util/BFloat16.h>
-#include <c10/util/Float8_e4m3fn.h>
-#include <c10/util/Half.h>
-#include <cuda_fp8.h>
-#include <cstdlib>
 #include <torch/all.h>
+
+// kFp8Max, kMinScale, kFastMaxThreads, VecTraits, VecIn, VecOut, clamp_fp8, floats_to_fp8x2,
+// float_to_fp8, AddOp/MaxOp, block_reduce, aligned16, kernel_sync_enabled -- all shared with
+// the other vtl fp8 kernels, now in one place.
+#include "fp8_common.cuh"
 
 namespace vtl {
 
 namespace {
-
-constexpr float kFp8Max = 448.0f;                      // quant_type_max_v<Float8_e4m3fn>
-constexpr float kMinScale = 1.0f / (kFp8Max * 512.0f); // min_scaling_factor<fp8>::val()
-
-// Fast-path block cap. Qwen2 (hidden=2048) launches 256 threads at bf16/fp16 (kVec=8) and
-// 512 at fp32 (kVec=4), so 512 covers every shape the fast path currently takes; wider hidden
-// falls to the generic kernel exactly as before. Given as an explicit __launch_bounds__ so the
-// SM90 register allocator sizes for a <=512-thread block instead of the default 1024 worst
-// case, keeping more blocks resident to hide HBM3e latency in the low-occupancy decode regime.
-constexpr int kFastMaxThreads = 512;
-
-// 16-byte loads: the widest a single thread can issue.
-template <typename scalar_t>
-struct VecTraits;
-template <>
-struct VecTraits<c10::BFloat16> {
-  static constexpr int kVec = 8;
-};
-template <>
-struct VecTraits<c10::Half> {
-  static constexpr int kVec = 8;
-};
-template <>
-struct VecTraits<float> {
-  static constexpr int kVec = 4;
-};
-
-template <typename scalar_t, int N>
-struct alignas(16) VecIn {
-  scalar_t v[N];
-};
-
-// N fp8 codes, written only as N/2 pairs by the hardware two-at-a-time converter.
-// One aligned N-byte store per thread.
-template <int N>
-struct alignas(N) VecOut {
-  static_assert(N % 2 == 0, "fp8 pair conversion needs an even vector width");
-  __nv_fp8x2_storage_t pair[N / 2];
-};
-
-// Clamp first, exactly as stock does, THEN convert. Not interchangeable with letting
-// __NV_SATFINITE do the clamping: satfinite maps NaN to 0x7f, whereas fminf(NaN, 448)
-// returns 448, so stock turns NaN into 0x7e. Measured, not assumed.
-__device__ __forceinline__ float clamp_fp8(float x) {
-  return fmaxf(-kFp8Max, fminf(x, kFp8Max));
-}
-
-// Hopper converts two floats per instruction. c10's static_cast is ~10 ALU ops of
-// software bit-twiddling per element; at 8 elements/thread that is the difference
-// between a free epilogue and a measurable one. Low byte is the first float (probed).
-__device__ __forceinline__ __nv_fp8x2_storage_t floats_to_fp8x2(float a, float b) {
-  float2 v;
-  v.x = clamp_fp8(a);
-  v.y = clamp_fp8(b);
-  return __nv_cvt_float2_to_fp8x2(v, __NV_SATFINITE, __NV_E4M3);
-}
-
-__device__ __forceinline__ c10::Float8_e4m3fn float_to_fp8(float x) {
-  __nv_fp8_storage_t const bits =
-      __nv_cvt_float_to_fp8(clamp_fp8(x), __NV_SATFINITE, __NV_E4M3);
-  return c10::Float8_e4m3fn(bits, c10::Float8_e4m3fn::from_bits());
-}
-
-struct AddOp {
-  __device__ __forceinline__ float operator()(float a, float b) const { return a + b; }
-};
-struct MaxOp {
-  __device__ __forceinline__ float operator()(float a, float b) const {
-    return fmaxf(a, b);
-  }
-};
-
-// Reduce across the block and broadcast to every thread. `op` is a functor resolved at
-// compile time and inlined -- no indirect call. Barriers, not atomics: a block-wide
-// atomicMax would serialise 256 lanes through one address and make the result depend on
-// arrival order. `smem` is caller-owned so two reductions can run back to back without a
-// barrier between them just to protect a shared buffer.
-template <typename Op>
-__device__ __forceinline__ float block_reduce(float v, Op op, float ident, float* smem) {
-  int const lane = threadIdx.x & 31;
-  int const wid = threadIdx.x >> 5;
-  int const nwarps = (blockDim.x + 31) >> 5;
-
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1) {
-    v = op(v, __shfl_xor_sync(0xffffffffu, v, off));
-  }
-  if (lane == 0) smem[wid] = v;
-  __syncthreads();
-
-  if (wid == 0) {
-    v = (lane < nwarps) ? smem[lane] : ident;
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-      v = op(v, __shfl_xor_sync(0xffffffffu, v, off));
-    }
-    if (lane == 0) smem[0] = v;
-  }
-  __syncthreads();
-  return smem[0];
-}
 
 // Fast path. Requires hidden_size % kVec == 0 and hidden_size / kVec <= 1024, so a
 // thread's slice fits in registers and no element is visited twice.
@@ -286,20 +181,6 @@ __global__ void fused_rms_norm_quant_generic_kernel(
     float const y = static_cast<float>(static_cast<scalar_t>(x * rms) * weight[i]);
     out[row_base + i] = float_to_fp8(y / scale);
   }
-}
-
-bool aligned16(void const* p) { return reinterpret_cast<uintptr_t>(p) % 16 == 0; }
-
-// Diagnostic, off unless VTL_KERNEL_SYNC is set (read once). When on, launch() synchronises
-// right after the kernel and, on a CUDA error, throws with the exact shape and path -- so a
-// fault is attributed to its own launch instead of surfacing at some later sync in another
-// test. Zero cost when off (one predicted branch per call).
-bool kernel_sync_enabled() {
-  static bool const v = [] {
-    char const* e = std::getenv("VTL_KERNEL_SYNC");
-    return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'y');
-  }();
-  return v;
 }
 
 template <typename scalar_t>

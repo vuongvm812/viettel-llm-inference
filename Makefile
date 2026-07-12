@@ -17,9 +17,11 @@ check:
 	python3 vtl/registry.py
 	PYTHONPATH=. python3 vtl/patches/quant_fp8.py
 	PYTHONPATH=. python3 vtl/patches/rms_norm_quant.py
+	PYTHONPATH=. python3 vtl/patches/dynamic_per_token_quant.py
+	PYTHONPATH=. python3 vtl/patches/silu_mul_quant.py
+	PYTHONPATH=. python3 vtl/patches/gdn_kernels.py
 	PYTHONPATH=. python3 vtl/patches/kv_cache_manager.py
 	PYTHONPATH=. python3 vtl/patches/sched_policy.py
-	PYTHONPATH=. python3 vtl/patches/inputs_embeds_optional.py
 	python3 bench/trace_stats.py --self-check
 	python3 bench/metrics.py
 	@python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
@@ -31,7 +33,9 @@ check:
 # docker silently pulls a stale published image and the tests run against whatever kernel
 # it happens to contain.
 KRUN := docker run --rm --gpus all -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
-PYTEST := pytest -q -p no:cacheprovider /bench/test_rms_norm_quant.py
+KERNEL_TESTS := /bench/test_rms_norm_quant.py /bench/test_dynamic_per_token_quant.py \
+                /bench/test_silu_mul_quant.py /bench/test_gdn_gated_rmsnorm.py
+PYTEST := pytest -q -p no:cacheprovider $(KERNEL_TESTS)
 
 ## Kernel correctness. Needs a GPU. Runs one oracle against our kernel AND against the
 ## stock one -- importing vtl._C overrides _C process-wide, so they cannot coexist and
@@ -43,8 +47,10 @@ test-kernel: build
 
 ## Kernel microbenchmark at the trace's real shapes. Needs a GPU.
 bench-kernel: build
-	$(KRUN) 'python3 /bench/test_rms_norm_quant.py && \
-	  VTL_SKIP_EXT=1 python3 /bench/test_rms_norm_quant.py'
+	$(KRUN) 'for t in $(KERNEL_TESTS); do \
+	    echo "=== $$t (vtl)"; python3 $$t; \
+	    echo "=== $$t (stock)"; VTL_SKIP_EXT=1 python3 $$t; \
+	  done'
 
 ## Pinpoint a memory fault. VTL_KERNEL_SYNC makes the kernel synchronise after every launch
 ## and, on a fault, raise with the exact shape and path (fast/generic, dtype, stride,
@@ -59,7 +65,7 @@ DBG_KRUN := docker run --rm --gpus all -e VTL_KERNEL_SYNC=1 -e CUDA_LAUNCH_BLOCK
               -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
 debug-kernel: build
 	$(DBG_KRUN) 'pip install -q pytest && \
-	  python3 -m pytest -q -p no:cacheprovider -x /bench/test_rms_norm_quant.py \
+	  python3 -m pytest -q -p no:cacheprovider -x $(KERNEL_TESTS) \
 	  $(if $(T),-k $(T),)'
 
 stats:

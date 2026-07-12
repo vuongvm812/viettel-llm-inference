@@ -147,6 +147,17 @@ def apply() -> None:
             method = super().get_quant_method(layer, prefix)
             if not isinstance(layer, LinearBase):
                 return method  # attention / MoE: leave stock behaviour alone
+
+            # SUBSTRING ignore -- vLLM's is_layer_skipped is EXACT prefix match
+            # (`prefix in ignored_layers`), so a bare "in_proj_a" passed to the parent never
+            # matches `...linear_attn.in_proj_a`. Enforce our substrings here so the GDN F32
+            # SSM projections (in_proj_a/b) and the vision tower are NEVER fp8-quantized --
+            # quantizing the Mamba decay/beta path is a correctness break. Keeps big GDN
+            # matmuls (in_proj_qkv/z, out_proj) and dense GEMMs on fp8.
+            if prefix and any(pat and pat in prefix for pat in self.ignored_layers):
+                from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+                return UnquantizedLinearMethod()
+
             if type(method) is not Fp8OnlineLinearMethod:
                 return method  # ignored layer (bf16) or fp8-serialized checkpoint
             if not channelwise_enabled(os.environ.get(CHANNELWISE_ENV)):

@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: linhthuydanhbo1234/vtl-vllm@sha256:c7debda55e934674e08d447bdca648c8351314f4f9b7e7d959218b441373609d # submission: pin by @sha256:<digest>
+    image: linhthuydanhbo1234/vtl-vllm:dev # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -46,10 +46,12 @@ services:
       # startup -- use VTL_FP8_CHANNELWISE=0 to get stock behaviour instead.
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
-      - --attention-backend FLASHINFER
+      # NOTE: --attention-backend FLASHINFER removed -- forcing it crashed the server; FA3 is
+      # auto-selected on SM90 (H200). Kept in sync with docker-compose-optimized.yaml.
 
-      # Turns on RMSNormQuantFusionPass, which rewrites all 72 of Qwen2's
-      # fused_add_rms_norm -> per-token-fp8-quant pairs into a single
+      # Turns on RMSNormQuantFusionPass, which rewrites the [2048]-wide
+      # fused_add_rms_norm -> per-token-fp8-quant pairs (input_layernorm->in_proj/qkv and
+      # post_attention_layernorm->gate_up, on GDN and full-attn layers) into a single
       # _C::rms_norm_dynamic_per_token_quant node. vtl/patches/rms_norm_quant.py replaces
       # that op's CUDA kernel with a single-pass one. Off by default because
       # enable_norm_fusion() (vllm/config/vllm.py:99) otherwise leaves the fusion to
@@ -65,14 +67,21 @@ services:
       # drops with no TTFT/throughput regression, else revert this to PIECEWISE default.
       # Re-warm (docker/cache/ was baked under PIECEWISE) and confirm the enum spelling:
       #   python3 -c "from vllm.config import CUDAGraphMode; print(list(CUDAGraphMode))"
-      - '--compilation-config={"pass_config": {"fuse_norm_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
+      # fuse_act_quant runs ActivationQuantFusionPass; silu_mul_quant.py adds a per-token
+      # silu->quant pattern so down_proj fuses into our single kernel. Non-match is a no-op.
+      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
     ports:
       - "8000:8000" # judge hits this -- MUST be :8000
     environment:
       # VLLM_ATTENTION_BACKEND is deliberately unset. Forcing FLASHINFER crashed the
       # server; FA3 is auto-selected on SM90 (H200).
       VLLM_PLUGINS: vtl
-      VTL_FP8_IGNORE: "lm_head" # keep the output head in bf16
+      # fp8 must NOT touch the GDN SSM path or the vision tower. vtl_fp8 enforces these as
+      # SUBSTRINGS in get_quant_method (vLLM's is_layer_skipped is exact-prefix-match, so a bare
+      # "in_proj_a" would never match). Excludes: lm_head (tied), GDN decay/beta in_proj_a/b
+      # (feed the F32 SSM), and the whole vision tower. Big GDN matmuls (in_proj_qkv/z, out_proj)
+      # and dense MLP/full-attn GEMMs stay fp8.
+      VTL_FP8_IGNORE: "lm_head,in_proj_a,in_proj_b,visual"
       # DEBUG makes rms_quant_fusion.py emit `fusion pass matches: {...}`, the only direct
       # evidence of how many nodes our kernel backs. `make verify` greps it. DEBUG logging
       # is not free -- leave at INFO when benchmarking or submitting.
