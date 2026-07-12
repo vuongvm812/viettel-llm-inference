@@ -1,4 +1,4 @@
-IMAGE ?= linhthuydanhbo1234/vtl-vllm
+IMAGE ?= linhthuydanhbo1234/awesome-badger
 TAG ?= dev
 TARGET ?= http://localhost:8000
 # The H200 box is amd64 and the vLLM base image is multi-arch. Never let the build
