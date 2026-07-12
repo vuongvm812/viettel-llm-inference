@@ -46,6 +46,7 @@ services:
       # startup -- use VTL_FP8_CHANNELWISE=0 to get stock behaviour instead.
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3 # halves decode KV bandwidth at 18.7K context
+      - --attention-backend FLASHINFER
 
       # Turns on RMSNormQuantFusionPass, which rewrites the [2048]-wide
       # fused_add_rms_norm -> per-token-fp8-quant pairs (input_layernorm->in_proj/qkv and
