@@ -29,7 +29,7 @@ services:
       # Longest prompt is 27,331 tokens + 200 generated = 27,531 required.
       # 16384 (baseline) rejects most of the trace; 262144 exceeds the model's
       # derived limit and vLLM refuses to start without VLLM_ALLOW_LONG_MAX_MODEL_LEN.
-      - --max-model-len=49152
+      - --max-model-len=32768
       - --gpu-memory-utilization=0.95 # 0.95 leaves no headroom for CUDA graph pools
       - --tensor-parallel-size=1
 
