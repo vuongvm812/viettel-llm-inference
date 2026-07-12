@@ -37,7 +37,7 @@ services:
       # ~31% of all prefill work disappears after the first request.
       - --enable-prefix-caching
       - --enable-chunked-prefill
-      - --max-num-seqs=64 # KV @p50 is 0.69 GB/req -> ~174 fit in bf16; sweep this
+      - --max-num-seqs=48 # 256->64 raised score by cutting TBT; keep walking down (next: 32)
       - --max-num-batched-tokens=16384 # prefill chunk size: TTFT vs prefill throughput
 
       # vtl_fp8 is registered by vtl/patches/quant_fp8.py: online FP8 W8A8 with
@@ -45,7 +45,11 @@ services:
       # disabled with VTL_ENABLE_FP8=0 the name stops resolving and vLLM aborts at
       # startup -- use VTL_FP8_CHANNELWISE=0 to get stock behaviour instead.
       - --quantization=vtl_fp8
-      - --kv-cache-dtype=fp8_e4m3 # halves decode KV bandwidth at 18.7K context
+      - --kv-cache-dtype=fp8
+      # fp8 KV cache DROPPED: KV working set is 15.7 GB against ~120 GB (8x headroom), so its
+      # only benefit -- bandwidth -- is not needed, while per-token fp8->bf16 dequant adds TBT.
+      # bf16 KV is also safer for the GPQA accuracy gate. Re-add if TBT does NOT improve.
+      # - --kv-cache-dtype=fp8_e4m3
 
       # Turns on RMSNormQuantFusionPass, which rewrites all 72 of Qwen2's
       # fused_add_rms_norm -> per-token-fp8-quant pairs into a single

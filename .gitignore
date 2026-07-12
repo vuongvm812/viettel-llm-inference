@@ -41,3 +41,4 @@ docker/cache/*
 !docker/cache/.gitkeep
 bench-*.json
 sndr_core_engine/
+sglang/
