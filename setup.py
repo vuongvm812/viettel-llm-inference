@@ -23,11 +23,7 @@ def _cuda_ext():
             "vtl/csrc/rms_norm_quant.cu",
             "vtl/csrc/dynamic_per_token_quant.cu",
             "vtl/csrc/silu_mul_quant.cu",
-            "vtl/csrc/mul_sigmoid_quant.cu",
             "vtl/csrc/gdn_gated_rmsnorm.cu",
-            "vtl/csrc/gdn/causal_conv1d.cu",
-            "vtl/csrc/gdn/chunk_gated_delta.cu",
-            "vtl/csrc/gdn/fused_recurrent_decode.cu",
             "vtl/csrc/torch_bindings.cpp",
         ],
         extra_compile_args={

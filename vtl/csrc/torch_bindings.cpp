@@ -38,31 +38,8 @@ void silu_and_mul_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor& 
                                           torch::Tensor const& input,
                                           std::optional<torch::Tensor> const& scale_ub);
 
-void mul_sigmoid_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor& scale,
-                                         torch::Tensor const& input, torch::Tensor const& gate,
-                                         std::optional<torch::Tensor> const& scale_ub);
-
 void gated_rmsnorm(torch::Tensor& result, torch::Tensor const& input,
                    torch::Tensor const& gate, torch::Tensor const& weight, double epsilon);
-
-// GDN linear-attention kernels (default-OFF, parity-gated; see vtl/csrc/gdn/*.cu).
-void gdn_causal_conv1d_update(torch::Tensor& x, torch::Tensor& conv_state,
-                              torch::Tensor const& weight,
-                              std::optional<torch::Tensor> const& bias, bool silu);
-void gdn_causal_conv1d_fn(torch::Tensor& y, torch::Tensor const& x, torch::Tensor const& weight,
-                          std::optional<torch::Tensor> const& bias,
-                          torch::Tensor const& query_start_loc,
-                          std::optional<torch::Tensor> const& initial_state,
-                          std::optional<torch::Tensor> const& has_initial_state,
-                          std::optional<torch::Tensor> const& final_state, bool silu);
-void gdn_recurrent_decode(torch::Tensor& o, torch::Tensor& state, torch::Tensor const& q,
-                          torch::Tensor const& k, torch::Tensor const& v, torch::Tensor const& g,
-                          torch::Tensor const& beta, bool qk_l2norm);
-void gdn_chunk_scan(torch::Tensor& o, torch::Tensor const& q, torch::Tensor const& k,
-                    torch::Tensor const& v, torch::Tensor const& g, torch::Tensor const& beta,
-                    torch::Tensor const& query_start_loc,
-                    std::optional<torch::Tensor> const& initial_state,
-                    torch::Tensor& final_state, bool qk_l2norm);
 }  // namespace vtl
 
 TORCH_LIBRARY(vllm_cuda, m) {
@@ -77,25 +54,8 @@ TORCH_LIBRARY(vllm_cuda, m) {
       "silu_and_mul_dynamic_per_token_quant(Tensor! result, Tensor! scale, "
       "Tensor input, Tensor? scale_ub) -> ()");
   m.def(
-      "mul_sigmoid_dynamic_per_token_quant(Tensor! result, Tensor! scale, "
-      "Tensor input, Tensor gate, Tensor? scale_ub) -> ()");
-  m.def(
       "gated_rmsnorm(Tensor! result, Tensor input, Tensor gate, Tensor weight, "
       "float epsilon) -> ()");
-  m.def(
-      "gdn_causal_conv1d_update(Tensor! x, Tensor! conv_state, Tensor weight, "
-      "Tensor? bias, bool silu) -> ()");
-  m.def(
-      "gdn_causal_conv1d_fn(Tensor! y, Tensor x, Tensor weight, Tensor? bias, "
-      "Tensor query_start_loc, Tensor? initial_state, Tensor? has_initial_state, "
-      "Tensor!? final_state, bool silu) -> ()");
-  m.def(
-      "gdn_recurrent_decode(Tensor! o, Tensor! state, Tensor q, Tensor k, Tensor v, "
-      "Tensor g, Tensor beta, bool qk_l2norm) -> ()");
-  m.def(
-      "gdn_chunk_scan(Tensor! o, Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
-      "Tensor query_start_loc, Tensor? initial_state, Tensor! final_state, "
-      "bool qk_l2norm) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
@@ -104,13 +64,7 @@ TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
          TORCH_FN(vtl::dynamic_per_token_scaled_fp8_quant));
   m.impl("silu_and_mul_dynamic_per_token_quant",
          TORCH_FN(vtl::silu_and_mul_dynamic_per_token_quant));
-  m.impl("mul_sigmoid_dynamic_per_token_quant",
-         TORCH_FN(vtl::mul_sigmoid_dynamic_per_token_quant));
   m.impl("gated_rmsnorm", TORCH_FN(vtl::gated_rmsnorm));
-  m.impl("gdn_causal_conv1d_update", TORCH_FN(vtl::gdn_causal_conv1d_update));
-  m.impl("gdn_causal_conv1d_fn", TORCH_FN(vtl::gdn_causal_conv1d_fn));
-  m.impl("gdn_recurrent_decode", TORCH_FN(vtl::gdn_recurrent_decode));
-  m.impl("gdn_chunk_scan", TORCH_FN(vtl::gdn_chunk_scan));
 }
 
 // Overrides of vLLM's own _C ops (schemas defined by vllm._C_stable_libtorch, imported first).

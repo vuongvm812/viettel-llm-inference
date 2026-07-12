@@ -15,12 +15,10 @@ LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.local
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server.
 check:
 	python3 vtl/registry.py
-	PYTHONPATH=. python3 vtl/_prefix.py
 	PYTHONPATH=. python3 vtl/patches/quant_fp8.py
 	PYTHONPATH=. python3 vtl/patches/rms_norm_quant.py
 	PYTHONPATH=. python3 vtl/patches/dynamic_per_token_quant.py
 	PYTHONPATH=. python3 vtl/patches/silu_mul_quant.py
-	PYTHONPATH=. python3 vtl/patches/mul_sigmoid_quant.py
 	PYTHONPATH=. python3 vtl/patches/gdn_kernels.py
 	PYTHONPATH=. python3 vtl/patches/kv_cache_manager.py
 	PYTHONPATH=. python3 vtl/patches/sched_policy.py
@@ -36,9 +34,7 @@ check:
 # it happens to contain.
 KRUN := docker run --rm --gpus all -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
 KERNEL_TESTS := /bench/test_rms_norm_quant.py /bench/test_dynamic_per_token_quant.py \
-                /bench/test_silu_mul_quant.py /bench/test_mul_sigmoid_quant.py \
-                /bench/test_gdn_gated_rmsnorm.py /bench/test_gdn_causal_conv1d.py \
-                /bench/test_gdn_chunk_scan.py /bench/test_gdn_recurrent_decode.py
+                /bench/test_silu_mul_quant.py /bench/test_gdn_gated_rmsnorm.py
 PYTEST := pytest -q -p no:cacheprovider $(KERNEL_TESTS)
 
 ## Kernel correctness. Needs a GPU. Runs one oracle against our kernel AND against the

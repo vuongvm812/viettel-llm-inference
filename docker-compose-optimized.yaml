@@ -78,23 +78,7 @@ services:
       VTL_FP8_IGNORE: "lm_head,in_proj_a,in_proj_b,visual"
       VLLM_LOGGING_LEVEL: INFO
       VTL_ENABLE_RMS_NORM_QUANT: 1
-      # o_proj gate-mul fusion: attn_output*sigmoid(gate) -> per-token fp8 quant, fused into one
-      # kernel on the 6 full-attn + MTP layers. Default on (like the silu-mul down_proj fusion);
-      # kill-switch VTL_ENABLE_MUL_SIGMOID_QUANT=0, pattern-only toggle VTL_MUL_SIGMOID_FUSION=0.
-      # Confirm `Replaced N patterns` (N>0) in the activation_quant pass log + `make test-kernel`.
-      # VTL_ENABLE_MUL_SIGMOID_QUANT: 1   # default
-      #
-      # GDN custom kernels. VTL_ENABLE_GDN_KERNELS gates the whole family; the shipped
-      # gated-RMSNorm rides it. The scan/conv sub-kernels below are OPT-IN (fail-closed): each is
-      # OFF unless its VTL_GDN_* flag is explicitly 1, even with the parent on. They are
-      # RESEARCH-GRADE and UNVERIFIED against vLLM's Triton/CuteDSL -- arm one only after on-box
-      # parity (make test-kernel, incl. the vs-vLLM cross-check) AND a bench win, and confirm the
-      # mixer arg-mapping (recurrent/chunk are inert pass-throughs until then). The 0s below are
-      # explicit documentation; the code already defaults them off.
       VTL_ENABLE_GDN_KERNELS: 1
-      VTL_GDN_CONV1D: 1
-      VTL_GDN_RECURRENT: 0
-      VTL_GDN_CHUNK_SCAN: 0
     shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
