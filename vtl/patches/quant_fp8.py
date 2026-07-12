@@ -39,6 +39,9 @@ CHANNELWISE_ENV = "VTL_FP8_CHANNELWISE"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+# One-shot warning latch for the channelwise weight-load fallback (per process).
+_load_fallback_logged = False
+
 
 def parse_ignored_layers(raw: str | None) -> list[str]:
     """Comma-separated layer names to keep in bf16, e.g. ``lm_head,model.layers.0``."""
@@ -61,7 +64,9 @@ def _build_channelwise_method(quant_config, stock_method):
     """
     from vllm import _custom_ops as ops
     from vllm.model_executor.layers.quantization import fp8 as fp8_mod
-    from vllm.model_executor.layers.quantization.fp8 import Fp8OnlineLinearMethod
+    # Fp8LinearMethod is the stable base in every version; <=0.22's Fp8OnlineLinearMethod was
+    # a subclass, folded back into it by 0.25. Subclass the base and let config drive online.
+    from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
         kFp8StaticChannelSym,
     )
@@ -70,7 +75,7 @@ def _build_channelwise_method(quant_config, stock_method):
     if not fp8_mod.cutlass_fp8_supported():
         raise RuntimeError("CUTLASS FP8 unavailable; Marlin needs a scalar weight scale")
 
-    class ChannelwiseFp8OnlineLinearMethod(Fp8OnlineLinearMethod):
+    class ChannelwiseFp8LinearMethod(Fp8LinearMethod):
         def __init__(self, cfg) -> None:
             super().__init__(cfg)
             # Must be set before create_weights() calls init_fp8_linear_kernel(),
@@ -78,27 +83,40 @@ def _build_channelwise_method(quant_config, stock_method):
             self.weight_quant_key = kFp8StaticChannelSym
 
         def process_weights_after_loading(self, layer) -> None:
-            if getattr(layer, "_already_called_process_weights_after_loading", False):
-                return
-            if self.use_marlin:  # Marlin needs a scalar weight scale
+            # Runs during weight loading -- OUTSIDE get_quant_method's guard -- so it must not
+            # crash either: on any drift in the base's attrs/ops we fall back to the stock
+            # per-tensor path. (Weights are not mutated before the first call that could fail,
+            # so the fallback re-quantizes cleanly from the original bf16 weight.)
+            try:
+                if getattr(layer, "_already_called_process_weights_after_loading", False):
+                    return
+                if self.use_marlin:  # Marlin needs a scalar weight scale
+                    return super().process_weights_after_loading(layer)
+
+                assert not self.block_quant
+                layer.input_scale = None
+                # weight is [out_features, in_features]; "per token" over its rows is
+                # exactly per-output-channel.
+                qweight, weight_scale = ops.scaled_fp8_quant(
+                    layer.weight, scale=None, use_per_token_if_dynamic=True
+                )
+                # CUTLASS wants B column-major [K, N]. The kernel's own
+                # process_weights_after_loading only pads, it does not transpose.
+                replace_parameter(layer, "weight", qweight.t().data)
+                replace_parameter(layer, "weight_scale", weight_scale.data)
+                self.fp8_linear.process_weights_after_loading(layer)
+                layer._already_called_process_weights_after_loading = True
+            except Exception as exc:
+                global _load_fallback_logged
+                if not _load_fallback_logged:
+                    _load_fallback_logged = True
+                    log.warning(
+                        "vtl: channelwise weight-load failed (%s); stock per-tensor fp8", exc
+                    )
                 return super().process_weights_after_loading(layer)
 
-            assert not self.block_quant
-            layer.input_scale = None
-            # weight is [out_features, in_features]; "per token" over its rows is
-            # exactly per-output-channel.
-            qweight, weight_scale = ops.scaled_fp8_quant(
-                layer.weight, scale=None, use_per_token_if_dynamic=True
-            )
-            # CUTLASS wants B column-major [K, N]. The kernel's own
-            # process_weights_after_loading only pads, it does not transpose.
-            replace_parameter(layer, "weight", qweight.t().data)
-            replace_parameter(layer, "weight_scale", weight_scale.data)
-            self.fp8_linear.process_weights_after_loading(layer)
-            layer._already_called_process_weights_after_loading = True
-
-    upgraded = ChannelwiseFp8OnlineLinearMethod(quant_config)
-    upgraded.marlin_input_dtype = stock_method.marlin_input_dtype
+    upgraded = ChannelwiseFp8LinearMethod(quant_config)
+    upgraded.marlin_input_dtype = getattr(stock_method, "marlin_input_dtype", None)
     return upgraded
 
 
@@ -139,10 +157,12 @@ def apply() -> None:
             return cls()
 
         def get_quant_method(self, layer, prefix: str):
+            # Runs for EVERY Linear at load time -- it must NEVER raise, or the whole engine
+            # dies at model load. No vLLM symbols are imported at the top: names drift across
+            # versions (e.g. Fp8OnlineLinearMethod existed in <=0.22 but was folded into
+            # Fp8LinearMethod by 0.25), so every import is lazy + guarded and any failure
+            # degrades to whatever the parent returned.
             from vllm.model_executor.layers.linear import LinearBase
-            from vllm.model_executor.layers.quantization.fp8 import (
-                Fp8OnlineLinearMethod,
-            )
 
             method = super().get_quant_method(layer, prefix)
             if not isinstance(layer, LinearBase):
@@ -155,15 +175,22 @@ def apply() -> None:
             # quantizing the Mamba decay/beta path is a correctness break. Keeps big GDN
             # matmuls (in_proj_qkv/z, out_proj) and dense GEMMs on fp8.
             if prefix and any(pat and pat in prefix for pat in self.ignored_layers):
-                from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-                return UnquantizedLinearMethod()
+                try:
+                    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+                    return UnquantizedLinearMethod()
+                except Exception:
+                    return method  # can't force bf16 -> at least don't crash
 
-            if type(method) is not Fp8OnlineLinearMethod:
-                return method  # ignored layer (bf16) or fp8-serialized checkpoint
             if not channelwise_enabled(os.environ.get(CHANNELWISE_ENV)):
                 return method
 
+            # Upgrade the dynamic/online fp8 linear method to per-CHANNEL weight scales.
+            # Fp8LinearMethod is the stable base present in every version; the "online"
+            # (bf16-checkpoint, dynamic-activation) behaviour is what our config selects.
             try:
+                from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+                if not isinstance(method, Fp8LinearMethod):
+                    return method  # unquantized / ignored / serialized: leave as is
                 return _build_channelwise_method(self, method)
             except Exception as exc:
                 if not VtlFp8Config._fallback_logged:
