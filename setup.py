@@ -23,6 +23,7 @@ def _cuda_ext():
             "vtl/csrc/rms_norm_quant.cu",
             "vtl/csrc/dynamic_per_token_quant.cu",
             "vtl/csrc/silu_mul_quant.cu",
+            "vtl/csrc/mul_sigmoid_quant.cu",
             "vtl/csrc/gdn_gated_rmsnorm.cu",
             "vtl/csrc/torch_bindings.cpp",
         ],

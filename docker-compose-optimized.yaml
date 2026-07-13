@@ -75,10 +75,34 @@ services:
       - "8000:8000" # judge hits this -- MUST be :8000
     environment:
       VLLM_PLUGINS: vtl
-      VTL_FP8_IGNORE: "lm_head,in_proj_a,in_proj_b,visual"
       VLLM_LOGGING_LEVEL: INFO
-      VTL_ENABLE_RMS_NORM_QUANT: 1
-      VTL_ENABLE_GDN_KERNELS: 0
+      VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
+
+      # FP8 (vtl_fp8). Load-bearing: --quantization=vtl_fp8 aborts at startup if disabled.
+      VTL_ENABLE_FP8: 1
+      VTL_FP8_CHANNELWISE: 1                  # 1 = per-channel weight scales; 0 = stock per-tensor
+      VTL_FP8_IGNORE: "lm_head,in_proj_a,in_proj_b,visual"
+
+      # Per-patch kill-switches (all default ON). Each = VTL_ENABLE_<patch>.
+      VTL_ENABLE_RMS_NORM_QUANT: 1            # needs pass_config.fuse_norm_quant (set above) to fire
+      VTL_ENABLE_DYNAMIC_PER_TOKEN_QUANT: 1
+      VTL_ENABLE_SILU_MUL_QUANT: 1           # down_proj silu-mul + fp8 quant fusion (needs fuse_act_quant)
+      VTL_SILU_MUL_FUSION: 1                  # 1 = register the down_proj pattern; 0 = op only, unfused
+      VTL_ENABLE_KV_CACHE_MANAGER: 1
+      VTL_ENABLE_SCHED_POLICY: 1             # SJF prefill reorder
+
+      # GDN kernel family, ONE parent flag: gated-RMSNorm fused with the out_proj fp8 per-token
+      # quant (hits all 18 GDN layers every prefill token) + the o_proj sigmoid-mul fusion on the
+      # 6 full-attn + MTP layers. VTL_ENABLE_GDN_KERNELS arms/disarms all of it; the family flags
+      # below only take effect when it is 1. To arm on the H200: confirm `make test-kernel` parity,
+      # set the parent to 1, and check the logs for "FUSION installed" + "Replaced N patterns"
+      # (N>0). The graph fusions need fuse_norm_quant + fuse_act_quant (set in --compilation-config).
+      VTL_ENABLE_GDN_KERNELS: 1
+      VTL_ENABLE_MUL_SIGMOID_QUANT: 1         # patch default ON, but still gated by the parent above
+      VTL_GDN_RMSNORM_FUSION: 1   # 1=graph-fuse norm->out_proj fp8 quant (the win); 0=eager kernel only
+      VTL_MUL_SIGMOID_FUSION: 1   # 1=graph-fuse o_proj sigmoid-mul->quant; 0=op available but unfused
+
+      VTL_KERNEL_SYNC: 0                       # DEBUG only: 1 = cudaStreamSynchronize per kernel (slow)
     shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]

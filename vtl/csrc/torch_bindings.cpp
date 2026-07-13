@@ -38,8 +38,19 @@ void silu_and_mul_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor& 
                                           torch::Tensor const& input,
                                           std::optional<torch::Tensor> const& scale_ub);
 
+void mul_sigmoid_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor& scale,
+                                         torch::Tensor const& input, torch::Tensor const& gate,
+                                         std::optional<torch::Tensor> const& scale_ub);
+
 void gated_rmsnorm(torch::Tensor& result, torch::Tensor const& input,
-                   torch::Tensor const& gate, torch::Tensor const& weight, double epsilon);
+                   torch::Tensor const& gate, torch::Tensor const& weight, double epsilon,
+                   bool gate_is_silu);
+
+void gated_rmsnorm_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor& scale,
+                                           torch::Tensor const& input, torch::Tensor const& gate,
+                                           torch::Tensor const& weight, double epsilon,
+                                           int64_t num_heads, bool gate_is_silu,
+                                           std::optional<torch::Tensor> const& scale_ub);
 }  // namespace vtl
 
 TORCH_LIBRARY(vllm_cuda, m) {
@@ -54,8 +65,15 @@ TORCH_LIBRARY(vllm_cuda, m) {
       "silu_and_mul_dynamic_per_token_quant(Tensor! result, Tensor! scale, "
       "Tensor input, Tensor? scale_ub) -> ()");
   m.def(
+      "mul_sigmoid_dynamic_per_token_quant(Tensor! result, Tensor! scale, "
+      "Tensor input, Tensor gate, Tensor? scale_ub) -> ()");
+  m.def(
       "gated_rmsnorm(Tensor! result, Tensor input, Tensor gate, Tensor weight, "
-      "float epsilon) -> ()");
+      "float epsilon, bool gate_is_silu) -> ()");
+  m.def(
+      "gated_rmsnorm_dynamic_per_token_quant(Tensor! result, Tensor! scale, Tensor input, "
+      "Tensor gate, Tensor weight, float epsilon, int num_heads, bool gate_is_silu, "
+      "Tensor? scale_ub) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
@@ -64,7 +82,11 @@ TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
          TORCH_FN(vtl::dynamic_per_token_scaled_fp8_quant));
   m.impl("silu_and_mul_dynamic_per_token_quant",
          TORCH_FN(vtl::silu_and_mul_dynamic_per_token_quant));
+  m.impl("mul_sigmoid_dynamic_per_token_quant",
+         TORCH_FN(vtl::mul_sigmoid_dynamic_per_token_quant));
   m.impl("gated_rmsnorm", TORCH_FN(vtl::gated_rmsnorm));
+  m.impl("gated_rmsnorm_dynamic_per_token_quant",
+         TORCH_FN(vtl::gated_rmsnorm_dynamic_per_token_quant));
 }
 
 // Overrides of vLLM's own _C ops (schemas defined by vllm._C_stable_libtorch, imported first).
