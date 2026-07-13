@@ -10,15 +10,19 @@ name: viettel-llm-optimized
 #
 # This workload is prefill-bound. Prefix caching and prefill throughput are the
 # levers; speculative decoding touches only ~1% of the tokens.
+#
+# INT8 W8A8: vtl_int8 does online per-channel weight + dynamic per-token
+# activation quant from the BF16 checkpoint, using stock CutlassInt8ScaledMM.
+# No fused norm+quant (vLLM v0.25.0 has no INT8 fusion ops); activation quant
+# runs un-fused inside the kernel's apply_weights.
 
 services:
   model:
     image: unseenablefuture/awesome-badger:dev # submission: pin by @sha256:<digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
-      - python3 #Don't change this to vllm-server
-      - -m  #Don't change this to vllm-server
-      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+      - bash #Don't change this to vllm-server
+      - /opt/vtl/entrypoint.sh #Don't change this to vllm-server
     command:
       - -O2
       - --model=/model #Don't change this to vllm-server
@@ -27,61 +31,41 @@ services:
       - --port=8000 #Don't change this to vllm-server
 
       # Longest prompt is 27,331 tokens + 200 generated = 27,531 required.
-      # 16384 (baseline) rejects most of the trace; 262144 exceeds the model's
-      # derived limit and vLLM refuses to start without VLLM_ALLOW_LONG_MAX_MODEL_LEN.
       - --max-model-len=32768
-      - --gpu-memory-utilization=0.95 # 0.95 leaves no headroom for CUDA graph pools
+      - --gpu-memory-utilization=0.92 # headroom for CUDA graph pools during warmup
       - --tensor-parallel-size=1
 
       # The 6,388-token shared system prompt makes this the single biggest win:
       # ~31% of all prefill work disappears after the first request.
       - --enable-prefix-caching
       - --enable-chunked-prefill
-      - --max-num-seqs=16 # KV @p50 is 0.69 GB/req -> ~174 fit in bf16; sweep this
-      - --max-num-batched-tokens=16384 # prefill chunk size: TTFT vs prefill throughput
-
-      # vtl_fp8 is registered by vtl/patches/quant_fp8.py: online FP8 W8A8 with
-      # per-CHANNEL weight scales (stock fp8 is per-tensor). If that patch is
-      # disabled with VTL_ENABLE_FP8=0 the name stops resolving and vLLM aborts at
-      # startup -- use VTL_FP8_CHANNELWISE=0 to get stock behaviour instead.
-      - --quantization=vtl_fp8
+      # Trace sends 5 bursts of 20 requests, 25ms apart. max-num-seqs=16 queues
+      # 4 per burst -> TTFT > 1500ms -> S_ttft = 0. 32 admits all 20 at once.
+      # KV budget is 8x headroom (15.7GB working set vs ~120GB), so 32 is safe.
+      - --max-num-seqs=32
+      # 32768 tokens/step halves prefill steps vs 16384: 18700/1638 ≈ 11 vs 23.
+      # TBT impact is minimal (TPOT=18ms with 45ms ceiling, 27ms headroom).
+      - --max-num-batched-tokens=32768
+      - --quantization=vtl_int8
       - --kv-cache-dtype=fp8_e4m3 # halves decode KV bandwidth at 18.7K context
       - --attention-backend FLASHINFER
-
-      # Turns on RMSNormQuantFusionPass, which rewrites the [2048]-wide
-      # fused_add_rms_norm -> per-token-fp8-quant pairs (input_layernorm->in_proj/qkv and
-      # post_attention_layernorm->gate_up, on both GDN and full-attn layers) into a single
-      # _C::rms_norm_dynamic_per_token_quant node. (The [16]/[128]/[256] F32 per-head norms
-      # are a different op and not fused here.) vtl/patches/rms_norm_quant.py replaces
-      # that op's CUDA kernel with a single-pass one. Off by default because
-      # enable_norm_fusion() (vllm/config/vllm.py:99) otherwise leaves the fusion to
-      # Inductor -- so this swaps Inductor's Triton norm+quant for our hand-written kernel.
-      # A user-set pass_config survives the -O2 defaults: _set_config_default only fills
-      # fields still None (vllm/config/vllm.py:702).
-      #
-      # cudagraph_mode=FULL_AND_PIECEWISE: full-graph capture for pure-decode batches,
-      # piecewise for prefill/mixed (required with chunked prefill + async scheduling;
-      # plain FULL would fall back or error). Governs graph CAPTURE only, not FX rewriting,
-      # so RMSNormQuantFusionPass and the vtl._C kernel binding are unchanged. EXPERIMENT:
-      # decode is ~1% of this 101:1 trace, so upside is bounded -- keep only if ITL p50/p90
-      # drops with no TTFT/throughput regression, else revert this to PIECEWISE default.
-      # Re-warm (docker/cache/ was baked under PIECEWISE) and confirm the enum spelling:
-      #   python3 -c "from vllm.config import CUDAGraphMode; print(list(CUDAGraphMode))"
-      # fuse_act_quant runs ActivationQuantFusionPass; vtl/patches/silu_mul_quant.py adds a
-      # per-token silu_and_mul->quant pattern to it so down_proj fuses into our single kernel
-      # (reads gate|up once, drops the bf16 intermediate). Non-match is a no-op.
-      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
     ports:
       - "8000:8000" # judge hits this -- MUST be :8000
     environment:
       VLLM_PLUGINS: vtl
+      VTL_INT8_IGNORE: "lm_head,in_proj_a,in_proj_b,visual"
       VTL_FP8_IGNORE: "lm_head,in_proj_a,in_proj_b,visual"
       VLLM_LOGGING_LEVEL: INFO
-      VTL_ENABLE_RMS_NORM_QUANT: 1
+      # FP8 kernel overrides are off -- INT8 path doesn't use them.
+      VTL_ENABLE_RMS_NORM_QUANT: 0
+      VTL_ENABLE_SILU_MUL_QUANT: 0
+      VTL_ENABLE_DYNAMIC_PER_TOKEN_QUANT: 0
       VTL_ENABLE_GDN_KERNELS: 0
     shm_size: "2g"
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      # Don't pass until warmup completes -- the warmed marker file is touched
+      # after the entrypoint script finishes sending shape-covering requests.
+      test: ["CMD-SHELL", "test -f /opt/vtl/warmed && python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 10s
       timeout: 5s
       retries: 40
