@@ -7,3 +7,5 @@
 !README.md
 !vtl/
 !docker/cache/
+!docker/entrypoint.sh
+!docker/warmup.py

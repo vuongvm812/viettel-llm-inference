@@ -17,6 +17,7 @@ log = logging.getLogger("vtl")
 # so the buffer is live and the patch was a dead no-op.
 _MODULES: tuple[str, ...] = (
     "quant_fp8",
+    "quant_int8",
     "rms_norm_quant",
     "dynamic_per_token_quant",
     "silu_mul_quant",

@@ -19,6 +19,8 @@ FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 
 COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
+COPY docker/entrypoint.sh docker/warmup.py /opt/vtl/
+RUN chmod +x /opt/vtl/entrypoint.sh
 
 # Which SM cubins go into vtl._C. Without this, nvcc probes the build host -- which has no
 # GPU -- and guesses. A mismatch does NOT degrade gracefully: dlopen succeeds, the override
@@ -73,5 +75,5 @@ ENV VLLM_PLUGINS=vtl \
 # stall on the first request.
 COPY docker/cache/ /opt/vtl/cache/
 
-# No ENTRYPOINT: the compose file pins
-# `python3 -m vllm.entrypoints.openai.api_server` to stay diffable against baseline.
+# No ENTRYPOINT: the compose file pins `bash /opt/vtl/entrypoint.sh`, which wraps
+# `python3 -m vllm.entrypoints.openai.api_server` with a warmup preamble.

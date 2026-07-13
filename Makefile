@@ -16,6 +16,7 @@ LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.local
 check:
 	python3 vtl/registry.py
 	PYTHONPATH=. python3 vtl/patches/quant_fp8.py
+	PYTHONPATH=. python3 vtl/patches/quant_int8.py
 	PYTHONPATH=. python3 vtl/patches/rms_norm_quant.py
 	PYTHONPATH=. python3 vtl/patches/dynamic_per_token_quant.py
 	PYTHONPATH=. python3 vtl/patches/silu_mul_quant.py
@@ -89,6 +90,9 @@ verify:
 	@grep -q "registered quantization method 'vtl_fp8'" /tmp/vtl-verify.log \
 	  && echo "OK   vtl_fp8 registered" \
 	  || { echo "FAIL vtl_fp8 not registered"; exit 1; }
+	@grep -q "registered quantization method 'vtl_int8'" /tmp/vtl-verify.log \
+	  && echo "OK   vtl_int8 registered" \
+	  || { echo "WARN vtl_int8 not registered (expected if --quantization=vtl_fp8)"; }
 	@grep -q "channelwise fp8 unavailable" /tmp/vtl-verify.log \
 	  && echo "WARN channelwise fp8 fell back to stock per-tensor" \
 	  || echo "OK   channelwise fp8 active"
