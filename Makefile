@@ -1,4 +1,4 @@
-IMAGE ?= linhthuydanhbo1234/vtl-vllm
+IMAGE ?= unseenablefuture/awesome-badger
 TAG ?= dev
 TARGET ?= http://localhost:8000
 # The H200 box is amd64 and the vLLM base image is multi-arch. Never let the build
@@ -17,9 +17,11 @@ check:
 	python3 vtl/registry.py
 	PYTHONPATH=. python3 vtl/patches/quant_fp8.py
 	PYTHONPATH=. python3 vtl/patches/rms_norm_quant.py
+	PYTHONPATH=. python3 vtl/patches/dynamic_per_token_quant.py
+	PYTHONPATH=. python3 vtl/patches/silu_mul_quant.py
+	PYTHONPATH=. python3 vtl/patches/gdn_kernels.py
 	PYTHONPATH=. python3 vtl/patches/kv_cache_manager.py
 	PYTHONPATH=. python3 vtl/patches/sched_policy.py
-	PYTHONPATH=. python3 vtl/patches/inputs_embeds_optional.py
 	python3 bench/trace_stats.py --self-check
 	python3 bench/metrics.py
 	@python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
@@ -31,7 +33,9 @@ check:
 # docker silently pulls a stale published image and the tests run against whatever kernel
 # it happens to contain.
 KRUN := docker run --rm --gpus all -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
-PYTEST := pytest -q -p no:cacheprovider /bench/test_rms_norm_quant.py
+KERNEL_TESTS := /bench/test_rms_norm_quant.py /bench/test_dynamic_per_token_quant.py \
+                /bench/test_silu_mul_quant.py /bench/test_gdn_gated_rmsnorm.py
+PYTEST := pytest -q -p no:cacheprovider $(KERNEL_TESTS)
 
 ## Kernel correctness. Needs a GPU. Runs one oracle against our kernel AND against the
 ## stock one -- importing vtl._C overrides _C process-wide, so they cannot coexist and
@@ -43,8 +47,10 @@ test-kernel: build
 
 ## Kernel microbenchmark at the trace's real shapes. Needs a GPU.
 bench-kernel: build
-	$(KRUN) 'python3 /bench/test_rms_norm_quant.py && \
-	  VTL_SKIP_EXT=1 python3 /bench/test_rms_norm_quant.py'
+	$(KRUN) 'for t in $(KERNEL_TESTS); do \
+	    echo "=== $$t (vtl)"; python3 $$t; \
+	    echo "=== $$t (stock)"; VTL_SKIP_EXT=1 python3 $$t; \
+	  done'
 
 ## Pinpoint a memory fault. VTL_KERNEL_SYNC makes the kernel synchronise after every launch
 ## and, on a fault, raise with the exact shape and path (fast/generic, dtype, stride,
@@ -59,7 +65,7 @@ DBG_KRUN := docker run --rm --gpus all -e VTL_KERNEL_SYNC=1 -e CUDA_LAUNCH_BLOCK
               -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
 debug-kernel: build
 	$(DBG_KRUN) 'pip install -q pytest && \
-	  python3 -m pytest -q -p no:cacheprovider -x /bench/test_rms_norm_quant.py \
+	  python3 -m pytest -q -p no:cacheprovider -x $(KERNEL_TESTS) \
 	  $(if $(T),-k $(T),)'
 
 stats:
@@ -104,8 +110,21 @@ verify:
 	   echo "OK   rms_norm+quant fusion replaced $$n patterns (each one calls our kernel)"; \
 	 fi
 
+# --provenance=false --sbom=false: skip the SBOM/provenance attestation manifest and the
+# single-entry manifest LIST buildx would otherwise wrap a one-platform image in -- pure export
+# overhead here, and the manifest-list form makes some `docker pull`s slower. The base image
+# layers still dominate a first push; that is a one-time cost (Docker Hub dedups by digest, so
+# later pushes upload only the changed vtl layer). For code iteration prefer `make build`
+# (local --load, no registry round-trip) and only `make push` for the submission.
+# NOCACHE=--no-cache forces a full rebuild: re-runs pip/nvcc so the CURRENT kernels are
+# recompiled and every COPY is redone, instead of reusing cached layers. The base FROM image
+# stays cached (pulled, not built). Use when you must be sure the latest vtl code is baked in:
+#   make push NOCACHE=--no-cache
+NOCACHE ?=
+BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
+
 build:
-	docker buildx build --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --load -t $(IMAGE):$(TAG) .
+	docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --load -t $(IMAGE):$(TAG) .
 	@docker inspect $(IMAGE):$(TAG) --format 'built {{.Os}}/{{.Architecture}}'
 
 up:
@@ -127,7 +146,7 @@ warm:
 ## buildx --push writes the manifest straight to the registry, so the pushed image
 ## is $(PLATFORM) regardless of what this machine is.
 push:
-	docker buildx build --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --push -t $(IMAGE):$(TAG) .
+	docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --push -t $(IMAGE):$(TAG) .
 	@echo "pin this digest in docker-compose-optimized.yaml:"
 	@docker buildx imagetools inspect $(IMAGE):$(TAG) --format '{{.Manifest.Digest}}'
 

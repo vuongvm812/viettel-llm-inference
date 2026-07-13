@@ -1,5 +1,13 @@
 # sndr_core_engine patch port — ledger
 
+> **SUPERSEDED (stack change).** This ledger's premise — *stock vLLM v0.22.1 + a dense
+> `Qwen2ForCausalLM`* — no longer holds. The served model is `Qwen3_5ForConditionalGeneration`
+> (a qwen3_5 VL hybrid: linear-attn/GDN + full-attn + MTP + vision) on **vLLM v0.25.0**. So
+> the "GDN/FLA", "MoE", and "MTP" families the table below marks *skipped as irrelevant* are
+> now **in scope**, and `inputs_embeds_optional` was **removed** (dead no-op on a VL model).
+> See `.claude/plans/valiant-moseying-wreath.md` for the current plan. Treat the rows below
+> as historical.
+
 Record of which Genesis/SNDR (`sndr_core_engine`) patches were evaluated for our
 `vtl` overlay and why. **Stack:** stock `vllm/vllm-openai:v0.22.1` + `vtl`, serving
 `hf-model/` = `Qwen2ForCausalLM` — a **dense** GQA transformer (no MoE, no GDN/linear

@@ -1,6 +1,6 @@
 services:
   model:
-    image: vllm/vllm-openai:v0.22.1
+    image: vllm/vllm-openai:v0.25.0   # v0.22.1 can't load qwen3_5 (VL hybrid); v0.25.0 registers it
     entrypoint:
       - python3 #Don't change this to vllm-server
       - -m  #Don't change this to vllm-server

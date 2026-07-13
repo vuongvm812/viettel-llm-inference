@@ -10,6 +10,13 @@ exactly. So instead we SUBCLASS the real manager and add read-only signals the s
 consumes for cache-aware + memory-aware ordering. Allocation/caching is 100% inherited;
 output is unchanged.
 
+Hybrid-KV note (qwen3_5): the served model has multiple KV cache groups (full-attention +
+GDN/mamba state), so ``coordinator.find_longest_cache_hit`` / ``block_pool.get_num_free_blocks``
+may behave differently than the single-group case these signals assume. That is a PERF concern,
+not a correctness one: both are read-only and only feed scheduling ORDER, and both degrade on
+any API mismatch (hit-walk failure -> prompt-length; free_blocks failure -> unlimited). Worst
+case is a suboptimal admission order, never a wrong result. Re-validate the benefit on the box.
+
 The scheduler constructs ``KVCacheManager`` at exactly one call site
 (``Scheduler.__init__``), by the name imported into ``vllm.v1.core.sched.scheduler``.
 Rebinding that name to our subclass makes every scheduler (sync and async) build ours,

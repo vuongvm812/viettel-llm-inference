@@ -13,6 +13,12 @@ Output-preserving: same requests, same per-request sampling; only admission orde
 TTFT changes. Base ``Scheduler.schedule()`` is inherited unchanged by ``AsyncScheduler``,
 so one patch covers both sync and async scheduling.
 
+Hybrid-KV note (qwen3_5): with multiple KV cache groups (full-attention + GDN state), the
+``find_longest_cache_hit`` / ``usage`` / ``free_blocks`` reads may mis-estimate. Because this
+patch ONLY reorders the waiting queue (output is identical), a mis-estimate can only produce a
+suboptimal order, never a wrong result -- and every read degrades on failure (to prompt-length /
+slack). Re-validate the ordering win on the box; the env flag reverts to stock FCFS.
+
 Set ``VTL_ENABLE_SCHED_POLICY=0`` to serve stock FCFS.
 """
 
@@ -115,12 +121,15 @@ def apply() -> None:
 
     original = Scheduler.schedule
 
-    def schedule(self):
+    # *args/**kwargs passthrough: schedule()'s signature drifts across versions -- v0.25.0
+    # passes should_throttle_prefills. Forward whatever vLLM gives so the wrapper never breaks
+    # the call convention; we only reorder the waiting queue first.
+    def schedule(self, *args, **kwargs):
         try:
             _reorder_waiting(self.waiting, self.kv_cache_manager)
         except Exception:
             log.exception("vtl: sched_policy reorder failed, using stock order")
-        return original(self)
+        return original(self, *args, **kwargs)
 
     Scheduler.schedule = mark_patched(schedule, original)
     log.info(

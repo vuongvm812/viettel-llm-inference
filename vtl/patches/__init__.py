@@ -12,12 +12,17 @@ import logging
 log = logging.getLogger("vtl")
 
 # Patch modules, in apply order. Add names here as they land.
+# inputs_embeds_optional removed: it dropped the inputs_embeds buffer on the assumption of a
+# dense text-only model; the served model is a qwen3_5 VL hybrid (supports_mm_inputs=True),
+# so the buffer is live and the patch was a dead no-op.
 _MODULES: tuple[str, ...] = (
     "quant_fp8",
     "rms_norm_quant",
+    "dynamic_per_token_quant",
+    "silu_mul_quant",
+    "gdn_kernels",
     "kv_cache_manager",
     "sched_policy",
-    "inputs_embeds_optional",
 )
 
 for _name in _MODULES:
