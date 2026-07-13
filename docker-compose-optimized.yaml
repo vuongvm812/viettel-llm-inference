@@ -21,8 +21,9 @@ services:
     image: unseenablefuture/awesome-badger:dev # submission: pin by @sha256:<digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
-      - bash #Don't change this to vllm-server
-      - /opt/vtl/entrypoint.sh #Don't change this to vllm-server
+      - python3 #Don't change this to vllm-server
+      - -m  #Don't change this to vllm-server
+      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
     command:
       - -O2
       - --model=/model #Don't change this to vllm-server
@@ -32,7 +33,7 @@ services:
 
       # Longest prompt is 27,331 tokens + 200 generated = 27,531 required.
       - --max-model-len=32768
-      - --gpu-memory-utilization=0.92 # headroom for CUDA graph pools during warmup
+      - --gpu-memory-utilization=0.95 # 0.95 leaves no headroom for CUDA graph pools
       - --tensor-parallel-size=1
 
       # The 6,388-token shared system prompt makes this the single biggest win:
@@ -64,9 +65,7 @@ services:
       VTL_ENABLE_GDN_KERNELS: 0
     shm_size: "2g"
     healthcheck:
-      # Don't pass until warmup completes -- the warmed marker file is touched
-      # after the entrypoint script finishes sending shape-covering requests.
-      test: ["CMD-SHELL", "test -f /opt/vtl/warmed && python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
       timeout: 5s
       retries: 40
