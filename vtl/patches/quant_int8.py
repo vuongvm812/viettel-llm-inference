@@ -163,12 +163,11 @@ def apply() -> None:
         _fallback_logged = False
 
         def __init__(self, ignored_layers: list[str] | None = None) -> None:
-            super().__init__(
-                ignored_layers=(
-                    ignored_layers
-                    if ignored_layers is not None
-                    else parse_ignored_layers(os.environ.get(IGNORE_ENV))
-                ),
+            super().__init__()
+            self.ignored_layers = (
+                ignored_layers
+                if ignored_layers is not None
+                else parse_ignored_layers(os.environ.get(IGNORE_ENV))
             )
             self.packed_modules_mapping: dict[str, list[str]] = {}
 
