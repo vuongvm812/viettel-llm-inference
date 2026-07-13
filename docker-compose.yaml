@@ -37,7 +37,7 @@ services:
       # ~31% of all prefill work disappears after the first request.
       - --enable-prefix-caching
       - --enable-chunked-prefill
-      - --max-num-seqs=20 # 256->64 raised score by cutting TBT; keep walking down (next: 32)
+      - --max-num-seqs=16 # 256->64 raised score by cutting TBT; keep walking down (next: 32)
       - --max-num-batched-tokens=16384 # prefill chunk size: TTFT vs prefill throughput
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
