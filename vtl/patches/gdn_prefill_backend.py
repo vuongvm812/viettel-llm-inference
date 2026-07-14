@@ -225,19 +225,30 @@ def _install_chunk_scan_route(cls) -> None:  # noqa: ANN001
             S = int(qsl.numel()) - 1
             init = None
             if initial_state is not None:
-                # per-seq state; tolerate a leading batch=1 by reshaping to [S,H,D,D].
-                init = initial_state.to(torch.float32).contiguous().reshape(S, H, D, D)
+                # vLLM state is [N,H,V,K] (fla/ops/chunk.py); our kernel is key-major [S,H,K,V], so
+                # transpose the last two dims on the way in. (Only matters for chunked prefill /
+                # non-None initial_state; verified by the carry test in bench/test_gdn_chunk_scan.)
+                init = (initial_state.to(torch.float32).reshape(S, H, D, D)
+                        .transpose(-1, -2).contiguous())
             o = torch.empty(L, H, D, dtype=q3.dtype, device=q3.device)
             final_state = torch.empty(S, H, D, D, dtype=torch.float32, device=q3.device)
             torch.ops.vllm_cuda.gdn_chunk_scan(
                 o, q3.contiguous(), k3.contiguous(), v3.contiguous(),
                 g2.to(torch.float32).contiguous(), b2.to(torch.float32).contiguous(),
                 qsl, init, final_state, bool(use_qk_l2norm_in_kernel))
+            # vLLM's chunk_gated_delta_rule defaults scale = head_dim**-0.5 (fla/ops/chunk.py) and
+            # stock relies on that default -- our op computes o=qᵀS unscaled, so apply it here.
+            # scale on the output == scale on q (q only appears in o), and it is applied AFTER the
+            # in-kernel l2norm, so this is exact regardless of qk_l2norm.
+            o.mul_(float(D) ** -0.5)
             if core_attn_out is not None:  # match stock: copy into the caller's buffer
                 o_flat = o.reshape(-1)
                 co_flat = core_attn_out.reshape(-1)
                 co_flat[: o_flat.numel()].copy_(o_flat)
-            return o.unsqueeze(0), (final_state if output_final_state else None)
+            # Return final_state in vLLM's [N,H,V,K] layout (transpose back from our [S,H,K,V]) so
+            # the next chunk reads it correctly from the state cache.
+            fs = final_state.transpose(-1, -2).contiguous() if output_final_state else None
+            return o.unsqueeze(0), fs
         except Exception as exc:  # any drift -> device-safe stock, never crash the model
             log.warning("vtl: gdn_chunk_scan route bailed (%s); stock backend", exc)
             return _stock(self, q, k, v, g, beta, initial_state, output_final_state,
