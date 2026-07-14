@@ -150,7 +150,7 @@ down:
 WARM_CONCURRENCY ?= 16
 WARM_REQS ?= 32
 warm:
-	$(LOCAL) up -d --build
+	$(LOCAL) up -d --build --wait   # --wait blocks until the healthcheck passes; replay 404s a booting API otherwise
 	python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --limit 4 --out /dev/null
 	python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	  --closed-loop $(WARM_CONCURRENCY) --limit $(WARM_REQS) --out /dev/null
