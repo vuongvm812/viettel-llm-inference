@@ -51,6 +51,12 @@ void gated_rmsnorm_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor&
                                            torch::Tensor const& weight, double epsilon,
                                            int64_t num_heads, bool gate_is_silu,
                                            std::optional<torch::Tensor> const& scale_ub);
+
+void gdn_chunk_scan(torch::Tensor& o, torch::Tensor const& q, torch::Tensor const& k,
+                    torch::Tensor const& v, torch::Tensor const& g, torch::Tensor const& beta,
+                    torch::Tensor const& query_start_loc,
+                    std::optional<torch::Tensor> const& initial_state,
+                    torch::Tensor& final_state, bool qk_l2norm);
 }  // namespace vtl
 
 TORCH_LIBRARY(vllm_cuda, m) {
@@ -74,6 +80,12 @@ TORCH_LIBRARY(vllm_cuda, m) {
       "gated_rmsnorm_dynamic_per_token_quant(Tensor! result, Tensor! scale, Tensor input, "
       "Tensor gate, Tensor weight, float epsilon, int num_heads, bool gate_is_silu, "
       "Tensor? scale_ub) -> ()");
+  // GDN prefill scan (own op; correctness-first sequential baseline, WY-parallel body is future
+  // work). Routed via vtl/patches/gdn_prefill_backend.py behind VTL_GDN_CHUNK_SCAN.
+  m.def(
+      "gdn_chunk_scan(Tensor! o, Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
+      "Tensor query_start_loc, Tensor? initial_state, Tensor! final_state, "
+      "bool qk_l2norm) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
@@ -87,6 +99,7 @@ TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
   m.impl("gated_rmsnorm", TORCH_FN(vtl::gated_rmsnorm));
   m.impl("gated_rmsnorm_dynamic_per_token_quant",
          TORCH_FN(vtl::gated_rmsnorm_dynamic_per_token_quant));
+  m.impl("gdn_chunk_scan", TORCH_FN(vtl::gdn_chunk_scan));
 }
 
 // Overrides of vLLM's own _C ops (schemas defined by vllm._C_stable_libtorch, imported first).

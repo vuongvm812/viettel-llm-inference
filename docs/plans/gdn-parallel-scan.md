@@ -1,8 +1,24 @@
 # Future work: chunk-parallel GDN scan on H200
 
-Status: **design only, not implemented.** Opt-in, profile-gated. Attempt only if an on-box
-profile shows the GDN prefill scan is a top cost AND you have time to beat a hand-tuned
-incumbent. High risk of no win.
+Status: **scaffold implemented, perf body pending.** The op, wiring, flags, and parity test now
+exist as a default-off sequential baseline (see "Wiring & gates" below); the chunk-parallel
+tensor-core body — the only part that can actually win — is NOT written. Opt-in, profile-gated:
+attempt the parallel body only if an on-box profile shows the GDN prefill scan is a top cost AND
+you have time to beat a hand-tuned incumbent. High risk of no win.
+
+**What ships today (fail-closed, default OFF):**
+- `vllm_cuda::gdn_chunk_scan` — a SEQUENTIAL per-token recurrence (`vtl/csrc/gdn/chunk_scan.cu`).
+  Correctness-first; will NOT beat the chunked incumbent on long prefills. It is the parity
+  reference and the base to build the WY body on.
+- `vtl/patches/gdn_prefill_backend.py` — routes the prefill scan to that op behind
+  `VTL_ENABLE_GDN_KERNELS` + `VTL_GDN_CHUNK_SCAN`, and pins the stock backend for A/B via
+  `VTL_GDN_PREFILL_BACKEND ∈ {stock,flashinfer,cutedsl,triton}`.
+- `bench/test_gdn_chunk_scan.py` — parity vs a pure-torch oracle (wired into `make test-kernel`).
+- Both compose files expose `VTL_GDN_PREFILL_BACKEND` + `VTL_GDN_CHUNK_SCAN` at their defaults.
+
+**Remaining (the actual win):** on-box Phase-0 profile; A/B the stock backends; then the
+CUTLASS/CuteDSL chunk-parallel WY body below (raw `wmma`/`mma.sync` fallback in
+`docs/improvements/gdn-scan-raw-mma.md`).
 
 ## Why this is hard (read first)
 
@@ -58,11 +74,17 @@ cumulative log-decay), and the `beta` placement on the box before trusting parit
 
 ## Wiring & gates (when/if implemented)
 
-- New op `vllm_cuda::gdn_chunk_scan_parallel(...)`, own op (parity-testable side-by-side).
-- Route via `ChunkGatedDeltaRule.forward_cuda` (or the `torch.ops.vllm.qwen_gdn_attention_core`
-  path) behind `VTL_ENABLE_GDN_KERNELS` + a dedicated sub-flag (fail-closed: stock unless armed).
-- Bench gate: add `bench/test_gdn_chunk_scan.py` cross-checking against FLA/FlashInfer, and only
-  enable after it BOTH passes parity AND wins the on-box micro-bench + trace replay.
+- Op `vllm_cuda::gdn_chunk_scan(...)`, own op (parity-testable side-by-side) —
+  `vtl/csrc/gdn/chunk_scan.cu`, registered in `vtl/csrc/torch_bindings.cpp`. **Done** (sequential
+  body). The WY-parallel version replaces the body under the same op name (the aspirational
+  `_parallel` suffix was dropped — one op, evolving body). `Dk=Dv=128`, `[L,H,D]` packed varlen.
+- Routed via `ChunkGatedDeltaRule.forward_cuda` behind `VTL_ENABLE_GDN_KERNELS` +
+  `VTL_GDN_CHUNK_SCAN` (fail-closed: stock unless armed) — `vtl/patches/gdn_prefill_backend.py`.
+  **Done.** The shim bails to stock on any layout/convention mismatch (esp. the `g` gate
+  convention, which must be reconciled on the box).
+- Bench gate: `bench/test_gdn_chunk_scan.py` (in `make test-kernel`/`bench-kernel`) — parity vs a
+  pure-torch oracle **done**; the definitive cross-check vs FLA/FlashInfer + the perf win are the
+  on-box A/B. Only enable after it BOTH passes parity AND wins the micro-bench + trace replay.
 
 ## Bar
 

@@ -71,6 +71,13 @@ services:
       VTL_GDN_RMSNORM_FUSION: 1   # 1=graph-fuse norm->out_proj fp8 quant (the win); 0=eager kernel only
       VTL_MUL_SIGMOID_FUSION: 1   # 1=graph-fuse o_proj sigmoid-mul->quant; 0=op available but unfused
 
+      # GDN prefill-scan A/B levers (both ride the parent above; default = stock FlashInfer).
+      # See docs/plans/gdn-parallel-scan.md. A/B by editing these -- no code change needed.
+      VTL_GDN_PREFILL_BACKEND: stock  # stock|flashinfer|cutedsl|triton -- pin the prefill scan backend
+      VTL_GDN_CHUNK_SCAN: 0           # 1 = route prefill scan to vtl's own gdn_chunk_scan CUDA op
+                                      #     (SEQUENTIAL baseline -- do NOT enable until the on-box
+                                      #     `make bench-kernel` A/B beats stock; see the plan doc)
+
       VTL_KERNEL_SYNC: 0                       # DEBUG only: 1 = cudaStreamSynchronize per kernel (slow)
     shm_size: "2g"
     healthcheck:
