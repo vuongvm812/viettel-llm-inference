@@ -25,6 +25,7 @@ services:
       - --served-model-name=Qwen3.5-2B #Don't change this to vllm-server
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
+      - --language-model-only
 
       # Longest prompt is 27,331 tokens + 200 generated = 27,531 required.
       # 16384 (baseline) rejects most of the trace; 262144 exceeds the model's
