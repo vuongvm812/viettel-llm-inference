@@ -139,9 +139,21 @@ down:
 ## torch.compile needs a real GPU, so `docker build` cannot warm its cache. Boot the
 ## image, drive enough traffic to trigger compile + CUDA graph capture + FlashInfer
 ## autotune, then copy the caches back into the build context and rebuild.
+##
+## Two passes on purpose. The open-loop --limit 4 warms the low-concurrency shapes.
+## The closed-loop pass then SATURATES a full batch (= --max-num-seqs in
+## docker-compose-optimized.yaml) so the multi-seq Triton kernels compile into the
+## cache too -- notably FlashInfer's batch_memcpy_kernel and vLLM's _zero_kv_blocks_kernel,
+## which only fire once a real batch forms and KV blocks churn. Without this pass they
+## JIT on the judge's first saturated batch and spike latency. WARM_REQS > concurrency
+## forces a second wave so blocks get freed/zeroed (triggers _zero_kv_blocks_kernel).
+WARM_CONCURRENCY ?= 16
+WARM_REQS ?= 32
 warm:
 	$(LOCAL) up -d --build
 	python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --limit 4 --out /dev/null
+	python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	  --closed-loop $(WARM_CONCURRENCY) --limit $(WARM_REQS) --out /dev/null
 	docker cp "$$($(LOCAL) ps -q model)":/opt/vtl/cache/. docker/cache/
 	$(LOCAL) down
 	$(MAKE) build
