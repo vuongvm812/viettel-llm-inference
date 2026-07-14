@@ -67,13 +67,21 @@ def run(q, k, v, g, beta, qsl, init_state, l2norm):
     return o, final
 
 
+def _unit(x):
+    """l2-normalize along the last dim, like the model's qk_l2norm. Real q,k reaching the GDN scan
+    are unit-norm; with raw randn (||k||~sqrt(D)) the delta-rule state OVERFLOWS over long
+    sequences (that was the 6e14 / NaN in earlier runs -- a bad-input artifact, not a kernel bug)."""
+    xf = x.float()
+    return (xf / xf.norm(dim=-1, keepdim=True).clamp_min(1e-6)).to(x.dtype)
+
+
 def _make(seqlens, H, D, dtype, with_init):
     torch.manual_seed(0)
     L = sum(seqlens)
     qsl = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32,
                        device="cuda")
-    q = torch.randn(L, H, D, dtype=dtype, device="cuda")
-    k = torch.randn(L, H, D, dtype=dtype, device="cuda")
+    q = _unit(torch.randn(L, H, D, dtype=dtype, device="cuda"))
+    k = _unit(torch.randn(L, H, D, dtype=dtype, device="cuda"))
     v = torch.randn(L, H, D, dtype=dtype, device="cuda")
     g = -torch.rand(L, H, dtype=torch.float32, device="cuda")  # log-decay <= 0
     beta = torch.rand(L, H, dtype=torch.float32, device="cuda")
@@ -95,7 +103,9 @@ def test_matches_reference(dtype, seqlens, with_init, l2norm):
     exp_o, exp_final = reference(q, k, v, g, beta, qsl, init, l2norm)
     otol = dict(rtol=3e-2, atol=3e-2) if dtype == torch.bfloat16 else dict(rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(got_o.float(), exp_o.float(), **otol)
-    torch.testing.assert_close(got_final, exp_final, rtol=1e-3, atol=1e-3)
+    # final_state accumulates over the sequence; bf16 reduction-order drift compounds, so use the
+    # same dtype-scaled tolerance as the output rather than a fixed tight one.
+    torch.testing.assert_close(got_final, exp_final, **otol)
 
 
 def _import_vllm_ref():
@@ -134,8 +144,10 @@ def test_matches_vllm_chunk_gated_delta_rule():
 
     torch.manual_seed(0)
     H, D, T = 16, 128, 128
-    q = torch.randn(1, T, H, D, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(1, T, H, D, dtype=torch.bfloat16, device="cuda")
+    # Prefill passes use_qk_l2norm_in_kernel=False because the module already l2-normed q,k -- feed
+    # unit-norm inputs to match, else the unnormalized recurrence overflows to NaN.
+    q = _unit(torch.randn(1, T, H, D, dtype=torch.bfloat16, device="cuda"))
+    k = _unit(torch.randn(1, T, H, D, dtype=torch.bfloat16, device="cuda"))
     v = torch.randn(1, T, H, D, dtype=torch.bfloat16, device="cuda")
     g_log = -torch.rand(1, T, H, dtype=torch.float32, device="cuda")  # log-decay <= 0
     beta = torch.rand(1, T, H, dtype=torch.float32, device="cuda")
@@ -170,8 +182,8 @@ def test_chunked_carry_matches_vllm():
     torch.manual_seed(0)
     H, D, T = 16, 128, 128
     half = T // 2
-    q = torch.randn(1, T, H, D, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(1, T, H, D, dtype=torch.bfloat16, device="cuda")
+    q = _unit(torch.randn(1, T, H, D, dtype=torch.bfloat16, device="cuda"))
+    k = _unit(torch.randn(1, T, H, D, dtype=torch.bfloat16, device="cuda"))
     v = torch.randn(1, T, H, D, dtype=torch.bfloat16, device="cuda")
     g_log = -torch.rand(1, T, H, dtype=torch.float32, device="cuda")
     beta = torch.rand(1, T, H, dtype=torch.float32, device="cuda")
