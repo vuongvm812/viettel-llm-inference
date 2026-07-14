@@ -17,6 +17,16 @@ ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.0
 
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 
+# jemalloc for host-side malloc: less fragmentation/contention and tighter RSS than
+# glibc for the prefix-cache/KV-manager metadata churn of this prefill-bound workload.
+# GPU allocs are unaffected (those go through PYTORCH_CUDA_ALLOC_CONF). Preloaded via
+# ENV below. The test -f fails the build now if the base ever moves the lib, instead of
+# LD_PRELOAD silently no-op'ing at the judge's run.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libjemalloc2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && test -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+
 COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
 
@@ -66,7 +76,9 @@ ENV VLLM_PLUGINS=vtl \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512 \
     CUDA_MODULE_LOADING=LAZY \
     OMP_NUM_THREADS=1 \
-    PYTHONHASHSEED=0
+    PYTHONHASHSEED=0 \
+    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+    MALLOC_CONF=background_thread:true,metadata_thp:auto,dirty_decay_ms:0,muzzy_decay_ms:0
 
 # Warm torch.compile / Triton / FlashInfer caches, produced by `make warm` on a GPU
 # box. Empty on a cold build -- the server still boots, it just pays the compile
