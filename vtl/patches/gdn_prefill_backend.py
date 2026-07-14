@@ -63,6 +63,35 @@ def _chunk_scan_enabled() -> bool:
     return os.environ.get("VTL_GDN_CHUNK_SCAN", "0").strip().lower() in _TRUTHY
 
 
+# flashinfer + cutedsl gated-delta-rule prefill kernels are SM90 (Hopper) ONLY -- forcing them on
+# an Ampere box (device major 8) raises "delta rule kernel does not support this device major
+# version: 8". vLLM's own _resolve_gdn_prefill_backend guards this; our pin must too, else it
+# bypasses the guard and crashes the server.
+_HOPPER_ONLY = frozenset({"flashinfer", "cutedsl"})
+
+
+def _device_major() -> int | None:
+    """CUDA compute-capability major, or None if it can't be determined (no GPU / CPU self-check)."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_capability()[0]
+    except Exception:
+        pass
+    return None
+
+
+def _backend_supported(backend: str) -> bool:
+    """False only when we can POSITIVELY tell the device is pre-Hopper and the backend needs SM90.
+    Unknown capability (CPU self-check) -> allow; the real gate is on the box."""
+    if backend in _HOPPER_ONLY:
+        major = _device_major()
+        if major is not None and major < 9:
+            return False
+    return True
+
+
 _fake_registered = False
 
 
@@ -96,30 +125,78 @@ def _target_method(cls) -> str | None:  # noqa: ANN001
             log.warning("vtl: VTL_GDN_PREFILL_BACKEND=%r not in %s; leaving stock",
                         choice, sorted(_BACKEND_METHOD))
             return None
+        if not _backend_supported(choice):
+            log.warning("vtl: VTL_GDN_PREFILL_BACKEND=%r needs a Hopper (SM90+) GPU but this "
+                        "device is major %s; leaving stock (vLLM will use Triton/FLA)",
+                        choice, _device_major())
+            return None
     return want if hasattr(cls, want) else None
+
+
+_shapes_dumped = False
+
+
+def _dump_shapes(**tensors) -> None:  # noqa: ANN003
+    """Log the real forward_cuda arg shapes/dtypes ONCE. This is how we learn vLLM v0.25.0's actual
+    GDN layout + gate convention -- paste this line back to finish the kernel wiring."""
+    global _shapes_dumped
+    if _shapes_dumped:
+        return
+    _shapes_dumped = True
+
+    def desc(t):  # noqa: ANN001
+        if t is None:
+            return "None"
+        try:
+            return f"{tuple(t.shape)}:{str(t.dtype).replace('torch.', '')}"
+        except Exception:
+            return type(t).__name__
+
+    log.info("vtl: GDN forward_cuda shapes -> %s",
+             {k: desc(v) for k, v in tensors.items()})
 
 
 def _install_chunk_scan_route(cls) -> None:  # noqa: ANN001
     """Wrap ChunkGatedDeltaRule.forward_cuda so it calls our op when VTL_GDN_CHUNK_SCAN=1, with a
-    fail-closed fallback to the original on any mismatch. Only replaces the method once."""
+    fail-closed fallback that NEVER crashes: on a pre-Hopper GPU the original forward_cuda IS
+    FlashInfer (SM90-only, would crash), so we fall back to forward_native (Triton/FLA) there.
+    Only replaces the method once."""
     import torch
 
     if already_patched(cls, "forward_cuda"):
         return
     orig_forward_cuda = cls.forward_cuda
 
+    def _stock(self, q, k, v, g, beta, initial_state, output_final_state,  # noqa: ANN001
+               cu_seqlens, chunk_indices, chunk_offsets, use_qk_l2norm_in_kernel, core_attn_out, kw):
+        # The device-safe stock path. orig forward_cuda == FlashInfer (crashes pre-Hopper) -> use
+        # forward_native (Triton) there; on Hopper keep the original FlashInfer.
+        major = _device_major()
+        if major is not None and major < 9 and hasattr(self, "forward_native"):
+            method = self.forward_native
+        else:
+            method = lambda *a, **k: orig_forward_cuda(self, *a, **k)  # noqa: E731
+        return method(q, k, v, g, beta, initial_state, output_final_state,
+                      cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+                      chunk_offsets=chunk_offsets,
+                      use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, core_attn_out=core_attn_out,
+                      **kw)
+
     def forward_cuda(self, q, k, v, g, beta, initial_state, output_final_state,  # noqa: ANN001
                      cu_seqlens=None, chunk_indices=None, chunk_offsets=None,
                      use_qk_l2norm_in_kernel=True, core_attn_out=None, **kw):
         if not _chunk_scan_enabled():
-            return orig_forward_cuda(
-                self, q, k, v, g, beta, initial_state, output_final_state,
-                cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, core_attn_out=core_attn_out, **kw)
+            return _stock(self, q, k, v, g, beta, initial_state, output_final_state,
+                          cu_seqlens, chunk_indices, chunk_offsets, use_qk_l2norm_in_kernel,
+                          core_attn_out, kw)
+        _dump_shapes(q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state,
+                     cu_seqlens=cu_seqlens, core_attn_out=core_attn_out)
         try:
             # Only fire on the exact packed-varlen [L,H,D] layout our kernel supports; anything
             # else (batched leading dim, missing cu_seqlens, g not [L,H]) bails to stock so the
-            # convention mismatch never corrupts output.
+            # convention mismatch never corrupts output. TODO(on-box): the shape dump above tells
+            # us vLLM's real layout -- widen this to match (likely a leading batch=1 dim to squeeze)
+            # only AFTER `make test-kernel` parity confirms the g gate convention.
             ok = (
                 cu_seqlens is not None
                 and q.dim() == 3 and k.dim() == 3 and v.dim() == 3
@@ -152,12 +229,11 @@ def _install_chunk_scan_route(cls) -> None:  # noqa: ANN001
                 co_flat = core_attn_out.reshape(-1)
                 co_flat[: o_flat.numel()].copy_(o_flat)
             return o, final_state
-        except Exception as exc:  # any drift -> stock FlashInfer, never crash the model
+        except Exception as exc:  # any drift -> device-safe stock, never crash the model
             log.warning("vtl: gdn_chunk_scan route bailed (%s); stock backend", exc)
-            return orig_forward_cuda(
-                self, q, k, v, g, beta, initial_state, output_final_state,
-                cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, core_attn_out=core_attn_out, **kw)
+            return _stock(self, q, k, v, g, beta, initial_state, output_final_state,
+                          cu_seqlens, chunk_indices, chunk_offsets, use_qk_l2norm_in_kernel,
+                          core_attn_out, kw)
 
     cls.forward_cuda = mark_patched(forward_cuda, orig_forward_cuda)
 
@@ -259,6 +335,22 @@ def _self_check() -> None:
 
     os.environ["VTL_GDN_PREFILL_BACKEND"] = "cutedsl"
     assert _target_method(_NoCuteDSL) is None  # method absent -> stock
+
+    # SM90-only guard: pinning flashinfer/cutedsl on a pre-Hopper device falls back to stock
+    # instead of crashing the delta-rule kernel (device major 8 = Ampere).
+    global _device_major
+    _saved_major = _device_major
+    try:
+        _device_major = lambda: 8  # noqa: E731  -- simulate Ampere
+        assert _backend_supported("flashinfer") is False
+        assert _backend_supported("cutedsl") is False
+        assert _backend_supported("triton") is True
+        assert _target_method(_Fake) is None  # cutedsl pinned but unsupported -> stock
+        _device_major = lambda: 9  # noqa: E731  -- simulate Hopper
+        assert _backend_supported("flashinfer") is True
+        assert _target_method(_Fake) == "forward_cutedsl"
+    finally:
+        _device_major = _saved_major
 
     for key in ("VTL_ENABLE_GDN_KERNELS", "VTL_GDN_PREFILL_BACKEND", "VTL_GDN_CHUNK_SCAN"):
         os.environ.pop(key, None)
