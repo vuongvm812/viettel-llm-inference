@@ -11,10 +11,10 @@ name: viettel-llm-optimized
 # This workload is prefill-bound. Prefix caching and prefill throughput are the
 # levers; speculative decoding touches only ~1% of the tokens.
 #
-# INT8 W8A8: vtl_int8 does online per-channel weight + dynamic per-token
-# activation quant from the BF16 checkpoint, using stock CutlassInt8ScaledMM.
-# No fused norm+quant (vLLM v0.25.0 has no INT8 fusion ops); activation quant
-# runs un-fused inside the kernel's apply_weights.
+# FP8 W8A8 with per-channel weight scales: vtl_fp8 quantizes the BF16 checkpoint
+# at load time and keeps the fused RMSNorm+quant + SiLU+mul+quant kernels.
+# The key TTFT fixes are max-num-seqs=32 (admits 20-request bursts without
+# queueing) and max-num-batched-tokens=32768 (halves prefill steps vs 16384).
 
 services:
   model:
@@ -47,7 +47,7 @@ services:
       # 32768 tokens/step halves prefill steps vs 16384: 18700/1638 ≈ 11 vs 23.
       # TBT impact is minimal (TPOT=18ms with 45ms ceiling, 27ms headroom).
       - --max-num-batched-tokens=32768
-      - --quantization=vtl_int8
+      - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3 # halves decode KV bandwidth at 18.7K context
       - --attention-backend FLASHINFER
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
@@ -55,13 +55,11 @@ services:
       - "8000:8000" # judge hits this -- MUST be :8000
     environment:
       VLLM_PLUGINS: vtl
-      VTL_INT8_IGNORE: "lm_head,in_proj_a,in_proj_b,visual"
       VTL_FP8_IGNORE: "lm_head,in_proj_a,in_proj_b,visual"
       VLLM_LOGGING_LEVEL: INFO
-      # FP8 kernel overrides are off -- INT8 path doesn't use them.
-      VTL_ENABLE_RMS_NORM_QUANT: 0
-      VTL_ENABLE_SILU_MUL_QUANT: 0
-      VTL_ENABLE_DYNAMIC_PER_TOKEN_QUANT: 0
+      # Custom FP8 fused kernels stay on (default). They fuse RMSNorm+quant and
+      # SiLU+mul+quant, keeping TPOT low -- critical because TPOT is 50% of ERS.
+      VTL_ENABLE_RMS_NORM_QUANT: 1
       VTL_ENABLE_GDN_KERNELS: 0
     shm_size: "2g"
     healthcheck:
