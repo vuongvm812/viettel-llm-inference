@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:acdab1c391d58cb6561bf0405c3fc0ddec3086ab495cd47c06b6590be0d723ea # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:2900badafb206a7c386da0f98524159ed980d4f9cc94c143fda7eb9c53c8f6a5 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -77,7 +77,7 @@ services:
       VTL_GDN_PREFILL_BACKEND: stock  # stock|flashinfer|cutedsl|triton -- pin the prefill scan backend.
                                       # flashinfer & cutedsl are SM90 (H200) ONLY; on a pre-Hopper
                                       # GPU the pin auto-falls-back to stock (Triton/FLA) with a warn.
-      VTL_GDN_CHUNK_SCAN: 0           # 1 = route prefill scan to vtl's own gdn_chunk_scan CUDA op
+      VTL_GDN_CHUNK_SCAN: 1           # 1 = route prefill scan to vtl's own gdn_chunk_scan CUDA op
                                       #     (SEQUENTIAL baseline -- do NOT enable until the on-box
                                       #     `make bench-kernel` A/B beats stock; see the plan doc)
 

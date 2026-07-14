@@ -192,43 +192,52 @@ def _install_chunk_scan_route(cls) -> None:  # noqa: ANN001
         _dump_shapes(q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state,
                      cu_seqlens=cu_seqlens, core_attn_out=core_attn_out)
         try:
-            # Only fire on the exact packed-varlen [L,H,D] layout our kernel supports; anything
-            # else (batched leading dim, missing cu_seqlens, g not [L,H]) bails to stock so the
-            # convention mismatch never corrupts output. TODO(on-box): the shape dump above tells
-            # us vLLM's real layout -- widen this to match (likely a leading batch=1 dim to squeeze)
-            # only AFTER `make test-kernel` parity confirms the g gate convention.
+            # vLLM v0.25.0 forward_cuda layout, confirmed from source
+            # (mamba/gdn/qwen_gdn_linear_attn.py, fi_chunk_gated_delta_rule):
+            #   q,k,v : [1, L, H, D]   (leading batch=1; stock does q.squeeze(0))
+            #   g,beta: [1, L, H]
+            #   g is per-STEP LOG-decay -- stock passes torch.exp(g) to FlashInfer, no cumsum, so
+            #     our kernel's per-step exp(g[t]) matches. l2norm + beta placement also match.
+            #   initial_state: [S, H, D, D] per sequence (or None); returns o [1,L,H,D],
+            #     final_state [S,H,D,D].
+            if cu_seqlens is None:
+                raise NotImplementedError("no cu_seqlens (varlen metadata required)")
+            q3 = q.squeeze(0) if q.dim() == 4 and q.shape[0] == 1 else q
+            k3 = k.squeeze(0) if k.dim() == 4 and k.shape[0] == 1 else k
+            v3 = v.squeeze(0) if v.dim() == 4 and v.shape[0] == 1 else v
+            g2 = g.squeeze(0) if g is not None and g.dim() == 3 and g.shape[0] == 1 else g
+            b2 = beta.squeeze(0) if beta is not None and beta.dim() == 3 and beta.shape[0] == 1 \
+                else beta
             ok = (
-                cu_seqlens is not None
-                and q.dim() == 3 and k.dim() == 3 and v.dim() == 3
-                and q.is_cuda and q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-                and q.shape == k.shape
-                and q.shape[0] == v.shape[0] and q.shape[1] == v.shape[1]
-                and q.shape[2] == v.shape[2]  # Dk == Dv (kernel assumes square state)
-                and g is not None and g.dim() == 2 and g.shape == (q.shape[0], q.shape[1])
-                and beta is not None and beta.shape == g.shape
+                q3.dim() == 3 and k3.dim() == 3 and v3.dim() == 3 and q3.is_cuda
+                and q3.shape == k3.shape
+                and v3.shape[0] == q3.shape[0] and v3.shape[1] == q3.shape[1]
+                and q3.shape[2] == v3.shape[2]  # Dk == Dv (kernel assumes square state)
+                and g2 is not None and g2.dim() == 2 and g2.shape == (q3.shape[0], q3.shape[1])
+                and b2 is not None and b2.shape == g2.shape
             )
             if not ok:
-                raise NotImplementedError("layout/convention unsupported by vtl gdn_chunk_scan")
+                raise NotImplementedError(
+                    f"unexpected layout q={tuple(q.shape)} g={None if g is None else tuple(g.shape)}")
 
-            L, H, D = q.shape
+            L, H, D = q3.shape
             qsl = cu_seqlens.to(torch.int32).contiguous()
             S = int(qsl.numel()) - 1
             init = None
             if initial_state is not None:
-                init = initial_state.to(torch.float32).contiguous()
-                if tuple(init.shape) != (S, H, D, D):
-                    raise NotImplementedError("initial_state shape != [S,H,Dk,Dv]")
-            o = torch.empty(L, H, D, dtype=q.dtype, device=q.device)
-            final_state = torch.empty(S, H, D, D, dtype=torch.float32, device=q.device)
+                # per-seq state; tolerate a leading batch=1 by reshaping to [S,H,D,D].
+                init = initial_state.to(torch.float32).contiguous().reshape(S, H, D, D)
+            o = torch.empty(L, H, D, dtype=q3.dtype, device=q3.device)
+            final_state = torch.empty(S, H, D, D, dtype=torch.float32, device=q3.device)
             torch.ops.vllm_cuda.gdn_chunk_scan(
-                o, q.contiguous(), k.contiguous(), v.contiguous(),
-                g.to(torch.float32).contiguous(), beta.to(torch.float32).contiguous(),
+                o, q3.contiguous(), k3.contiguous(), v3.contiguous(),
+                g2.to(torch.float32).contiguous(), b2.to(torch.float32).contiguous(),
                 qsl, init, final_state, bool(use_qk_l2norm_in_kernel))
             if core_attn_out is not None:  # match stock: copy into the caller's buffer
                 o_flat = o.reshape(-1)
                 co_flat = core_attn_out.reshape(-1)
                 co_flat[: o_flat.numel()].copy_(o_flat)
-            return o, final_state
+            return o.unsqueeze(0), (final_state if output_final_state else None)
         except Exception as exc:  # any drift -> device-safe stock, never crash the model
             log.warning("vtl: gdn_chunk_scan route bailed (%s); stock backend", exc)
             return _stock(self, q, k, v, g, beta, initial_state, output_final_state,
