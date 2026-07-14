@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:acdab1c391d58cb6561bf0405c3fc0ddec3086ab495cd47c06b6590be0d723ea # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:fa5d90002e2557e693f466452b48f0d6f04212fd992cd9b17a75d91d0ff93651 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -25,6 +25,7 @@ services:
       - --served-model-name=Qwen3.5-2B #Don't change this to vllm-server
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
+      - --language-model-only
 
       # Longest prompt is 27,331 tokens + 200 generated = 27,531 required.
       # 16384 (baseline) rejects most of the trace; 262144 exceeds the model's
@@ -37,7 +38,7 @@ services:
       # ~31% of all prefill work disappears after the first request.
       - --enable-prefix-caching
       - --enable-chunked-prefill
-      - --max-num-seqs=16 # 256->64 raised score by cutting TBT; keep walking down (next: 32)
+      - --max-num-seqs=16 # Pareto optimum: 12 cut tbt 18->17 but blew ttft_p95 14k->20k (-0.3). 20 raised tbt (worse). Frontier is ~62.5 here.
       - --max-num-batched-tokens=16384 # prefill chunk size: TTFT vs prefill throughput
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
@@ -47,10 +48,40 @@ services:
       - "8000:8000"
     environment:
       VLLM_PLUGINS: vtl
-      VTL_FP8_IGNORE: "lm_head,in_proj_a,in_proj_b,visual"
       VLLM_LOGGING_LEVEL: INFO
-      VTL_ENABLE_RMS_NORM_QUANT: 1
-      VTL_ENABLE_GDN_KERNELS: 0
+      VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
+
+      # FP8 (vtl_fp8). Load-bearing: --quantization=vtl_fp8 aborts at startup if disabled.
+      VTL_ENABLE_FP8: 1
+      VTL_FP8_CHANNELWISE: 1                  # 1 = per-channel weight scales; 0 = stock per-tensor
+      VTL_FP8_IGNORE: "lm_head,in_proj_a,in_proj_b,visual"
+
+      # Per-patch kill-switches (all default ON). Each = VTL_ENABLE_<patch>.
+      VTL_ENABLE_RMS_NORM_QUANT: 1            # needs pass_config.fuse_norm_quant to fire
+      VTL_ENABLE_DYNAMIC_PER_TOKEN_QUANT: 1
+      VTL_ENABLE_SILU_MUL_QUANT: 1           # down_proj silu-mul + fp8 quant fusion
+      VTL_SILU_MUL_FUSION: 1                  # 1 = register the down_proj pattern; 0 = op only, unfused
+      VTL_ENABLE_KV_CACHE_MANAGER: 1
+      VTL_ENABLE_SCHED_POLICY: 1             # SJF prefill reorder
+
+      # GDN kernel family (gated-RMSNorm(+fp8-quant fusion) + the o_proj sigmoid-mul fusion).
+      # VTL_ENABLE_GDN_KERNELS is the ONE parent that arms/disarms all of it; the family flags
+      # below only take effect when it is 1. Arm only after on-box parity (`make test-kernel`).
+      VTL_ENABLE_GDN_KERNELS: 1
+      VTL_ENABLE_MUL_SIGMOID_QUANT: 1         # patch default ON, but still gated by the parent above
+      VTL_GDN_RMSNORM_FUSION: 1   # 1=graph-fuse norm->out_proj fp8 quant (the win); 0=eager kernel only
+      VTL_MUL_SIGMOID_FUSION: 1   # 1=graph-fuse o_proj sigmoid-mul->quant; 0=op available but unfused
+
+      # GDN prefill-scan A/B levers (both ride the parent above; default = stock FlashInfer).
+      # See docs/plans/gdn-parallel-scan.md. A/B by editing these -- no code change needed.
+      VTL_GDN_PREFILL_BACKEND: stock  # stock|flashinfer|cutedsl|triton -- pin the prefill scan backend.
+                                      # flashinfer & cutedsl are SM90 (H200) ONLY; on a pre-Hopper
+                                      # GPU the pin auto-falls-back to stock (Triton/FLA) with a warn.
+      VTL_GDN_CHUNK_SCAN: 0           # 1 = route prefill scan to vtl's own gdn_chunk_scan CUDA op
+                                      #     (SEQUENTIAL baseline -- do NOT enable until the on-box
+                                      #     `make bench-kernel` A/B beats stock; see the plan doc)
+
+      VTL_KERNEL_SYNC: 0                       # DEBUG only: 1 = cudaStreamSynchronize per kernel (slow)
     shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]

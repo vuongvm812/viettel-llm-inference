@@ -20,7 +20,9 @@ _MODULES: tuple[str, ...] = (
     "rms_norm_quant",
     "dynamic_per_token_quant",
     "silu_mul_quant",
+    "mul_sigmoid_quant",
     "gdn_kernels",
+    "gdn_prefill_backend",
     "kv_cache_manager",
     "sched_policy",
 )
