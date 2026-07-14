@@ -104,9 +104,7 @@ def _register_fake() -> None:
     import torch
 
     @torch.library.register_fake("vllm_cuda::gdn_chunk_scan")
-    def _fake(
-        o, q, k, v, g, beta, query_start_loc, initial_state, final_state, qk_l2norm
-    ):  # noqa: ANN001, E501
+    def _fake(o, q, k, v, g, beta, query_start_loc, initial_state, final_state, qk_l2norm):  # noqa: ANN001, E501
         return None
 
     _fake_registered = True
@@ -124,19 +122,13 @@ def _target_method(cls) -> str | None:  # noqa: ANN001
             return None
         want = _BACKEND_METHOD.get(choice)
         if want is None:
-            log.warning(
-                "vtl: VTL_GDN_PREFILL_BACKEND=%r not in %s; leaving stock",
-                choice,
-                sorted(_BACKEND_METHOD),
-            )
+            log.warning("vtl: VTL_GDN_PREFILL_BACKEND=%r not in %s; leaving stock",
+                        choice, sorted(_BACKEND_METHOD))
             return None
         if not _backend_supported(choice):
-            log.warning(
-                "vtl: VTL_GDN_PREFILL_BACKEND=%r needs a Hopper (SM90+) GPU but this "
-                "device is major %s; leaving stock (vLLM will use Triton/FLA)",
-                choice,
-                _device_major(),
-            )
+            log.warning("vtl: VTL_GDN_PREFILL_BACKEND=%r needs a Hopper (SM90+) GPU but this "
+                        "device is major %s; leaving stock (vLLM will use Triton/FLA)",
+                        choice, _device_major())
             return None
     return want if hasattr(cls, want) else None
 
@@ -160,9 +152,8 @@ def _dump_shapes(**tensors) -> None:  # noqa: ANN003
         except Exception:
             return type(t).__name__
 
-    log.info(
-        "vtl: GDN forward_cuda shapes -> %s", {k: desc(v) for k, v in tensors.items()}
-    )
+    log.info("vtl: GDN forward_cuda shapes -> %s",
+             {k: desc(v) for k, v in tensors.items()})
 
 
 def _install_chunk_scan_route(cls) -> None:  # noqa: ANN001
@@ -176,22 +167,8 @@ def _install_chunk_scan_route(cls) -> None:  # noqa: ANN001
         return
     orig_forward_cuda = cls.forward_cuda
 
-    def _stock(
-        self,
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state,
-        output_final_state,  # noqa: ANN001
-        cu_seqlens,
-        chunk_indices,
-        chunk_offsets,
-        use_qk_l2norm_in_kernel,
-        core_attn_out,
-        kw,
-    ):
+    def _stock(self, q, k, v, g, beta, initial_state, output_final_state,  # noqa: ANN001
+               cu_seqlens, chunk_indices, chunk_offsets, use_qk_l2norm_in_kernel, core_attn_out, kw):
         # The device-safe stock path. orig forward_cuda == FlashInfer (crashes pre-Hopper) -> use
         # forward_native (Triton) there; on Hopper keep the original FlashInfer.
         major = _device_major()
@@ -199,142 +176,84 @@ def _install_chunk_scan_route(cls) -> None:  # noqa: ANN001
             method = self.forward_native
         else:
             method = lambda *a, **k: orig_forward_cuda(self, *a, **k)  # noqa: E731
-        return method(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state,
-            output_final_state,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            core_attn_out=core_attn_out,
-            **kw,
-        )
+        return method(q, k, v, g, beta, initial_state, output_final_state,
+                      cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+                      chunk_offsets=chunk_offsets,
+                      use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, core_attn_out=core_attn_out,
+                      **kw)
 
-    def forward_cuda(
-        self,
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state,
-        output_final_state,  # noqa: ANN001
-        cu_seqlens=None,
-        chunk_indices=None,
-        chunk_offsets=None,
-        use_qk_l2norm_in_kernel=True,
-        core_attn_out=None,
-        **kw,
-    ):
+    def forward_cuda(self, q, k, v, g, beta, initial_state, output_final_state,  # noqa: ANN001
+                     cu_seqlens=None, chunk_indices=None, chunk_offsets=None,
+                     use_qk_l2norm_in_kernel=True, core_attn_out=None, **kw):
         if not _chunk_scan_enabled():
-            return _stock(
-                self,
-                q,
-                k,
-                v,
-                g,
-                beta,
-                initial_state,
-                output_final_state,
-                cu_seqlens,
-                chunk_indices,
-                chunk_offsets,
-                use_qk_l2norm_in_kernel,
-                core_attn_out,
-                kw,
-            )
-        _dump_shapes(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            cu_seqlens=cu_seqlens,
-            core_attn_out=core_attn_out,
-        )
+            return _stock(self, q, k, v, g, beta, initial_state, output_final_state,
+                          cu_seqlens, chunk_indices, chunk_offsets, use_qk_l2norm_in_kernel,
+                          core_attn_out, kw)
+        _dump_shapes(q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state,
+                     cu_seqlens=cu_seqlens, core_attn_out=core_attn_out)
         try:
-            # Only fire on the exact packed-varlen [L,H,D] layout our kernel supports; anything
-            # else (batched leading dim, missing cu_seqlens, g not [L,H]) bails to stock so the
-            # convention mismatch never corrupts output. TODO(on-box): the shape dump above tells
-            # us vLLM's real layout -- widen this to match (likely a leading batch=1 dim to squeeze)
-            # only AFTER `make test-kernel` parity confirms the g gate convention.
+            # vLLM v0.25.0 forward_cuda layout, confirmed from source
+            # (mamba/gdn/qwen_gdn_linear_attn.py, fi_chunk_gated_delta_rule):
+            #   q,k,v : [1, L, H, D]   (leading batch=1; stock does q.squeeze(0))
+            #   g,beta: [1, L, H]
+            #   g is per-STEP LOG-decay -- stock passes torch.exp(g) to FlashInfer, no cumsum, so
+            #     our kernel's per-step exp(g[t]) matches. l2norm + beta placement also match.
+            #   initial_state: [S, H, D, D] per sequence (or None); returns o [1,L,H,D],
+            #     final_state [S,H,D,D].
+            if cu_seqlens is None:
+                raise NotImplementedError("no cu_seqlens (varlen metadata required)")
+            q3 = q.squeeze(0) if q.dim() == 4 and q.shape[0] == 1 else q
+            k3 = k.squeeze(0) if k.dim() == 4 and k.shape[0] == 1 else k
+            v3 = v.squeeze(0) if v.dim() == 4 and v.shape[0] == 1 else v
+            g2 = g.squeeze(0) if g is not None and g.dim() == 3 and g.shape[0] == 1 else g
+            b2 = beta.squeeze(0) if beta is not None and beta.dim() == 3 and beta.shape[0] == 1 \
+                else beta
             ok = (
-                cu_seqlens is not None
-                and q.dim() == 3
-                and k.dim() == 3
-                and v.dim() == 3
-                and q.is_cuda
-                and q.is_contiguous()
-                and k.is_contiguous()
-                and v.is_contiguous()
-                and q.shape == k.shape
-                and q.shape[0] == v.shape[0]
-                and q.shape[1] == v.shape[1]
-                and q.shape[2] == v.shape[2]  # Dk == Dv (kernel assumes square state)
-                and g is not None
-                and g.dim() == 2
-                and g.shape == (q.shape[0], q.shape[1])
-                and beta is not None
-                and beta.shape == g.shape
+                q3.dim() == 3 and k3.dim() == 3 and v3.dim() == 3 and q3.is_cuda
+                and q3.shape == k3.shape
+                and v3.shape[0] == q3.shape[0] and v3.shape[1] == q3.shape[1]
+                and q3.shape[2] == v3.shape[2]  # Dk == Dv (kernel assumes square state)
+                and g2 is not None and g2.dim() == 2 and g2.shape == (q3.shape[0], q3.shape[1])
+                and b2 is not None and b2.shape == g2.shape
             )
             if not ok:
                 raise NotImplementedError(
-                    "layout/convention unsupported by vtl gdn_chunk_scan"
-                )
+                    f"unexpected layout q={tuple(q.shape)} g={None if g is None else tuple(g.shape)}")
 
-            L, H, D = q.shape
+            L, H, D = q3.shape
             qsl = cu_seqlens.to(torch.int32).contiguous()
             S = int(qsl.numel()) - 1
             init = None
             if initial_state is not None:
-                init = initial_state.to(torch.float32).contiguous()
-                if tuple(init.shape) != (S, H, D, D):
-                    raise NotImplementedError("initial_state shape != [S,H,Dk,Dv]")
-            o = torch.empty(L, H, D, dtype=q.dtype, device=q.device)
-            final_state = torch.empty(S, H, D, D, dtype=torch.float32, device=q.device)
+                # vLLM state is [N,H,V,K] (fla/ops/chunk.py); our kernel is key-major [S,H,K,V], so
+                # transpose the last two dims on the way in. (Only matters for chunked prefill /
+                # non-None initial_state; verified by the carry test in bench/test_gdn_chunk_scan.)
+                init = (initial_state.to(torch.float32).reshape(S, H, D, D)
+                        .transpose(-1, -2).contiguous())
+            o = torch.empty(L, H, D, dtype=q3.dtype, device=q3.device)
+            final_state = torch.empty(S, H, D, D, dtype=torch.float32, device=q3.device)
             torch.ops.vllm_cuda.gdn_chunk_scan(
-                o,
-                q.contiguous(),
-                k.contiguous(),
-                v.contiguous(),
-                g.to(torch.float32).contiguous(),
-                beta.to(torch.float32).contiguous(),
-                qsl,
-                init,
-                final_state,
-                bool(use_qk_l2norm_in_kernel),
-            )
+                o, q3.contiguous(), k3.contiguous(), v3.contiguous(),
+                g2.to(torch.float32).contiguous(), b2.to(torch.float32).contiguous(),
+                qsl, init, final_state, bool(use_qk_l2norm_in_kernel))
+            # vLLM's chunk_gated_delta_rule defaults scale = head_dim**-0.5 (fla/ops/chunk.py) and
+            # stock relies on that default -- our op computes o=qᵀS unscaled, so apply it here.
+            # scale on the output == scale on q (q only appears in o), and it is applied AFTER the
+            # in-kernel l2norm, so this is exact regardless of qk_l2norm.
+            o.mul_(float(D) ** -0.5)
             if core_attn_out is not None:  # match stock: copy into the caller's buffer
                 o_flat = o.reshape(-1)
                 co_flat = core_attn_out.reshape(-1)
                 co_flat[: o_flat.numel()].copy_(o_flat)
-            return o, final_state
-        except (
-            Exception
-        ) as exc:  # any drift -> device-safe stock, never crash the model
+            # Return final_state in vLLM's [N,H,V,K] layout (transpose back from our [S,H,K,V]) so
+            # the next chunk reads it correctly from the state cache.
+            fs = final_state.transpose(-1, -2).contiguous() if output_final_state else None
+            return o.unsqueeze(0), fs
+        except Exception as exc:  # any drift -> device-safe stock, never crash the model
             log.warning("vtl: gdn_chunk_scan route bailed (%s); stock backend", exc)
-            return _stock(
-                self,
-                q,
-                k,
-                v,
-                g,
-                beta,
-                initial_state,
-                output_final_state,
-                cu_seqlens,
-                chunk_indices,
-                chunk_offsets,
-                use_qk_l2norm_in_kernel,
-                core_attn_out,
-                kw,
-            )
+            return _stock(self, q, k, v, g, beta, initial_state, output_final_state,
+                          cu_seqlens, chunk_indices, chunk_offsets, use_qk_l2norm_in_kernel,
+                          core_attn_out, kw)
 
     cls.forward_cuda = mark_patched(forward_cuda, orig_forward_cuda)
 
@@ -352,12 +271,8 @@ def _install_backend_pin(cls) -> None:  # noqa: ANN001
             want = _target_method(type(self))
             if want is not None:
                 self._forward_method = getattr(self, want)
-                log.info(
-                    "vtl: GDN prefill pinned to %s (chunk_scan=%s, backend=%s)",
-                    want,
-                    _chunk_scan_enabled(),
-                    _backend_choice(),
-                )
+                log.info("vtl: GDN prefill pinned to %s (chunk_scan=%s, backend=%s)",
+                         want, _chunk_scan_enabled(), _backend_choice())
         except Exception as exc:
             log.warning("vtl: GDN backend pin failed (%s); stock selection kept", exc)
 
@@ -375,36 +290,27 @@ def apply() -> None:
         return  # nothing to force; leave stock vLLM entirely alone
 
     try:
-        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-            ChunkGatedDeltaRule,
-        )
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import ChunkGatedDeltaRule
     except Exception as exc:  # symbol moved/renamed in this vLLM -> stay stock
-        log.warning(
-            "vtl: ChunkGatedDeltaRule not importable (%s); GDN prefill backend unchanged",
-            exc,
-        )
+        log.warning("vtl: ChunkGatedDeltaRule not importable (%s); GDN prefill backend unchanged",
+                    exc)
         return
 
     if _chunk_scan_enabled():
         try:
-            import torch
             import vllm._C_stable_libtorch  # noqa: F401
-
             import vtl._C  # noqa: F401  -- registers vllm_cuda::gdn_chunk_scan
+            import torch
 
             if not hasattr(torch.ops.vllm_cuda, "gdn_chunk_scan"):
                 log.warning("vtl: gdn_chunk_scan op absent; not routing prefill scan")
             else:
                 _register_fake()
                 _install_chunk_scan_route(ChunkGatedDeltaRule)
-                log.info(
-                    "vtl: GDN prefill scan routed to vtl gdn_chunk_scan "
-                    "(SEQUENTIAL baseline -- VERIFY it wins on the box before shipping)"
-                )
+                log.info("vtl: GDN prefill scan routed to vtl gdn_chunk_scan "
+                         "(SEQUENTIAL baseline -- VERIFY it wins on the box before shipping)")
         except Exception as exc:
-            log.warning(
-                "vtl: gdn_chunk_scan route install failed (%s); stock backend", exc
-            )
+            log.warning("vtl: gdn_chunk_scan route install failed (%s); stock backend", exc)
 
     _install_backend_pin(ChunkGatedDeltaRule)
 
@@ -417,11 +323,7 @@ def _self_check() -> None:
     assert patch.default is True
     assert is_enabled(patch) is True  # selected by default...
 
-    for key in (
-        "VTL_ENABLE_GDN_KERNELS",
-        "VTL_GDN_PREFILL_BACKEND",
-        "VTL_GDN_CHUNK_SCAN",
-    ):
+    for key in ("VTL_ENABLE_GDN_KERNELS", "VTL_GDN_PREFILL_BACKEND", "VTL_GDN_CHUNK_SCAN"):
         os.environ.pop(key, None)
     assert _gdn_enabled() is False  # ...but fail-closed: family off
     assert _backend_choice() == "stock"
@@ -470,15 +372,10 @@ def _self_check() -> None:
     finally:
         _device_major = _saved_major
 
-    for key in (
-        "VTL_ENABLE_GDN_KERNELS",
-        "VTL_GDN_PREFILL_BACKEND",
-        "VTL_GDN_CHUNK_SCAN",
-    ):
+    for key in ("VTL_ENABLE_GDN_KERNELS", "VTL_GDN_PREFILL_BACKEND", "VTL_GDN_CHUNK_SCAN"):
         os.environ.pop(key, None)
     print("gdn_prefill_backend self-check ok")
 
 
 if __name__ == "__main__":
     _self_check()
-
