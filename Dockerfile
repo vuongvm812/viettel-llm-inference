@@ -22,7 +22,10 @@ FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 # GPU allocs are unaffected (those go through PYTORCH_CUDA_ALLOC_CONF). Preloaded via
 # ENV below. The test -f fails the build now if the base ever moves the lib, instead of
 # LD_PRELOAD silently no-op'ing at the judge's run.
-RUN apt-get update \
+# -o Dir::Etc::sourceparts=- skips sources.list.d/* (the CUDA + deadsnakes repos) for
+# this one update: jemalloc is in the base Ubuntu universe repo, and the NVIDIA mirror
+# is intermittently mid-sync (Packages.gz size mismatch) which otherwise fails the build.
+RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
     && apt-get install -y --no-install-recommends libjemalloc2 \
     && rm -rf /var/lib/apt/lists/* \
     && test -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
