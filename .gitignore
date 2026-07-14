@@ -43,3 +43,5 @@ bench-*.json
 sndr_core_engine/
 sglang/
 model/
+
+*.pem
