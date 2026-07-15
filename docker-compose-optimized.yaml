@@ -37,44 +37,17 @@ services:
       # The 6,388-token shared system prompt makes this the single biggest win:
       # ~31% of all prefill work disappears after the first request.
       - --enable-prefix-caching
-      - --enable-chunked-prefill
       - --mamba_cache_mode=all
-      - --max-num-seqs=16 # KV @p50 is 0.69 GB/req -> ~174 fit in bf16; sweep this
+      - --enable-chunked-prefill
+      - --max-num-seqs=16 # Pareto optimum: 12 cut tbt 18->17 but blew ttft_p95 14k->20k (-0.3). 20 raised tbt (worse). Frontier is ~62.5 here.
       - --max-num-batched-tokens=16384 # prefill chunk size: TTFT vs prefill throughput
-
-      # vtl_fp8 is registered by vtl/patches/quant_fp8.py: online FP8 W8A8 with
-      # per-CHANNEL weight scales (stock fp8 is per-tensor). If that patch is
-      # disabled with VTL_ENABLE_FP8=0 the name stops resolving and vLLM aborts at
-      # startup -- use VTL_FP8_CHANNELWISE=0 to get stock behaviour instead.
       - --quantization=vtl_fp8
-      - --kv-cache-dtype=fp8_e4m3 # halves decode KV bandwidth at 18.7K context
+      - --kv-cache-dtype=fp8_e4m3
       - --attention-backend FLASHINFER
-
-      # Turns on RMSNormQuantFusionPass, which rewrites the [2048]-wide
-      # fused_add_rms_norm -> per-token-fp8-quant pairs (input_layernorm->in_proj/qkv and
-      # post_attention_layernorm->gate_up, on both GDN and full-attn layers) into a single
-      # _C::rms_norm_dynamic_per_token_quant node. (The [16]/[128]/[256] F32 per-head norms
-      # are a different op and not fused here.) vtl/patches/rms_norm_quant.py replaces
-      # that op's CUDA kernel with a single-pass one. Off by default because
-      # enable_norm_fusion() (vllm/config/vllm.py:99) otherwise leaves the fusion to
-      # Inductor -- so this swaps Inductor's Triton norm+quant for our hand-written kernel.
-      # A user-set pass_config survives the -O2 defaults: _set_config_default only fills
-      # fields still None (vllm/config/vllm.py:702).
-      #
-      # cudagraph_mode=FULL_AND_PIECEWISE: full-graph capture for pure-decode batches,
-      # piecewise for prefill/mixed (required with chunked prefill + async scheduling;
-      # plain FULL would fall back or error). Governs graph CAPTURE only, not FX rewriting,
-      # so RMSNormQuantFusionPass and the vtl._C kernel binding are unchanged. EXPERIMENT:
-      # decode is ~1% of this 101:1 trace, so upside is bounded -- keep only if ITL p50/p90
-      # drops with no TTFT/throughput regression, else revert this to PIECEWISE default.
-      # Re-warm (docker/cache/ was baked under PIECEWISE) and confirm the enum spelling:
-      #   python3 -c "from vllm.config import CUDAGraphMode; print(list(CUDAGraphMode))"
-      # fuse_act_quant runs ActivationQuantFusionPass; vtl/patches/silu_mul_quant.py adds a
-      # per-token silu_and_mul->quant pattern to it so down_proj fuses into our single kernel
-      # (reads gate|up once, drops the bf16 intermediate). Non-match is a no-op.
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
+      - '--speculative-config={"method":"qwen3_next_mtp","num_speculative_tokens":1}'
     ports:
-      - "8000:8000" # judge hits this -- MUST be :8000
+      - "8000:8000"
     environment:
       VLLM_PLUGINS: vtl
       VLLM_LOGGING_LEVEL: INFO
@@ -86,23 +59,27 @@ services:
       VTL_FP8_IGNORE: "lm_head,visual"
 
       # Per-patch kill-switches (all default ON). Each = VTL_ENABLE_<patch>.
-      VTL_ENABLE_RMS_NORM_QUANT: 1            # needs pass_config.fuse_norm_quant (set above) to fire
+      VTL_ENABLE_RMS_NORM_QUANT: 1            # needs pass_config.fuse_norm_quant to fire
       VTL_ENABLE_DYNAMIC_PER_TOKEN_QUANT: 1
-      VTL_ENABLE_SILU_MUL_QUANT: 1           # down_proj silu-mul + fp8 quant fusion (needs fuse_act_quant)
+      VTL_ENABLE_SILU_MUL_QUANT: 1           # down_proj silu-mul + fp8 quant fusion
       VTL_SILU_MUL_FUSION: 1                  # 1 = register the down_proj pattern; 0 = op only, unfused
       VTL_ENABLE_KV_CACHE_MANAGER: 1
       VTL_ENABLE_SCHED_POLICY: 1             # SJF prefill reorder
 
-      # GDN kernel family, ONE parent flag: gated-RMSNorm fused with the out_proj fp8 per-token
-      # quant (hits all 18 GDN layers every prefill token) + the o_proj sigmoid-mul fusion on the
-      # 6 full-attn + MTP layers. VTL_ENABLE_GDN_KERNELS arms/disarms all of it; the family flags
-      # below only take effect when it is 1. To arm on the H200: confirm `make test-kernel` parity,
-      # set the parent to 1, and check the logs for "FUSION installed" + "Replaced N patterns"
-      # (N>0). The graph fusions need fuse_norm_quant + fuse_act_quant (set in --compilation-config).
+      # GDN kernel family (gated-RMSNorm(+fp8-quant fusion) + the o_proj sigmoid-mul fusion).
+      # VTL_ENABLE_GDN_KERNELS is the ONE parent that arms/disarms all of it; the family flags
+      # below only take effect when it is 1. Arm only after on-box parity (`make test-kernel`).
       VTL_ENABLE_GDN_KERNELS: 1
       VTL_ENABLE_MUL_SIGMOID_QUANT: 1         # patch default ON, but still gated by the parent above
       VTL_GDN_RMSNORM_FUSION: 1   # 1=graph-fuse norm->out_proj fp8 quant (the win); 0=eager kernel only
       VTL_MUL_SIGMOID_FUSION: 1   # 1=graph-fuse o_proj sigmoid-mul->quant; 0=op available but unfused
+
+      # MTP-head fused-projection GEMM (cuBLASDx). Only active when the model runs with
+      # --speculative-config qwen3_next_mtp AND vtl._C was built with cuBLASDx headers
+      # (nvidia-mathdx). The fc weight is fp8 under vtl_fp8, so the bf16 GEMM falls back to
+      # stock unless fc runs unquantized. Arm only after on-box `make test-kernel` parity.
+      VTL_ENABLE_MTP_KERNELS: 1   # parent gate; 1 = route the MTP fc GEMM through vtl's cuBLASDx op
+      VTL_MTP_FC_FUSION: 1        # 1 = wire the fc GEMM (Stage A); 0 = op built but unused (A/B off)
 
       # GDN prefill-scan A/B levers (both ride the parent above; default = stock FlashInfer).
       # See docs/plans/gdn-parallel-scan.md. A/B by editing these -- no code change needed.

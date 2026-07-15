@@ -45,6 +45,7 @@ services:
       - --kv-cache-dtype=fp8_e4m3
       - --attention-backend FLASHINFER
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
+      - '--speculative-config={"method":"qwen3_next_mtp","num_speculative_tokens":1}'
     ports:
       - "8000:8000"
     environment:
@@ -72,6 +73,13 @@ services:
       VTL_ENABLE_MUL_SIGMOID_QUANT: 1         # patch default ON, but still gated by the parent above
       VTL_GDN_RMSNORM_FUSION: 1   # 1=graph-fuse norm->out_proj fp8 quant (the win); 0=eager kernel only
       VTL_MUL_SIGMOID_FUSION: 1   # 1=graph-fuse o_proj sigmoid-mul->quant; 0=op available but unfused
+
+      # MTP-head fused-projection GEMM (cuBLASDx). Only active when the model runs with
+      # --speculative-config qwen3_next_mtp AND vtl._C was built with cuBLASDx headers
+      # (nvidia-mathdx). The fc weight is fp8 under vtl_fp8, so the bf16 GEMM falls back to
+      # stock unless fc runs unquantized. Arm only after on-box `make test-kernel` parity.
+      VTL_ENABLE_MTP_KERNELS: 1   # parent gate; 1 = route the MTP fc GEMM through vtl's cuBLASDx op
+      VTL_MTP_FC_FUSION: 1        # 1 = wire the fc GEMM (Stage A); 0 = op built but unused (A/B off)
 
       # GDN prefill-scan A/B levers (both ride the parent above; default = stock FlashInfer).
       # See docs/plans/gdn-parallel-scan.md. A/B by editing these -- no code change needed.

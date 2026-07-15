@@ -23,6 +23,7 @@ _MODULES: tuple[str, ...] = (
     "mul_sigmoid_quant",
     "gdn_kernels",
     "gdn_prefill_backend",
+    "mtp_kernels",
     "kv_cache_manager",
     "sched_policy",
 )

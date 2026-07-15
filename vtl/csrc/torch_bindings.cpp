@@ -57,6 +57,13 @@ void gdn_chunk_scan(torch::Tensor& o, torch::Tensor const& q, torch::Tensor cons
                     torch::Tensor const& query_start_loc,
                     std::optional<torch::Tensor> const& initial_state,
                     torch::Tensor& final_state, bool qk_l2norm);
+
+#ifdef VTL_WITH_MTP_FC_GEMM
+// MTP-head fused-projection GEMM: result[M,N] = input[M,K] @ weight[N,K]^T (a Linear).
+// cuBLASDx device GEMM for the small-M decode regime. Own op, wired behind
+// VTL_ENABLE_MTP_KERNELS. Built only when cuBLASDx headers were present at build time.
+void mtp_fc_gemm(torch::Tensor& result, torch::Tensor const& input, torch::Tensor const& weight);
+#endif
 }  // namespace vtl
 
 TORCH_LIBRARY(vllm_cuda, m) {
@@ -86,6 +93,9 @@ TORCH_LIBRARY(vllm_cuda, m) {
       "gdn_chunk_scan(Tensor! o, Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
       "Tensor query_start_loc, Tensor? initial_state, Tensor! final_state, "
       "bool qk_l2norm) -> ()");
+#ifdef VTL_WITH_MTP_FC_GEMM
+  m.def("mtp_fc_gemm(Tensor! result, Tensor input, Tensor weight) -> ()");
+#endif
 }
 
 TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
@@ -100,6 +110,9 @@ TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
   m.impl("gated_rmsnorm_dynamic_per_token_quant",
          TORCH_FN(vtl::gated_rmsnorm_dynamic_per_token_quant));
   m.impl("gdn_chunk_scan", TORCH_FN(vtl::gdn_chunk_scan));
+#ifdef VTL_WITH_MTP_FC_GEMM
+  m.impl("mtp_fc_gemm", TORCH_FN(vtl::mtp_fc_gemm));
+#endif
 }
 
 // Overrides of vLLM's own _C ops (schemas defined by vllm._C_stable_libtorch, imported first).

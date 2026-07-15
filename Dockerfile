@@ -33,6 +33,12 @@ RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
 COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
 
+# cuBLASDx headers for vtl/csrc/mtp_fc_gemm.cu (the fused MTP-head GEMM). Header-only
+# device library shipped in the nvidia-mathdx wheel (bundles CUTLASS); setup.py resolves
+# the include dir from `import nvidia.mathdx` and drops mtp_fc_gemm.cu if it is absent, so
+# this install is what turns the kernel on. Pinned wheel-only (no build), so it is cheap.
+RUN pip install --no-cache-dir nvidia-mathdx
+
 # Which SM cubins go into vtl._C. Without this, nvcc probes the build host -- which has no
 # GPU -- and guesses. A mismatch does NOT degrade gracefully: dlopen succeeds, the override
 # installs, and the first kernel launch dies with cudaErrorNoKernelImageForDevice. So build
