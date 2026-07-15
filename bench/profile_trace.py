@@ -44,11 +44,24 @@ from pathlib import Path
 # (bucket, regex) in PRIORITY order: a kernel name is charged to the FIRST match.
 # gdn before attn (delta-rule has its own GEMMs), quant before gemm (norm/quant names
 # must not fall into the generic gemm bucket). Edit these once real names are known.
+# Priority order (first match wins). Tuned against the real v0.25.0 kernel names seen in the
+# first on-box capture (2026-07-16). gdn/attn first so their internal GEMM-ish kernels aren't
+# stolen by the generic gemm bucket; gemm before quant so `*_marlin_gemm_*` GEMMs (even when
+# their fused name also mentions rms_norm) land in gemm, not quant_fusion.
 BUCKETS: tuple[tuple[str, str], ...] = (
-    ("gdn_scan", r"gated_delta|delta_rule|chunk_scan|fused_recurrent|causal_conv1d|solve_tril|\bgdn\b|chunk_o|chunk_state|chunk_a"),
-    ("full_attn", r"flashinfer|batch_?prefill|batch_?decode|paged|flash_?attn|\bmha\b|\bmla\b|prefill_kernel|decode_kernel|_attention"),
-    ("quant_fusion", r"rms_?norm|layer_?norm|dynamic_per_token|silu_and_mul|mul_sigmoid|scaled_fp8|\bquant\b|gated_rmsnorm|rotary|\bnorm\b"),
-    ("gemm", r"cutlass|gemm|scaled_mm|wgmma|\bsm90\b|\bsm80\b|matmul|nvjet|hgemm|s16816|ampere_|_linear|cublas|triton_.*mm"),
+    # FLA chunked gated-delta-rule (prefill) + conv + recurrent decode -- the 18 GDN layers.
+    ("gdn_scan", r"gated_delta|delta_rule|causal_conv1d|fused_recurrent|sigmoid_gating|solve_tril|"
+                 r"chunk_fwd|chunk_o\b|chunk_state|chunk_scaled_dot|recompute_w|fused_post_conv|"
+                 r"merge_\d+x\d+.*inverse|\bgdn\b|chunk_scan"),
+    # the 6 full-attention layers (FlashInfer prefill/decode).
+    ("full_attn", r"flashinfer|batch_?prefill|batch_?decode|paged_?attn|flash_?attn|\bmha\b|\bmla\b|_attention"),
+    # projection + FFN matmuls. marlin::Marlin is FP8-Marlin (the current fallback path); cutlass
+    # scaled_mm / s16816 / gemv are the native ones. reshape_and_cache = KV write, keep with gemm-ish.
+    ("gemm", r"\bmarlin\b|cutlass|scaled_mm|_gemm\b|\bgemm|gemv|wgmma|\bsm90\b|s16816|ampere_.*gemm|"
+             r"hgemm|nvjet|cublas|reshape_and_cache"),
+    # the vtl fused norm/act -> fp8 quant kernels + rope/rmsnorm.
+    ("quant_fusion", r"rms_?norm|layer_?norm|dynamic_per_token|silu_and_mul|mul_sigmoid|scaled_fp8|"
+                     r"\bquant\b|gated_rmsnorm|rope|rotary|\bnorm\b"),
 )
 _COMPILED = tuple((name, re.compile(rx, re.IGNORECASE)) for name, rx in BUCKETS)
 
@@ -171,6 +184,13 @@ def _selfcheck() -> None:
     assert bucket_of("elementwise_kernel<AddFunctor>") == "other"
     # a delta-rule GEMM stays in gdn_scan, not gemm (priority).
     assert bucket_of("gated_delta_rule_gemm") == "gdn_scan"
+    # real names from the 2026-07-16 capture that were misfiled the first time:
+    assert bucket_of("void marlin::Marlin<...>(int4 const*, ...)") == "gemm"
+    assert bucket_of("chunk_fwd_kernel_o") == "gdn_scan"
+    assert bucket_of("recompute_w_u_fwd_kernel") == "gdn_scan"
+    assert bucket_of("fused_sigmoid_gating_delta_rule_update_kernel") == "gdn_scan"
+    assert bucket_of("merge_16x16_to_64x64_inverse_kernel") == "gdn_scan"
+    assert bucket_of("ampere_bf16_s16816gemm_bf16_64x64_ldg8_f2f_stages_64x6_tn") == "gemm"
 
     events = [
         {"ph": "X", "cat": "kernel", "name": "chunk_gated_delta_rule_fwd", "dur": 100.0},
