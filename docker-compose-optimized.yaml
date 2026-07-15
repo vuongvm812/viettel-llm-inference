@@ -50,17 +50,6 @@ services:
       - --kv-cache-dtype=fp8_e4m3 # halves decode KV bandwidth at 18.7K context
       - --attention-backend FLASHINFER
 
-      # MTP speculative decode. The model ships a native MTP head (config: mtp_num_hidden_layers=1),
-      # so no draft model is needed -- vLLM drafts K tokens/step from the MTP head and verifies them
-      # in one target pass. Fewer decode forward passes -> lower per-request decode wall-clock ->
-      # lower E2E latency (and TTFT of queued requests, since decode frees the batch slot sooner).
-      # K=3 is the multi-request default: a sibling Qwen3.5 MTP sweep
-      # (sndr_core_engine/tools/bench_results/2026-06-30_ctx_depth_sweep_35b_awq.md) measured K=3 at
-      # 1.7-2.1x aggregate tok/s for concurrency>=2 and no concurrency cliff, vs K=5 which wins only
-      # single-stream. The judge fires ~20-wide waves, so start at K=3 and A/B K=3 vs K=5 vs off with
-      # `make bench` (accept-rate + TTFT/E2E/ITL). Different model, so re-measure the optimal K on-box.
-      - '--speculative-config={"method": "mtp", "num_speculative_tokens": 3}'
-
       # Turns on RMSNormQuantFusionPass, which rewrites the [2048]-wide
       # fused_add_rms_norm -> per-token-fp8-quant pairs (input_layernorm->in_proj/qkv and
       # post_attention_layernorm->gate_up, on both GDN and full-attn layers) into a single
