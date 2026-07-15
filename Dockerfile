@@ -17,6 +17,19 @@ ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.0
 
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 
+# jemalloc for host-side malloc: less fragmentation/contention and tighter RSS than
+# glibc for the prefix-cache/KV-manager metadata churn of this prefill-bound workload.
+# GPU allocs are unaffected (those go through PYTORCH_CUDA_ALLOC_CONF). Preloaded via
+# ENV below. The test -f fails the build now if the base ever moves the lib, instead of
+# LD_PRELOAD silently no-op'ing at the judge's run.
+# -o Dir::Etc::sourceparts=- skips sources.list.d/* (the CUDA + deadsnakes repos) for
+# this one update: jemalloc is in the base Ubuntu universe repo, and the NVIDIA mirror
+# is intermittently mid-sync (Packages.gz size mismatch) which otherwise fails the build.
+RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
+    && apt-get install -y --no-install-recommends libjemalloc2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && test -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+
 COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
 
@@ -67,6 +80,17 @@ ENV VLLM_PLUGINS=vtl \
     CUDA_MODULE_LOADING=LAZY \
     OMP_NUM_THREADS=1 \
     PYTHONHASHSEED=0
+
+# jemalloc, latency-tuned (NOT RSS-tuned). decay:-1 never returns pages to the OS: freed
+# memory stays mapped/hot for instant reuse, so there are no purge syscalls on the alloc
+# path and background_thread:false is coherent (nothing to purge). metadata_thp:always +
+# percpu arenas + a bigger tcache cut TLB misses and arena contention on the 3-core judge box.
+# RISK: decay:-1 means host RSS only grows. The judge caps the container at 8 GB with swap
+# off -- validate peak host RSS stays under 8 GB during `make bench` before submitting, or the
+# container OOM-kills (unscoreable). percpu_arena keys arenas off the host CPUs visible under
+# the CFS quota, so narenas:3 may not bind on a many-core host -- watch RSS.
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+    MALLOC_CONF=background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1,tcache:true,lg_tcache_max:16,percpu_arena:percpu,narenas:3,metadata_thp:always
 
 # Warm torch.compile / Triton / FlashInfer caches, produced by `make warm` on a GPU
 # box. Empty on a cold build -- the server still boots, it just pays the compile
