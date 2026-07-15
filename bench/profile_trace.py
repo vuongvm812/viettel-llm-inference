@@ -39,7 +39,6 @@ import json
 import os
 import re
 import sys
-import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
@@ -115,24 +114,32 @@ def print_report(s: dict) -> None:
         print(f"{row['pct']:>5.1f}%{row['us'] / 1e3:>10.1f}  {row['bucket']:<13}{nm}")
 
 
-def _post(url: str) -> None:
-    """POST with no body; tolerate 404 (endpoint only exists when the profiler dir is set)."""
+async def _post(session, url: str) -> int | None:  # noqa: ANN001
+    """POST no body over the SAME aiohttp transport the replay uses (urllib tripped over
+    proxy env / IPv6-localhost and got ECONNRESET). Returns the HTTP status, or None on a
+    transport error. A clean 404 here means VLLM_TORCH_PROFILER_DIR wasn't set at boot."""
     try:
-        req = urllib.request.Request(url, method="POST", data=b"")
-        with urllib.request.urlopen(req, timeout=30) as r:  # noqa: S310 (local target)
-            r.read()
+        async with session.post(url) as r:
+            body = (await r.text())[:200]
+            if r.status != 200:
+                print(f"warn: POST {url} -> HTTP {r.status}: {body}", file=sys.stderr)
+            return r.status
     except Exception as e:  # noqa: BLE001
-        print(f"warn: POST {url} failed ({e}); is VLLM_TORCH_PROFILER_DIR set on the server?",
-              file=sys.stderr)
+        print(f"warn: POST {url} failed ({type(e).__name__}: {e})", file=sys.stderr)
+        return None
 
 
-async def _drive_replay(target: str, records: list, concurrency: int) -> None:
+async def _profile_run(target: str, records: list, concurrency: int) -> int | None:
+    """One session: /start_profile -> closed-loop replay -> /stop_profile. Returns the
+    start_profile status so main() can tell 'endpoint missing' from 'ran but no trace'."""
     import aiohttp
 
     from replay import do_request  # lazy: keeps aiohttp out of --self-check
 
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=600)
+    # no trust_env: ignore http_proxy/no_proxy so localhost never routes via a proxy.
     async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=0)) as s:
+        start_status = await _post(s, f"{target}/start_profile")
         loop = asyncio.get_running_loop()
         t0 = loop.time()
         q: asyncio.Queue = asyncio.Queue()
@@ -148,6 +155,8 @@ async def _drive_replay(target: str, records: list, concurrency: int) -> None:
                 await do_request(s, target, rec, t0)
 
         await asyncio.gather(*(worker() for _ in range(concurrency)))
+        await _post(s, f"{target}/stop_profile")
+        return start_status
 
 
 def _newest_trace(profile_dir: Path) -> Path | None:
@@ -182,9 +191,16 @@ def main() -> None:
 
         records = load_trace(args.trace)[: args.limit]
         print(f"profiling {len(records)} requests @ conc={args.concurrency} -> {args.target}", file=sys.stderr)
-        _post(f"{args.target}/start_profile")
-        asyncio.run(_drive_replay(args.target, records, args.concurrency))
-        _post(f"{args.target}/stop_profile")
+        start_status = asyncio.run(_profile_run(args.target, records, args.concurrency))
+        if start_status == 404:
+            sys.exit(
+                "start_profile returned 404: the server was NOT launched with "
+                "VLLM_TORCH_PROFILER_DIR set, so vLLM never registered the profiler endpoint. "
+                "Use `make profile` (the docker-compose.profile.yaml overlay sets it), and make "
+                "sure no OTHER server is already bound to :8000."
+            )
+        if start_status != 200:
+            print(f"warn: start_profile status={start_status}; trace may be empty", file=sys.stderr)
         # vLLM flushes the trace asynchronously on stop; give it a moment, then pick the newest.
         import time
 
