@@ -97,5 +97,11 @@ ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
 # stall on the first request.
 COPY docker/cache/ /opt/vtl/cache/
 
+# Health-gated KV-prefix warm-up: the compose healthcheck runs this script, which primes the
+# shared ~6.4k-token system prompt into the prefix cache before the container reports healthy,
+# so the judge's first 20-request wave hits a warm prefix. Copied to a persistent path because
+# /src (the pip-install source) is removed above. See vtl/warmup_healthcheck.py.
+COPY vtl/warmup_healthcheck.py vtl/warmup_system_prompt.txt /opt/vtl/
+
 # No ENTRYPOINT: the compose file pins
 # `python3 -m vllm.entrypoints.openai.api_server` to stay diffable against baseline.

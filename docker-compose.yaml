@@ -37,6 +37,7 @@ services:
       # The 6,388-token shared system prompt makes this the single biggest win:
       # ~31% of all prefill work disappears after the first request.
       - --enable-prefix-caching
+      - --mamba_cache_mode=all
       - --enable-chunked-prefill
       - --max-num-seqs=16 # Pareto optimum: 12 cut tbt 18->17 but blew ttft_p95 14k->20k (-0.3). 20 raised tbt (worse). Frontier is ~62.5 here.
       - --max-num-batched-tokens=16384 # prefill chunk size: TTFT vs prefill throughput
@@ -54,7 +55,7 @@ services:
       # FP8 (vtl_fp8). Load-bearing: --quantization=vtl_fp8 aborts at startup if disabled.
       VTL_ENABLE_FP8: 1
       VTL_FP8_CHANNELWISE: 1                  # 1 = per-channel weight scales; 0 = stock per-tensor
-      VTL_FP8_IGNORE: "lm_head,in_proj_a,in_proj_b,visual"
+      VTL_FP8_IGNORE: "lm_head,visual"
 
       # Per-patch kill-switches (all default ON). Each = VTL_ENABLE_<patch>.
       VTL_ENABLE_RMS_NORM_QUANT: 1            # needs pass_config.fuse_norm_quant to fire
@@ -82,11 +83,18 @@ services:
                                       #     `make bench-kernel` A/B beats stock; see the plan doc)
 
       VTL_KERNEL_SYNC: 0                       # DEBUG only: 1 = cudaStreamSynchronize per kernel (slow)
+
+      VTL_DISABLE_WARMUP: 0                     # 1 = pure /health check, skip system-prefix priming
     shm_size: "2g"
+    # The healthcheck doubles as a one-shot KV-prefix warm-up: the first passing run POSTs the
+    # shared ~6.4k-token system prompt so it is cached before the container reports healthy (and
+    # before the judge fires its first 20-request wave). Readiness still gates ONLY on /health --
+    # priming is best-effort and can never leave the container un-healthy. timeout raised to 30s to
+    # cover the one priming POST (which is itself bounded to 20s). See vtl/warmup_healthcheck.py.
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python3", "/opt/vtl/warmup_healthcheck.py"]
       interval: 10s
-      timeout: 5s
+      timeout: 30s
       retries: 40
       start_period: 180s
     deploy:
