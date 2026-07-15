@@ -24,6 +24,7 @@ check:
 	PYTHONPATH=. python3 vtl/patches/gdn_prefill_backend.py
 	PYTHONPATH=. python3 vtl/patches/kv_cache_manager.py
 	PYTHONPATH=. python3 vtl/patches/sched_policy.py
+	PYTHONPATH=. python3 vtl/patches/profiler.py
 	python3 bench/trace_stats.py --self-check
 	python3 bench/metrics.py
 	python3 bench/profile_trace.py --self-check
@@ -180,7 +181,10 @@ bench:
 ## chunk-parallel scan only if gdn_scan is a top-2 cost. See docs/plans/gdn-parallel-scan.md.
 profile:
 	mkdir -p bench-profile
-	$(LOCAL) -f docker-compose.profile.yaml up -d --build --wait
-	python3 bench/profile_trace.py --target $(TARGET) --trace $(TRACE) \
-	  --limit 8 --concurrency 8 --profile-dir bench-profile --out bench-profile-summary.json
+	rm -f bench-profile/vtl-trace-*.json bench-profile/.arm
+	$(LOCAL) -f docker-compose.profile.yaml up -d --build --force-recreate --wait
+	touch bench-profile/.arm   # arm AFTER warmup so the capture is the replay, not warmup
+	python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --closed-loop 8 --limit 48 --out /dev/null
+	sleep 3   # let the worker finish export_chrome_trace
+	python3 bench/profile_trace.py --profile-dir bench-profile --out bench-profile-summary.json
 	$(LOCAL) -f docker-compose.profile.yaml down

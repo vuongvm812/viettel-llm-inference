@@ -15,15 +15,15 @@ The ranked table is the deliverable that decides Phase 2: if `gdn_scan` is a top
 cost the chunk-parallel WY kernel is justified; if `full_attn` dominates, the fp8 /
 cascade attention work in Phase 1 is the priority.
 
-Usage (server must be launched with VLLM_TORCH_PROFILER_DIR set -- `make profile` does this):
+This is only the PARSER. The capture is done by vtl/patches/profiler.py inside the worker
+(this build's vLLM stripped the /start_profile endpoint), driven by `make profile`:
+boot -> wait healthy -> touch bench-profile/.arm -> replay load -> worker dumps
+bench-profile/vtl-trace-<pid>.json. Then this script buckets that trace.
 
-    # drive the profiler around a replay, then parse the newest trace it wrote
-    python3 bench/profile_trace.py --target http://localhost:8000 \
-        --profile-dir ./bench-profile --limit 8 --concurrency 8
+    make profile                                     # capture + parse end to end (needs H200)
 
-    # just re-bucket an already-captured chrome trace (no server needed)
-    python3 bench/profile_trace.py --trace-file ./bench-profile/<...>.pt.trace.json.gz
-
+    python3 bench/profile_trace.py --profile-dir ./bench-profile   # parse newest capture
+    python3 bench/profile_trace.py --trace-file ./bench-profile/vtl-trace-147.json
     python3 bench/profile_trace.py --self-check      # no GPU, no server
 
 The buckets are HEURISTIC (name substrings). Real v0.25.0 kernel names are only known
@@ -32,7 +32,6 @@ by editing BUCKETS below once you see them.
 """
 
 import argparse
-import asyncio
 import glob
 import gzip
 import json
@@ -41,9 +40,6 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-
-# `replay` (and its aiohttp dep) is imported lazily in the replay path only, so
-# --self-check / --trace-file parsing run with no HTTP deps (and stay in `make check`).
 
 # (bucket, regex) in PRIORITY order: a kernel name is charged to the FIRST match.
 # gdn before attn (delta-rule has its own GEMMs), quant before gemm (norm/quant names
@@ -114,68 +110,30 @@ def print_report(s: dict) -> None:
         print(f"{row['pct']:>5.1f}%{row['us'] / 1e3:>10.1f}  {row['bucket']:<13}{nm}")
 
 
-async def _post(session, url: str) -> int | None:  # noqa: ANN001
-    """POST no body over the SAME aiohttp transport the replay uses (urllib tripped over
-    proxy env / IPv6-localhost and got ECONNRESET). Returns the HTTP status, or None on a
-    transport error. A clean 404 here means VLLM_TORCH_PROFILER_DIR wasn't set at boot."""
-    try:
-        async with session.post(url) as r:
-            body = (await r.text())[:200]
-            if r.status != 200:
-                print(f"warn: POST {url} -> HTTP {r.status}: {body}", file=sys.stderr)
-            return r.status
-    except Exception as e:  # noqa: BLE001
-        print(f"warn: POST {url} failed ({type(e).__name__}: {e})", file=sys.stderr)
-        return None
-
-
-async def _profile_run(target: str, records: list, concurrency: int) -> int | None:
-    """One session: /start_profile -> closed-loop replay -> /stop_profile. Returns the
-    start_profile status so main() can tell 'endpoint missing' from 'ran but no trace'."""
-    import aiohttp
-
-    from replay import do_request  # lazy: keeps aiohttp out of --self-check
-
-    timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=600)
-    # no trust_env: ignore http_proxy/no_proxy so localhost never routes via a proxy.
-    async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=0)) as s:
-        start_status = await _post(s, f"{target}/start_profile")
-        loop = asyncio.get_running_loop()
-        t0 = loop.time()
-        q: asyncio.Queue = asyncio.Queue()
-        for r in records:
-            q.put_nowait(r)
-
-        async def worker():
-            while True:
-                try:
-                    rec = q.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                await do_request(s, target, rec, t0)
-
-        await asyncio.gather(*(worker() for _ in range(concurrency)))
-        await _post(s, f"{target}/stop_profile")
-        return start_status
-
-
-def _newest_trace(profile_dir: Path) -> Path | None:
-    cands = glob.glob(str(profile_dir / "**" / "*.json*"), recursive=True)
-    cands = [c for c in cands if c.endswith((".json", ".json.gz"))]
+def _best_trace(profile_dir: Path) -> Path | None:
+    """The chrome trace vtl/patches/profiler.py wrote. Pick the LARGEST json (a real
+    kernel-rich capture dwarfs any stray/empty file, e.g. from a non-worker process)."""
+    cands = [
+        Path(c)
+        for c in glob.glob(str(profile_dir / "**" / "vtl-trace-*.json*"), recursive=True)
+        if c.endswith((".json", ".json.gz"))
+    ]
+    if not cands:  # fall back to any *.json* if the naming ever changes
+        cands = [
+            Path(c)
+            for c in glob.glob(str(profile_dir / "**" / "*.json*"), recursive=True)
+            if c.endswith((".json", ".json.gz")) and "summary" not in Path(c).name
+        ]
     if not cands:
         return None
-    return Path(max(cands, key=os.path.getmtime))
+    return max(cands, key=lambda p: p.stat().st_size)
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--target", default="http://localhost:8000")
-    p.add_argument("--trace", type=Path, default=Path(__file__).resolve().parent.parent / "data" / "input" / "trace-round1.jsonl")
-    p.add_argument("--limit", type=int, default=8, help="requests to replay under the profiler")
-    p.add_argument("--concurrency", type=int, default=8, help="closed-loop workers (exercise batched/wave behavior)")
     p.add_argument("--profile-dir", type=Path, default=Path("bench-profile"),
-                   help="host dir the server's VLLM_TORCH_PROFILER_DIR maps to")
-    p.add_argument("--trace-file", type=Path, help="skip the replay; just re-bucket this chrome trace")
+                   help="dir the worker wrote vtl-trace-<pid>.json into (mounted from /profile)")
+    p.add_argument("--trace-file", type=Path, help="parse this specific chrome trace instead of scanning --profile-dir")
     p.add_argument("--out", type=Path, default=Path("bench-profile-summary.json"))
     p.add_argument("--top", type=int, default=40)
     p.add_argument("--self-check", action="store_true")
@@ -185,33 +143,14 @@ def main() -> None:
         _selfcheck()
         return
 
-    trace_file = args.trace_file
+    trace_file = args.trace_file or _best_trace(args.profile_dir)
     if trace_file is None:
-        from replay import load_trace  # lazy: keeps aiohttp out of --self-check
-
-        records = load_trace(args.trace)[: args.limit]
-        print(f"profiling {len(records)} requests @ conc={args.concurrency} -> {args.target}", file=sys.stderr)
-        start_status = asyncio.run(_profile_run(args.target, records, args.concurrency))
-        if start_status == 404:
-            sys.exit(
-                "start_profile returned 404: the server was NOT launched with "
-                "VLLM_TORCH_PROFILER_DIR set, so vLLM never registered the profiler endpoint. "
-                "Use `make profile` (the docker-compose.profile.yaml overlay sets it), and make "
-                "sure no OTHER server is already bound to :8000."
-            )
-        if start_status != 200:
-            print(f"warn: start_profile status={start_status}; trace may be empty", file=sys.stderr)
-        # vLLM flushes the trace asynchronously on stop; give it a moment, then pick the newest.
-        import time
-
-        for _ in range(30):
-            trace_file = _newest_trace(args.profile_dir)
-            if trace_file is not None:
-                break
-            time.sleep(1)
-        if trace_file is None:
-            sys.exit(f"no trace file appeared in {args.profile_dir}; check the mount + VLLM_TORCH_PROFILER_DIR")
-        print(f"parsing {trace_file}", file=sys.stderr)
+        sys.exit(
+            f"no vtl-trace-*.json in {args.profile_dir}. Did the worker arm+dump? "
+            "`make profile` touches .arm after the server is healthy, then replays load; "
+            "check the server logs for 'vtl: profiler wrote ...'."
+        )
+    print(f"parsing {trace_file} ({trace_file.stat().st_size / 1e6:.1f} MB)", file=sys.stderr)
 
     by_name = parse_chrome_trace(trace_file)
     if not by_name:

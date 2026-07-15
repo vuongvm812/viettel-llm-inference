@@ -25,6 +25,7 @@ _MODULES: tuple[str, ...] = (
     "gdn_prefill_backend",
     "kv_cache_manager",
     "sched_policy",
+    "profiler",
 )
 
 for _name in _MODULES:
