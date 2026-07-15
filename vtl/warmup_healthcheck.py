@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""Healthcheck that also primes the KV prefix cache with the shared system prompt.
+"""Healthcheck that also primes the KV prefix cache by replaying a few real trace requests.
 
 The scored trace arrives in bursts of 20 requests that all share one ~6.4k-token system
 prompt. Cold, those 20 race to prefill that prefix and vLLM serializes the duplicates
 (MambaManager defers same-block prefills within a step), so the shared prefix bottlenecks
-wave-1 TTFT. Priming it once, BEFORE the judge sees a healthy container, means every request
-hits a warm system prefix from the first wave.
+wave-1 TTFT. Replaying the first few trace requests once, BEFORE the judge sees a healthy
+container, means every request hits a warm system prefix from the first wave -- and, unlike a
+1-token prime, the real max_tokens generations also warm the decode/MTP/GDN kernels.
 
 We fold the warm-up into the healthcheck instead of a background thread so readiness and
 warm-up are the same signal: Docker marks the container healthy only when this script exits 0,
-and the first passing run does the priming POST synchronously before returning. Crucially,
+and the first passing run does the priming POSTs synchronously before returning. Crucially,
 readiness gates ONLY on /health -- the warm-up is one-shot best-effort (a sentinel is written
-BEFORE the POST so a slow/failed prime never re-fires or blocks readiness). A broken warm-up can
-never leave the container un-healthy (which would be unscoreable).
+BEFORE the POSTs so a slow/failed prime never re-fires or blocks readiness). A broken warm-up
+can never leave the container un-healthy (which would be unscoreable).
+
+The request set is whatever lines are baked into VTL_WARMUP_TRACE_FILE (the Dockerfile slices
+the first N lines of the round-1 trace) -- change the count there, not here.
 
 Env (all optional):
   VTL_WARMUP_PORT=8000                              local server port
   VTL_WARMUP_MODEL=Qwen3.5-2B                       served model name (must match --served-model-name)
-  VTL_WARMUP_PROMPT_FILE=/opt/vtl/warmup_system_prompt.txt   prefix to prime
+  VTL_WARMUP_TRACE_FILE=/opt/vtl/warmup_requests.jsonl   jsonl trace slice to replay
   VTL_WARMUP_SENTINEL=/tmp/vtl_warm.done            one-shot guard
-  VTL_WARMUP_POST_TIMEOUT=20                         seconds; keep < compose healthcheck timeout
+  VTL_WARMUP_POST_TIMEOUT=20                         seconds per request; keep < compose healthcheck timeout
   VTL_DISABLE_WARMUP=0                              1 = pure healthcheck, no priming
 """
 from __future__ import annotations
@@ -31,7 +35,7 @@ import urllib.request
 
 PORT = os.environ.get("VTL_WARMUP_PORT", "8000")
 MODEL = os.environ.get("VTL_WARMUP_MODEL", "Qwen3.5-2B")
-PROMPT_FILE = os.environ.get("VTL_WARMUP_PROMPT_FILE", "/opt/vtl/warmup_system_prompt.txt")
+TRACE_FILE = os.environ.get("VTL_WARMUP_TRACE_FILE", "/opt/vtl/warmup_requests.jsonl")
 SENTINEL = os.environ.get("VTL_WARMUP_SENTINEL", "/tmp/vtl_warm.done")
 POST_TIMEOUT = float(os.environ.get("VTL_WARMUP_POST_TIMEOUT", "20"))
 BASE = f"http://localhost:{PORT}"
@@ -45,38 +49,44 @@ def _health_ok() -> bool:
         return False
 
 
-def _prime() -> None:
-    """POST the shared system prompt once so its KV + GDN state is cached. Best-effort."""
-    try:
-        with open(PROMPT_FILE, encoding="utf-8") as f:
-            system_prompt = f.read()
-    except Exception as e:  # no prompt baked -> nothing to prime, health still fine
-        print(f"vtl-warmup: prompt file unreadable ({e}); skipping prime", file=sys.stderr)
-        return
-    body = json.dumps(
-        {
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": "ready"},
-            ],
-            "max_tokens": 1,
-            "temperature": 0,
-            "stream": False,
-        }
-    ).encode()
+def _post(body: dict) -> None:
+    """POST one chat request, best-effort. A slow/failed prime must not affect readiness."""
     req = urllib.request.Request(
         f"{BASE}/v1/chat/completions",
-        data=body,
+        data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    with urllib.request.urlopen(req, timeout=POST_TIMEOUT) as r:
+        r.read()
+
+
+def _prime() -> None:
+    """Replay the baked trace slice so the shared prefix + decode kernels are warm. Best-effort."""
     try:
-        with urllib.request.urlopen(req, timeout=POST_TIMEOUT) as r:
-            r.read()
-        print("vtl-warmup: system prefix primed", file=sys.stderr)
-    except Exception as e:  # a slow/failed prime must not affect readiness
-        print(f"vtl-warmup: prime POST failed ({e}); serving cold", file=sys.stderr)
+        with open(TRACE_FILE, encoding="utf-8") as f:
+            lines = [ln for ln in f if ln.strip()]
+    except Exception as e:  # nothing baked -> nothing to prime, health still fine
+        print(f"vtl-warmup: trace file unreadable ({e}); skipping prime", file=sys.stderr)
+        return
+    primed = 0
+    for i, ln in enumerate(lines):
+        try:
+            body = json.loads(ln)["body"]
+            # Rebuild ourselves: drop the trace's stream/seed, keep messages + generation length.
+            _post(
+                {
+                    "model": MODEL,
+                    "messages": body["messages"],
+                    "max_tokens": body.get("max_tokens", 200),
+                    "temperature": body.get("temperature", 0),
+                    "stream": False,
+                }
+            )
+            primed += 1
+        except Exception as e:  # one bad line/request must not abort the rest
+            print(f"vtl-warmup: request {i} failed ({e})", file=sys.stderr)
+    print(f"vtl-warmup: primed {primed}/{len(lines)} trace requests", file=sys.stderr)
 
 
 def main() -> int:

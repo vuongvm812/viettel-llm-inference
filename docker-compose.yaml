@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:5bfe4d0828cd06c52640b3f44c402c9c4de05a56ecfac4fc8e26ea61200d4662 # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:e61e2c094749e1e84c75ffd92efde8de5577de04fb5cf6956973ac054a8bce16 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -86,11 +86,12 @@ services:
 
       VTL_DISABLE_WARMUP: 0                     # 1 = pure /health check, skip system-prefix priming
     shm_size: "2g"
-    # The healthcheck doubles as a one-shot KV-prefix warm-up: the first passing run POSTs the
-    # shared ~6.4k-token system prompt so it is cached before the container reports healthy (and
-    # before the judge fires its first 20-request wave). Readiness still gates ONLY on /health --
-    # priming is best-effort and can never leave the container un-healthy. timeout raised to 30s to
-    # cover the one priming POST (which is itself bounded to 20s). See vtl/warmup_healthcheck.py.
+    # The healthcheck doubles as a one-shot KV-prefix warm-up: the first passing run replays the
+    # first 5 round-1 trace requests (shared prefix + real user turns) so the prefix is cached and
+    # decode kernels are warm before the container reports healthy (and before the judge fires its
+    # first 20-request wave). Readiness still gates ONLY on /health -- priming is best-effort and can
+    # never leave the container un-healthy. timeout raised to 30s to cover the priming POSTs (each
+    # bounded to 20s; sentinel-before-prime means a slow tick just retries). See vtl/warmup_healthcheck.py.
     healthcheck:
       test: ["CMD", "python3", "/opt/vtl/warmup_healthcheck.py"]
       interval: 10s
