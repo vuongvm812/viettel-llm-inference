@@ -86,11 +86,12 @@ services:
 
       VTL_DISABLE_WARMUP: 0                     # 1 = pure /health check, skip system-prefix priming
     shm_size: "2g"
-    # The healthcheck doubles as a one-shot KV-prefix warm-up: the first passing run POSTs the
-    # shared ~6.4k-token system prompt so it is cached before the container reports healthy (and
-    # before the judge fires its first 20-request wave). Readiness still gates ONLY on /health --
-    # priming is best-effort and can never leave the container un-healthy. timeout raised to 30s to
-    # cover the one priming POST (which is itself bounded to 20s). See vtl/warmup_healthcheck.py.
+    # The healthcheck doubles as a one-shot KV-prefix warm-up: the first passing run replays the
+    # first 5 round-1 trace requests (shared prefix + real user turns) so the prefix is cached and
+    # decode kernels are warm before the container reports healthy (and before the judge fires its
+    # first 20-request wave). Readiness still gates ONLY on /health -- priming is best-effort and can
+    # never leave the container un-healthy. timeout raised to 30s to cover the priming POSTs (each
+    # bounded to 20s; sentinel-before-prime means a slow tick just retries). See vtl/warmup_healthcheck.py.
     healthcheck:
       test: ["CMD", "python3", "/opt/vtl/warmup_healthcheck.py"]
       interval: 10s

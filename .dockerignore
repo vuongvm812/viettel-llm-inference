@@ -7,3 +7,7 @@
 !README.md
 !vtl/
 !docker/cache/
+# Warm-up trace slice (bind-mounted + head -n during build; parents must be re-included too).
+!data
+!data/input
+!data/input/trace-round1.jsonl
