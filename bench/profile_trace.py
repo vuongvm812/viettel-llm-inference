@@ -44,10 +44,19 @@ from pathlib import Path
 # (bucket, regex) in PRIORITY order: a kernel name is charged to the FIRST match.
 # gdn before attn (delta-rule has its own GEMMs), quant before gemm (norm/quant names
 # must not fall into the generic gemm bucket). Edit these once real names are known.
-# Priority order (first match wins). Tuned against the real v0.25.0 kernel names seen in the
-# first on-box capture (2026-07-16). gdn/attn first so their internal GEMM-ish kernels aren't
-# stolen by the generic gemm bucket; gemm before quant so `*_marlin_gemm_*` GEMMs (even when
-# their fused name also mentions rms_norm) land in gemm, not quant_fusion.
+# Priority order (first match wins). Tuned against real v0.25.0 kernel names.
+#
+# HARDWARE CAVEAT: the first capture (2026-07-16) was on an RTX 3060 (Ampere, sm_86), which has
+# NO FP8 tensor cores -- so cutlass_fp8_supported() is False and every FP8 Linear fell back to
+# FP8-Marlin (`void marlin::Marlin<...>`, ~70% of GPU time there). That is EXPECTED on Ampere and
+# tells us nothing about the H200 target: on Hopper (sm_90) those GEMMs run native FP8
+# cutlass_scaled_mm and Marlin does not appear. So the 3060 bucket shares are NOT representative --
+# re-run `make profile` on the H200 before drawing any Phase-1/2 conclusion. The gdn/quant kernel
+# names below (FLA chunk_*, causal_conv1d, rms_norm) DO run on both, so those buckets carry over.
+#
+# gdn/attn first so their internal GEMM-ish kernels aren't stolen by the generic gemm bucket;
+# gemm before quant so `*_marlin_gemm_*` GEMMs (even when their fused name also mentions rms_norm)
+# land in gemm, not quant_fusion.
 BUCKETS: tuple[tuple[str, str], ...] = (
     # FLA chunked gated-delta-rule (prefill) + conv + recurrent decode -- the 18 GDN layers.
     ("gdn_scan", r"gated_delta|delta_rule|causal_conv1d|fused_recurrent|sigmoid_gating|solve_tril|"
