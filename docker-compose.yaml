@@ -45,7 +45,7 @@ services:
       - --kv-cache-dtype=fp8_e4m3
       - --attention-backend FLASHINFER
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
-      - '--speculative-config={"method":"qwen3_next_mtp","num_speculative_tokens":1}'
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":1}'
     ports:
       - "8000:8000"
     environment:
