@@ -1,0 +1,13 @@
+# Phase-0 profiling overlay -- do NOT submit. Turns on vLLM's built-in torch profiler
+# (writes a chrome trace on /stop_profile) and mounts its output dir so
+# bench/profile_trace.py can read + bucket the captured GPU kernels. Used only by
+# `make profile`; kept out of the normal LOCAL stack so profiler overhead never taints
+# `make bench`/`make warm`. Layer AFTER the localtest overlay:
+#   docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml \
+#                  -f docker-compose.profile.yaml up
+services:
+  model:
+    environment:
+      VLLM_TORCH_PROFILER_DIR: /profile
+    volumes:
+      - ./bench-profile:/profile

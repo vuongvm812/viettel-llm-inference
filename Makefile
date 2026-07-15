@@ -10,7 +10,7 @@ CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 TRACE := data/input/trace-round1.jsonl
 LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 
-.PHONY: check stats build up down warm push bench test-kernel bench-kernel verify
+.PHONY: check stats build up down warm push bench profile test-kernel bench-kernel verify
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server.
 check:
@@ -26,6 +26,7 @@ check:
 	PYTHONPATH=. python3 vtl/patches/sched_policy.py
 	python3 bench/trace_stats.py --self-check
 	python3 bench/metrics.py
+	python3 bench/profile_trace.py --self-check
 	@python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
 
 # No compose, no server, no model: the kernel tests just need the image and a GPU.
@@ -172,3 +173,14 @@ bench:
 	  python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	    --closed-loop $$n --out bench-closed-$$n.json; \
 	done
+
+## Phase-0 profiler (needs the H200). Boots with vLLM's torch profiler enabled, drives a
+## small closed-loop replay, and prints a ranked GPU-kernel cost table bucketed into
+## {gdn_scan, full_attn, gemm, quant_fusion, other}. This table decides Phase 2: GDN
+## chunk-parallel scan only if gdn_scan is a top-2 cost. See docs/plans/gdn-parallel-scan.md.
+profile:
+	mkdir -p bench-profile
+	$(LOCAL) -f docker-compose.profile.yaml up -d --build --wait
+	python3 bench/profile_trace.py --target $(TARGET) --trace $(TRACE) \
+	  --limit 8 --concurrency 8 --profile-dir bench-profile --out bench-profile-summary.json
+	$(LOCAL) -f docker-compose.profile.yaml down
