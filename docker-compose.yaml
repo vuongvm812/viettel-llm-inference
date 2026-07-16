@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:e61e2c094749e1e84c75ffd92efde8de5577de04fb5cf6956973ac054a8bce16 # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:e3d16a39e12fe72a739de268c2d43e6eb99f5de22cf7559024dcbd56b415f81a # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -40,10 +40,11 @@ services:
       - --mamba_cache_mode=all
       - --enable-chunked-prefill
       - --max-num-seqs=16 # Pareto optimum: 12 cut tbt 18->17 but blew ttft_p95 14k->20k (-0.3). 20 raised tbt (worse). Frontier is ~62.5 here.
-      - --max-num-batched-tokens=16384 # prefill chunk size: TTFT vs prefill throughput
+      - --max-num-batched-tokens=8192 # prefill chunk size: TTFT vs prefill throughput
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
-      - --attention-backend FLASHINFER
+      # - --attention-backend FLASHINFER
+      - --attention-config={"backend":"FLASHINFER","use_trtllm_attention":false,"disable_flashinfer_q_quantization":false}
 
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
     ports:
@@ -52,6 +53,10 @@ services:
       VLLM_PLUGINS: vtl
       VLLM_LOGGING_LEVEL: INFO
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
+
+      # FlashInfer config
+      VLLM_USE_FLASHINFER_SAMPLER: 1
+      VLLM_FLASHINFER_FORCE_TENSOR_CORES: 1
 
       # FP8 (vtl_fp8). Load-bearing: --quantization=vtl_fp8 aborts at startup if disabled.
       VTL_ENABLE_FP8: 1
