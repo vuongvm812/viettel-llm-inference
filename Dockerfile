@@ -44,9 +44,14 @@ COPY vtl /src/vtl
 #   make build CUDA_ARCHS='9.0+PTX'
 ARG CUDA_ARCHS="8.0;8.6;8.9;9.0+PTX"
 
+# ninja parallelism. Unset, it fans out to nproc: on a 28-core box that is ~28
+# concurrent nvcc, each building a 4-arch fat binary (~1-2 GB RSS) => 30-50 GB peak,
+# which OOM-kills a small dev box. Cap it. Big CI hosts override: make build MAX_JOBS=28.
+ARG MAX_JOBS=4
+
 # Scoped to the RUN, not ENV: it is a build input and has no business in the served image.
 # --no-build-isolation so setup.py sees the image's torch.
-RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" \
+RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
     pip install --no-cache-dir --no-build-isolation --no-deps /src \
     && rm -rf /src
 

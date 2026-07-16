@@ -7,6 +7,9 @@ PLATFORM ?= linux/amd64
 # SM archs baked into vtl._C. A wrong arch fails at the first kernel launch, not at import.
 # Narrow to '9.0+PTX' for the submission build. See the ARG in Dockerfile.
 CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
+# Cap parallel nvcc so the CUDA build does not OOM a small box (see ARG in Dockerfile).
+# Bump on a big-RAM CI host: make build MAX_JOBS=28.
+MAX_JOBS ?= 4
 TRACE := data/input/trace-round1.jsonl
 LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 
@@ -129,7 +132,7 @@ NOCACHE ?=
 BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 
 build:
-	docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --load -t $(IMAGE):$(TAG) .
+	docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --load -t $(IMAGE):$(TAG) .
 	@docker inspect $(IMAGE):$(TAG) --format 'built {{.Os}}/{{.Architecture}}'
 
 up:
