@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:e3d16a39e12fe72a739de268c2d43e6eb99f5de22cf7559024dcbd56b415f81a # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:fea8f5c09b7297a969b2e041263f15101e8fec8d2f6650c7d60148584398831f # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -40,15 +40,17 @@ services:
       - --enable-prefix-caching
       - --mamba_cache_mode=align
       - --enable-chunked-prefill
-      - --max-num-seqs=16 # RE-TUNE: was Pareto for 18.7k prefill-bound prompts; the 4k multi-turn
+      - --max-num-seqs=48 # RE-TUNE: was Pareto for 18.7k prefill-bound prompts; the 4k multi-turn
                           # phase-2 workload is more decode-heavy. Sweep with bench/replay.py.
       - --max-num-batched-tokens=8192 # RE-TUNE: prefill chunk size; smaller prompts may prefer less.
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
-      # - --attention-backend FLASHINFER
-      - --attention-config={"backend":"FLASHINFER","use_trtllm_attention":false,"disable_flashinfer_q_quantization":false}
+      - --attention-backend=FLASHINFER
 
-      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
+      # cudagraph_mode: PIECEWISE only. FULL_AND_PIECEWISE captures both graph sets and OOM-killed
+      # the container (exit 137) at CUDA-graph capture on the 8GB-RAM MiG. PIECEWISE alone survives;
+      # restore FULL_AND_PIECEWISE only if the box gets more host RAM.
+      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "PIECEWISE"}'
     ports:
       - "8000:8000"
     environment:
@@ -79,7 +81,7 @@ services:
       VTL_KERNEL_SYNC: 0                       # DEBUG only: 1 = cudaStreamSynchronize per kernel (slow)
 
       VTL_DISABLE_WARMUP: 0                     # 1 = pure /health check, skip system-prefix priming
-    shm_size: "2g"
+    shm_size: "2g" # tmpfs counts against the 8GB cgroup; 2g helped push it into OOMKill. TP=1 needs little.
     # The healthcheck doubles as a one-shot KV-prefix warm-up: the first passing run replays the
     # first few round-2 trace requests (shared system prefix + real multi-turn threads) so the prefix
     # is cached and decode kernels are warm before the container reports healthy (and before the judge

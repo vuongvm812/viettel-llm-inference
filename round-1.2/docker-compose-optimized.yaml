@@ -45,8 +45,7 @@ services:
       - --max-num-batched-tokens=8192 # RE-TUNE: prefill chunk size; smaller prompts may prefer less.
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
-      # - --attention-backend FLASHINFER
-      - --attention-config={"backend":"FLASHINFER","use_trtllm_attention":false,"disable_flashinfer_q_quantization":false}
+      - --attention-backend=FLASHINFER
 
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
     ports:
