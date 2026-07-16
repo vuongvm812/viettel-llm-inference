@@ -111,7 +111,7 @@ COPY docker/cache/ /opt/vtl/cache/
 # count here, not in the script. Priming is best-effort (see vtl/warmup_healthcheck.py).
 COPY vtl/warmup_healthcheck.py /opt/vtl/
 RUN --mount=type=bind,source=data/input/trace-round2.jsonl,target=/tmp/trace.jsonl \
-    head -n 40 /tmp/trace.jsonl > /opt/vtl/warmup_requests.jsonl
+    head -n 15 /tmp/trace.jsonl > /opt/vtl/warmup_requests.jsonl
 
 # No ENTRYPOINT: the compose file pins
 # `python3 -m vllm.entrypoints.openai.api_server` to stay diffable against baseline.
