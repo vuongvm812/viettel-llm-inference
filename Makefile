@@ -10,7 +10,7 @@ CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 TRACE := data/input/trace-round1.jsonl
 LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 
-.PHONY: check stats build up down warm push bench test-kernel bench-kernel verify
+.PHONY: check stats build up down warm push bench profile test-kernel bench-kernel verify
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server.
 check:
@@ -24,8 +24,10 @@ check:
 	PYTHONPATH=. python3 vtl/patches/gdn_prefill_backend.py
 	PYTHONPATH=. python3 vtl/patches/kv_cache_manager.py
 	PYTHONPATH=. python3 vtl/patches/sched_policy.py
+	PYTHONPATH=. python3 vtl/patches/profiler.py
 	python3 bench/trace_stats.py --self-check
 	python3 bench/metrics.py
+	python3 bench/profile_trace.py --self-check
 	@python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
 
 # No compose, no server, no model: the kernel tests just need the image and a GPU.
@@ -172,3 +174,17 @@ bench:
 	  python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	    --closed-loop $$n --out bench-closed-$$n.json; \
 	done
+
+## Phase-0 profiler (needs the H200). Boots with vLLM's torch profiler enabled, drives a
+## small closed-loop replay, and prints a ranked GPU-kernel cost table bucketed into
+## {gdn_scan, full_attn, gemm, quant_fusion, other}. This table decides Phase 2: GDN
+## chunk-parallel scan only if gdn_scan is a top-2 cost. See docs/plans/gdn-parallel-scan.md.
+profile:
+	mkdir -p bench-profile
+	rm -f bench-profile/vtl-trace-*.json bench-profile/.arm
+	$(LOCAL) -f docker-compose.profile.yaml up -d --build --force-recreate --wait
+	touch bench-profile/.arm   # arm AFTER warmup so the capture is the replay, not warmup
+	python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --closed-loop 8 --limit 48 --out /dev/null
+	sleep 3   # let the worker finish export_chrome_trace
+	python3 bench/profile_trace.py --profile-dir bench-profile --out bench-profile-summary.json
+	$(LOCAL) -f docker-compose.profile.yaml down
