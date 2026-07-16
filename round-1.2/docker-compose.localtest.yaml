@@ -1,0 +1,13 @@
+# LOCAL boot-test overlay -- do NOT submit this. The judge populates /model itself
+# and pulls the image from the registry; this builds locally and mounts a stand-in.
+# Usage:
+#   docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml up
+services:
+  model:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+    volumes:
+      - ../hf-model:/model:ro # shared HF weights at repo root (not duplicated per round)

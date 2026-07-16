@@ -1,0 +1,57 @@
+# OPT-IN overlay: KV cache offloading to CPU RAM and an NVMe tier.
+#
+#   docker compose -f docker-compose-optimized.yaml -f docker-compose.offload.yaml up
+#
+# ---------------------------------------------------------------------------
+# Read this before enabling it. On the round-1 trace it should do nothing.
+#
+# `python bench/trace_stats.py` reports:
+#   retained KV (the reusable working set)   15.7 GB bf16  /  7.8 GB fp8
+#   GPU KV budget                            ~120 GB       -> 8x headroom
+#
+# OffloadingConnector exists to raise the prefix-cache hit rate when GPU KV is
+# scarce and blocks get evicted. Here the *entire* reusable working set is 15.7 GB
+# against a ~120 GB budget, so nothing is ever evicted and there is nothing to
+# promote back. Every offloaded block is a block nobody will read from disk.
+#
+# It is also 700x slower on the miss path: NVMe reads at ~7 GB/s, H200 HBM at
+# ~4.8 TB/s. A hit served from NVMe is a hit you would rather have recomputed.
+#
+# So this is wired, correct, and default-OFF. It becomes worth enabling if any of
+# these change:
+#   * the real trace is much larger than round-1 (rerun trace_stats.py),
+#   * --gpu-memory-utilization has to drop a lot,
+#   * --max-model-len grows and the working set stops fitting.
+#
+# trace_stats.py prints exactly which regime you are in; trust it over intuition.
+# ---------------------------------------------------------------------------
+services:
+  model:
+    command:
+      - --model=/model #Don't change this to vllm-server
+      - --served-model-name=Qwen3.5-2B #Don't change this to vllm-server
+      - --host=0.0.0.0 #Don't change this to vllm-server
+      - --port=8000 #Don't change this to vllm-server
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.92
+      - --tensor-parallel-size=1
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-seqs=256
+      - --max-num-batched-tokens=8192
+      - --quantization=vtl_fp8
+      - --kv-cache-dtype=fp8_e4m3
+      # async scheduling is on by default; passing it explicitly turns any
+      # incompatibility into a hard startup failure. See docker-compose-optimized.yaml.
+      # CPU tier (DMA, async, cheap) + NVMe tier. block_size must be a multiple of
+      # the GPU block size (16).
+      - >-
+        --kv-transfer-config={"kv_connector":"OffloadingConnector","kv_role":"kv_both",
+        "kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec",
+        "block_size":64,"cpu_bytes_to_use":34359738368,"eviction_policy":"lru",
+        "secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv_cache",
+        "n_read_threads":32,"n_write_threads":16}]}}
+    volumes:
+      # Point this at real NVMe. A path on the container's overlay filesystem makes
+      # the "NVMe tier" a slow write to the Docker graph driver.
+      - ${VTL_NVME_DIR:-/mnt/nvme/kv_cache}:/mnt/kv_cache
