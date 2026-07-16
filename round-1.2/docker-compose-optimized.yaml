@@ -5,7 +5,7 @@ name: viettel-llm-optimized
 #
 # Phase-2 workload (LFM2.5-1.2B; regenerate stats with `python bench/trace_stats.py`):
 #   70 multi-turn conversations, <=6 turns each (420 turns), ~4,000 input tok/turn,
-#   max_tokens=200, temperature=0, 3s think-time between turns.
+#   max_tokens=200, temperature=0, random human think-pauses between turns.
 #   Far less prefill-bound than round-1's 18.7k single-turn prompts. The dominant cache
 #   win is now INTRA-conversation prefix reuse: turn N reuses turns 0..N-1. Prefix caching
 #   + decode throughput are the levers; re-tune --max-num-seqs/--max-num-batched-tokens
@@ -26,10 +26,10 @@ services:
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
 
-      # Phase-2 turns are ~4k tokens each and NON-accumulating (in_tokens_est is flat ~4,000 across
-      # a conversation's 6 turns -- a fixed per-session context + a small varying question, not a
-      # growing history). So the real requirement is only ~4.3k; 32768 is generous headroom against
-      # a longer private grading trace. Tighten to 8192 to free KV/graph memory if it stays this shape.
+      # Phase-2 is real multi-turn chat: a fixed per-conversation system prompt (~4k tokens) plus an
+      # accumulating [user, assistant] history, so a turn-0 prompt is ~4k and grows to ~4.5k by turn 6.
+      # 32768 is generous headroom against a longer private grading trace. Tighten to 8192 to free
+      # KV/graph memory if the private trace stays this shape.
       - --max-model-len=32768
       - --gpu-memory-utilization=0.95 # 0.95 leaves no headroom for CUDA graph pools
       - --tensor-parallel-size=1
