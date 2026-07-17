@@ -41,9 +41,9 @@ services:
       - --enable-prefix-caching
       - --mamba_cache_mode=align
       - --enable-chunked-prefill
-      - --max-num-seqs=16 # peak concurrency ~6 in the trace; a small cap shrinks the cudagraph
+      - --max-num-seqs=128 # peak concurrency ~6 in the trace; a small cap shrinks the cudagraph
                           # capture set + VRAM and leaves OOM headroom. Sweep with bench/replay.py.
-      - --max-num-batched-tokens=2048 # small prefill chunks: a new turn's ~4k prefill no longer
+      - --max-num-batched-tokens=8192 # small prefill chunks: a new turn's ~4k prefill no longer
                           # spikes in-flight decode ITL (gamma=2 punishes that tail); TTFT has slack.
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
@@ -53,7 +53,7 @@ services:
       - --disable-log-stats
       - --uvicorn-log-level=warning
 
-      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8]}'
+      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16]}'
     ports:
       - "8000:8000"
     environment:

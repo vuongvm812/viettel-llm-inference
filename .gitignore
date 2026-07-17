@@ -45,3 +45,4 @@ sglang/
 model/
 flashinfer-competition-codebase/
 vllm/
+flash-attention/
