@@ -43,7 +43,7 @@ services:
       - --enable-chunked-prefill
       - --max-num-seqs=64 # RE-TUNE: was Pareto for 18.7k prefill-bound prompts; the 4k multi-turn
                           # phase-2 workload is more decode-heavy. Sweep with bench/replay.py.
-      - --max-num-batched-tokens=8192 # RE-TUNE: prefill chunk size; smaller prompts may prefer less.
+      - --max-num-batched-tokens=4096 # RE-TUNE: prefill chunk size; smaller prompts may prefer less.
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
 
@@ -54,8 +54,6 @@ services:
       VLLM_PLUGINS: vtl
       VLLM_LOGGING_LEVEL: INFO
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
-
-      VLLM_ATTENTION_BACKEND: FLASHINFER
 
       # FP8 (vtl_fp8). Load-bearing: --quantization=vtl_fp8 aborts at startup if disabled.
       VTL_ENABLE_FP8: 1
