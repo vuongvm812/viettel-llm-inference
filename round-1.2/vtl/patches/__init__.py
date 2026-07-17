@@ -26,6 +26,8 @@ _MODULES: tuple[str, ...] = (
     "silu_mul_quant",
     "kv_cache_manager",
     "sched_policy",
+    "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)
+    "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
     "profiler",
 )
 
