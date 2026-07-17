@@ -1,3 +1,19 @@
+# Root dispatcher. The buildable project lives in per-round folders; this Makefile drives
+# whichever round you select and keeps the shared model weights (hf-model/) and vendored engine
+# repos at the root so they are not duplicated per round.
+#
+#   round-1.1/  frozen Qwen3.5-2B baseline (phase-1)
+#   round-1.2/  LFM2.5-1.2B refactor       (phase-2, default)
+#
+# Pick the round with ROUND=... on any target:
+#   make up                      # round-1.2 (default)
+#   make up ROUND=round-1.1      # the baseline
+#   make test-kernel ROUND=round-1.2
+ROUND ?= round-1.2
+ifeq ($(wildcard $(ROUND)/.),)
+$(error ROUND '$(ROUND)' not found -- use ROUND=round-1.1 or ROUND=round-1.2)
+endif
+
 IMAGE ?= unseenablefuture/awesome-badger
 TAG ?= dev
 TARGET ?= http://localhost:8000
@@ -10,40 +26,39 @@ CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 # Cap parallel nvcc so the CUDA build does not OOM a small box (see ARG in Dockerfile).
 # Bump on a big-RAM CI host: make build MAX_JOBS=28.
 MAX_JOBS ?= 4
-TRACE := data/input/trace-round1.jsonl
-LOCAL := docker compose -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 
-.PHONY: check stats build up down warm push bench profile test-kernel bench-kernel verify
+# All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
+# contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
+IN := cd $(ROUND) &&
+TRACE := data/input/trace-round2.jsonl
+COMPOSE_FILES := -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
+DC := docker compose $(COMPOSE_FILES)
 
-## Self-checks. Run anywhere: no GPU, no vLLM, no running server.
+.PHONY: check stats build up down warm push bench profile test-kernel bench-kernel debug-kernel verify
+
+## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
+## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
 check:
-	python3 vtl/registry.py
-	PYTHONPATH=. python3 vtl/patches/quant_fp8.py
-	PYTHONPATH=. python3 vtl/patches/rms_norm_quant.py
-	PYTHONPATH=. python3 vtl/patches/dynamic_per_token_quant.py
-	PYTHONPATH=. python3 vtl/patches/silu_mul_quant.py
-	PYTHONPATH=. python3 vtl/patches/mul_sigmoid_quant.py
-	PYTHONPATH=. python3 vtl/patches/gdn_kernels.py
-	PYTHONPATH=. python3 vtl/patches/gdn_prefill_backend.py
-	PYTHONPATH=. python3 vtl/patches/kv_cache_manager.py
-	PYTHONPATH=. python3 vtl/patches/sched_policy.py
-	PYTHONPATH=. python3 vtl/patches/profiler.py
-	python3 bench/trace_stats.py --self-check
-	python3 bench/metrics.py
-	python3 bench/profile_trace.py --self-check
-	@python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
+	$(IN) python3 vtl/registry.py
+	$(IN) for f in vtl/patches/*.py; do \
+	  case "$$f" in */__init__.py) continue;; esac; \
+	  echo "-- $$f"; PYTHONPATH=. python3 "$$f" || exit 1; \
+	done
+	$(IN) python3 bench/trace_stats.py --self-check
+	$(IN) python3 bench/metrics.py
+	$(IN) python3 bench/profile_trace.py --self-check
+	$(IN) [ -f bench/build_trace_round2.py ] && PYTHONPATH=. python3 bench/build_trace_round2.py --self-check || true
+	$(IN) python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
 
 # No compose, no server, no model: the kernel tests just need the image and a GPU.
 # --entrypoint bash because the vLLM base image starts the API server otherwise.
 # -p no:cacheprovider because /bench is mounted read-only.
+# The /bench/test_*.py glob expands IN THE CONTAINER, so each round runs exactly its own tests.
 # Both targets depend on `build`: $(IMAGE):$(TAG) also names a registry repo, so without it
 # docker silently pulls a stale published image and the tests run against whatever kernel
 # it happens to contain.
-KRUN := docker run --rm --gpus all -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
-KERNEL_TESTS := /bench/test_rms_norm_quant.py /bench/test_dynamic_per_token_quant.py \
-                /bench/test_silu_mul_quant.py /bench/test_mul_sigmoid_quant.py \
-                /bench/test_gdn_gated_rmsnorm.py /bench/test_gdn_chunk_scan.py
-PYTEST := pytest -q -p no:cacheprovider $(KERNEL_TESTS)
+KRUN := docker run --rm --gpus all -v $(PWD)/$(ROUND)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
+PYTEST := pytest -q -p no:cacheprovider /bench/test_*.py
 
 ## Kernel correctness. Needs a GPU. Runs one oracle against our kernel AND against the
 ## stock one -- importing vtl._C overrides _C process-wide, so they cannot coexist and
@@ -55,34 +70,30 @@ test-kernel: build
 
 ## Kernel microbenchmark at the trace's real shapes. Needs a GPU.
 bench-kernel: build
-	$(KRUN) 'for t in $(KERNEL_TESTS); do \
+	$(KRUN) 'for t in /bench/test_*.py; do \
 	    echo "=== $$t (vtl)"; python3 $$t; \
 	    echo "=== $$t (stock)"; VTL_SKIP_EXT=1 python3 $$t; \
 	  done'
 
 ## Pinpoint a memory fault. VTL_KERNEL_SYNC makes the kernel synchronise after every launch
-## and, on a fault, raise with the exact shape and path (fast/generic, dtype, stride,
-## pointer alignments) -- so it is attributed to its own launch instead of cascading into a
-## later test. Runs each test in its own process (-p no:randomly, --forked-ish via -x stop)
-## so the first raise is the culprit. compute-sanitizer is not in the runtime image; this
-## needs no extra tooling.
+## and, on a fault, raise with the exact shape and path. Runs each test stopping at first raise.
 ##   make debug-kernel                          # whole suite, stops at first fault
 ##   make debug-kernel T=test_misaligned        # one test
 T ?=
 DBG_KRUN := docker run --rm --gpus all -e VTL_KERNEL_SYNC=1 -e CUDA_LAUNCH_BLOCKING=1 \
-              -v $(PWD)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
+              -v $(PWD)/$(ROUND)/bench:/bench:ro --entrypoint bash $(IMAGE):$(TAG) -lc
 debug-kernel: build
 	$(DBG_KRUN) 'pip install -q pytest && \
-	  python3 -m pytest -q -p no:cacheprovider -x $(KERNEL_TESTS) \
+	  python3 -m pytest -q -p no:cacheprovider -x /bench/test_*.py \
 	  $(if $(T),-k $(T),)'
 
 stats:
-	python3 bench/trace_stats.py
+	$(IN) python3 bench/trace_stats.py --trace $(TRACE)
 
 ## Post-boot assertions. We rely on vLLM's defaults rather than passing risky flags,
 ## so prove the defaults actually resolved our way. Run against a live container.
 verify:
-	@$(LOCAL) logs model 2>/dev/null > /tmp/vtl-verify.log || true
+	@$(IN) $(DC) logs model 2>/dev/null > /tmp/vtl-verify.log || true
 	@# vLLM always logs this line once config is resolved, enabled or not. Its absence
 	@# means the server died before that -- do not report it as "async disabled".
 	@grep -q "Asynchronous scheduling is" /tmp/vtl-verify.log \
@@ -104,10 +115,8 @@ verify:
 	@grep -q "fused rms_norm+fp8-quant CUDA kernel installed" /tmp/vtl-verify.log \
 	  && echo "OK   vtl fused norm+quant kernel installed" \
 	  || { echo "FAIL vtl kernel not installed -- stock _C kernel is running"; exit 1; }
-	@# RMSNormQuantFusionPass.__call__ overrides VllmPatternMatcherPass.__call__ and never
-	@# touches match_table, so it never appears in "fusion pass matches:". The only line it
-	@# emits is `Replaced N patterns` (rms_quant_fusion.py:671, DEBUG). N is how many nodes
-	@# were rewritten into the op our kernel backs; N=0 means the kernel never runs.
+	@# RMSNormQuantFusionPass emits only `Replaced N patterns` (rms_quant_fusion.py, DEBUG).
+	@# N is how many nodes were rewritten into the op our kernel backs; N=0 means it never runs.
 	@n=$$(grep "rms_quant_fusion.py.*Replaced" /tmp/vtl-verify.log | tail -1 \
 	      | sed -n 's/.*Replaced \([0-9]*\) patterns.*/\1/p'); \
 	 if [ -z "$$n" ]; then \
@@ -119,75 +128,59 @@ verify:
 	 fi
 
 # --provenance=false --sbom=false: skip the SBOM/provenance attestation manifest and the
-# single-entry manifest LIST buildx would otherwise wrap a one-platform image in -- pure export
-# overhead here, and the manifest-list form makes some `docker pull`s slower. The base image
-# layers still dominate a first push; that is a one-time cost (Docker Hub dedups by digest, so
-# later pushes upload only the changed vtl layer). For code iteration prefer `make build`
-# (local --load, no registry round-trip) and only `make push` for the submission.
-# NOCACHE=--no-cache forces a full rebuild: re-runs pip/nvcc so the CURRENT kernels are
-# recompiled and every COPY is redone, instead of reusing cached layers. The base FROM image
-# stays cached (pulled, not built). Use when you must be sure the latest vtl code is baked in:
-#   make push NOCACHE=--no-cache
+# single-entry manifest LIST buildx would otherwise wrap a one-platform image in.
+# NOCACHE=--no-cache forces a full rebuild (re-runs pip/nvcc so the CURRENT kernels are recompiled).
 NOCACHE ?=
 BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 
 build:
-	docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --load -t $(IMAGE):$(TAG) .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --load -t $(IMAGE):$(TAG) .
 	@docker inspect $(IMAGE):$(TAG) --format 'built {{.Os}}/{{.Architecture}}'
 
 up:
-	$(LOCAL) up --build
+	$(IN) $(DC) up --build
 
 down:
-	$(LOCAL) down -v
+	$(IN) $(DC) down -v
 
-## torch.compile needs a real GPU, so `docker build` cannot warm its cache. Boot the
-## image, drive enough traffic to trigger compile + CUDA graph capture + FlashInfer
-## autotune, then copy the caches back into the build context and rebuild.
-##
-## Two passes on purpose. The open-loop --limit 4 warms the low-concurrency shapes.
-## The closed-loop pass then SATURATES a full batch (= --max-num-seqs in
-## docker-compose-optimized.yaml) so the multi-seq Triton kernels compile into the
-## cache too -- notably FlashInfer's batch_memcpy_kernel and vLLM's _zero_kv_blocks_kernel,
-## which only fire once a real batch forms and KV blocks churn. Without this pass they
-## JIT on the judge's first saturated batch and spike latency. WARM_REQS > concurrency
-## forces a second wave so blocks get freed/zeroed (triggers _zero_kv_blocks_kernel).
+## torch.compile needs a real GPU, so `docker build` cannot warm its cache. Boot the image, drive
+## enough traffic to trigger compile + CUDA graph capture + FlashInfer autotune, then copy the
+## caches back into the build context and rebuild. Two passes: open-loop warms low-concurrency
+## shapes; closed-loop saturates a full batch so the multi-seq kernels compile into the cache too.
 WARM_CONCURRENCY ?= 16
 WARM_REQS ?= 32
 warm:
-	$(LOCAL) up -d --build --wait   # --wait blocks until the healthcheck passes; replay 404s a booting API otherwise
-	python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --limit 4 --out /dev/null
-	python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	$(IN) $(DC) up -d --build --wait   # --wait blocks until the healthcheck passes
+	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --limit 4 --out /dev/null
+	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	  --closed-loop $(WARM_CONCURRENCY) --limit $(WARM_REQS) --out /dev/null
-	docker cp "$$($(LOCAL) ps -q model)":/opt/vtl/cache/. docker/cache/
-	$(LOCAL) down
-	$(MAKE) build
+	$(IN) docker cp "$$($(DC) ps -q model)":/opt/vtl/cache/. docker/cache/
+	$(IN) $(DC) down
+	$(MAKE) build ROUND=$(ROUND)
 
 ## buildx --push writes the manifest straight to the registry, so the pushed image
 ## is $(PLATFORM) regardless of what this machine is.
 push:
-	docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --push -t $(IMAGE):$(TAG) .
-	@echo "pin this digest in docker-compose-optimized.yaml:"
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --push -t $(IMAGE):$(TAG) .
+	@echo "pin this digest in $(ROUND)/docker-compose.yaml:"
 	@docker buildx imagetools inspect $(IMAGE):$(TAG) --format '{{.Manifest.Digest}}'
 
 ## Open-loop replay (honors the trace's arrival times) + a closed-loop sweep.
 bench:
-	python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --out bench-open.json
-	for n in 1 8 32 128; do \
+	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --out bench-open.json
+	$(IN) for n in 1 8 32 128; do \
 	  python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	    --closed-loop $$n --out bench-closed-$$n.json; \
 	done
 
-## Phase-0 profiler (needs the H200). Boots with vLLM's torch profiler enabled, drives a
-## small closed-loop replay, and prints a ranked GPU-kernel cost table bucketed into
-## {gdn_scan, full_attn, gemm, quant_fusion, other}. This table decides Phase 2: GDN
-## chunk-parallel scan only if gdn_scan is a top-2 cost. See docs/plans/gdn-parallel-scan.md.
+## Phase-0 profiler (needs the H200). Boots with vLLM's torch profiler enabled, drives a small
+## closed-loop replay, and prints a ranked GPU-kernel cost table. See docs/plans/.
 profile:
-	mkdir -p bench-profile
-	rm -f bench-profile/vtl-trace-*.json bench-profile/.arm
-	$(LOCAL) -f docker-compose.profile.yaml up -d --build --force-recreate --wait
-	touch bench-profile/.arm   # arm AFTER warmup so the capture is the replay, not warmup
-	python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --closed-loop 8 --limit 48 --out /dev/null
-	sleep 3   # let the worker finish export_chrome_trace
-	python3 bench/profile_trace.py --profile-dir bench-profile --out bench-profile-summary.json
-	$(LOCAL) -f docker-compose.profile.yaml down
+	$(IN) mkdir -p bench-profile
+	$(IN) rm -f bench-profile/vtl-trace-*.json bench-profile/.arm
+	$(IN) $(DC) -f docker-compose.profile.yaml up -d --build --force-recreate --wait
+	$(IN) touch bench-profile/.arm   # arm AFTER warmup so the capture is the replay, not warmup
+	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --closed-loop 8 --limit 48 --out /dev/null
+	$(IN) sleep 3   # let the worker finish export_chrome_trace
+	$(IN) python3 bench/profile_trace.py --profile-dir bench-profile --out bench-profile-summary.json
+	$(IN) $(DC) -f docker-compose.profile.yaml down

@@ -10,4 +10,4 @@ services:
       platforms:
         - linux/amd64
     volumes:
-      - ./hf-model:/model:ro # HF safetensors dir (config.json + *.safetensors)
+      - ../hf-model:/model:ro # shared HF weights at repo root (not duplicated per round)

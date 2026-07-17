@@ -22,7 +22,7 @@ services:
     command:
       - -O3
       - --model=/model #Don't change this to vllm-server
-      - --served-model-name=Qwen3.5-2B #Don't change this to vllm-server
+      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
       - --language-model-only
