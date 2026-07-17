@@ -41,7 +41,7 @@ services:
       - --enable-prefix-caching
       - --mamba_cache_mode=align
       - --enable-chunked-prefill
-      - --max-num-seqs=128 # RE-TUNE: was Pareto for 18.7k prefill-bound prompts; the 4k multi-turn
+      - --max-num-seqs=64 # RE-TUNE: was Pareto for 18.7k prefill-bound prompts; the 4k multi-turn
                           # phase-2 workload is more decode-heavy. Sweep with bench/replay.py.
       - --max-num-batched-tokens=8192 # RE-TUNE: prefill chunk size; smaller prompts may prefer less.
       - --quantization=vtl_fp8
