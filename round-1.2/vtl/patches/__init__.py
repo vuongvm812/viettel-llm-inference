@@ -27,6 +27,7 @@ _MODULES: tuple[str, ...] = (
     "kv_cache_manager",
     "sched_policy",
     "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)
+    "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
     "profiler",
 )
