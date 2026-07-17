@@ -33,7 +33,6 @@ services:
       - --max-model-len=8192
       - --gpu-memory-utilization=0.92 # 0.92 = vLLM default; leaves headroom for CUDA graph pools
       - --tensor-parallel-size=1
-      - --attention-backend=FLASHINFER
 
       # Intra-conversation prefix reuse is the biggest win now (turn N reuses turns 0..N-1).
       # LFM2 is a hybrid (short-conv state + attn KV): mamba_cache_mode MUST be `align` --
