@@ -30,7 +30,7 @@ services:
       # accumulating [user, assistant] history, so a turn-0 prompt is ~4k and grows to ~4.5k by turn 6.
       # 32768 is generous headroom against a longer private grading trace. Tighten to 8192 to free
       # KV/graph memory if the private trace stays this shape.
-      - --max-model-len=32768
+      - --max-model-len=8192
       - --gpu-memory-utilization=0.95 # 0.95 leaves no headroom for CUDA graph pools
       - --tensor-parallel-size=1
 
@@ -40,12 +40,11 @@ services:
       - --enable-prefix-caching
       - --mamba_cache_mode=align
       - --enable-chunked-prefill
-      - --max-num-seqs=16 # RE-TUNE: was Pareto for 18.7k prefill-bound prompts; the 4k multi-turn
+      - --max-num-seqs=128 # RE-TUNE: was Pareto for 18.7k prefill-bound prompts; the 4k multi-turn
                           # phase-2 workload is more decode-heavy. Sweep with bench/replay.py.
       - --max-num-batched-tokens=8192 # RE-TUNE: prefill chunk size; smaller prompts may prefer less.
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
-      - --attention-backend=FLASHINFER
 
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
     ports:
@@ -55,9 +54,7 @@ services:
       VLLM_LOGGING_LEVEL: INFO
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
 
-      # FlashInfer config
-      VLLM_USE_FLASHINFER_SAMPLER: 1
-      VLLM_FLASHINFER_FORCE_TENSOR_CORES: 1
+      VLLM_ATTENTION_BACKEND: FLASHINFER
 
       # FP8 (vtl_fp8). Load-bearing: --quantization=vtl_fp8 aborts at startup if disabled.
       VTL_ENABLE_FP8: 1
@@ -78,7 +75,7 @@ services:
       VTL_KERNEL_SYNC: 0                       # DEBUG only: 1 = cudaStreamSynchronize per kernel (slow)
 
       VTL_DISABLE_WARMUP: 0                     # 1 = pure /health check, skip system-prefix priming
-    shm_size: "2g"
+    shm_size: "2g" # tmpfs counts against the 8GB cgroup; 2g helped push it into OOMKill. TP=1 needs little.
     # The healthcheck doubles as a one-shot KV-prefix warm-up: the first passing run replays the
     # first few round-2 trace requests (shared system prefix + real multi-turn threads) so the prefix
     # is cached and decode kernels are warm before the container reports healthy (and before the judge
