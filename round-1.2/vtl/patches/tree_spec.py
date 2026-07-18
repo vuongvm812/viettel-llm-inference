@@ -102,11 +102,15 @@ def _install_metadata_hook() -> bool:
         # up with this verify's batch (num_draft_tokens is [batch_size]). Mismatch -> skip.
         if trees and len(trees) == len(getattr(md, "num_draft_tokens", [])):
             try:
-                from vtl.tree_spec import flatten_batch_trees
+                from vtl.tree_runtime import build_carrier
                 seq_lens = getattr(drafter, "_vtl_seq_lens", None) or [0] * len(trees)
-                setattr(md, "vtl_tree", flatten_batch_trees(
+                device = getattr(self, "device", "cpu")
+                # Device-tensor carrier (static [b, max_nodes]) consumed by the attention/sampler
+                # forks. For a width-1 (chain) batch every consumer routes to stock, so attaching it
+                # is behavior-neutral — the P2 regression gate (bit-identical to the no-carrier run).
+                setattr(md, "vtl_tree", build_carrier(
                     trees, seq_lens=seq_lens,
-                    max_nodes=getattr(drafter, "_vtl_max_nodes", 16)))
+                    max_nodes=getattr(drafter, "_vtl_max_nodes", 16), device=device))
             except Exception:
                 log.exception("vtl tree_spec: tree metadata build failed; using chain md")
         return md

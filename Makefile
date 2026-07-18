@@ -30,6 +30,14 @@ MAX_JOBS ?= 4
 # Flows as a build arg through build/push (buildx) and up/warm (compose build): make push VTL_BUILD_NGRAM=1
 VTL_BUILD_NGRAM ?= 0
 
+# Base image the MAIN image builds FROM. Default = stock vLLM; override to the forked base (below)
+# for the tree-verify path: make build VLLM_IMAGE=$(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
+VLLM_IMAGE ?= vllm/vllm-openai:v0.25.0
+# Forked vLLM base = stock v0.25.0 + vtl tree-spec source patches, built by $(ROUND)/Dockerfile.vllm-fork
+# (Python-only overlay -> no CUDA rebuild). See make vllm-fork.
+VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
+VLLM_FORK_TAG ?= v0.25.0-tree
+
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
 IN := cd $(ROUND) &&
@@ -37,7 +45,7 @@ TRACE := data/input/trace-round2.jsonl
 COMPOSE_FILES := -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 DC := docker compose $(COMPOSE_FILES)
 
-.PHONY: check stats build up down warm push bench profile test-kernel bench-kernel debug-kernel verify
+.PHONY: check stats build up down warm push bench profile test-kernel bench-kernel debug-kernel verify vllm-fork
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -136,8 +144,17 @@ verify:
 NOCACHE ?=
 BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 
+## Build (PUSH=1 to push) the forked vLLM base image: stock v0.25.0 + vtl/vllm_patches, Python-only
+## overlay (no CUDA rebuild). Then point the main image at it and pin by digest:
+##   make vllm-fork PUSH=1
+##   make push VLLM_IMAGE=$(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)@sha256:<digest>
+vllm-fork:
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
+	@echo "forked vLLM base: $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)"
+	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'pin this digest: {{.Manifest.Digest}}'; fi
+
 build:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)' --load -t $(IMAGE):$(TAG) .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)' --load -t $(IMAGE):$(TAG) .
 	@docker inspect $(IMAGE):$(TAG) --format 'built {{.Os}}/{{.Architecture}}'
 
 # `docker compose up --build` cannot take --build-arg, so build first (which honors it) then up.
@@ -167,7 +184,7 @@ warm:
 ## buildx --push writes the manifest straight to the registry, so the pushed image
 ## is $(PLATFORM) regardless of what this machine is.
 push:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)' --push -t $(IMAGE):$(TAG) .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)' --push -t $(IMAGE):$(TAG) .
 	@echo "pin this digest in $(ROUND)/docker-compose.yaml:"
 	@docker buildx imagetools inspect $(IMAGE):$(TAG) --format '{{.Manifest.Digest}}'
 

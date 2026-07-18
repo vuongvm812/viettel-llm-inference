@@ -31,10 +31,12 @@ def _lat_stats(seconds):
     return out
 
 
-def aggregate(records, wall_time):
+def aggregate(records, wall_time, spec=None):
     """Roll per-request records + wall clock into a summary dict.
 
-    Reports the primary metric set (TTFT/ITL/E2E percentiles, tok/s, req/s).
+    Reports the primary metric set (TTFT/ITL/E2E percentiles, tok/s, req/s). `itl_ms` IS the
+    per-output-token latency (TPOT) — the two are the same measurement. `spec` (optional) is a
+    server-side spec-decode summary from spec_decode_stats(), folded in as `spec_decode`.
     ponytail: design.md's secondary "queue delay" (arrival → first server activity) is
     omitted — it's an approximation of TTFT minus a warm baseline, redundant with TTFT here.
     """
@@ -53,8 +55,60 @@ def aggregate(records, wall_time):
         "output_tok_s": total_out / wall_time if wall_time > 0 else 0.0,
         "req_s": len(ok) / wall_time if wall_time > 0 else 0.0,
         "ttft_ms": _lat_stats(col("ttft")),
-        "itl_ms": _lat_stats(col("itl_mean")),
+        "itl_ms": _lat_stats(col("itl_mean")),  # == TPOT (time per output token)
         "e2e_ms": _lat_stats(col("e2e")),
+        "spec_decode": spec,
+    }
+
+
+# -------------------------------------------------------------- spec-decode acceptance
+
+# vLLM exposes these as Prometheus Counters; the client appends `_total`. Populated only when
+# the server runs WITHOUT --disable-log-stats (the production compose disables it, so acceptance
+# is n/a there — run a stats-enabled server for the A/B measurement).
+SPEC_COUNTERS = {
+    "num_drafts": "vllm:spec_decode_num_drafts_total",
+    "num_draft_tokens": "vllm:spec_decode_num_draft_tokens_total",
+    "num_accepted_tokens": "vllm:spec_decode_num_accepted_tokens_total",
+}
+
+
+def parse_spec_counters(prom_text):
+    """Sum each spec-decode counter across its label series in Prometheus text. None if absent."""
+    if not prom_text:
+        return None
+    wanted = {v: k for k, v in SPEC_COUNTERS.items()}
+    totals = {k: 0.0 for k in SPEC_COUNTERS}
+    seen = False
+    for line in prom_text.splitlines():
+        if not line or line[0] == "#":
+            continue
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        key = wanted.get(name)
+        if key is None:
+            continue
+        try:
+            totals[key] += float(line.rsplit(" ", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        seen = True
+    return totals if seen else None
+
+
+def spec_decode_stats(before, after):
+    """Deltas + acceptance from two parse_spec_counters snapshots. None if either is missing."""
+    if not before or not after:
+        return None
+    d = {k: after[k] - before[k] for k in after}
+    draft, drafts, acc = d["num_draft_tokens"], d["num_drafts"], d["num_accepted_tokens"]
+    return {
+        "num_drafts": drafts,
+        "num_draft_tokens": draft,
+        "num_accepted_tokens": acc,
+        # fraction of drafted tokens the target accepted (higher = better drafter)
+        "acceptance_rate": acc / draft if draft > 0 else None,
+        # mean accepted draft tokens per decode step that drafted (excludes the bonus token)
+        "mean_accept_len": acc / drafts if drafts > 0 else None,
     }
 
 
@@ -77,6 +131,27 @@ def _selfcheck():
     assert agg["req_s"] == 0.2
     assert agg["ttft_ms"]["p50"] == 200.0  # midpoint of 100ms and 300ms
     assert agg["ttft_ms"]["mean"] == 200.0
+    assert agg["spec_decode"] is None  # default: no spec stats
+
+    # spec-decode counter parsing: sum across label series, ignore comments/other metrics
+    prom = (
+        "# HELP vllm:spec_decode_num_drafts_total drafts\n"
+        '# TYPE vllm:spec_decode_num_drafts_total counter\n'
+        'vllm:spec_decode_num_drafts_total{model_name="m",engine="0"} 100.0\n'
+        'vllm:spec_decode_num_draft_tokens_total{model_name="m",engine="0"} 300.0\n'
+        'vllm:spec_decode_num_accepted_tokens_total{model_name="m",engine="0"} 210.0\n'
+        'vllm:other_metric_total{x="y"} 999.0\n'
+    )
+    snap = parse_spec_counters(prom)
+    assert snap == {"num_drafts": 100.0, "num_draft_tokens": 300.0, "num_accepted_tokens": 210.0}, snap
+    assert parse_spec_counters("# nothing here\nvllm:foo 1.0") is None  # no spec counters -> None
+    assert parse_spec_counters("") is None
+
+    # deltas: 300 drafted, 210 accepted over 100 draft-steps -> 0.70 accept, 2.1 tokens/draft
+    before = {"num_drafts": 0.0, "num_draft_tokens": 0.0, "num_accepted_tokens": 0.0}
+    st = spec_decode_stats(before, snap)
+    assert abs(st["acceptance_rate"] - 0.70) < 1e-9 and abs(st["mean_accept_len"] - 2.1) < 1e-9, st
+    assert spec_decode_stats(None, snap) is None  # stats disabled on server -> graceful None
     print("metrics self-check OK")
 
 

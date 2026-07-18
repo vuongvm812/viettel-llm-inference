@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.7
+# check=skip=FromPlatformFlagConstDisallowed
+#
+# Forked vLLM base image = stock v0.25.0 + vtl's tree-spec source patches (Python-only, so this is
+# a CHEAP overlay: the compiled _C*.so / CUDA kernels in the base are untouched, no from-source
+# build). The main round-1.2 Dockerfile sets ARG VLLM_IMAGE to the image this produces.
+#
+# Build + push (see Makefile target `vllm-fork`):
+#   docker build -f Dockerfile.vllm-fork --platform linux/amd64 -t unseenablefuture/vllm-fork:v0.25.0-tree .
+#   docker push unseenablefuture/vllm-fork:v0.25.0-tree     # then pin the main image by @sha256:<digest>
+#
+# The patches under vtl/vllm_patches/v0.25.0/ are generated from the local (gitignored) vllm/
+# checkout with `git -C vllm diff` — see vtl/vllm_patches/README.md.
+
+ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.0
+FROM --platform=linux/amd64 ${VLLM_IMAGE} AS vllm-fork
+
+# Load-bearing: patches are line-addressed against v0.25.0. If the base ever moves, the version
+# assert fails the build here instead of the patch silently applying to the wrong lines (or the
+# server misbehaving at the judge's run).
+RUN python3 -c "import vllm; v=vllm.__version__; assert v=='0.25.0', f'expected vllm 0.25.0, got {v}'; print('vllm', v, 'ok')"
+
+COPY vtl/vllm_patches/v0.25.0/ /tmp/vtl_patches/
+
+# Apply every *.patch to the installed package. `git diff` emits a/vllm/... b/vllm/... paths, so -p1
+# strips the a/ and we apply from the site-packages dir (the parent of the vllm package). --dry-run
+# first so a drifted patch fails the build loudly and atomically, before any half-apply.
+RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))") \
+ && echo "site-packages: $SITE" \
+ && for p in /tmp/vtl_patches/*.patch; do \
+      [ -e "$p" ] || { echo "no patches found"; exit 1; }; \
+      echo "== dry-run $p"; patch -p1 -d "$SITE" --dry-run < "$p" || exit 1; \
+    done \
+ && for p in /tmp/vtl_patches/*.patch; do \
+      echo "== apply   $p"; patch -p1 -d "$SITE" < "$p" || exit 1; \
+    done \
+ && rm -rf /tmp/vtl_patches \
+ && python3 -c "import vllm.v1.sample.rejection_sampler, vllm.v1.attention.backends.flash_attn, vllm.model_executor.layers.mamba.short_conv, vllm.v1.worker.gpu_model_runner; print('patched vllm imports OK')"
