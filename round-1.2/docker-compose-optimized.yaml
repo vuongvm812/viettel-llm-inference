@@ -53,6 +53,11 @@ services:
       - '--speculative-config={"method": "ngram", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
       #- '--speculative-config={"method": "ngram_gpu", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
       #- '--speculative-config={"method": "suffix", "suffix_decoding_max_tree_depth": 24, "suffix_decoding_max_spec_factor": 1.0, "suffix_decoding_min_token_prob": 0.1}'
+      # Phase-1 of the SGLang ngram-v2 tree-spec fork: vtl's tree drafter, emitting the best root->leaf
+      # CHAIN via vLLM's existing chain verify (no core fork yet). Python reference (vtl/ngram_tree.py);
+      # C++/CUDA corpus + tree verify (attention/sampler/conv-commit) are later phases. Validate the
+      # custom_class propose() signature on-box before relying on it.
+      #- '--speculative-config={"method": "custom_class", "model": "vtl.ngram_tree.TreeNgramProposer", "num_speculative_tokens": 4, "prompt_lookup_min": 3, "prompt_lookup_max": 8}'
 
       # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
       # drop the periodic stats logger and quiet uvicorn.
