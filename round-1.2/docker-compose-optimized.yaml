@@ -26,11 +26,7 @@ services:
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
 
-      # Phase-2 is real multi-turn chat: a fixed per-conversation system prompt (~4k tokens) plus an
-      # accumulating [user, assistant] history, so a turn-0 prompt is ~4k and grows to ~4.5k by turn 6.
-      # 32768 is generous headroom against a longer private grading trace. Tighten to 8192 to free
-      # KV/graph memory if the private trace stays this shape.
-      - --max-model-len=8192
+      - --max-model-len=32768
       - --gpu-memory-utilization=0.92 # 0.92 = vLLM default; leaves headroom for CUDA graph pools
       - --tensor-parallel-size=1
 

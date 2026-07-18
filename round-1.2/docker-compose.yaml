@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:fea8f5c09b7297a969b2e041263f15101e8fec8d2f6650c7d60148584398831f # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:034bea1ad8c90c15bef6dfa7adeda5e56dd859ac54d7c5b2b367ec74eaf8f579 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -26,11 +26,7 @@ services:
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
 
-      # Phase-2 is real multi-turn chat: a fixed per-conversation system prompt (~4k tokens) plus an
-      # accumulating [user, assistant] history, so a turn-0 prompt is ~4k and grows to ~4.5k by turn 6.
-      # 32768 is generous headroom against a longer private grading trace. Tighten to 8192 to free
-      # KV/graph memory if the private trace stays this shape.
-      - --max-model-len=8192
+      - --max-model-len=32768
       - --gpu-memory-utilization=0.92 # 0.92 = vLLM default; leaves headroom for CUDA graph pools
       - --tensor-parallel-size=1
 
