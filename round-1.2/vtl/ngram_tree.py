@@ -19,6 +19,7 @@ Self-check (no torch/vllm/numpy):  python vtl/ngram_tree.py
 """
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 
 try:  # optional C++ fast path (vtl/csrc/ngram_tree/ngram_tree.cpp); pure-Python fallback below
@@ -185,11 +186,16 @@ class TreeNgramProposer:
             max_depth=self.k,
         )
         self.max_model_len = vllm_config.model_config.max_model_len
-        # ponytail: only the last `ctx_window` tokens are scanned for a suffix repeat, so the
-        # matcher is O(window) not O(context) — the whole point of A. Multi-turn repeats are
-        # recent; 2048 covers a turn or two. The full 32k context was materialized to a Python
-        # list AND scanned O(n^2) every decode step per request before this cap.
-        self.ctx_window = 2048
+        # Scan the last `ctx_window` context tokens for a recurring suffix. Default = the FULL
+        # context: in a multi-turn trace the recurrence the drafter should match (a prior turn, the
+        # shared system prompt) frequently sits >2048 tokens back, so the old 2048 cap silently
+        # missed it and left acceptance on the table. A wider window can only find an equal-or-longer
+        # suffix match (never a worse draft). This is cheap once the C++ drafter is built
+        # (VTL_BUILD_NGRAM=1): it reads the token buffer in place, no per-step .tolist(). The
+        # pure-Python fallback scans O(window*max_n) in Python, so cap it there via the env knob.
+        # Tune acceptance-vs-scan-cost on-box with VTL_NGRAM_CTX_WINDOW (0/unset -> full context).
+        _w = os.environ.get("VTL_NGRAM_CTX_WINDOW", "").strip()
+        self.ctx_window = int(_w) if _w.isdigit() and int(_w) > 0 else self.max_model_len
         # Per-request draft trees stashed for the tree-spec metadata hook (patches/tree_spec.py
         # reads these off `runner.drafter`). Chain milestone -> each tree is a linear chain.
         self._vtl_pending_trees: list[tuple[list[int], list[int]]] = []

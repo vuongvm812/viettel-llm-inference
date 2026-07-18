@@ -26,9 +26,11 @@ CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 # Cap parallel nvcc so the CUDA build does not OOM a small box (see ARG in Dockerfile).
 # Bump on a big-RAM CI host: make build MAX_JOBS=28.
 MAX_JOBS ?= 4
-# Compile the C++ tree-ngram drafter (vtl_ngram) into the image. 0 = skip (pure-Python fallback).
-# Flows as a build arg through build/push (buildx) and up/warm (compose build): make push VTL_BUILD_NGRAM=1
-VTL_BUILD_NGRAM ?= 0
+# Compile the C++ tree-ngram drafter (vtl_ngram) into the image. ON by default: it takes the
+# per-step .tolist()+scan off the spec-decode critical path (buffer read in C++), which matters more
+# now that the drafter scans the full context (VTL_NGRAM_CTX_WINDOW). 0 = pure-Python fallback.
+# Flows as a build arg through build/push (buildx) and up/warm (compose build): make push VTL_BUILD_NGRAM=0
+VTL_BUILD_NGRAM ?= 1
 
 # Upstream stock vLLM. The forked image is built FROM this (make vllm-fork); never FROM the fork.
 VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
