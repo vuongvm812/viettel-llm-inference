@@ -30,6 +30,17 @@ RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
     && rm -rf /var/lib/apt/lists/* \
     && test -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 
+# Speculative-decoding draft model, baked in: the judge mounts ONLY the target at /model and runs
+# the pushed image offline (no build, no network), so the draft weights must ship in the image.
+# Qwen2.5-0.5B-Instruct is a dense Qwen2 model (public, no HF token). It must be dense: vLLM's
+# DraftModelProposer asserts all draft layers share one kv-cache group, which an LFM2-family hybrid
+# draft (short-conv + attn) would break. Placed before the vtl COPY/install so code edits don't bust
+# this ~1GB layer's cache. safetensors only (Qwen2.5 ships them); config.json check fails the build
+# if the download silently produced nothing.
+RUN python3 -c "from huggingface_hub import snapshot_download; \
+snapshot_download('Qwen/Qwen2.5-0.5B-Instruct', local_dir='/draft')" \
+    && test -f /draft/config.json
+
 COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
 # Vendored official FA3 (hopper): python wrapper + CUDA sources + CUTLASS headers.
@@ -49,8 +60,10 @@ ARG CUDA_ARCHS="8.0;8.6;8.9;9.0+PTX"
 
 # ninja parallelism. Unset, it fans out to nproc: on a 28-core box that is ~28
 # concurrent nvcc, each building a 4-arch fat binary (~1-2 GB RSS) => 30-50 GB peak,
-# which OOM-kills a small dev box. Cap it. Big CI hosts override: make build MAX_JOBS=28.
-ARG MAX_JOBS=4
+# which OOM-kills a small dev box. Cap it. 2 by default because the vendored FA3 CUTLASS
+# sm90 TUs peak ~2-4 GB each in cicc, so 4 OOM-kills a 14 GB box. Big CI hosts override:
+# make build MAX_JOBS=28.
+ARG MAX_JOBS=2
 
 # Scoped to the RUN, not ENV: it is a build input and has no business in the served image.
 # --no-build-isolation so setup.py sees the image's torch.
