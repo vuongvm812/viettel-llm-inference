@@ -144,6 +144,12 @@ def _install(cls) -> None:  # noqa: ANN001
 
     from flash_attn_3 import flash_attn_with_kvcache
 
+    # Hoist process-constant gates out of the per-forward hot path. apply() only installs
+    # when armed on sm90, so both are fixed for the process; recomputing them every decode
+    # step is pure host overhead (vLLM warns to minimise CPU work in this method).
+    _armed = _fa3_enabled()
+    _major = _device_major()
+
     def forward(
         self,
         layer,
@@ -157,14 +163,13 @@ def _install(cls) -> None:  # noqa: ANN001
         output_block_scale=None,
     ):  # noqa: ANN001
         global _fired_logged
-        enabled = _fa3_enabled()
         is_decoder = getattr(self, "attn_type", _DECODER) == _DECODER
         causal_is_bool = attn_metadata is not None and isinstance(
             getattr(attn_metadata, "causal", True), bool
         )
         fire = _should_fire(
-            enabled=enabled,
-            device_major=_device_major(),
+            enabled=_armed,
+            device_major=_major,
             has_metadata=attn_metadata is not None,
             use_cascade=bool(getattr(attn_metadata, "use_cascade", False))
             if attn_metadata is not None
@@ -191,7 +196,11 @@ def _install(cls) -> None:  # noqa: ANN001
             cache_seqlens = attn_metadata.seq_lens
             max_seqlen_q = attn_metadata.max_query_len
             block_table = attn_metadata.block_table
-            scheduler_metadata = getattr(attn_metadata, "scheduler_metadata", None)
+            # NOTE: do NOT reuse attn_metadata.scheduler_metadata -- that blob is produced
+            # by vLLM's BUNDLED get_scheduler_metadata op, a different format than upstream
+            # FA3 expects. Pass None so upstream FA3 schedules internally. (No latency cost:
+            # cache_seqlens grows every decode step, so a precomputed schedule can't be
+            # cached across steps anyway.)
 
             window = (
                 attn_metadata.sliding_window
@@ -236,8 +245,14 @@ def _install(cls) -> None:  # noqa: ANN001
                 causal=bool(attn_metadata.causal),
                 window_size=window_size,
                 softcap=self.logits_soft_cap or 0.0,
-                scheduler_metadata=scheduler_metadata,
-                num_splits=int(getattr(attn_metadata, "max_num_splits", 0) or 0),
+                scheduler_metadata=None,
+                # 0 = FA3's own split-count heuristic. We run EAGER (not cudagraph-captured),
+                # so we don't need vLLM's fixed max_num_splits; the heuristic picks the split
+                # count that best fills the H200's 132 SMs for small-batch decode -- the main
+                # decode-occupancy lever for GQA 32:8 at TP=1. (If this path is ever cudagraph-
+                # captured, a data-dependent grid would break capture -> revisit.)
+                num_splits=0,
+                pack_gqa=None,  # auto: packs the 4 q-heads/kv-head so KV is loaded once
             )
             # with_kvcache has no out= param: copy its result into vLLM's buffer.
             output[:n].copy_(out.view(output[:n].shape))

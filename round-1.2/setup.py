@@ -112,7 +112,8 @@ def _fa3_ext():
         "-O3",
         "-std=c++17",
         "--use_fast_math",
-        "-lineinfo",
+        # No -lineinfo: upstream flags it as a release de-opt (bloats the cubin, slower to
+        # load). We don't debug the vendored kernel line-by-line; drop it for a leaner binary.
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",  # WGMMA shapes FA3 uses
         "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # PDL
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
