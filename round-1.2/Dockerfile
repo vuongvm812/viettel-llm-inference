@@ -30,16 +30,14 @@ RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
     && rm -rf /var/lib/apt/lists/* \
     && test -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 
-# Speculative-decoding draft model, baked in: the judge mounts ONLY the target at /model and runs
-# the pushed image offline (no build, no network), so the draft weights must ship in the image.
-# Qwen2.5-0.5B-Instruct is a dense Qwen2 model (public, no HF token). It must be dense: vLLM's
-# DraftModelProposer asserts all draft layers share one kv-cache group, which an LFM2-family hybrid
-# draft (short-conv + attn) would break. Placed before the vtl COPY/install so code edits don't bust
-# this ~1GB layer's cache. safetensors only (Qwen2.5 ships them); config.json check fails the build
-# if the download silently produced nothing.
-RUN python3 -c "from huggingface_hub import snapshot_download; \
-snapshot_download('Qwen/Qwen2.5-0.5B-Instruct', local_dir='/draft')" \
-    && test -f /draft/config.json
+# Suffix speculative decoding: vLLM's suffix proposer imports `arctic_inference` (ngram needs nothing
+# extra). A separate draft model (Qwen2.5-0.5B) is impossible on this hybrid target -- vLLM's
+# uniform-page-size KV allocator shards a draft's attn layers across groups and DraftModelProposer
+# asserts one group -- so we use ngram/suffix instead (no draft model to bake). --no-deps so this can't
+# reinstall/override the pinned vLLM v0.25.0 or torch from the base image; the base provides its runtime
+# deps. ponytail: --no-deps ceiling -- if suffix boot ImportErrors on a missing arctic dep, drop it.
+RUN pip install --no-cache-dir --no-deps arctic-inference==0.1.1 \
+    && python3 -c "import arctic_inference; print('arctic_inference ok')"
 
 COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
