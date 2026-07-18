@@ -18,4 +18,6 @@ dependencies = []
 vtl = "vtl.plugin:register"
 
 [tool.setuptools.packages.find]
-include = ["vtl*"]
+# flash_attn_3 = vendored official FA3 python wrapper; its _C extension is built by
+# setup.py. csrc/ has no __init__ so find skips it (build-time sources only).
+include = ["vtl*", "flash_attn_3*"]

@@ -30,6 +30,7 @@ _MODULES: tuple[str, ...] = (
     "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
     "profiler",
+    "fa3_attention",    # gated A/B: route GQA attention through vendored official FA3
 )
 
 for _name in _MODULES:

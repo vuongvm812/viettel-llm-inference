@@ -29,6 +29,7 @@ services:
       - --max-model-len=32768
       - --gpu-memory-utilization=0.92 # 0.92 = vLLM default; leaves headroom for CUDA graph pools
       - --tensor-parallel-size=1
+      - --attention-backend=FLASH_ATTN
 
       # Intra-conversation prefix reuse is the biggest win now (turn N reuses turns 0..N-1).
       # LFM2 is a hybrid (short-conv state + attn KV): mamba_cache_mode MUST be `align` --
@@ -70,6 +71,11 @@ services:
       VTL_SILU_MUL_FUSION: 1                  # 1 = register the down_proj pattern; 0 = op only, unfused
       VTL_ENABLE_KV_CACHE_MANAGER: 1
       VTL_ENABLE_SCHED_POLICY: 1             # SJF prefill reorder
+
+      # EXPERIMENTAL A/B, default OFF. 1 = route GQA attention through the vendored official
+      # FA3 kernel (flash_attn_3, sm_90a) instead of vLLM's bundled FA. vLLM already defaults
+      # to FA3 on H200, so expect PARITY; measure TPOT before shipping (cudagraph-capture risk).
+      VTL_ENABLE_FA3_ATTN: 1
 
       # No GDN family here: LFM2.5 has no gated-delta-net and no attn output gate, so the old
       # VTL_ENABLE_GDN_KERNELS / MUL_SIGMOID / GDN_PREFILL_BACKEND flags were removed with their code.

@@ -32,6 +32,9 @@ RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
 
 COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
+# Vendored official FA3 (hopper): python wrapper + CUDA sources + CUTLASS headers.
+# setup.py compiles these into flash_attn_3._C (sm_90a) during the pip install below.
+COPY flash_attn_3 /src/flash_attn_3
 
 # Which SM cubins go into vtl._C. Without this, nvcc probes the build host -- which has no
 # GPU -- and guesses. A mismatch does NOT degrade gracefully: dlopen succeeds, the override
@@ -73,6 +76,17 @@ print('vtl._C built:', s.origin)" \
  && echo "vtl._C device code:" \
  && cuobjdump --list-elf "$SO" | sed 's/^/  /' \
  && { cuobjdump --list-ptx "$SO" | sed 's/^/  /' || echo "  (no PTX: no JIT fallback)"; }
+
+# Vendored FA3 extension: confirm it built and targets sm_90. Import needs a driver, so
+# only check the .so landed here; vtl/patches/fa3_attention.py imports it (gated) at start.
+# A wrong-SM .so builds and imports fine and only dies at first launch -- catch it now.
+RUN python3 -c "import importlib.util as u; \
+s = u.find_spec('flash_attn_3._C'); \
+assert s is not None, 'flash_attn_3._C did not build'; \
+print('flash_attn_3._C built:', s.origin)" \
+ && SO=$(python3 -c "import importlib.util as u; print(u.find_spec('flash_attn_3._C').origin)") \
+ && echo "flash_attn_3._C device code:" \
+ && cuobjdump --list-elf "$SO" | sed 's/^/  /'
 
 ENV VLLM_PLUGINS=vtl \
     VLLM_USE_AOT_COMPILE=1 \
