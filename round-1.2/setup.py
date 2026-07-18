@@ -104,8 +104,10 @@ def _fa3_ext():
     else:
         api, stable = "flash_api.cpp", []
 
+    # setuptools requires source paths RELATIVE to the setup.py dir (absolute paths raise
+    # "setup script specifies an absolute path"). include_dirs below may stay absolute.
     rel_sources = [api] + fwd + ["flash_fwd_combine.cu", "flash_prepare_scheduler.cu"]
-    sources = [str(csrc / s) for s in rel_sources]
+    sources = [f"flash_attn_3/csrc/{s}" for s in rel_sources]
 
     feature_args = [f"-D{flag}" for flag in _FA3_DISABLE]
     nvcc = [
