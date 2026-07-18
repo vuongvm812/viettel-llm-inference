@@ -27,6 +27,9 @@ COPY vtl/vllm_patches/v0.25.0/ /tmp/vtl_patches/
 # first so a drifted patch fails the build loudly and atomically, before any half-apply.
 RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))") \
  && echo "site-packages: $SITE" \
+ && if grep -q "_vtl_tree_accept" "$SITE/vllm/v1/sample/rejection_sampler.py"; then \
+      echo "ERROR: base already carries vtl patches. Build the fork FROM STOCK vllm (make vllm-fork uses VLLM_STOCK), not FROM the fork."; exit 1; \
+    fi \
  && for p in /tmp/vtl_patches/*.patch; do \
       [ -e "$p" ] || { echo "no patches found"; exit 1; }; \
       echo "== dry-run $p"; patch -p1 -d "$SITE" --dry-run < "$p" || exit 1; \

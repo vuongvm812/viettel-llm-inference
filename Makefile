@@ -30,12 +30,14 @@ MAX_JOBS ?= 4
 # Flows as a build arg through build/push (buildx) and up/warm (compose build): make push VTL_BUILD_NGRAM=1
 VTL_BUILD_NGRAM ?= 0
 
-# Forked vLLM base = stock v0.25.0 + vtl tree-spec source patches, built by $(ROUND)/Dockerfile.vllm-fork
+# Upstream stock vLLM. The forked image is built FROM this (make vllm-fork); never FROM the fork.
+VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
+# Forked vLLM base = VLLM_STOCK + vtl tree-spec source patches, built by $(ROUND)/Dockerfile.vllm-fork
 # (Python-only overlay -> no CUDA rebuild). Pin VLLM_FORK_TAG to the pushed digest. See make vllm-fork.
 VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
 VLLM_FORK_TAG ?= v0.25.0-tree
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
-# tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=vllm/vllm-openai:v0.25.0
+# tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
@@ -149,7 +151,7 @@ BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 ##   make vllm-fork PUSH=1
 ##   make push VLLM_IMAGE=$(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)@sha256:<digest>
 vllm-fork:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
 	@echo "forked vLLM base: $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)"
 	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'pin this digest: {{.Manifest.Digest}}'; fi
 
