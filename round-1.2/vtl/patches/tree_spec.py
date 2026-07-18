@@ -93,15 +93,20 @@ def _install_metadata_hook() -> bool:
 
     def wrapper(self, *args, **kwargs):
         md = orig(self, *args, **kwargs)
-        # Attach tree topology captured by the proposer (hook 1) so the attention +
-        # sampler hooks can read it. Absence -> plain chain metadata (stock behavior).
-        trees = getattr(self, "_vtl_pending_trees", None)
-        if trees is not None:
+        # Attach tree topology captured by the proposer (hook 1, TreeNgramProposer.propose
+        # stashes it on the drafter) so the sampler hook can read it. Absence / any mismatch
+        # -> plain chain metadata (stock behavior).
+        drafter = getattr(self, "drafter", None)
+        trees = getattr(drafter, "_vtl_pending_trees", None)
+        # Guard: the stash is from the previous step's propose; only attach if it still lines
+        # up with this verify's batch (num_draft_tokens is [batch_size]). Mismatch -> skip.
+        if trees and len(trees) == len(getattr(md, "num_draft_tokens", [])):
             try:
                 from vtl.tree_spec import flatten_batch_trees
+                seq_lens = getattr(drafter, "_vtl_seq_lens", None) or [0] * len(trees)
                 setattr(md, "vtl_tree", flatten_batch_trees(
-                    trees, seq_lens=getattr(self, "_vtl_seq_lens", [0] * len(trees)),
-                    max_nodes=getattr(self, "_vtl_max_nodes", 16)))
+                    trees, seq_lens=seq_lens,
+                    max_nodes=getattr(drafter, "_vtl_max_nodes", 16)))
             except Exception:
                 log.exception("vtl tree_spec: tree metadata build failed; using chain md")
         return md
@@ -128,51 +133,72 @@ def _install_sampler_hook() -> bool:
     if orig is None:
         return False
 
+    warned = [False]
+
     def wrapper(*args, **kwargs):
         md = kwargs.get("metadata") or (args[-1] if args else None)
-        if md is None or getattr(md, "vtl_tree", None) is None:
-            return orig(*args, **kwargs)  # stock chain path
-        # Tree path: the actual per-request walk uses tree_verify_ref.tree_greedy_accept over
-        # the target argmax. Signature of the surrounding tensors must be confirmed on-box
-        # before this replaces the stock kernel; until then, degrade rather than guess.
-        log.warning("vtl tree_spec: tree sampler hook active but tensor wiring unvalidated; "
-                    "deferring to stock sampler (confirm rejection_sample tensors on-box)")
+        tree = getattr(md, "vtl_tree", None) if md is not None else None
+        if tree is None:
+            return orig(*args, **kwargs)  # no tree metadata -> stock chain path
+        # A width-1 tree IS a chain: greedy tree-accept over a linear tree is exactly stock
+        # rejection sampling, so stock is CORRECT here (not a fallback) and we run it directly.
+        # A branching tree needs the tree kernel + tree attention (Phase-3 core edit); until
+        # that lands we emit chains only, so this degrade path should never trigger in serving.
+        if _is_chain(tree):
+            return orig(*args, **kwargs)
+        if not warned[0]:
+            warned[0] = True
+            log.warning("vtl tree_spec: branching tree reached the sampler but tree attention "
+                        "is not installed (Phase-3 core edit); accepting the chain via stock. "
+                        "Keep the drafter emitting chains until the backend path lands.")
         return orig(*args, **kwargs)
 
     setattr(rs, "rejection_sample", mark_patched(wrapper, orig))
     return True
 
 
+def _is_chain(tree) -> bool:
+    """True iff every per-request tree in the flattened metadata is linear (no branching).
+
+    Chain <=> no node has a next-sibling. flatten_batch_trees emits retrieve_next_sibling as
+    [batch, max_nodes] with -1 for "none"; any other value means a fork.
+    """
+    sib = tree.get("retrieve_next_sibling") if isinstance(tree, dict) else None
+    if sib is None:
+        return True  # unknown shape -> treat as chain (stock is safe)
+    return all(s == -1 for row in sib for s in row)
+
+
 def _install_attention_hook() -> bool:
     """Hook 3: cascade tree attention for the verify step (FA3 on H200, no custom mask).
 
-    The production path builds two `flash_attn_varlen_func` calls (prefix + expand with the
-    page-index permutation) over a block_size=1 draft KV region and LSE-merges them; the merge
-    math is validated (bench/spike_fa3_tree_cascade.py). This requires editing the FA metadata
-    builder + forward (fork map: flash_attn.py) with paged token-granular indices, which cannot
-    be done as a safe monkeypatch without the on-box buffer layout. Left as an explicit stub so
-    enabling tree_spec never silently runs WRONG attention: we log and let the verify step fall
-    back to stock causal (correct for a chain, wrong for a branching tree -> keep tree size 1
-    until the backend path lands).
+    For the chain milestone (width-1 tree) stock causal attention is EXACTLY the tree
+    attention, so nothing needs patching here and the verify is correct. The width>1 path
+    builds two `flash_attn_varlen_func` calls (prefix + expand with the page-index permutation)
+    over a block_size=1 draft KV region and LSE-merges them; the merge math is validated
+    (bench/spike_fa3_tree_cascade.py). That edit touches the FA metadata builder + forward
+    (fork map: flash_attn.py) with paged token-granular indices and cannot be a safe monkeypatch
+    without the on-box buffer layout -> it is the one remaining core edit, validated on the H200.
     """
-    log.warning("vtl tree_spec: cascade attention backend path not installed (Phase-3 core "
-                "edit required); tree verify falls back to causal chain. See vtl.tree_spec."
-                "cascade_tree_attention for the validated merge.")
+    log.info("vtl tree_spec: attention uses stock causal (correct for the width-1 chain "
+             "milestone). Width>1 cascade attention is the remaining core edit; see "
+             "vtl.tree_spec.cascade_tree_attention for the validated merge.")
     return True
 
 
 def _install_conv_commit_hook() -> bool:
     """Hook 5: short-conv Bx staging + accepted-path gather-commit.
 
-    Wraps LFM2 ShortConv.forward to stage per-node Bx and replaces the scalar-prefix conv
-    commit with `tree_spec.conv_commit_window` (validated: bench/spike_tree_conv_commit.py).
-    Also needs the multi-token verify path added to ShortConv.forward_cuda (fork map:
-    short_conv.py:282). Both are model-layer edits; installed only when the attention hook
-    is real (a tree with >1 node), so with tree size 1 the stock conv path stays correct.
+    For the width-1 chain milestone the accepted path is linear, so the stock scalar-prefix
+    conv commit is already correct and nothing is patched here. The width>1 path wraps LFM2
+    ShortConv.forward to stage per-node Bx and replaces the commit with
+    `tree_spec.conv_commit_window` (validated: bench/spike_tree_conv_commit.py), plus a
+    multi-token verify path in ShortConv.forward_cuda (fork map: short_conv.py:282). Those are
+    model-layer edits that go in together with the tree attention edit and are validated on-box.
     """
-    log.warning("vtl tree_spec: conv gather-commit not installed (Phase-5 core edit required); "
-                "stock scalar-prefix conv commit stays (correct only for chain). See "
-                "vtl.tree_spec.conv_commit_window for the validated commit.")
+    log.info("vtl tree_spec: conv uses stock scalar-prefix commit (correct for the width-1 "
+             "chain milestone). Width>1 gather-commit ships with the tree attention edit; see "
+             "vtl.tree_spec.conv_commit_window for the validated commit.")
     return True
 
 
@@ -184,7 +210,8 @@ def apply() -> None:
     ok_attn = _install_attention_hook()
     ok_conv = _install_conv_commit_hook()
     log.info("vtl tree_spec: hooks metadata=%s sampler=%s attention=%s conv=%s "
-             "(attention/conv are Phase-3/5 core edits, not yet live -> use tree size 1)",
+             "(width-1 chain flow is complete + correct; width>1 tree attention/conv is the "
+             "one remaining core edit, validated on-box)",
              ok_meta, ok_samp, ok_attn, ok_conv)
 
 

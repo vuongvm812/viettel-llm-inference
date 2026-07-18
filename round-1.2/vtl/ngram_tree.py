@@ -120,6 +120,26 @@ class TreeNgramDrafter:
         node_tokens, parent = self.build_tree(tokens)
         return self.best_chain(node_tokens, parent, k)
 
+    def best_suffix_chain(self, tokens: list[int], k: int) -> list[int]:
+        """Chain-milestone drafter: longest recurring suffix -> its most-recent earlier
+        occurrence's next k tokens. No trie (build_tree/best_chain are only needed for the
+        width>1 tree path); O(window * max_n) instead of building+ranking a full trie.
+
+        Same longest-match / most-recent rule as vLLM's builtin ngram, so vLLM's stock chain
+        verify consumes it directly. Caller windows `tokens` (see TreeNgramProposer.propose)
+        so this scan is bounded regardless of context length.
+        """
+        n = len(tokens)
+        if n < 2 or k <= 0:
+            return []
+        hi = min(self.max_n, n - 1)
+        for L in range(hi, self.min_n - 1, -1):
+            suffix = tokens[n - L :]
+            for p in range(n - L - 1, -1, -1):  # most-recent occurrence first
+                if tokens[p : p + L] == suffix:
+                    return tokens[p + L : p + L + k]
+        return []
+
 
 def tree_mask_from_parent(parent: list[int]) -> list[list[bool]]:
     """n x n: mask[i][j] = True iff j is on i's root-path (ancestor incl. self).
@@ -156,6 +176,16 @@ class TreeNgramProposer:
             max_depth=self.k,
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        # ponytail: only the last `ctx_window` tokens are scanned for a suffix repeat, so the
+        # matcher is O(window) not O(context) — the whole point of A. Multi-turn repeats are
+        # recent; 2048 covers a turn or two. The full 32k context was materialized to a Python
+        # list AND scanned O(n^2) every decode step per request before this cap.
+        self.ctx_window = 2048
+        # Per-request draft trees stashed for the tree-spec metadata hook (patches/tree_spec.py
+        # reads these off `runner.drafter`). Chain milestone -> each tree is a linear chain.
+        self._vtl_pending_trees: list[tuple[list[int], list[int]]] = []
+        self._vtl_seq_lens: list[int] = []
+        self._vtl_max_nodes: int = self.k
 
     def propose(
         self,
@@ -168,18 +198,29 @@ class TreeNgramProposer:
         # `elif spec_config.method == "custom_class"` branch): NO leading
         # num_speculative_tokens (that's the ngram path); k comes from our config.
         drafts: list[list[int]] = []
+        trees: list[tuple[list[int], list[int]]] = []
+        seq_lens: list[int] = []
         for i, sampled in enumerate(sampled_token_ids):
-            if not sampled:
+            n = int(num_tokens_no_spec[i]) if sampled else 0
+            if not sampled or n >= self.max_model_len:
                 drafts.append([])
+                trees.append(([], []))
+                seq_lens.append(n)
                 continue
-            n = int(num_tokens_no_spec[i])
-            if n >= self.max_model_len:
-                drafts.append([])
-                continue
+            lo = max(0, n - self.ctx_window)  # A: bound the suffix scan to the recent window
             row = token_ids_cpu[i]
-            ctx = row[:n].tolist() if hasattr(row, "tolist") else list(row[:n])
+            ctx = row[lo:n].tolist() if hasattr(row, "tolist") else list(row[lo:n])
             k = min(self.k, self.max_model_len - n)
-            drafts.append(self.drafter.propose_chain(ctx, k))
+            chain = self.drafter.best_suffix_chain(ctx, k)  # C: direct match, no trie
+            drafts.append(chain)
+            # Represent the chain as a linear tree (parent[j] = j-1) so the tree-spec hooks
+            # consume one uniform structure; a chain is a width-1 tree -> stock causal verify
+            # is exactly correct (see patches/tree_spec.py).
+            trees.append((list(chain), [j - 1 for j in range(len(chain))]))
+            seq_lens.append(n)
+        # Hook 1: stash for the metadata hook (read via runner.drafter next step's verify).
+        self._vtl_pending_trees = trees
+        self._vtl_seq_lens = seq_lens
         return drafts
 
     def load_model(self, *args, **kwargs):
@@ -193,6 +234,12 @@ def _selfcheck():
     toks = [5, 1, 2, 3, 9, 1, 2, 3, 9, 1, 2, 3]
     assert d.propose_chain(toks, 2) == [9, 1], d.propose_chain(toks, 2)
     assert d.propose_chain(toks, 4) == [9, 1, 2, 3], d.propose_chain(toks, 4)
+
+    # best_suffix_chain (chain milestone, no trie) matches the trie's chain on this input,
+    # and never scans past the caller's window.
+    assert d.best_suffix_chain(toks, 2) == [9, 1], d.best_suffix_chain(toks, 2)
+    assert d.best_suffix_chain(toks, 4) == [9, 1, 2, 3], d.best_suffix_chain(toks, 4)
+    assert d.best_suffix_chain([1, 2, 3, 4, 5], 3) == []  # no recurrence -> no draft
 
     # No recurrence -> no draft.
     assert TreeNgramDrafter(min_n=3, max_n=5).propose_chain([1, 2, 3, 4, 5], 3) == []
@@ -227,10 +274,19 @@ def _selfcheck():
     ctx = [5, 1, 2, 3, 9, 1, 2, 3, 9, 1, 2, 3]
     out = prop.propose([[3]], [len(ctx)], [ctx])  # exact runner arg order
     assert out == [[9, 1, 2, 3]], out
+    # Hook 1: propose stashed a linear tree (parent[j]=j-1) + seq_len for the metadata hook.
+    assert prop._vtl_pending_trees == [([9, 1, 2, 3], [-1, 0, 1, 2])], prop._vtl_pending_trees
+    assert prop._vtl_seq_lens == [len(ctx)], prop._vtl_seq_lens
     assert prop.propose([[]], [len(ctx)], [ctx]) == [[]]  # empty sample -> skip
 
+    # Windowing (A): a repeat older than ctx_window is not matched; a recent one is.
+    pw = TreeNgramProposer(cfg)
+    pw.ctx_window = 4
+    long_ctx = [9, 1, 2, 3] + [0] * 20 + [1, 2, 3]  # suffix 1,2,3 recurs only outside window
+    assert pw.propose([[3]], [len(long_ctx)], [long_ctx]) == [[]], "window must bound the scan"
+
     print("PASS: TreeNgramDrafter — suffix match, frequency chain, branching, tree mask; "
-          "TreeNgramProposer.propose matches vLLM custom_class signature")
+          "TreeNgramProposer.propose matches vLLM custom_class signature, stashes tree, windows")
 
 
 if __name__ == "__main__":
