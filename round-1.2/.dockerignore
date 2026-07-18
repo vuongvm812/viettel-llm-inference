@@ -6,9 +6,6 @@
 !setup.py
 !README.md
 !vtl/
-# Vendored official FA3 (python wrapper + CUDA sources + CUTLASS headers); setup.py
-# compiles it into flash_attn_3._C. Without this the COPY in the Dockerfile can't find it.
-!flash_attn_3/
 !docker/cache/
 # Warm-up trace slice (bind-mounted + head -n during build; parents must be re-included too).
 !data

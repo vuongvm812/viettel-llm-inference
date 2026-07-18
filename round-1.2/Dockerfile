@@ -43,9 +43,6 @@ snapshot_download('Qwen/Qwen2.5-0.5B-Instruct', local_dir='/draft')" \
 
 COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
-# Vendored official FA3 (hopper): python wrapper + CUDA sources + CUTLASS headers.
-# setup.py compiles these into flash_attn_3._C (sm_90a) during the pip install below.
-COPY flash_attn_3 /src/flash_attn_3
 
 # Which SM cubins go into vtl._C. Without this, nvcc probes the build host -- which has no
 # GPU -- and guesses. A mismatch does NOT degrade gracefully: dlopen succeeds, the override
@@ -60,10 +57,8 @@ ARG CUDA_ARCHS="8.0;8.6;8.9;9.0+PTX"
 
 # ninja parallelism. Unset, it fans out to nproc: on a 28-core box that is ~28
 # concurrent nvcc, each building a 4-arch fat binary (~1-2 GB RSS) => 30-50 GB peak,
-# which OOM-kills a small dev box. Cap it. 2 by default because the vendored FA3 CUTLASS
-# sm90 TUs peak ~2-4 GB each in cicc, so 4 OOM-kills a 14 GB box. Big CI hosts override:
-# make build MAX_JOBS=28.
-ARG MAX_JOBS=2
+# which OOM-kills a small dev box. Cap it. Big CI hosts override: make build MAX_JOBS=28.
+ARG MAX_JOBS=4
 
 # Scoped to the RUN, not ENV: it is a build input and has no business in the served image.
 # --no-build-isolation so setup.py sees the image's torch.
@@ -89,17 +84,6 @@ print('vtl._C built:', s.origin)" \
  && echo "vtl._C device code:" \
  && cuobjdump --list-elf "$SO" | sed 's/^/  /' \
  && { cuobjdump --list-ptx "$SO" | sed 's/^/  /' || echo "  (no PTX: no JIT fallback)"; }
-
-# Vendored FA3 extension: confirm it built and targets sm_90. Import needs a driver, so
-# only check the .so landed here; vtl/patches/fa3_attention.py imports it (gated) at start.
-# A wrong-SM .so builds and imports fine and only dies at first launch -- catch it now.
-RUN python3 -c "import importlib.util as u; \
-s = u.find_spec('flash_attn_3._C'); \
-assert s is not None, 'flash_attn_3._C did not build'; \
-print('flash_attn_3._C built:', s.origin)" \
- && SO=$(python3 -c "import importlib.util as u; print(u.find_spec('flash_attn_3._C').origin)") \
- && echo "flash_attn_3._C device code:" \
- && cuobjdump --list-elf "$SO" | sed 's/^/  /'
 
 ENV VLLM_PLUGINS=vtl \
     VLLM_USE_AOT_COMPILE=1 \

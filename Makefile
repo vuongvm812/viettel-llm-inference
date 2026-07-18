@@ -24,9 +24,8 @@ PLATFORM ?= linux/amd64
 # Narrow to '9.0+PTX' for the submission build. See the ARG in Dockerfile.
 CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 # Cap parallel nvcc so the CUDA build does not OOM a small box (see ARG in Dockerfile).
-# 2 by default: the vendored FA3 CUTLASS sm90 TUs peak ~2-4 GB each in cicc, so 4 OOM-kills
-# a 14 GB box. Bump on a big-RAM CI host: make build MAX_JOBS=28.
-MAX_JOBS ?= 2
+# Bump on a big-RAM CI host: make build MAX_JOBS=28.
+MAX_JOBS ?= 4
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
