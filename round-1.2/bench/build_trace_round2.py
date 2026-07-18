@@ -191,25 +191,40 @@ SCENARIOS = [
 ]
 
 
+# Fixed system guidelines shared VERBATIM by every conversation. Placed first in every system
+# message so its tokens are a GLOBAL prefix-cache hit (the grading spec's shared_system_prefix).
+# Padded to shared_system_prefix_tokens at build time from the note bank (see sized_text).
+SHARED_SYSTEM_INTRO = (
+    "You are a careful, grounded assistant embedded in an internal knowledge tool. Answer only "
+    "from the reference material provided in this conversation; if the material does not cover "
+    "something, say so plainly rather than guessing. Prefer short, structured answers: lead with "
+    "the direct answer, then the few supporting points that matter. Keep a neutral, professional "
+    "tone, define any term a new colleague might not know, and never invent policies, numbers, "
+    "names, or dates that are not in the material. When a question is ambiguous, state the "
+    "assumption you are making before answering, and cite the relevant part of the material in "
+    "your own words rather than quoting it at length. The standing reference for every "
+    "conversation in this tool follows:"
+)
+
+
 def encode_len(tok, text: str) -> int:
     return len(tok.encode(text).ids)
 
 
-def build_briefing(tok, note_ids: list[list[int]], target_tokens: int, conv_seed: int) -> str:
-    """Assemble a per-conversation reference briefing of ~target_tokens from shuffled notes.
-
-    Whole notes are concatenated (so it stays readable); a per-conv shuffle makes each briefing a
-    distinct prefix. If the bank is smaller than the target the shuffle cycles -- a long briefing
-    that revisits themes, which reads naturally as a notes digest.
+def sized_text(tok, base_text: str, note_ids: list[list[int]], target_tokens: int, seed: int) -> str:
+    """Real-English text of EXACTLY ``target_tokens``: ``base_text`` then whole notes (shuffled by
+    ``seed``) appended until the target is reached, then decoded back. Deterministic per seed, so
+    a fixed seed yields identical text (a shared prefix) and a per-conv seed yields a distinct one.
+    Whole notes keep it readable; the cycle just revisits themes, which reads as a longer digest.
     """
+    ids: list[int] = list(tok.encode(base_text).ids)
     order = list(range(len(note_ids)))
-    random.Random(conv_seed).shuffle(order)
-    ids: list[int] = []
+    random.Random(seed).shuffle(order)
     i = 0
     while len(ids) < target_tokens:
         ids.extend(note_ids[order[i % len(order)]])
         i += 1
-        if i > len(order) * 8:  # safety: never loop unbounded
+        if i > len(order) * 16:  # safety: never loop unbounded
             break
     return tok.decode(ids[:target_tokens])
 
@@ -218,10 +233,22 @@ def think_pause_ms(rng: random.Random) -> int:
     return int(min(max(rng.lognormvariate(THINK_LOG_MU, THINK_LOG_SIGMA), THINK_MIN_MS), THINK_MAX_MS))
 
 
-def build_records(spec: list[dict], tok) -> list[dict]:
+def build_records(spec: list[dict], tok, sizes: dict) -> list[dict]:
+    """Turn the per-turn grading spec into replayable bodies matching the workload structure.
+
+    ``sizes`` carries the grading spec's token blocks: ``shared`` (global system prefix),
+    ``conv`` (per-conversation prefix), ``user`` (new user tokens/turn), ``output`` (pinned
+    output/turn). The system message is ``shared_prefix + conv_block`` so the first ``shared``
+    tokens are identical across every conversation (a global cache hit) and the next ``conv``
+    are unique per conversation; each turn adds a ``user``-sized question, and history answers
+    are ``output``-sized, so the accumulating prompt grows exactly as the spec's in_tokens_est.
+    """
     from collections import defaultdict
 
     note_ids = [tok.encode(n).ids for n in KB_NOTES] if tok is not None else None
+
+    # Global shared prefix: fixed seed -> byte-identical for every conversation.
+    shared_prefix = sized_text(tok, SHARED_SYSTEM_INTRO, note_ids, sizes["shared"], seed=0)
 
     by_conv: dict[int, list[dict]] = defaultdict(list)
     for row in spec:
@@ -235,28 +262,33 @@ def build_records(spec: list[dict], tok) -> list[dict]:
         scenario = SCENARIOS[conv_id % len(SCENARIOS)]
         n_turns = min(len(turns), len(scenario["qa"]))
 
-        # A per-conversation-unique header keeps prefixes distinct across conversations even when
-        # two pick the same scenario; the briefing (below) is also uniquely shuffled per conv.
-        header = f"[Session {conv_id:04d}] Reference material follows; base every answer on it.\n\n"
-        persona = scenario["persona"]
-        first_user = scenario["qa"][0][0]
+        # Per-conversation prefix: persona + a unique header + reference briefing, sized to `conv`
+        # tokens and uniquely shuffled per conv so it is a distinct prefix (no cross-conv hits).
+        header = (f"[Session {conv_id:04d}] Reference material for this conversation "
+                  f"({scenario['label']}):\n\n")
+        conv_base = f"{scenario['persona']}\n\n{header}"
+        conv_block = sized_text(tok, conv_base, note_ids, sizes["conv"], seed=1000 + conv_id)
+        system_content = f"{shared_prefix}\n\n{conv_block}"
 
-        # Size the briefing so the turn-0 prompt (persona + header + briefing + first user) is close
-        # to the spec's in_tokens_est. Later turns grow as the real dialogue accumulates.
-        target0 = turns[0]["in_tokens_est"]
-        overhead = encode_len(tok, persona) + encode_len(tok, header) + encode_len(tok, first_user) + 24
-        briefing_tokens = max(target0 - overhead, 128)
-        briefing = build_briefing(tok, note_ids, briefing_tokens, conv_seed=1000 + conv_id)
-        system_content = f"{persona}\n\n{header}{scenario['label']}:\n\n{briefing}"
+        # Size each turn's question to `user` tokens (question + the excerpt the user is asking
+        # about) and each historical answer to `output` tokens (a thorough grounded reply), so the
+        # thread accumulates ~ (user + output) per turn.
+        user_texts, asst_texts = [], []
+        for i in range(n_turns):
+            q, a = scenario["qa"][i]
+            user_texts.append(sized_text(
+                tok, f"{q}\n\nThe part I'm looking at:\n", note_ids, sizes["user"], seed=7000 + conv_id * 10 + i))
+            asst_texts.append(sized_text(
+                tok, f"{a} ", note_ids, sizes["output"], seed=9000 + conv_id * 10 + i))
 
         arrival = turns[0]["timestamp_ms"]
         for t in range(n_turns):
             # Accumulating thread: system + completed (user, assistant) pairs + the new user turn.
             messages = [{"role": "system", "content": system_content}]
             for i in range(t):
-                messages.append({"role": "user", "content": scenario["qa"][i][0]})
-                messages.append({"role": "assistant", "content": scenario["qa"][i][1]})
-            messages.append({"role": "user", "content": scenario["qa"][t][0]})
+                messages.append({"role": "user", "content": user_texts[i]})
+                messages.append({"role": "assistant", "content": asst_texts[i]})
+            messages.append({"role": "user", "content": user_texts[t]})
 
             out_max = turns[t]["out_tokens_max"]
             staged.append((arrival, {
@@ -277,9 +309,21 @@ def build_records(spec: list[dict], tok) -> list[dict]:
     return [{"request_id": i, **rec} for i, (_, rec) in enumerate(staged)]
 
 
+def load_sizes(path: str) -> dict:
+    """Token blocks from the grading workload spec (data/input/grading-workload-spec.json)."""
+    s = json.load(open(path))
+    return {
+        "shared": s["shared_system_prefix_tokens"],
+        "conv": s["per_conversation_prefix_tokens"],
+        "user": s["new_user_tokens_per_turn"],
+        "output": s["output_tokens_per_turn_pinned"],
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--spec", default="data/input/trace_grading_public.jsonl")
+    ap.add_argument("--workload", default="data/input/grading-workload-spec.json")
     ap.add_argument("--model", default="../hf-model")
     ap.add_argument("--out", default="data/input/trace-round2.jsonl")
     args = ap.parse_args()
@@ -287,8 +331,9 @@ def main() -> None:
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(str(Path(args.model) / "tokenizer.json"))
+    sizes = load_sizes(args.workload)
     spec = [json.loads(line) for line in open(args.spec) if line.strip()]
-    records = build_records(spec, tok)
+    records = build_records(spec, tok, sizes)
 
     with open(args.out, "w") as f:
         for rec in records:
@@ -296,13 +341,21 @@ def main() -> None:
 
     lens = sorted(sum(encode_len(tok, m["content"]) for m in r["body"]["messages"]) for r in records)
     n_turns = [len(r["body"]["messages"]) for r in records]
+    # Verify the prefix-cache structure the benchmark depends on: the shared block is byte-identical
+    # across all conversations, the per-conv block differs, and prompts grow with the thread.
+    systems = {r["body"]["messages"][0]["content"] for r in records}
+    shared_len = encode_len(tok, sized_text(tok, SHARED_SYSTEM_INTRO,
+                                            [tok.encode(n).ids for n in KB_NOTES], sizes["shared"], seed=0))
+    assert all(s[:200] == next(iter(systems))[:200] for s in systems), "shared prefix must be identical"
     assert all(r["body"]["model"] == MODEL_NAME for r in records)
+    assert all(r["body"]["messages"][-1]["role"] == "user" for r in records)
     assert len(records) == len(spec)
     print(
         f"wrote {len(records)} records to {args.out}\n"
-        f"  prompt tokens   min={lens[0]:,}  p50={lens[len(lens) // 2]:,}  max={lens[-1]:,}\n"
-        f"  messages/req    min={min(n_turns)}  max={max(n_turns)}  (multi-turn: system + accumulating history)\n"
-        f"  conversations   {len({r['request_id'] for r in records}) and len(spec) // 6} of ~6 turns each"
+        f"  shared prefix   {shared_len} tok, identical across all {len(systems)} conversations (global cache hit)\n"
+        f"  prompt tokens   min={lens[0]:,}  p50={lens[len(lens) // 2]:,}  max={lens[-1]:,}  (grows per turn)\n"
+        f"  messages/req    min={min(n_turns)}  max={max(n_turns)}  (system + accumulating history)\n"
+        f"  out_tokens      pinned {sizes['output']} per turn"
     )
 
 
@@ -319,15 +372,16 @@ def _self_check() -> None:
             return "".join(chr(65 + (i % 26)) for i in ids)
 
     tok = FakeTok()
+    sizes = {"shared": 60, "conv": 40, "user": 20, "output": 30}
     spec = []
     for conv_id in range(3):
         for turn_idx in range(6):
             spec.append({
                 "conv_id": conv_id, "turn_idx": turn_idx,
                 "timestamp_ms": conv_id * 100, "think_ms": 3000,
-                "in_tokens_est": 600, "out_tokens_max": 200,
+                "in_tokens_est": 2150 + turn_idx * 450, "out_tokens_max": sizes["output"],
             })
-    recs = build_records(spec, tok)
+    recs = build_records(spec, tok, sizes)
 
     assert len(recs) == 18, len(recs)
     assert [r["request_id"] for r in recs] == list(range(18)), "sequential ids after sort"
@@ -340,9 +394,16 @@ def _self_check() -> None:
     assert counts == [2, 4, 6, 8, 10, 12], counts
     # System prompt is identical across a conversation's turns (prefix reuse) ...
     assert all(r["body"]["messages"][0]["content"] == sys0 for r in conv0)
-    # ... and distinct across conversations (distinct prefixes -> no cross-conv cache hits).
+    # ... full system content is distinct across conversations (per-conv block differs) ...
     systems = {r["body"]["messages"][0]["content"] for r in recs}
     assert len(systems) == 3, len(systems)
+    # ... but the SHARED prefix (first `shared` tokens) is byte-identical across every conversation
+    # (the global cache hit); the per-conv block only starts after it.
+    assert len({s[:sizes["shared"]] for s in systems}) == 1, "shared prefix must be identical across convs"
+    # User/assistant turns are sized to the spec blocks so the thread grows ~(user+output)/turn.
+    assert encode_len(tok, recs[0]["body"]["messages"][-1]["content"]) == sizes["user"], "user turn sized"
+    a_msgs = [m for m in conv0[-1]["body"]["messages"] if m["role"] == "assistant"]
+    assert a_msgs and all(encode_len(tok, m["content"]) == sizes["output"] for m in a_msgs), "history answers sized"
     # Last message is always a user turn; assistant turns only appear in history.
     assert all(r["body"]["messages"][-1]["role"] == "user" for r in recs)
     # Think-pauses vary (not a constant cadence).
