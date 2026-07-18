@@ -29,7 +29,6 @@ services:
       - --max-model-len=32768
       - --gpu-memory-utilization=0.92 # 0.92 = vLLM default; leaves headroom for CUDA graph pools
       - --tensor-parallel-size=1
-      - --attention-backend=FLASH_ATTN
 
       # Intra-conversation prefix reuse is the biggest win now (turn N reuses turns 0..N-1).
       # LFM2 is a hybrid (short-conv state + attn KV): mamba_cache_mode MUST be `align` --
@@ -42,9 +41,6 @@ services:
       - --max-num-batched-tokens=8192 # small prefill chunks: a new turn's ~4k prefill no longer
                           # spikes in-flight decode ITL (gamma=2 punishes that tail); TTFT has slack.
       - --quantization=vtl_fp8
-      # ponytail: KV stays bf16. fp8_e4m3 KV quantizes every cached K/V and tanks
-      # long-context recall (~0% on the judge's needle probe -> "truncation" abort),
-      # while short workload turns look fine. Re-enable only if a long-context A/B stays green.
       - --kv-cache-dtype=fp8_e4m3
 
       - '--speculative-config={"method": "ngram", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
