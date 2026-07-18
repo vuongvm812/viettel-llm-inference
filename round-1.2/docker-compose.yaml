@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:fea8f5c09b7297a969b2e041263f15101e8fec8d2f6650c7d60148584398831f # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:034bea1ad8c90c15bef6dfa7adeda5e56dd859ac54d7c5b2b367ec74eaf8f579 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -26,14 +26,9 @@ services:
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
 
-      # Phase-2 is real multi-turn chat: a fixed per-conversation system prompt (~4k tokens) plus an
-      # accumulating [user, assistant] history, so a turn-0 prompt is ~4k and grows to ~4.5k by turn 6.
-      # 32768 is generous headroom against a longer private grading trace. Tighten to 8192 to free
-      # KV/graph memory if the private trace stays this shape.
-      - --max-model-len=8192
-      - --gpu-memory-utilization=0.95 # 0.95 leaves no headroom for CUDA graph pools
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.92 # 0.92 = vLLM default; leaves headroom for CUDA graph pools
       - --tensor-parallel-size=1
-      - --attention-backend=FLASHINFER
 
       # Intra-conversation prefix reuse is the biggest win now (turn N reuses turns 0..N-1).
       # LFM2 is a hybrid (short-conv state + attn KV): mamba_cache_mode MUST be `align` --
@@ -41,18 +36,26 @@ services:
       - --enable-prefix-caching
       - --mamba_cache_mode=align
       - --enable-chunked-prefill
-      - --max-num-seqs=64 # RE-TUNE: was Pareto for 18.7k prefill-bound prompts; the 4k multi-turn
-                          # phase-2 workload is more decode-heavy. Sweep with bench/replay.py.
-      - --max-num-batched-tokens=4096 # RE-TUNE: prefill chunk size; smaller prompts may prefer less.
+      - --max-num-seqs=128 # peak concurrency ~6 in the trace; a small cap shrinks the cudagraph
+                          # capture set + VRAM and leaves OOM headroom. Sweep with bench/replay.py.
+      - --max-num-batched-tokens=8192 # small prefill chunks: a new turn's ~4k prefill no longer
+                          # spikes in-flight decode ITL (gamma=2 punishes that tail); TTFT has slack.
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
 
-      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE"}'
+      # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
+      # drop the periodic stats logger and quiet uvicorn.
+      - --disable-log-stats
+      - --uvicorn-log-level=warning
+
+      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16]}'
     ports:
       - "8000:8000"
     environment:
       VLLM_PLUGINS: vtl
-      VLLM_LOGGING_LEVEL: INFO
+      VLLM_LOGGING_LEVEL: WARNING             # INFO does per-request log work on the hot path
+      DO_NOT_TRACK: "1"                        # disable anonymous usage stats / telemetry
+      VLLM_NO_USAGE_STATS: "1"
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
 
       # FP8 (vtl_fp8). Load-bearing: --quantization=vtl_fp8 aborts at startup if disabled.

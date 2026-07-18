@@ -44,3 +44,5 @@ sndr_core_engine/
 sglang/
 model/
 flashinfer-competition-codebase/
+vllm/
+flash-attention/
