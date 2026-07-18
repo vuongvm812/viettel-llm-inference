@@ -6,7 +6,26 @@ stock kernel in place. Requires ``--no-build-isolation`` so setup.py sees the
 image's torch instead of an empty build env.
 """
 
+import os
+
 from setuptools import setup
+
+
+def _ngram_ext():
+    """Opt-in C++ tree-ngram drafter (vtl_ngram). OFF unless VTL_BUILD_NGRAM=1 so the standard
+    image build is byte-identical; vtl/ngram_tree.py always has a pure-Python fallback. Needs
+    only torch's pybind11 (CppExtension), no CUDA."""
+    if os.environ.get("VTL_BUILD_NGRAM", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    try:
+        from torch.utils.cpp_extension import CppExtension
+    except ImportError:
+        return None
+    return CppExtension(
+        name="vtl_ngram",
+        sources=["vtl/csrc/ngram_tree/ngram_tree.cpp"],
+        extra_compile_args={"cxx": ["-O3", "-std=c++17"]},
+    )
 
 
 def _cuda_ext():
@@ -44,5 +63,15 @@ def _cuda_ext():
 
 
 _ext, _cmdclass = _cuda_ext()
+_ngram = _ngram_ext()
+if _ngram is not None and "build_ext" not in _cmdclass:
+    # vtl._C was skipped (no CUDA_HOME) but we still need BuildExtension for the C++ ext.
+    try:
+        from torch.utils.cpp_extension import BuildExtension
 
-setup(ext_modules=[_ext] if _ext else [], cmdclass=_cmdclass)
+        _cmdclass = {"build_ext": BuildExtension}
+    except ImportError:
+        _ngram = None
+
+_exts = [e for e in (_ext, _ngram) if e is not None]
+setup(ext_modules=_exts, cmdclass=_cmdclass)

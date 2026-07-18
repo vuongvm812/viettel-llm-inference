@@ -44,15 +44,8 @@ services:
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
 
-      # Speculative decoding (cut TPOT). A separate draft model is impossible on this hybrid target
-      # (vLLM shards the draft's attn layers across KV groups -> single-group assertion fails), so use
-      # model-free speculation. Same flag => exactly one active. Three variants (swap + `make up`, runtime
-      # arg, no rebuild): ngram (numba/CPU, default), ngram_gpu (torch-compiled on GPU -- spares the
-      # 3-core judge CPU), suffix (Arctic C++ tree, highest accept but heaviest CPU; needs arctic-inference).
-      # A/B all three with bench/replay.py under the cpucap.
       - '--speculative-config={"method": "ngram", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
-      #- '--speculative-config={"method": "ngram_gpu", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
-      #- '--speculative-config={"method": "suffix", "suffix_decoding_max_tree_depth": 24, "suffix_decoding_max_spec_factor": 1.0, "suffix_decoding_min_token_prob": 0.1}'
+
       # Phase-1 of the SGLang ngram-v2 tree-spec fork: vtl's tree drafter, emitting the best root->leaf
       # CHAIN via vLLM's existing chain verify (no core fork yet). Python reference (vtl/ngram_tree.py);
       # C++/CUDA corpus + tree verify (attention/sampler/conv-commit) are later phases. Validate the

@@ -42,17 +42,13 @@ services:
       - --max-num-batched-tokens=8192 # small prefill chunks: a new turn's ~4k prefill no longer
                           # spikes in-flight decode ITL (gamma=2 punishes that tail); TTFT has slack.
       - --quantization=vtl_fp8
-      - --kv-cache-dtype=fp8_e4m3
+      # ponytail: KV stays bf16. fp8_e4m3 KV quantizes every cached K/V and tanks
+      # long-context recall (~0% on the judge's needle probe -> "truncation" abort),
+      # while short workload turns look fine. Re-enable only if a long-context A/B stays green.
+      #- --kv-cache-dtype=fp8_e4m3
 
-      # Speculative decoding (cut TPOT). A separate draft model is impossible on this hybrid target
-      # (vLLM shards the draft's attn layers across KV groups -> single-group assertion fails), so use
-      # model-free speculation. Same flag => exactly one active. Three variants (swap + `make up`, runtime
-      # arg, no rebuild): ngram (numba/CPU, default), ngram_gpu (torch-compiled on GPU -- spares the
-      # 3-core judge CPU), suffix (Arctic C++ tree, highest accept but heaviest CPU; needs arctic-inference).
-      # A/B all three with bench/replay.py under the cpucap.
       - '--speculative-config={"method": "ngram", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
-      #- '--speculative-config={"method": "ngram_gpu", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
-      #- '--speculative-config={"method": "suffix", "suffix_decoding_max_tree_depth": 24, "suffix_decoding_max_spec_factor": 1.0, "suffix_decoding_min_token_prob": 0.1}'
+
       # Phase-1 of the SGLang ngram-v2 tree-spec fork: vtl's tree drafter, emitting the best root->leaf
       # CHAIN via vLLM's existing chain verify (no core fork yet). Python reference (vtl/ngram_tree.py);
       # C++/CUDA corpus + tree verify (attention/sampler/conv-commit) are later phases. Validate the

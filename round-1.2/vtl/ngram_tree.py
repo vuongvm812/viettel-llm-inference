@@ -21,6 +21,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+try:  # optional C++ fast path (vtl/csrc/ngram_tree/ngram_tree.cpp); pure-Python fallback below
+    import vtl_ngram as _cpp
+except Exception:  # not built (e.g. off-box) -> use the reference Python implementation
+    _cpp = None
+
 
 class TreeNgramDrafter:
     """Suffix-match tree drafter over a token context (intra-sequence corpus).
@@ -63,6 +68,10 @@ class TreeNgramDrafter:
         parent[i] is the node index of i's parent, or -1 for a first-level draft
         token. Node order is insertion order (root-first within each branch).
         """
+        if _cpp is not None:  # C++ mirror; identical semantics to the Python below
+            r = _cpp.build_tree(list(tokens), self.min_n, self.max_n, self.max_nodes, self.max_depth)
+            self._count = list(r.count)
+            return list(r.node_tokens), list(r.parent)
         node_tokens: list[int] = []
         parent: list[int] = []
         count: list[int] = []
