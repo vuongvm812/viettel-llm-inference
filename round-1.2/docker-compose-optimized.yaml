@@ -46,10 +46,12 @@ services:
 
       # Speculative decoding (cut TPOT). A separate draft model is impossible on this hybrid target
       # (vLLM shards the draft's attn layers across KV groups -> single-group assertion fails), so use
-      # ngram/suffix: no model, no attn layers, fits this multi-turn temp=0 workload. Same flag => one
-      # active; ngram is default, suffix (needs arctic-inference, baked in Dockerfile) via the commented
-      # line + `make up` (runtime arg, no rebuild). Tune params with bench/replay.py.
+      # model-free speculation. Same flag => exactly one active. Three variants (swap + `make up`, runtime
+      # arg, no rebuild): ngram (numba/CPU, default), ngram_gpu (torch-compiled on GPU -- spares the
+      # 3-core judge CPU), suffix (Arctic C++ tree, highest accept but heaviest CPU; needs arctic-inference).
+      # A/B all three with bench/replay.py under the cpucap.
       - '--speculative-config={"method": "ngram", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
+      #- '--speculative-config={"method": "ngram_gpu", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
       #- '--speculative-config={"method": "suffix", "suffix_decoding_max_tree_depth": 24, "suffix_decoding_max_spec_factor": 1.0, "suffix_decoding_min_token_prob": 0.1}'
 
       # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
