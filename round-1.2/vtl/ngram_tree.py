@@ -159,12 +159,14 @@ class TreeNgramProposer:
 
     def propose(
         self,
-        num_speculative_tokens,
         sampled_token_ids,
         num_tokens_no_spec,
         token_ids_cpu,
         slot_mappings=None,  # unused (chain milestone)
     ):
+        # Signature matches vLLM's custom_class call site (gpu_model_runner.py: the
+        # `elif spec_config.method == "custom_class"` branch): NO leading
+        # num_speculative_tokens (that's the ngram path); k comes from our config.
         drafts: list[list[int]] = []
         for i, sampled in enumerate(sampled_token_ids):
             if not sampled:
@@ -176,7 +178,7 @@ class TreeNgramProposer:
                 continue
             row = token_ids_cpu[i]
             ctx = row[:n].tolist() if hasattr(row, "tolist") else list(row[:n])
-            k = min(num_speculative_tokens, self.max_model_len - n)
+            k = min(self.k, self.max_model_len - n)
             drafts.append(self.drafter.propose_chain(ctx, k))
         return drafts
 
@@ -211,7 +213,24 @@ def _selfcheck():
     assert m[2] == [True, False, True, False]  # node 2 sees root 0, self 2
     assert m[0] == [True, False, False, False]
 
-    print("PASS: TreeNgramDrafter — suffix match, frequency chain, branching, tree mask")
+    # Proposer.propose must match vLLM's custom_class call site EXACTLY:
+    #   propose(sampled_token_ids, num_tokens_no_spec, token_ids_cpu, slot_mappings=...)
+    import types
+
+    cfg = types.SimpleNamespace(
+        speculative_config=types.SimpleNamespace(
+            num_speculative_tokens=4, prompt_lookup_min=2, prompt_lookup_max=4
+        ),
+        model_config=types.SimpleNamespace(max_model_len=100),
+    )
+    prop = TreeNgramProposer(cfg)
+    ctx = [5, 1, 2, 3, 9, 1, 2, 3, 9, 1, 2, 3]
+    out = prop.propose([[3]], [len(ctx)], [ctx])  # exact runner arg order
+    assert out == [[9, 1, 2, 3]], out
+    assert prop.propose([[]], [len(ctx)], [ctx]) == [[]]  # empty sample -> skip
+
+    print("PASS: TreeNgramDrafter — suffix match, frequency chain, branching, tree mask; "
+          "TreeNgramProposer.propose matches vLLM custom_class signature")
 
 
 if __name__ == "__main__":
