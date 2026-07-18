@@ -120,7 +120,7 @@ class TreeNgramDrafter:
         node_tokens, parent = self.build_tree(tokens)
         return self.best_chain(node_tokens, parent, k)
 
-    def best_suffix_chain(self, tokens: list[int], k: int) -> list[int]:
+    def best_suffix_chain(self, tokens, k: int) -> list[int]:
         """Chain-milestone drafter: longest recurring suffix -> its most-recent earlier
         occurrence's next k tokens. No trie (build_tree/best_chain are only needed for the
         width>1 tree path); O(window * max_n) instead of building+ranking a full trie.
@@ -129,20 +129,24 @@ class TreeNgramDrafter:
         verify consumes it directly. Caller windows `tokens` (see TreeNgramProposer.propose)
         so this scan is bounded regardless of context length.
 
-        Runs in C++ (vtl_ngram, built with VTL_BUILD_NGRAM=1) when available; the pure-Python
-        body below is the off-box fallback and the correctness reference for the self-check.
+        `tokens` is a 1-D int buffer (numpy/torch CPU view — the live path) or a Python list
+        (self-check / reference). The C++ path (vtl_ngram, built with VTL_BUILD_NGRAM=1) scans
+        the buffer in place — no per-step .tolist() / list copy. The pure-Python fallback below
+        is the off-box path and the correctness reference; it needs an indexable list, so it
+        materializes one only when C++ is unavailable.
         """
         if _cpp is not None and hasattr(_cpp, "best_suffix_chain"):
-            return list(_cpp.best_suffix_chain(list(tokens), self.min_n, self.max_n, k))
-        n = len(tokens)
+            return _cpp.best_suffix_chain(tokens, self.min_n, self.max_n, k)
+        toks = tokens.tolist() if hasattr(tokens, "tolist") else tokens
+        n = len(toks)
         if n < 2 or k <= 0:
             return []
         hi = min(self.max_n, n - 1)
         for L in range(hi, self.min_n - 1, -1):
-            suffix = tokens[n - L :]
+            suffix = toks[n - L :]
             for p in range(n - L - 1, -1, -1):  # most-recent occurrence first
-                if tokens[p : p + L] == suffix:
-                    return tokens[p + L : p + L + k]
+                if toks[p : p + L] == suffix:
+                    return toks[p + L : p + L + k]
         return []
 
 

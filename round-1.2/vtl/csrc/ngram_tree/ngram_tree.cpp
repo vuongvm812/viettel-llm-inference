@@ -14,6 +14,7 @@
 //   CppExtension("vtl_ngram", ["vtl/csrc/ngram_tree/ngram_tree.cpp"])
 // Torch's cpp_extension provides <pybind11/*>; no extra build dep.
 
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -89,9 +90,11 @@ TreeResult build_tree(const std::vector<int64_t> &toks, int min_n, int max_n, in
 // [min_n, max_n]) -> its most-recent earlier occurrence's next k tokens. This is the live
 // chain drafter (TreeNgramProposer.propose calls it every step); early-exits on the first
 // match, so it is O(window * max_n) with the caller's window cap. No trie.
+//
+// Takes a raw pointer so the pybind binding can read the caller's token buffer (numpy/torch
+// CPU view) directly — no per-step .tolist() / list->vector copy of the whole window.
 std::vector<int64_t>
-best_suffix_chain(const std::vector<int64_t> &toks, int min_n, int max_n, int k) {
-  const int n = static_cast<int>(toks.size());
+best_suffix_chain(const int64_t *toks, int n, int min_n, int max_n, int k) {
   if (n < 2 || k <= 0) return {};
   const int hi = std::min(max_n, n - 1);
   for (int L = hi; L >= min_n; --L) {
@@ -102,7 +105,7 @@ best_suffix_chain(const std::vector<int64_t> &toks, int min_n, int max_n, int k)
       }
       if (match) {
         const int e = std::min(p + L + k, n);
-        return std::vector<int64_t>(toks.begin() + p + L, toks.begin() + e);
+        return std::vector<int64_t>(toks + p + L, toks + e);
       }
     }
   }
@@ -120,7 +123,15 @@ PYBIND11_MODULE(vtl_ngram, m) {
   m.def("build_tree", &build_tree, py::arg("tokens"), py::arg("min_n"), py::arg("max_n"),
         py::arg("max_nodes"), py::arg("max_depth"),
         "Build a frequency-counted draft trie; returns TreeResult(node_tokens, parent, count).");
-  m.def("best_suffix_chain", &best_suffix_chain, py::arg("tokens"), py::arg("min_n"),
-        py::arg("max_n"), py::arg("k"),
+  // Accept the caller's token window as a buffer (numpy/torch CPU view, or a list via
+  // forcecast) and scan it in place — avoids materializing 2048 Python ints every decode step.
+  m.def("best_suffix_chain",
+        [](py::array_t<int64_t, py::array::c_style | py::array::forcecast> tokens, int min_n,
+           int max_n, int k) {
+          const auto info = tokens.request();
+          return best_suffix_chain(static_cast<const int64_t *>(info.ptr),
+                                   static_cast<int>(info.size), min_n, max_n, k);
+        },
+        py::arg("tokens"), py::arg("min_n"), py::arg("max_n"), py::arg("k"),
         "Longest recurring suffix -> most-recent occurrence's next k tokens (chain drafter).");
 }
