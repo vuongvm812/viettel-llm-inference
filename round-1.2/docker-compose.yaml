@@ -45,7 +45,7 @@ services:
       # ponytail: KV stays bf16. fp8_e4m3 KV quantizes every cached K/V and tanks
       # long-context recall (~0% on the judge's needle probe -> "truncation" abort),
       # while short workload turns look fine. Re-enable only if a long-context A/B stays green.
-      #- --kv-cache-dtype=fp8_e4m3
+      - --kv-cache-dtype=fp8_e4m3
 
       - '--speculative-config={"method": "ngram", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
 
@@ -60,6 +60,10 @@ services:
       - --disable-log-stats
       - --uvicorn-log-level=warning
 
+      # ponytail: PIECEWISE, not FULL_AND_PIECEWISE. Spec-decode feeds k+1 query positions
+      # per "decode" step; the FULL graph is captured for batch-1-per-req shapes and replays
+      # a shape it never captured once ngram fires every step (long/repetitive context) ->
+      # 0% long-context probe ("dual-path" abort). PIECEWISE is spec-safe; fusions unaffected.
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16]}'
     ports:
       - "8000:8000"
@@ -82,6 +86,14 @@ services:
       VTL_SILU_MUL_FUSION: 1                  # 1 = register the down_proj pattern; 0 = op only, unfused
       VTL_ENABLE_KV_CACHE_MANAGER: 1
       VTL_ENABLE_SCHED_POLICY: 1             # SJF prefill reorder
+
+      # Tree speculative decoding -- EXPERIMENTAL SGLang ngram-v2 port. Default OFF, not yet
+      # validated on hardware; needs the custom_class spec variant above active too.
+      VTL_ENABLE_TREE_SPEC: 0                # 1 = install tree-spec hooks (vtl/patches/tree_spec.py)
+      # VTL_BUILD_NGRAM is BUILD-time (setup.py compiles the C++ drafter) -- set it in the image
+      # build, not here; as a runtime env it is a no-op. Listed for discoverability; the pure-Python
+      # drafter fallback works without it. Enable in the build: `VTL_BUILD_NGRAM=1 make build`.
+      # VTL_BUILD_NGRAM: 1
 
       # No GDN family here: LFM2.5 has no gated-delta-net and no attn output gate, so the old
       # VTL_ENABLE_GDN_KERNELS / MUL_SIGMOID / GDN_PREFILL_BACKEND flags were removed with their code.

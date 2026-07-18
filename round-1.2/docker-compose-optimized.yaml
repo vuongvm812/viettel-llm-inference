@@ -80,6 +80,14 @@ services:
       VTL_ENABLE_KV_CACHE_MANAGER: 1
       VTL_ENABLE_SCHED_POLICY: 1             # SJF prefill reorder
 
+      # Tree speculative decoding -- EXPERIMENTAL SGLang ngram-v2 port. Default OFF, not yet
+      # validated on hardware; needs the custom_class spec variant above active too.
+      VTL_ENABLE_TREE_SPEC: 0                # 1 = install tree-spec hooks (vtl/patches/tree_spec.py)
+      # VTL_BUILD_NGRAM is BUILD-time (setup.py compiles the C++ drafter) -- set it in the image
+      # build, not here; as a runtime env it is a no-op. Listed for discoverability; the pure-Python
+      # drafter fallback works without it. Enable in the build: `VTL_BUILD_NGRAM=1 make build`.
+      # VTL_BUILD_NGRAM: 1
+
       # No GDN family here: LFM2.5 has no gated-delta-net and no attn output gate, so the old
       # VTL_ENABLE_GDN_KERNELS / MUL_SIGMOID / GDN_PREFILL_BACKEND flags were removed with their code.
 
