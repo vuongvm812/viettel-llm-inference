@@ -44,26 +44,7 @@ services:
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
 
-      # Speculative decoding: Qwen2.5-0.5B-Instruct (dense) drafts for the LFM2.5 target to cut TPOT
-      # (round-2 scores TPOT ~33x/ms). Dense on purpose: vLLM's DraftModelProposer asserts all draft
-      # layers share ONE kv-cache group, which an LFM2-family hybrid draft (short-conv + attn = two
-      # groups) breaks. Different tokenizer than LFM2.5 => use_heterogeneous_vocab (greedy draft, logits
-      # constrained to the shared-token intersection; rejection sampling stays lossless). Draft weights
-      # baked to /draft in the Dockerfile (judge runs offline). Draft stays bf16 here to protect
-      # acceptance; fp8-on-draft is a separate A/B (add "quantization":"vtl_fp8"). gamma=3 to start.
-      # cudagraph_mode=FULL_AND_PIECEWISE below covers the wider per-step token count (B*(gamma+1)) via
-      # the piecewise fallback for sizes past the capture set -- extend capture_sizes only if profiled.
-      # RISK to sweep with bench/replay.py: spec-decode helps low-concurrency TPOT, but the draft's
-      # weights + its kv group eat target KV capacity (round-2 is KV-capacity-capped) -> TTFT/throughput.
-      # Stage 1 (default): draft in bf16 -- protects acceptance rate until the bench sweep runs.
       - '--speculative-config={"method": "draft_model", "model": "/draft", "num_speculative_tokens": 3, "draft_tensor_parallel_size": 1, "use_heterogeneous_vocab": true}'
-      # Stage 3 A/B (draft on the vtl fp8 kernel path): swap the line above for the one below, then
-      # `make up` (no rebuild -- serve args are runtime). "quantization":"vtl_fp8" loads the dense
-      # Qwen2 draft under the same online W8A8 method as the target; the plugin registers vtl_fp8
-      # before the draft loads, and Qwen2's RMSNorm/SiLU-mul/per-token-quant ops are the exact
-      # patterns the vtl _C kernels already override -- no new kernels. KEEP fp8-draft ONLY if the
-      # sweep shows acceptance rate + TPOT stay net-positive (fp8 can degrade a 0.5B draft's quality
-      # => more rejects => net slower). `make verify` confirms fusion fires on the draft graph.
       #- '--speculative-config={"method": "draft_model", "model": "/draft", "num_speculative_tokens": 3, "draft_tensor_parallel_size": 1, "use_heterogeneous_vocab": true, "quantization": "vtl_fp8"}'
 
       # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
