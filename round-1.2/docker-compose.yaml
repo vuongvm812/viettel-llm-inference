@@ -49,7 +49,7 @@ services:
       # CHAIN via vLLM's existing chain verify (no core fork yet). Python reference (vtl/ngram_tree.py);
       # C++/CUDA corpus + tree verify (attention/sampler/conv-commit) are later phases. Validate the
       # custom_class propose() signature on-box before relying on it.
-      - '--speculative-config={"method": "custom_class", "model": "vtl.ngram_tree.TreeNgramProposer", "num_speculative_tokens": 4, "prompt_lookup_min": 3, "prompt_lookup_max": 8}'
+      - '--speculative-config={"method": "custom_class", "model": "vtl.ngram_tree.TreeNgramProposer", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 8}'
 
       # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
       # drop the periodic stats logger and quiet uvicorn.
