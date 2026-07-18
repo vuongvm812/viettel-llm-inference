@@ -56,10 +56,6 @@ services:
       - --disable-log-stats
       - --uvicorn-log-level=warning
 
-      # ponytail: PIECEWISE, not FULL_AND_PIECEWISE. Spec-decode feeds k+1 query positions
-      # per "decode" step; the FULL graph is captured for batch-1-per-req shapes and replays
-      # a shape it never captured once ngram fires every step (long/repetitive context) ->
-      # 0% long-context probe ("dual-path" abort). PIECEWISE is spec-safe; fusions unaffected.
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16]}'
     ports:
       - "8000:8000"

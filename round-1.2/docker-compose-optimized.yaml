@@ -36,7 +36,7 @@ services:
       - --enable-prefix-caching
       - --mamba_cache_mode=align
       - --enable-chunked-prefill
-      - --max-num-seqs=64 # peak concurrency ~6 in the trace; a small cap shrinks the cudagraph
+      - --max-num-seqs=75 # peak concurrency ~6 in the trace; a small cap shrinks the cudagraph
                           # capture set + VRAM and leaves OOM headroom. Sweep with bench/replay.py.
       - --max-num-batched-tokens=8192 # small prefill chunks: a new turn's ~4k prefill no longer
                           # spikes in-flight decode ITL (gamma=2 punishes that tail); TTFT has slack.
