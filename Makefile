@@ -30,13 +30,13 @@ MAX_JOBS ?= 4
 # Flows as a build arg through build/push (buildx) and up/warm (compose build): make push VTL_BUILD_NGRAM=1
 VTL_BUILD_NGRAM ?= 0
 
-# Base image the MAIN image builds FROM. Default = stock vLLM; override to the forked base (below)
-# for the tree-verify path: make build VLLM_IMAGE=$(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
-VLLM_IMAGE ?= vllm/vllm-openai:v0.25.0
 # Forked vLLM base = stock v0.25.0 + vtl tree-spec source patches, built by $(ROUND)/Dockerfile.vllm-fork
-# (Python-only overlay -> no CUDA rebuild). See make vllm-fork.
+# (Python-only overlay -> no CUDA rebuild). Pin VLLM_FORK_TAG to the pushed digest. See make vllm-fork.
 VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
-VLLM_FORK_TAG ?= v0.25.0-tree
+VLLM_FORK_TAG ?= v0.25.0-tree@sha256:5f8358646df3e1870c0bfb8a11ee67f9c9e935a8ac7bb23572a324597af131f3
+# Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
+# tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=vllm/vllm-openai:v0.25.0
+VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
@@ -159,7 +159,7 @@ build:
 
 # `docker compose up --build` cannot take --build-arg, so build first (which honors it) then up.
 up:
-	$(IN) $(DC) build --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)'
+	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)'
 	$(IN) $(DC) up
 
 down:
@@ -172,7 +172,7 @@ down:
 WARM_CONCURRENCY ?= 16
 WARM_REQS ?= 32
 warm:
-	$(IN) $(DC) build --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)'
+	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)'
 	$(IN) $(DC) up -d --wait   # --wait blocks until the healthcheck passes
 	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --limit 4 --out /dev/null
 	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
