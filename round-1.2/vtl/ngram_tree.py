@@ -128,7 +128,12 @@ class TreeNgramDrafter:
         Same longest-match / most-recent rule as vLLM's builtin ngram, so vLLM's stock chain
         verify consumes it directly. Caller windows `tokens` (see TreeNgramProposer.propose)
         so this scan is bounded regardless of context length.
+
+        Runs in C++ (vtl_ngram, built with VTL_BUILD_NGRAM=1) when available; the pure-Python
+        body below is the off-box fallback and the correctness reference for the self-check.
         """
+        if _cpp is not None and hasattr(_cpp, "best_suffix_chain"):
+            return list(_cpp.best_suffix_chain(list(tokens), self.min_n, self.max_n, k))
         n = len(tokens)
         if n < 2 or k <= 0:
             return []

@@ -85,6 +85,30 @@ TreeResult build_tree(const std::vector<int64_t> &toks, int min_n, int max_n, in
   return r;
 }
 
+// Mirror of TreeNgramDrafter.best_suffix_chain: longest recurring suffix (length in
+// [min_n, max_n]) -> its most-recent earlier occurrence's next k tokens. This is the live
+// chain drafter (TreeNgramProposer.propose calls it every step); early-exits on the first
+// match, so it is O(window * max_n) with the caller's window cap. No trie.
+std::vector<int64_t>
+best_suffix_chain(const std::vector<int64_t> &toks, int min_n, int max_n, int k) {
+  const int n = static_cast<int>(toks.size());
+  if (n < 2 || k <= 0) return {};
+  const int hi = std::min(max_n, n - 1);
+  for (int L = hi; L >= min_n; --L) {
+    for (int p = n - L - 1; p >= 0; --p) {  // most-recent occurrence first
+      bool match = true;
+      for (int t = 0; t < L; ++t) {
+        if (toks[p + t] != toks[n - L + t]) { match = false; break; }  // suffix = toks[n-L:]
+      }
+      if (match) {
+        const int e = std::min(p + L + k, n);
+        return std::vector<int64_t>(toks.begin() + p + L, toks.begin() + e);
+      }
+    }
+  }
+  return {};
+}
+
 }  // namespace
 
 PYBIND11_MODULE(vtl_ngram, m) {
@@ -96,4 +120,7 @@ PYBIND11_MODULE(vtl_ngram, m) {
   m.def("build_tree", &build_tree, py::arg("tokens"), py::arg("min_n"), py::arg("max_n"),
         py::arg("max_nodes"), py::arg("max_depth"),
         "Build a frequency-counted draft trie; returns TreeResult(node_tokens, parent, count).");
+  m.def("best_suffix_chain", &best_suffix_chain, py::arg("tokens"), py::arg("min_n"),
+        py::arg("max_n"), py::arg("k"),
+        "Longest recurring suffix -> most-recent occurrence's next k tokens (chain drafter).");
 }
