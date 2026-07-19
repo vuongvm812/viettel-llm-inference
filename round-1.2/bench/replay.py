@@ -19,7 +19,7 @@ from pathlib import Path
 
 import aiohttp
 
-from metrics import aggregate
+from metrics import aggregate, parse_spec_counters, spec_decode_stats
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TRACE = REPO_ROOT / "data" / "input" / "trace-round2.jsonl"
@@ -114,6 +114,18 @@ async def do_request(session, url, rec, t0):
     return result
 
 
+async def scrape_spec_counters(session, url):
+    """Snapshot vLLM's spec-decode Prometheus counters. None if /metrics is unavailable
+    (e.g. the server ran with --disable-log-stats) or carries no spec-decode series."""
+    try:
+        async with session.get(f"{url}/metrics") as resp:
+            if resp.status != 200:
+                return None
+            return parse_spec_counters(await resp.text())
+    except Exception:
+        return None
+
+
 async def run_open_loop(session, url, records):
     loop = asyncio.get_running_loop()
     t0 = loop.time()
@@ -159,25 +171,35 @@ async def main_async(args):
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=args.timeout)
     connector = aiohttp.TCPConnector(limit=0)  # unlimited concurrent conns (open-loop bursts)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        spec_before = await scrape_spec_counters(session, args.target)
         if args.closed_loop:
             results, wall = await run_closed_loop(session, args.target, records, args.closed_loop)
         else:
             results, wall = await run_open_loop(session, args.target, records)
+        spec_after = await scrape_spec_counters(session, args.target)
 
+    spec = spec_decode_stats(spec_before, spec_after)
     run = {
         "target": args.target,
         "trace": str(args.trace),
         "mode": mode,
         "wall_time": wall,
+        "spec_decode": spec,
         "records": results,
     }
     Path(args.out).write_text(json.dumps(run, indent=2))
 
-    agg = aggregate(results, wall)
+    agg = aggregate(results, wall, spec=spec)
+    accept = (
+        f"accept {spec['acceptance_rate']:.2f} (len {spec['mean_accept_len']:.2f})"
+        if spec and spec.get("acceptance_rate") is not None
+        else "accept n/a"
+    )
     print(
         f"done: {agg['n_success']}/{agg['n_total']} ok, {agg['n_error']} err, "
         f"{agg['output_tok_s']:.1f} tok/s, {agg['req_s']:.2f} req/s, "
-        f"TTFT p50 {agg['ttft_ms']['p50'] or 0:.0f}ms → {args.out}",
+        f"TTFT p50 {agg['ttft_ms']['p50'] or 0:.0f}ms, "
+        f"TPOT p50 {agg['itl_ms']['p50'] or 0:.1f}ms, {accept} → {args.out}",
         file=sys.stderr,
     )
 

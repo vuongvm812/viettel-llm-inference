@@ -1,0 +1,23 @@
+--- a/vllm/model_executor/layers/mamba/short_conv.py
++++ b/vllm/model_executor/layers/mamba/short_conv.py
+@@ -279,9 +279,19 @@
+ 
+         if has_decode:
+             Bx_d = (B_d * x_d).contiguous()
++            # vtl tree-spec P5 seam: during tree verify every draft node arrives as a "decode"
++            # token and causal_conv1d_update would advance the PERSISTENT conv_state for rejected
++            # drafts too. When the runner activates staging (_VTL_CONV_STAGE set), we stage each
++            # node's Bx and update a SCRATCH clone instead; the accepted path is committed
++            # post-sample (vtl.conv_commit). Inactive (None) -> byte-identical stock decode.
++            # ON-BOX: scratch layout, state_indices, and cudagraph capture of the staged path.
++            _vtl_stage = globals().get("_VTL_CONV_STAGE")
++            _conv_state_d = conv_state
++            if _vtl_stage is not None:
++                _conv_state_d = _vtl_stage(id(self), Bx_d, conv_state, state_indices_tensor_d)
+             Bx = causal_conv1d_update(
+                 Bx_d,
+-                conv_state,
++                _conv_state_d,
+                 conv_weights,
+                 self.conv.bias,
+                 activation=None,

@@ -1,0 +1,47 @@
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -166,20 +166,31 @@
+             sampling_metadata,
+         )
+ 
+-        output_token_ids = rejection_sample(
+-            metadata.draft_token_ids,
+-            metadata.num_draft_tokens,
+-            metadata.max_spec_len,
+-            metadata.cu_num_draft_tokens,
+-            draft_probs,
+-            target_logits,
+-            bonus_token_ids,
+-            sampling_metadata,
+-            synthetic_mode=self.synthetic_mode,
+-            synthetic_conditional_rates=self.synthetic_conditional_rates,
+-            use_fp64_gumbel=self.use_fp64_gumbel,
+-        )
++        # vtl tree-spec fork: greedy tree acceptance for a BRANCHING draft tree (md.vtl_tree set by
++        # the metadata hook). Returns None for a chain / no carrier / any error -> stock chain
++        # rejection sampling below, which is exactly correct for a width-1 tree. Never breaks serving.
++        output_token_ids = None
++        try:
++            from vtl.tree_verify import accept as _vtl_tree_accept
+ 
++            output_token_ids = _vtl_tree_accept(metadata, target_logits, bonus_token_ids)
++        except Exception:
++            output_token_ids = None
++        if output_token_ids is None:
++            output_token_ids = rejection_sample(
++                metadata.draft_token_ids,
++                metadata.num_draft_tokens,
++                metadata.max_spec_len,
++                metadata.cu_num_draft_tokens,
++                draft_probs,
++                target_logits,
++                bonus_token_ids,
++                sampling_metadata,
++                synthetic_mode=self.synthetic_mode,
++                synthetic_conditional_rates=self.synthetic_conditional_rates,
++                use_fp64_gumbel=self.use_fp64_gumbel,
++            )
++
+         logprobs_tensors = None
+         if sampling_metadata.max_num_logprobs is not None:
+             logprobs_tensors = self._get_logprobs_tensors(

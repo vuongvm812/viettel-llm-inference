@@ -44,5 +44,5 @@ def _cuda_ext():
 
 
 _ext, _cmdclass = _cuda_ext()
-
-setup(ext_modules=[_ext] if _ext else [], cmdclass=_cmdclass)
+_exts = [e for e in (_ext,) if e is not None]
+setup(ext_modules=_exts, cmdclass=_cmdclass)
