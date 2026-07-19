@@ -25,6 +25,7 @@ _MODULES: tuple[str, ...] = (
     "dynamic_per_token_quant",
     "silu_mul_quant",
     "kv_cache_manager",
+    "radix_cache",      # shadow radix tree (SGLang RadixAttention port), default-off A/B harness
     "sched_policy",
     "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)
     "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
