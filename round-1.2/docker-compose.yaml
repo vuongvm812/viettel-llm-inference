@@ -48,12 +48,6 @@ services:
 
       # - '--speculative-config={"method": "ngram", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
 
-      # Phase-1 of the SGLang ngram-v2 tree-spec fork: vtl's tree drafter, emitting the best root->leaf
-      # CHAIN via vLLM's existing chain verify (no core fork yet). Python reference (vtl/ngram_tree.py);
-      # C++/CUDA corpus + tree verify (attention/sampler/conv-commit) are later phases. Validate the
-      # custom_class propose() signature on-box before relying on it.
-      # - '--speculative-config={"method": "custom_class", "model": "vtl.ngram_tree.TreeNgramProposer", "num_speculative_tokens": 2, "prompt_lookup_min": 3, "prompt_lookup_max": 8}'
-
       # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
       # drop the periodic stats logger and quiet uvicorn.
       - --disable-log-stats
@@ -81,16 +75,6 @@ services:
       VTL_SILU_MUL_FUSION: 1                  # 1 = register the down_proj pattern; 0 = op only, unfused
       VTL_ENABLE_KV_CACHE_MANAGER: 1
       VTL_ENABLE_SCHED_POLICY: 1             # SJF prefill reorder
-
-      # Tree speculative decoding -- EXPERIMENTAL SGLang ngram-v2 port. Default OFF, not yet
-      # validated on hardware; needs the custom_class spec variant above active too.
-      VTL_ENABLE_TREE_SPEC: 0                # 1 = install tree-spec hooks (vtl/patches/tree_spec.py)
-
-      # ngram drafter scan window (spec-decode). Unset/0 = full context (default), so multi-turn
-      # repeats sitting >2048 tokens back (prior turns, shared system prompt) are matched -- the
-      # biggest acceptance lever on this trace. Lower it to trade acceptance for a cheaper per-step
-      # scan (matters most without the C++ drafter). Needs the custom_class spec variant above.
-      VTL_NGRAM_CTX_WINDOW: 4096
 
       # No GDN family here: LFM2.5 has no gated-delta-net and no attn output gate, so the old
       # VTL_ENABLE_GDN_KERNELS / MUL_SIGMOID / GDN_PREFILL_BACKEND flags were removed with their code.

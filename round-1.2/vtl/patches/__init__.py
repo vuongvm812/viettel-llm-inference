@@ -30,7 +30,6 @@ _MODULES: tuple[str, ...] = (
     "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
     "profiler",
-    "tree_spec",        # EXPERIMENTAL tree spec-decode (SGLang ngram-v2 port); default OFF, box-unvalidated
 )
 
 for _name in _MODULES:

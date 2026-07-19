@@ -26,11 +26,6 @@ CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 # Cap parallel nvcc so the CUDA build does not OOM a small box (see ARG in Dockerfile).
 # Bump on a big-RAM CI host: make build MAX_JOBS=28.
 MAX_JOBS ?= 4
-# Compile the C++ tree-ngram drafter (vtl_ngram) into the image. ON by default: it takes the
-# per-step .tolist()+scan off the spec-decode critical path (buffer read in C++), which matters more
-# now that the drafter scans the full context (VTL_NGRAM_CTX_WINDOW). 0 = pure-Python fallback.
-# Flows as a build arg through build/push (buildx) and up/warm (compose build): make push VTL_BUILD_NGRAM=0
-VTL_BUILD_NGRAM ?= 0
 
 # Upstream stock vLLM. The forked image is built FROM this (make vllm-fork); never FROM the fork.
 VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
@@ -158,12 +153,12 @@ vllm-fork:
 	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'pin this digest: {{.Manifest.Digest}}'; fi
 
 build:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)' --load -t $(IMAGE):$(TAG) .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --load -t $(IMAGE):$(TAG) .
 	@docker inspect $(IMAGE):$(TAG) --format 'built {{.Os}}/{{.Architecture}}'
 
 # `docker compose up --build` cannot take --build-arg, so build first (which honors it) then up.
 up:
-	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)'
+	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)'
 	$(IN) $(DC) up
 
 down:
@@ -176,19 +171,19 @@ down:
 WARM_CONCURRENCY ?= 16
 WARM_REQS ?= 32
 warm:
-	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)'
+	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)'
 	$(IN) $(DC) up -d --wait   # --wait blocks until the healthcheck passes
 	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --limit 4 --out /dev/null
 	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	  --closed-loop $(WARM_CONCURRENCY) --limit $(WARM_REQS) --out /dev/null
 	$(IN) docker cp "$$($(DC) ps -q model)":/opt/vtl/cache/. docker/cache/
 	$(IN) $(DC) down
-	$(MAKE) build ROUND=$(ROUND) VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)'
+	$(MAKE) build ROUND=$(ROUND)
 
 ## buildx --push writes the manifest straight to the registry, so the pushed image
 ## is $(PLATFORM) regardless of what this machine is.
 push:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --build-arg VTL_BUILD_NGRAM='$(VTL_BUILD_NGRAM)' --push -t $(IMAGE):$(TAG) .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --push -t $(IMAGE):$(TAG) .
 	@echo "pin this digest in $(ROUND)/docker-compose.yaml:"
 	@docker buildx imagetools inspect $(IMAGE):$(TAG) --format '{{.Manifest.Digest}}'
 

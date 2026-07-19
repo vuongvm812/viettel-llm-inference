@@ -53,14 +53,9 @@ ARG CUDA_ARCHS="8.0;8.6;8.9;9.0+PTX"
 # which OOM-kills a small dev box. Cap it. Big CI hosts override: make build MAX_JOBS=28.
 ARG MAX_JOBS=4
 
-# Compile the optional C++ tree-ngram drafter (vtl_ngram) into the wheel. 0 = skip it (default);
-# vtl/ngram_tree.py then uses the pure-Python drafter. setup.py reads this env during the install.
-# Driven by `make ... VTL_BUILD_NGRAM=1` (see Makefile).
-ARG VTL_BUILD_NGRAM=0
-
 # Scoped to the RUN, not ENV: it is a build input and has no business in the served image.
 # --no-build-isolation so setup.py sees the image's torch.
-RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS="${MAX_JOBS}" VTL_BUILD_NGRAM="${VTL_BUILD_NGRAM}" \
+RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
     pip install --no-cache-dir --no-build-isolation --no-deps /src \
     && rm -rf /src
 
