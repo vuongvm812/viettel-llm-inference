@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:c5e35ab3167c95206e4a60f8e0bad2445ec7edd225a37be5d972f5f72843005b # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:fae53854330edebc1c4905f21c04c0f4ef9508327751d00ac43db4024c8865b3 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -29,7 +29,7 @@ services:
       # Must match the model's native context (config.json max_position_embeddings=128000).
       # Any tighter cap truncates the judge's long-context probe -> flagged as
       # "truncation / dual-path" cheating.
-      - --max-model-len=128000
+      - --max-model-len=32768
       - --gpu-memory-utilization=0.95
       - --tensor-parallel-size=1
 
@@ -52,7 +52,7 @@ services:
       # CHAIN via vLLM's existing chain verify (no core fork yet). Python reference (vtl/ngram_tree.py);
       # C++/CUDA corpus + tree verify (attention/sampler/conv-commit) are later phases. Validate the
       # custom_class propose() signature on-box before relying on it.
-      - '--speculative-config={"method": "custom_class", "model": "vtl.ngram_tree.TreeNgramProposer", "num_speculative_tokens": 2, "prompt_lookup_min": 3, "prompt_lookup_max": 8}'
+      # - '--speculative-config={"method": "custom_class", "model": "vtl.ngram_tree.TreeNgramProposer", "num_speculative_tokens": 2, "prompt_lookup_min": 3, "prompt_lookup_max": 8}'
 
       # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
       # drop the periodic stats logger and quiet uvicorn.
@@ -84,7 +84,7 @@ services:
 
       # Tree speculative decoding -- EXPERIMENTAL SGLang ngram-v2 port. Default OFF, not yet
       # validated on hardware; needs the custom_class spec variant above active too.
-      VTL_ENABLE_TREE_SPEC: 1                # 1 = install tree-spec hooks (vtl/patches/tree_spec.py)
+      VTL_ENABLE_TREE_SPEC: 0                # 1 = install tree-spec hooks (vtl/patches/tree_spec.py)
 
       # ngram drafter scan window (spec-decode). Unset/0 = full context (default), so multi-turn
       # repeats sitting >2048 tokens back (prior turns, shared system prompt) are matched -- the

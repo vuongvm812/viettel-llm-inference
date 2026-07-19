@@ -30,7 +30,7 @@ MAX_JOBS ?= 4
 # per-step .tolist()+scan off the spec-decode critical path (buffer read in C++), which matters more
 # now that the drafter scans the full context (VTL_NGRAM_CTX_WINDOW). 0 = pure-Python fallback.
 # Flows as a build arg through build/push (buildx) and up/warm (compose build): make push VTL_BUILD_NGRAM=0
-VTL_BUILD_NGRAM ?= 1
+VTL_BUILD_NGRAM ?= 0
 
 # Upstream stock vLLM. The forked image is built FROM this (make vllm-fork); never FROM the fork.
 VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
