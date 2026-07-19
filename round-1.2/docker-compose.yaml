@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:067882127b1f389744c4f08ab4409dd17e2932d9535a99a0e9972f4c324e8b2d # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:c5e35ab3167c95206e4a60f8e0bad2445ec7edd225a37be5d972f5f72843005b # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -26,7 +26,10 @@ services:
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
 
-      - --max-model-len=5120
+      # Must match the model's native context (config.json max_position_embeddings=128000).
+      # Any tighter cap truncates the judge's long-context probe -> flagged as
+      # "truncation / dual-path" cheating.
+      - --max-model-len=128000
       - --gpu-memory-utilization=0.95
       - --tensor-parallel-size=1
 

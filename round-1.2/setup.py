@@ -24,7 +24,11 @@ def _ngram_ext():
     return CppExtension(
         name="vtl_ngram",
         sources=["vtl/csrc/ngram_tree/ngram_tree.cpp"],
-        extra_compile_args={"cxx": ["-O3", "-std=c++17"]},
+        # -flto: single-TU host ext, so LTO only helps the linker prune/inline into
+        # torch's runtime — marginal, but free. No PGO: device code can't, host drafter
+        # isn't hot enough to justify a profile step.
+        extra_compile_args={"cxx": ["-O3", "-std=c++17", "-flto"]},
+        extra_link_args=["-flto"],
     )
 
 
