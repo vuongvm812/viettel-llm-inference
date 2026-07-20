@@ -63,6 +63,8 @@ services:
       VLLM_NO_USAGE_STATS: "1"
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
 
+      VLLM_USE_RUST_FRONTEND: "1"
+
       # FP8 (vtl_fp8). Load-bearing: --quantization=vtl_fp8 aborts at startup if disabled.
       VTL_ENABLE_FP8: 1
       VTL_FP8_CHANNELWISE: 1                  # 1 = per-channel weight scales; 0 = stock per-tensor

@@ -1,0 +1,19 @@
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -735,4 +735,15 @@
+     args = parser.parse_args()
+     validate_parsed_serve_args(args)
+ 
+-    uvloop.run(run_server(args))
++    # vtl: compose pins `python -m ...api_server` (can't switch to `vllm serve`),
++    # so mirror ServeSubcommand.cmd's Rust-frontend dispatch here. Only the HTTP
++    # frontend changes; EngineCore/executor/workers (and every engine-side vtl
++    # patch) are identical.
++    if envs.VLLM_RUST_FRONTEND_PATH:
++        from vllm.entrypoints.cli.serve import run_multi_api_server
++
++        if getattr(args, "api_server_count", None) is None:
++            args.api_server_count = 1
++        run_multi_api_server(args)
++    else:
++        uvloop.run(run_server(args))
