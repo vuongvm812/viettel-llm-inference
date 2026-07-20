@@ -36,6 +36,16 @@ VLLM_FORK_TAG ?= v0.25.0-tree@sha256:57acfae9f16756d89eda027436076cd39316d1c5e0e
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
+# 1 = the fork's rust-builder stage does a profile-guided-optimization build of vllm-rs
+# (CPU-only training run against the mock engine). 0 = plain optimized (fat-LTO) build.
+VLLM_RS_PGO ?= 1
+# Tokenizer the PGO training run boots the frontend with. Defaults to the local model
+# (hf-model/, bind-mounted at /model in the fork's PGO stage — only tokenizer/config are
+# read, the mock fakes the forward pass so the 5.9 GB of weights are never loaded).
+# Override with a HF repo id to fetch a stand-in over the network, e.g. PGO_MODEL=Qwen/Qwen3-0.6B.
+PGO_MODEL ?= /model
+# Host path to the local model dir mounted at /model for the PGO training run.
+PGO_HFMODEL ?= ../hf-model
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
@@ -143,12 +153,16 @@ verify:
 NOCACHE ?=
 BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 
-## Build (PUSH=1 to push) the forked vLLM base image: stock v0.25.0 + vtl/vllm_patches, Python-only
-## overlay (no CUDA rebuild). Then point the main image at it and pin by digest:
+## Build (PUSH=1 to push) the forked vLLM base image: stock v0.25.0 + vtl/vllm_patches +
+## an optimized rebuild of the Rust frontend `vllm-rs` (fat-LTO release; VLLM_RS_PGO=1 adds a
+## CPU-only PGO training run via the mock engine). The rust-builder stage reads the vllm/rust/
+## workspace at repo root via the named build context. Then point the main image at it, pin by digest:
+##   make vllm-fork                 # plain optimized rebuild
+##   make vllm-fork VLLM_RS_PGO=1   # + profile-guided optimization
 ##   make vllm-fork PUSH=1
 ##   make push VLLM_IMAGE=$(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)@sha256:<digest>
 vllm-fork:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg PGO_MODEL='$(PGO_MODEL)' --build-context rustsrc=../vllm/rust $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-context hfmodel=$(PGO_HFMODEL)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
 	@echo "forked vLLM base: $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)"
 	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'pin this digest: {{.Manifest.Digest}}'; fi
 

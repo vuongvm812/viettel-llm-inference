@@ -1,19 +1,94 @@
 # syntax=docker/dockerfile:1.7
 # check=skip=FromPlatformFlagConstDisallowed
 #
-# Forked vLLM base image = stock v0.25.0 + vtl's tree-spec source patches (Python-only, so this is
-# a CHEAP overlay: the compiled _C*.so / CUDA kernels in the base are untouched, no from-source
-# build). The main round-1.2 Dockerfile sets ARG VLLM_IMAGE to the image this produces.
+# Forked vLLM base image = stock v0.25.0 + vtl's tree-spec Python source patches
+# + an optimized (optionally PGO) rebuild of the Rust frontend binary `vllm-rs`.
 #
-# Build + push (see Makefile target `vllm-fork`):
-#   docker build -f Dockerfile.vllm-fork --platform linux/amd64 -t unseenablefuture/vllm-fork:v0.25.0-tree .
-#   docker push unseenablefuture/vllm-fork:v0.25.0-tree     # then pin the main image by @sha256:<digest>
+# The Python patches remain a CHEAP overlay (the compiled _C*.so / CUDA kernels in
+# the base are untouched — no from-source engine build). The `rust-builder` stage
+# additionally compiles `vllm-rs` from the local vllm/rust/ workspace with the
+# tuned release profile (Cargo.toml: fat LTO, codegen-units=1), and — when
+# --build-arg VLLM_RS_PGO=1 — profile-guided optimization. The result replaces the
+# stock `vllm-rs` shipped in the base. The main round-1.2 Dockerfile sets ARG
+# VLLM_IMAGE to the image this produces and inherits the optimized binary, so it
+# needs no COPY of its own.
 #
-# The patches under vtl/vllm_patches/v0.25.0/ are generated from the local (gitignored) vllm/
-# checkout with `git -C vllm diff` — see vtl/vllm_patches/README.md.
+# Build + push (see Makefile target `vllm-fork`, which passes
+# --build-context rustsrc=../vllm/rust so the workspace at repo root is reachable):
+#   make vllm-fork                 # plain optimized rebuild
+#   make vllm-fork VLLM_RS_PGO=1   # + PGO training run (CPU-only, uses the mock engine)
+#   make vllm-fork PUSH=1          # build + push, then pin the main image by @sha256:<digest>
+#
+# The patches under vtl/vllm_patches/v0.25.0/ are generated from the local
+# (gitignored) vllm/ checkout with `git -C vllm diff` — see vtl/vllm_patches/README.md.
 
 ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.0
+ARG RUST_TOOLCHAIN=1.95   # keep in sync with vllm/rust-toolchain.toml
+# PGO tokenizer for the training run: defaults to the local hf-model bind-mounted at
+# /model (only tokenizer/config are read — the mock fakes the forward pass, weights are
+# never loaded). Override with a HF repo id to fetch over the network.
+ARG PGO_MODEL=/model
+# The final stage copies vllm-rs from this stage. `make vllm-fork VLLM_RS_PGO=1` sets it
+# to rust-builder-pgo so only then is the (heavier, network/model-dependent) PGO stage built.
+ARG RUST_BUILDER=rust-builder
+
+# ------------------------------------------------------------------------------
+# Stage 1: plain optimized vllm-rs build (fat-LTO release; linux/amd64, base glibc).
+# ------------------------------------------------------------------------------
+FROM --platform=linux/amd64 ${VLLM_IMAGE} AS rust-builder
+ARG RUST_TOOLCHAIN
+ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:${PATH}
+
+# native-tls-vendored compiles openssl from source (needs a C toolchain + perl);
+# curl/ca-certificates for rustup. -o Dir::Etc::sourceparts=- skips the CUDA /
+# deadsnakes repos in sources.list.d (intermittently mid-sync) — these packages
+# are in the base Ubuntu repos.
+RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
+    && apt-get install -y --no-install-recommends build-essential perl pkg-config curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --profile minimal \
+    && rustup component add llvm-tools-preview
+
+# vllm/rust/ lives at repo root, outside this build's context, so the Makefile
+# passes it as the named build context `rustsrc`.
+COPY --from=rustsrc . /src/rust
+
+# PGO training assets (only used by the rust-builder-pgo stage below).
+COPY vtl/pgo_train.sh /src/pgo_train.sh
+COPY bench /src/bench
+COPY data/input/trace-round2.jsonl /src/trace-round2.jsonl
+
+WORKDIR /src/rust
+RUN set -eux; \
+    cargo build --release --bin vllm-rs --features native-tls-vendored; \
+    mkdir -p /out; \
+    cp target/release/vllm-rs /out/vllm-rs; \
+    /out/vllm-rs --help >/dev/null
+
+# ------------------------------------------------------------------------------
+# Stage 1b: PGO build. Only built when RUST_BUILDER=rust-builder-pgo (VLLM_RS_PGO=1),
+# so plain/CI builds never require the hf-model context or a network model.
+# The CPU-only training run (pgo_train.sh) drives the frontend + mock engine and
+# replays the round-2 trace; the served tokenizer is the local hf-model mounted at
+# /model (weights ignored — the mock fakes the forward pass).
+# ------------------------------------------------------------------------------
+FROM rust-builder AS rust-builder-pgo
+ARG PGO_MODEL
+ENV PGO_MODEL=${PGO_MODEL}
+WORKDIR /src/rust
+RUN --mount=type=bind,from=hfmodel,target=/model \
+    set -eux; \
+    bash /src/pgo_train.sh; \
+    cp /src/rust/target/release/vllm-rs /out/vllm-rs; \
+    /out/vllm-rs --help >/dev/null
+
+# ------------------------------------------------------------------------------
+# Stage 2: the fork overlay — Python source patches + the optimized binary.
+# ------------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS vllm-fork
+ARG RUST_BUILDER
 
 # Load-bearing: patches are line-addressed against v0.25.0. If the base ever moves, the version
 # assert fails the build here instead of the patch silently applying to the wrong lines (or the
@@ -39,3 +114,12 @@ RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vll
     done \
  && rm -rf /tmp/vtl_patches \
  && python3 -c "import vllm.v1.sample.rejection_sampler, vllm.v1.attention.backends.flash_attn, vllm.model_executor.layers.mamba.short_conv, vllm.v1.worker.gpu_model_runner; print('patched vllm imports OK')"
+
+# Replace the stock vllm-rs with the optimized/PGO build. The Python side spawns
+# this exact file (RustFrontendProcessManager) when VLLM_USE_RUST_FRONTEND=1.
+COPY --from=${RUST_BUILDER} /out/vllm-rs /tmp/vllm-rs
+RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))") \
+ && install -m0755 /tmp/vllm-rs "$SITE/vllm/vllm-rs" \
+ && rm /tmp/vllm-rs \
+ && "$SITE/vllm/vllm-rs" --help >/dev/null \
+ && echo "optimized vllm-rs installed at $SITE/vllm/vllm-rs"
