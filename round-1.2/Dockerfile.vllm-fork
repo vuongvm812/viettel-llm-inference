@@ -55,6 +55,23 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # passes it as the named build context `rustsrc`.
 COPY --from=rustsrc . /src/rust
 
+# The frontend optimizations (simd_json parse extractor + tuned release profile) are
+# tracked as a patch because the vllm/ checkout is gitignored — so a clean checkout
+# still builds the optimized binary instead of stock. Idempotent: skip if the checkout
+# already carries the change (grep-guarded, like the api_server_rust_frontend patch).
+COPY vtl/vllm_patches/rust-frontend/ /tmp/rust_patches/
+RUN F=/src/rust/src/server/src/routes/openai/utils/validated_json.rs; \
+    if grep -q simd_json "$F"; then \
+      echo "rust-frontend optimizations already present in the checkout; skipping patch"; \
+    else \
+      for p in /tmp/rust_patches/*.patch; do \
+        [ -e "$p" ] || { echo "no rust patches found"; exit 1; }; \
+        echo "== apply $p"; patch -p1 -d /src/rust --dry-run < "$p" && patch -p1 -d /src/rust < "$p" || exit 1; \
+      done; \
+    fi \
+ && rm -rf /tmp/rust_patches \
+ && grep -q simd_json "$F"   # fail loudly if neither the checkout nor the patch supplied it
+
 # PGO training assets (only used by the rust-builder-pgo stage below).
 COPY vtl/pgo_train.sh /src/pgo_train.sh
 COPY bench /src/bench
@@ -84,11 +101,15 @@ RUN --mount=type=bind,from=hfmodel,target=/model \
     cp /src/rust/target/release/vllm-rs /out/vllm-rs; \
     /out/vllm-rs --help >/dev/null
 
+# Alias the selected builder. `FROM ${ARG}` expands reliably (COPY --from=${ARG}
+# does not), and only the selected stage lands in the final target's build graph —
+# so plain builds never build rust-builder-pgo or need the hf-model context.
+FROM ${RUST_BUILDER} AS selected-builder
+
 # ------------------------------------------------------------------------------
 # Stage 2: the fork overlay — Python source patches + the optimized binary.
 # ------------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS vllm-fork
-ARG RUST_BUILDER
 
 # Load-bearing: patches are line-addressed against v0.25.0. If the base ever moves, the version
 # assert fails the build here instead of the patch silently applying to the wrong lines (or the
@@ -117,7 +138,7 @@ RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vll
 
 # Replace the stock vllm-rs with the optimized/PGO build. The Python side spawns
 # this exact file (RustFrontendProcessManager) when VLLM_USE_RUST_FRONTEND=1.
-COPY --from=${RUST_BUILDER} /out/vllm-rs /tmp/vllm-rs
+COPY --from=selected-builder /out/vllm-rs /tmp/vllm-rs
 RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))") \
  && install -m0755 /tmp/vllm-rs "$SITE/vllm/vllm-rs" \
  && rm /tmp/vllm-rs \
