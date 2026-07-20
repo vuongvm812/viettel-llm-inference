@@ -26,6 +26,11 @@ CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 # Cap parallel nvcc so the CUDA build does not OOM a small box (see ARG in Dockerfile).
 # Bump on a big-RAM CI host: make build MAX_JOBS=28.
 MAX_JOBS ?= 4
+# Experimental device LTO in vtl._C, off by default so the scored build stays byte-for-byte
+# unchanged. Codegen-affecting (see VTL_LTO in $(ROUND)/setup.py + the ARG in Dockerfile) --
+# Nsight/eval-validate before trusting, and if the toolchain rejects the LTO objects at link,
+# leave it off.  make build VTL_LTO=1
+VTL_LTO ?= 0
 
 # Upstream stock vLLM. The forked image is built FROM this (make vllm-fork); never FROM the fork.
 VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
@@ -153,7 +158,7 @@ vllm-fork:
 	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'pin this digest: {{.Manifest.Digest}}'; fi
 
 build:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --load -t $(IMAGE):$(TAG) .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --build-arg VTL_LTO='$(VTL_LTO)' --load -t $(IMAGE):$(TAG) .
 	@docker inspect $(IMAGE):$(TAG) --format 'built {{.Os}}/{{.Architecture}}'
 
 # `docker compose up --build` cannot take --build-arg, so build first (which honors it) then up.
@@ -183,7 +188,7 @@ warm:
 ## buildx --push writes the manifest straight to the registry, so the pushed image
 ## is $(PLATFORM) regardless of what this machine is.
 push:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --push -t $(IMAGE):$(TAG) .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --build-arg VTL_LTO='$(VTL_LTO)' --push -t $(IMAGE):$(TAG) .
 	@echo "pin this digest in $(ROUND)/docker-compose.yaml:"
 	@docker buildx imagetools inspect $(IMAGE):$(TAG) --format '{{.Manifest.Digest}}'
 
