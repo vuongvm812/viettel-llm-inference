@@ -1,6 +1,6 @@
 --- a/vllm/entrypoints/openai/api_server.py
 +++ b/vllm/entrypoints/openai/api_server.py
-@@ -735,4 +735,15 @@
+@@ -735,4 +735,21 @@
      args = parser.parse_args()
      validate_parsed_serve_args(args)
  
@@ -12,6 +12,12 @@
 +    if envs.VLLM_RUST_FRONTEND_PATH:
 +        from vllm.entrypoints.cli.serve import run_multi_api_server
 +
++        # The Rust frontend's --args-json requires `model_tag` (the `vllm serve`
++        # positional, the only serde-required field in SharedRuntimeArgs). Our
++        # command uses --model, which leaves the positional unset, so mirror it
++        # across for jsonify_non_default_args to emit.
++        if getattr(args, "model_tag", None) is None:
++            args.model_tag = args.model
 +        if getattr(args, "api_server_count", None) is None:
 +            args.api_server_count = 1
 +        run_multi_api_server(args)
