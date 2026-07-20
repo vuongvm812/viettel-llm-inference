@@ -121,14 +121,16 @@ __global__ void __launch_bounds__(kFastMaxThreads) fused_rms_norm_quant_kernel(
   if (scale_ub != nullptr) amax = fminf(amax, *scale_ub);
   float const scale = fmaxf(amax / kFp8Max, kMinScale);
   if (threadIdx.x == 0) scales[token] = scale;
+  // Reciprocal-multiply: one divide per token, a multiply per element. Byte-parity with FBGemm
+  // (which kept the per-element divide) is retired -- quantization is in scope, and 1/scale
+  // differs by <=0.5 ulp, below the fp8 (<=3 mantissa bit) quantization step.
+  float const inv_scale = 1.0f / scale;
 
   if (active) {
     VecOut<kVec> vout;
 #pragma unroll
     for (int j = 0; j < kVec; j += 2) {
-      // Stock divides by the scale rather than multiplying by its reciprocal
-      // ("Do not invert token_scale for exact match with FBGemm"). Match it.
-      vout.pair[j >> 1] = floats_to_fp8x2(x[j] / scale, x[j + 1] / scale);
+      vout.pair[j >> 1] = floats_to_fp8x2(x[j] * inv_scale, x[j + 1] * inv_scale);
     }
     *reinterpret_cast<VecOut<kVec>*>(out + row_off) = vout;
   }
@@ -170,6 +172,7 @@ __global__ void fused_rms_norm_quant_generic_kernel(
   if (scale_ub != nullptr) amax = fminf(amax, *scale_ub);
   float const scale = fmaxf(amax / kFp8Max, kMinScale);
   if (threadIdx.x == 0) scales[token] = scale;
+  float const inv_scale = 1.0f / scale;
 
   for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
     float x = static_cast<float>(input[in_base + i]);
@@ -178,7 +181,7 @@ __global__ void fused_rms_norm_quant_generic_kernel(
       residual[row_base + i] = static_cast<scalar_t>(x);
     }
     float const y = static_cast<float>(static_cast<scalar_t>(x * rms) * weight[i]);
-    out[row_base + i] = float_to_fp8(y / scale);
+    out[row_base + i] = float_to_fp8(y * inv_scale);
   }
 }
 

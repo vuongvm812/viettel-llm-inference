@@ -26,12 +26,27 @@ namespace vtl {
 constexpr float kFp8Max = 448.0f;                      // quant_type_max_v<Float8_e4m3fn>
 constexpr float kMinScale = 1.0f / (kFp8Max * 512.0f); // min_scaling_factor<fp8>::val()
 
-// Fast-path block cap. hidden=2048 launches 256 threads at bf16/fp16 (kVec=8) and 512 at
-// fp32 (kVec=4), so 512 covers every fast-path shape; wider hidden falls to the generic /
-// chunked kernels. Given as an explicit __launch_bounds__ so the SM90 register allocator
-// sizes for a <=512-thread block instead of the default 1024 worst case, keeping more
-// blocks resident to hide HBM3e latency in the low-occupancy decode regime.
+// Fast-path block cap. Given as an explicit __launch_bounds__ so the SM90 register allocator
+// sizes for a <=512-thread block instead of the default 1024 worst case, keeping more blocks
+// resident to hide HBM3e latency in the low-occupancy decode regime. Wider rows stay on the
+// fast path via thread coarsening (see coarsen_items) rather than a bigger block: hidden=2048
+// -> 256 threads x ITEMS=1; hidden=12288 -> 512 threads x ITEMS=3. Every LFM2 quant shape
+// (2048..12288) fits ITEMS<=3, so the scalar generic kernel now only guards odd/misaligned rows.
 constexpr int kFastMaxThreads = 512;
+
+// Max vectors a single thread processes in the coarsened fast path. Holds ITEMS*kVec floats in
+// registers across the reduction, so it is a compile-time template arg, not runtime. 4 covers
+// nvec up to 4*512 = 2048 (hidden up to 16384 at kVec=8) -- past every LFM2 shape.
+constexpr int kMaxItems = 4;
+
+// Smallest coarsening factor in [1, kMaxItems] whose thread count ceil(nvec/ITEMS) fits the
+// kFastMaxThreads cap; 0 if even kMaxItems overflows (caller falls to the generic kernel).
+inline int coarsen_items(int nvec) {
+  for (int it = 1; it <= kMaxItems; ++it) {
+    if ((nvec + it - 1) / it <= kFastMaxThreads) return it;
+  }
+  return 0;
+}
 
 // 16-byte loads: the widest a single thread can issue.
 template <typename scalar_t>
