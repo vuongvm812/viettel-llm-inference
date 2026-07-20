@@ -70,6 +70,8 @@ services:
       VTL_ENABLE_DYNAMIC_PER_TOKEN_QUANT: 1
       VTL_ENABLE_SILU_MUL_QUANT: 1           # down_proj silu-mul + fp8 quant fusion
       VTL_SILU_MUL_FUSION: 1                  # 1 = register the down_proj pattern; 0 = op only, unfused
+      VTL_ENABLE_SHORTCONV_QUANT: 1          # fp8 the short-conv in_proj/out_proj (the TPOT lever)
+      VTL_ENABLE_MUL_QUANT: 1                # fused conv-gate mul+fp8-quant, pure-decode fast path
       VTL_ENABLE_KV_CACHE_MANAGER: 1
       VTL_ENABLE_SCHED_POLICY: 1             # SJF prefill reorder
 

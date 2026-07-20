@@ -13,9 +13,11 @@
 //   amax = max_d |f32(input)|                 (per token, accumulated in fp32)
 //   t    = scale_ub ? min(amax, *scale_ub) : amax
 //   s    = max(t / 448, 1/(448*512))          (per token, written to scales[token])
-//   out  = fp8(clamp(f32(input) / s, -448, 448))   -- DIVIDE (is_scale_inverted=false),
-//                                                     clamp THEN hw convert (SATFINITE).
-// amax and the divide are fp32; the only narrowing is the fp8 output.
+//   out  = fp8(clamp(f32(input) * (1/s), -448, 448))  -- reciprocal-multiply (one divide per
+//                                                        token), clamp THEN hw convert (SATFINITE).
+// amax and the multiply are fp32; the only narrowing is the fp8 output. Byte-parity with FBGemm
+// (which used a per-element divide) is retired -- quantization is in scope, and 1/s differs by
+// <=0.5 ulp, below the fp8 (<=3 mantissa bit) quantization step.
 //
 // Schema (must match _C exactly, incl. the mutable-alias / optional markers):
 //   dynamic_per_token_scaled_fp8_quant(Tensor! result, Tensor input, Tensor! scale,
@@ -29,9 +31,13 @@ namespace vtl {
 
 namespace {
 
-// Fast path. hidden % kVec == 0 and hidden/kVec <= kFastMaxThreads, so a thread's slice is one
-// 16-byte load held in registers across the single amax reduction -- input read exactly once.
-template <typename scalar_t>
+// Fast path. hidden % kVec == 0 and hidden/kVec <= ITEMS*kFastMaxThreads, so each thread holds
+// its ITEMS 16-byte slices in registers across the single amax reduction -- input read once.
+// Thread t owns vectors {t, t+B, ..., t+(ITEMS-1)*B} (B = blockDim.x): strided so consecutive
+// threads hit consecutive addresses (coalesced) within each item. ITEMS=1 is byte-identical to
+// the old single-slice kernel; ITEMS>=2 keeps wide rows (e.g. 6144, 12288) on this path instead
+// of the scalar generic kernel, at 512 threads/block for occupancy.
+template <typename scalar_t, int ITEMS>
 __global__ void __launch_bounds__(kFastMaxThreads) dynamic_per_token_quant_kernel(
     c10::Float8_e4m3fn* __restrict__ out,  // [num_tokens, hidden]
     float* __restrict__ scales,            // [num_tokens]
@@ -41,41 +47,48 @@ __global__ void __launch_bounds__(kFastMaxThreads) dynamic_per_token_quant_kerne
   constexpr int kVec = VecTraits<scalar_t>::kVec;
 
   int64_t const token = blockIdx.x;
-  int const idx = threadIdx.x * kVec;
-  bool const active = idx < hidden_size;
+  int const B = blockDim.x;
+  int64_t const in_row = token * input_stride;
+  int64_t const out_row = token * static_cast<int64_t>(hidden_size);
 
-  int64_t const in_off = token * input_stride + idx;
-  int64_t const row_off = token * static_cast<int64_t>(hidden_size) + idx;
-
-  float x[kVec];
-  if (active) {
-    VecIn<scalar_t, kVec> vin =
-        *reinterpret_cast<VecIn<scalar_t, kVec> const*>(input + in_off);
+  float x[ITEMS][kVec];
+  float amax = 0.0f;
 #pragma unroll
-    for (int j = 0; j < kVec; ++j) x[j] = static_cast<float>(vin.v[j]);
-  } else {
+  for (int k = 0; k < ITEMS; ++k) {
+    int const idx = (threadIdx.x + k * B) * kVec;
+    if (idx < hidden_size) {
+      VecIn<scalar_t, kVec> vin =
+          *reinterpret_cast<VecIn<scalar_t, kVec> const*>(input + in_row + idx);
 #pragma unroll
-    for (int j = 0; j < kVec; ++j) x[j] = 0.0f;
+      for (int j = 0; j < kVec; ++j) {
+        x[k][j] = static_cast<float>(vin.v[j]);
+        amax = fmaxf(amax, fabsf(x[k][j]));
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) x[k][j] = 0.0f;
+    }
   }
 
   __shared__ float smem_max[32];
-  float amax = 0.0f;
-#pragma unroll
-  for (int j = 0; j < kVec; ++j) amax = fmaxf(amax, fabsf(x[j]));
   amax = block_reduce(amax, MaxOp{}, 0.0f, smem_max);
   if (scale_ub != nullptr) amax = fminf(amax, *scale_ub);
   float const scale = fmaxf(amax / kFp8Max, kMinScale);
   if (threadIdx.x == 0) scales[token] = scale;
+  // One divide per token, then a multiply per element (byte-parity retired; see file header).
+  float const inv_scale = 1.0f / scale;
 
-  if (active) {
-    VecOut<kVec> vout;
 #pragma unroll
-    for (int j = 0; j < kVec; j += 2) {
-      // Divide, not reciprocal-multiply: stock's is_scale_inverted=false path, for exact
-      // match with FBGemm. --use_fast_math is off so this stays a real divide.
-      vout.pair[j >> 1] = floats_to_fp8x2(x[j] / scale, x[j + 1] / scale);
+  for (int k = 0; k < ITEMS; ++k) {
+    int const idx = (threadIdx.x + k * B) * kVec;
+    if (idx < hidden_size) {
+      VecOut<kVec> vout;
+#pragma unroll
+      for (int j = 0; j < kVec; j += 2) {
+        vout.pair[j >> 1] = floats_to_fp8x2(x[k][j] * inv_scale, x[k][j + 1] * inv_scale);
+      }
+      *reinterpret_cast<VecOut<kVec>*>(out + out_row + idx) = vout;
     }
-    *reinterpret_cast<VecOut<kVec>*>(out + row_off) = vout;
   }
 }
 
@@ -102,9 +115,10 @@ __global__ void dynamic_per_token_quant_generic_kernel(
   if (scale_ub != nullptr) amax = fminf(amax, *scale_ub);
   float const scale = fmaxf(amax / kFp8Max, kMinScale);
   if (threadIdx.x == 0) scales[token] = scale;
+  float const inv_scale = 1.0f / scale;
 
   for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-    out[row_base + i] = float_to_fp8(static_cast<float>(input[in_base + i]) / scale);
+    out[row_base + i] = float_to_fp8(static_cast<float>(input[in_base + i]) * inv_scale);
   }
 }
 
@@ -124,15 +138,25 @@ void launch(torch::Tensor const& out, torch::Tensor const& input,
   auto const* in_p = input.const_data_ptr<scalar_t>();
   auto const* ub_p = scale_ub.has_value() ? scale_ub->const_data_ptr<float>() : nullptr;
 
-  int const nthreads = (hidden_size + kVec - 1) / kVec;
-  bool const fast = hidden_size % kVec == 0 && nthreads <= kFastMaxThreads &&
-                    input_stride % kVec == 0 && aligned16(in_p) && aligned16(out_p);
+  int const nvec = hidden_size % kVec == 0 ? hidden_size / kVec : 0;
+  int const items = nvec > 0 ? coarsen_items(nvec) : 0;
+  bool const fast =
+      items > 0 && input_stride % kVec == 0 && aligned16(in_p) && aligned16(out_p);
 
   dim3 const grid(num_tokens);
   if (fast) {
+    int const nthreads = (nvec + items - 1) / items;
     dim3 const block((nthreads + 31) / 32 * 32);
-    dynamic_per_token_quant_kernel<scalar_t><<<grid, block, 0, stream>>>(
-        out_p, scales_p, in_p, ub_p, hidden_size, input_stride);
+#define VTL_LAUNCH_DPTQ(IT)                                                          \
+  dynamic_per_token_quant_kernel<scalar_t, IT><<<grid, block, 0, stream>>>(          \
+      out_p, scales_p, in_p, ub_p, hidden_size, input_stride)
+    switch (items) {
+      case 1: VTL_LAUNCH_DPTQ(1); break;
+      case 2: VTL_LAUNCH_DPTQ(2); break;
+      case 3: VTL_LAUNCH_DPTQ(3); break;
+      default: VTL_LAUNCH_DPTQ(4); break;  // coarsen_items caps at kMaxItems=4
+    }
+#undef VTL_LAUNCH_DPTQ
   } else {
     dim3 const block(std::min((hidden_size + 31) / 32 * 32, 1024));
     dynamic_per_token_quant_generic_kernel<scalar_t><<<grid, block, 0, stream>>>(
@@ -144,7 +168,7 @@ void launch(torch::Tensor const& out, torch::Tensor const& input,
     cudaError_t const err = cudaStreamSynchronize(stream);
     TORCH_CHECK(err == cudaSuccess, "vtl dynamic_per_token_quant faulted: ",
                 cudaGetErrorString(err), " | path=", (fast ? "fast" : "generic"),
-                " dtype=", input.scalar_type(), " num_tokens=", num_tokens,
+                " items=", items, " dtype=", input.scalar_type(), " num_tokens=", num_tokens,
                 " hidden=", hidden_size, " stride=", input_stride, " kVec=", kVec,
                 " aligned16(in,out)=", aligned16(in_p), aligned16(out_p));
   }

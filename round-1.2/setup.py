@@ -23,12 +23,14 @@ def _cuda_ext():
             "vtl/csrc/rms_norm_quant.cu",
             "vtl/csrc/dynamic_per_token_quant.cu",
             "vtl/csrc/silu_mul_quant.cu",
+            "vtl/csrc/mul_quant.cu",
             "vtl/csrc/torch_bindings.cpp",
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
-            # No --use_fast_math: it would turn `y / scale` into a reciprocal
-            # approximation and break element-for-element parity with stock.
+            # No --use_fast_math: the kernels do a TARGETED reciprocal-multiply on the fp8
+            # output (one true `1.0f / scale` per token); global fast-math would also perturb
+            # the SiLU sigmoid and the RMS rsqrt more broadly than intended.
             "nvcc": [
                 "-O3",
                 "-std=c++17",

@@ -19,8 +19,12 @@
 //   silu_and_mul_dynamic_per_token_quant       -- NEW op, vllm_cuda only (w2/down_proj fusion target;
 //                                                 inserted into the graph by a fusion pattern, so
 //                                                 its fake/meta kernel is registered in Python).
-// (The short-conv gate `C * Bx` -> out_proj is bf16 in LFM2 -- Liquid builds those projections
-//  without a quant_config -- so there is no fp8 quant to fuse there and no conv-gate op exists.)
+//   mul_dynamic_per_token_quant                -- NEW op, vllm_cuda only. Fuses the short-conv gate
+//                                                 `y = C * Bx` + out_proj input quant (once the conv
+//                                                 projections are fp8, see shortconv_quant.py).
+//                                                 Called directly from the patched ShortConv decode
+//                                                 path (no FX pattern -- short_conv is an opaque op);
+//                                                 its fake kernel is registered in Python.
 
 #include <torch/extension.h>
 #include <torch/library.h>
@@ -39,6 +43,10 @@ void dynamic_per_token_scaled_fp8_quant(torch::Tensor& result, torch::Tensor con
 void silu_and_mul_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor& scale,
                                           torch::Tensor const& input,
                                           std::optional<torch::Tensor> const& scale_ub);
+
+void mul_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor& scale,
+                                 torch::Tensor const& a, torch::Tensor const& b,
+                                 std::optional<torch::Tensor> const& scale_ub);
 }  // namespace vtl
 
 TORCH_LIBRARY(vllm_cuda, m) {
@@ -52,6 +60,9 @@ TORCH_LIBRARY(vllm_cuda, m) {
   m.def(
       "silu_and_mul_dynamic_per_token_quant(Tensor! result, Tensor! scale, "
       "Tensor input, Tensor? scale_ub) -> ()");
+  m.def(
+      "mul_dynamic_per_token_quant(Tensor! result, Tensor! scale, "
+      "Tensor a, Tensor b, Tensor? scale_ub) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
@@ -60,6 +71,7 @@ TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
          TORCH_FN(vtl::dynamic_per_token_scaled_fp8_quant));
   m.impl("silu_and_mul_dynamic_per_token_quant",
          TORCH_FN(vtl::silu_and_mul_dynamic_per_token_quant));
+  m.impl("mul_dynamic_per_token_quant", TORCH_FN(vtl::mul_dynamic_per_token_quant));
 }
 
 // Overrides of vLLM's own _C ops (schemas defined by vllm._C_stable_libtorch, imported first).

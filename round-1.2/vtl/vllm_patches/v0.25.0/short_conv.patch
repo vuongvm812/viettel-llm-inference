@@ -1,6 +1,103 @@
 --- a/vllm/model_executor/layers/mamba/short_conv.py
 +++ b/vllm/model_executor/layers/mamba/short_conv.py
-@@ -279,9 +279,19 @@
+@@ -2,6 +2,9 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import logging
++import os
++
+ import torch
+ 
+ from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
+@@ -28,6 +31,86 @@
+ from vllm.v1.attention.backend import AttentionMetadata
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+ from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
++
++# vtl Phase-3: fused conv-gate `y = C*Bx` + fp8 quant + out_proj, opt-in and fail-closed.
++# See round-1.2/vtl/patches/mul_quant.py and round-1.2/vtl/csrc/mul_quant.cu.
++_VTL_MUL_QUANT = os.environ.get("VTL_ENABLE_MUL_QUANT", "").strip().lower() in {
++    "1",
++    "true",
++    "yes",
++    "on",
++}
++
++
++def _vtl_mul_quant_eligible(out_proj) -> bool:
++    """True if ``out_proj`` can take a pre-quantized fp8 activation for the fused gate path.
++
++    Cached per-layer. Requires the flag on, the fused op registered, and ``out_proj`` on our
++    channelwise vtl_fp8 path: a column-major fp8 weight + per-channel ``weight_scale``, no bias,
++    not Marlin, and TP=1 (RowParallelLinear's all-reduce is not replicated here). Any miss ->
++    stock path, so this never changes numerics outside the exact config it checks for.
++    """
++    cached = getattr(out_proj, "_vtl_mul_quant_ok", None)
++    if cached is not None:
++        return cached
++    ok = False
++    try:
++        from vllm.distributed import get_tensor_model_parallel_world_size
++
++        weight = getattr(out_proj, "weight", None)
++        ok = (
++            _VTL_MUL_QUANT
++            and hasattr(torch.ops, "vllm_cuda")
++            and hasattr(torch.ops.vllm_cuda, "mul_dynamic_per_token_quant")
++            and weight is not None
++            and weight.dtype == torch.float8_e4m3fn
++            and getattr(out_proj, "weight_scale", None) is not None
++            and getattr(out_proj, "bias", None) is None
++            and not getattr(getattr(out_proj, "quant_method", None), "use_marlin", False)
++            and get_tensor_model_parallel_world_size() == 1
++        )
++    except Exception:
++        ok = False
++    out_proj._vtl_mul_quant_ok = ok
++    return ok
++
++
++def _vtl_mul_quant_out(layer, C_d, Bx, output, n) -> bool:
++    """Fused ``y = C_d * Bx`` -> fp8 quant -> out_proj GEMM, writing ``output[:n]`` in place.
++
++    Returns True on the fast path; False (leaving ``output`` untouched) to fall back to stock.
++    Fail-closed: any error disables this layer's fast path and reverts to ``y = C*Bx`` + out_proj.
++    """
++    out_proj = layer.out_proj
++    if not _vtl_mul_quant_eligible(out_proj):
++        return False
++    try:
++        from vllm import _custom_ops as ops
++
++        num_tok, dim = C_d.shape[0], C_d.shape[-1]
++        y_fp8 = torch.empty((num_tok, dim), dtype=torch.float8_e4m3fn, device=C_d.device)
++        y_scale = torch.empty((num_tok, 1), dtype=torch.float32, device=C_d.device)
++        # Fuses the bf16 `y = C_d * Bx` with out_proj's per-token input quant; y never hits HBM.
++        torch.ops.vllm_cuda.mul_dynamic_per_token_quant(y_fp8, y_scale, C_d, Bx, None)
++        # Pre-quantized fp8 GEMM: weight is column-major [K, N] fp8, weight_scale per-channel [N,1]
++        # -- exactly what the stock Fp8 apply_weights passes to cutlass_scaled_mm (no padding at
++        # dim=2048, no bias, TP=1; all guaranteed by _vtl_mul_quant_eligible).
++        out = ops.cutlass_scaled_mm(
++            y_fp8,
++            out_proj.weight,
++            scale_a=y_scale,
++            scale_b=out_proj.weight_scale,
++            out_dtype=C_d.dtype,
++            bias=None,
++        )
++        output[:n] = out
++        return True
++    except Exception:
++        out_proj._vtl_mul_quant_ok = False  # stop retrying this layer; no log-spam
++        logging.getLogger("vtl").exception(
++            "vtl: mul_quant out_proj fast path failed; using stock"
++        )
++        return False
+ 
+ 
+ # --8<-- [start:short_conv]
+@@ -279,14 +362,35 @@
  
          if has_decode:
              Bx_d = (B_d * x_d).contiguous()
@@ -21,3 +118,19 @@
                  conv_weights,
                  self.conv.bias,
                  activation=None,
+                 conv_state_indices=state_indices_tensor_d,
+             )
++            # vtl Phase-3 fused fast path (opt-in, fail-closed): out_proj is a single GEMM over
++            # the merged decode|prefill tensor, so we can only feed it pre-quantized when there is
++            # no prefill half. Skipped while tree-spec staging is active (_vtl_stage not None) to
++            # avoid interacting with the deferred conv-state commit. ON-BOX: validate under
++            # cudagraph capture. On miss/failure -> stock `y = C*Bx` + vstack + out_proj below.
++            if (
++                _vtl_stage is None
++                and not has_prefill
++                and _vtl_mul_quant_out(self, C_d, Bx, output, num_actual_tokens)
++            ):
++                return
+             y = C_d * Bx
+             conv_output_list.insert(0, y)
+ 
