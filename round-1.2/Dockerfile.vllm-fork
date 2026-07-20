@@ -13,8 +13,10 @@
 # VLLM_IMAGE to the image this produces and inherits the optimized binary, so it
 # needs no COPY of its own.
 #
-# Build + push (see Makefile target `vllm-fork`, which passes
-# --build-context rustsrc=../vllm/rust so the workspace at repo root is reachable):
+# The Rust workspace is fetched in-build (git clone vLLM @ VLLM_SRC_REF, sparse rust/),
+# so this builds on any box with no dependency on a local vllm/ checkout.
+#
+# Build + push (see Makefile target `vllm-fork`):
 #   make vllm-fork                 # plain optimized rebuild
 #   make vllm-fork VLLM_RS_PGO=1   # + PGO training run (CPU-only, uses the mock engine)
 #   make vllm-fork PUSH=1          # build + push, then pin the main image by @sha256:<digest>
@@ -28,37 +30,60 @@ ARG RUST_TOOLCHAIN=1.95   # keep in sync with vllm/rust-toolchain.toml
 # /model (only tokenizer/config are read — the mock fakes the forward pass, weights are
 # never loaded). Override with a HF repo id to fetch over the network.
 ARG PGO_MODEL=/model
+# Optional -Ctarget-cpu for the PGO binary. Empty = baseline (portable to Rosetta + H200).
+ARG PGO_TARGET_CPU=
 # The final stage copies vllm-rs from this stage. `make vllm-fork VLLM_RS_PGO=1` sets it
 # to rust-builder-pgo so only then is the (heavier, network/model-dependent) PGO stage built.
 ARG RUST_BUILDER=rust-builder
+# vLLM source tag to fetch the Rust workspace from — must match the base image version so
+# the rebuilt vllm-rs speaks the same frontend/ZMQ protocol the Python side expects.
+ARG VLLM_SRC_REF=v0.25.0
 
 # ------------------------------------------------------------------------------
 # Stage 1: plain optimized vllm-rs build (fat-LTO release; linux/amd64, base glibc).
 # ------------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS rust-builder
 ARG RUST_TOOLCHAIN
+ARG VLLM_SRC_REF
 ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:${PATH}
 
 # native-tls-vendored compiles openssl from source (needs a C toolchain + perl);
-# curl/ca-certificates for rustup. -o Dir::Etc::sourceparts=- skips the CUDA /
-# deadsnakes repos in sources.list.d (intermittently mid-sync) — these packages
-# are in the base Ubuntu repos.
+# curl/ca-certificates for rustup; unzip for the protoc release below; git to fetch the
+# Rust workspace source. -o Dir::Etc::sourceparts=- skips the CUDA / deadsnakes repos in
+# sources.list.d (intermittently mid-sync) — these packages are in the base Ubuntu repos.
 RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
-    && apt-get install -y --no-install-recommends build-essential perl pkg-config curl ca-certificates \
+    && apt-get install -y --no-install-recommends build-essential perl pkg-config curl ca-certificates unzip git \
     && rm -rf /var/lib/apt/lists/*
+
+# vllm-server's gRPC build script needs protoc. The proto uses proto3 `optional`,
+# which Ubuntu 22.04's protoc (3.12) only handles behind an experimental flag, so
+# pull a modern release for determinism and point PROTOC at it.
+ARG PROTOC_VERSION=28.3
+RUN curl -fsSL -o /tmp/protoc.zip \
+      "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
+    && unzip -o /tmp/protoc.zip -d /usr/local 'bin/protoc' 'include/*' \
+    && rm /tmp/protoc.zip \
+    && chmod +x /usr/local/bin/protoc \
+    && protoc --version
+ENV PROTOC=/usr/local/bin/protoc
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --profile minimal \
     && rustup component add llvm-tools-preview
 
-# vllm/rust/ lives at repo root, outside this build's context, so the Makefile
-# passes it as the named build context `rustsrc`.
-COPY --from=rustsrc . /src/rust
+# Fetch the pristine vLLM Rust workspace in-build (sparse: only rust/). This makes the
+# fork build self-contained — no dependency on a local vllm/ checkout — so it builds on
+# any box (the dev machine's gitignored checkout is only for editing/regenerating patches).
+RUN git clone --depth 1 --branch "${VLLM_SRC_REF}" --filter=blob:none --sparse \
+      https://github.com/vllm-project/vllm /src/vllm-src \
+    && git -C /src/vllm-src sparse-checkout set rust \
+    && mv /src/vllm-src/rust /src/rust \
+    && rm -rf /src/vllm-src
 
-# The frontend optimizations (simd_json parse extractor + tuned release profile) are
-# tracked as a patch because the vllm/ checkout is gitignored — so a clean checkout
-# still builds the optimized binary instead of stock. Idempotent: skip if the checkout
-# already carries the change (grep-guarded, like the api_server_rust_frontend patch).
+# Our frontend optimizations (simd_json parse extractor + tuned release profile) live as a
+# tracked patch — the fetched source is pristine v0.25.0, so this is what makes the build
+# produce the optimized binary instead of stock. Grep-guarded (idempotent) like the
+# api_server_rust_frontend patch, so a pre-modified source is a no-op too.
 COPY vtl/vllm_patches/rust-frontend/ /tmp/rust_patches/
 RUN F=/src/rust/src/server/src/routes/openai/utils/validated_json.rs; \
     if grep -q simd_json "$F"; then \
@@ -93,7 +118,8 @@ RUN set -eux; \
 # ------------------------------------------------------------------------------
 FROM rust-builder AS rust-builder-pgo
 ARG PGO_MODEL
-ENV PGO_MODEL=${PGO_MODEL}
+ARG PGO_TARGET_CPU
+ENV PGO_MODEL=${PGO_MODEL} PGO_TARGET_CPU=${PGO_TARGET_CPU}
 WORKDIR /src/rust
 RUN --mount=type=bind,from=hfmodel,target=/model \
     set -eux; \

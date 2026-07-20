@@ -25,7 +25,11 @@ PGO_DATA=/pgo.profdata
 HANDSHAKE_PORT=29550
 HTTP_PORT=8000
 FEAT="--features native-tls-vendored"
-CPU="-Ctarget-cpu=x86-64-v3"
+# No -Ctarget-cpu: keep the binary baseline-x86-64 so it runs both on the H200 and
+# under Rosetta/OrbStack (which lacks AVX2 — an AVX2 build crashes at startup during
+# the training run). simd_json runtime-detects SIMD, so the JSON win survives anyway.
+# Override with PGO_TARGET_CPU=x86-64-v3 only when building on native amd64 for H200-only.
+CPU="${PGO_TARGET_CPU:+-Ctarget-cpu=$PGO_TARGET_CPU}"
 
 cd "$RUST_DIR"
 PROFDATA="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin/llvm-profdata"
@@ -60,25 +64,42 @@ print(f"prepared {n} training requests -> {dst}")
 PY
 
 echo "== [pgo 4/6] boot frontend (CPU-only) + mock engine"
+export RUST_BACKTRACE=full
 BIN="$RUST_DIR/target/release"
+FRONTEND_LOG=/tmp/pgo-frontend.log
+
+# Self-check: does the instrumented binary even run? Isolates a PGO-instrumentation
+# crash from a serve/model-specific one. `vllm-rs` needs a subcommand, so use --help
+# (exits 0); the profile-generate rt writes profraw to $PGO_RAW.
+echo "-- instrumented binary self-check (--help):"
+LLVM_PROFILE_FILE="$PGO_RAW/selfcheck-%p.profraw" "$BIN/vllm-rs" --help >/dev/null \
+    || { echo "FATAL: instrumented vllm-rs crashes before serve (PGO-instrumentation issue, not model/serve)"; exit 1; }
+
+echo "-- model dir contents ($MODEL):"; ls -la "$MODEL" 2>&1 | head -20 || true
+
 "$BIN/vllm-rs" serve "$MODEL" \
     --data-parallel-size 1 --data-parallel-size-local 0 \
-    --handshake-port "$HANDSHAKE_PORT" --host 127.0.0.1 --port "$HTTP_PORT" &
+    --handshake-port "$HANDSHAKE_PORT" --host 127.0.0.1 --port "$HTTP_PORT" \
+    > "$FRONTEND_LOG" 2>&1 &
 FRONTEND_PID=$!
 "$BIN/vllm-mock-engine" --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" &
 MOCK_PID=$!
 
-# Wait for the frontend to report healthy (tokenizer download + engine register).
+dump_frontend_log() { echo "--- frontend log (${FRONTEND_LOG}) ---"; cat "$FRONTEND_LOG" 2>/dev/null || echo "(empty)"; echo "--- end frontend log ---"; }
+
+# Wait for the frontend to report healthy (tokenizer load + engine register).
 for i in $(seq 1 120); do
     if curl -fsS "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null 2>&1; then
         echo "frontend healthy after ${i}s"; break
     fi
     if ! kill -0 "$FRONTEND_PID" 2>/dev/null; then
-        echo "ERROR: frontend exited before becoming healthy"; exit 1
+        echo "ERROR: frontend exited before becoming healthy (exit/signal below)"
+        wait "$FRONTEND_PID"; echo "frontend exit status: $?"
+        dump_frontend_log; exit 1
     fi
     sleep 1
 done
-curl -fsS "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null
+curl -fsS "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null || { dump_frontend_log; exit 1; }
 
 echo "== [pgo 5/6] replay training corpus"
 pip install --no-cache-dir -q aiohttp

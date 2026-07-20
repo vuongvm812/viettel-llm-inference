@@ -46,6 +46,11 @@ VLLM_RS_PGO ?= 1
 PGO_MODEL ?= /model
 # Host path to the local model dir mounted at /model for the PGO training run.
 PGO_HFMODEL ?= ../hf-model
+# Optional -Ctarget-cpu for the PGO binary. Empty = baseline x86-64 (portable: the
+# instrumented binary runs under Rosetta/OrbStack AND the H200; simd_json still runtime-
+# detects SIMD). Set to x86-64-v3 ONLY when building on native amd64 for an H200-only
+# image — AVX2 crashes the training run under Rosetta.
+PGO_TARGET_CPU ?=
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
@@ -162,7 +167,7 @@ BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 ##   make vllm-fork PUSH=1
 ##   make push VLLM_IMAGE=$(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)@sha256:<digest>
 vllm-fork:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg PGO_MODEL='$(PGO_MODEL)' --build-context rustsrc=../vllm/rust $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-context hfmodel=$(PGO_HFMODEL)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg PGO_MODEL='$(PGO_MODEL)' $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-arg PGO_TARGET_CPU='$(PGO_TARGET_CPU)' --build-context hfmodel=$(PGO_HFMODEL)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
 	@echo "forked vLLM base: $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)"
 	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'pin this digest: {{.Manifest.Digest}}'; fi
 
