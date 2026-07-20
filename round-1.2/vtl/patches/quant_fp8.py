@@ -120,88 +120,109 @@ def _build_channelwise_method(quant_config, stock_method):
     return upgraded
 
 
+# Fp8Config is the parent. Imported at module scope (guarded) so VtlFp8Config below
+# is defined at import time -- see the class docstring for why that must be so. The
+# guard keeps the module importable without vLLM for the `make check` self-test, which
+# never calls apply() and never instantiates the class.
+try:
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config as _Fp8Config
+except Exception:  # pragma: no cover - vLLM absent (self-check import only)
+    _Fp8Config = object
+
+
+class VtlFp8Config(_Fp8Config):
+    """``vtl_fp8`` quant config.
+
+    Defined at MODULE scope (not nested inside ``apply``) so it is picklable across
+    ``spawn``: the multi-api-server / Rust-frontend engine-core launch pickles
+    ``vllm_config``, which references this instance. A class nested in a function has
+    qualname ``apply.<locals>.VtlFp8Config`` that pickle can't resolve, and the spawned
+    child unpickles at plain import time (before ``apply`` runs), so the name must exist
+    at module scope. ``apply()`` only registers it.
+    """
+
+    # One warning per process, not one per layer.
+    _fallback_logged = False
+
+    def __init__(self, ignored_layers: list[str] | None = None) -> None:
+        super().__init__(
+            is_checkpoint_fp8_serialized=False,
+            activation_scheme="dynamic",
+            ignored_layers=(
+                ignored_layers
+                if ignored_layers is not None
+                else parse_ignored_layers(os.environ.get(IGNORE_ENV))
+            ),
+            weight_block_size=None,
+        )
+
+    @classmethod
+    def get_name(cls):
+        return "vtl_fp8"
+
+    @classmethod
+    def get_config_filenames(cls) -> list[str]:
+        # Empty => weight_utils.get_quant_config() constructs us with no args,
+        # which is the bf16-checkpoint path we care about.
+        return []
+
+    @classmethod
+    def from_config(cls, config: dict) -> "VtlFp8Config":
+        return cls()
+
+    def get_quant_method(self, layer, prefix: str):
+        # Runs for EVERY Linear at load time -- it must NEVER raise, or the whole engine
+        # dies at model load. No vLLM symbols are imported at the top: names drift across
+        # versions (e.g. Fp8OnlineLinearMethod existed in <=0.22 but was folded into
+        # Fp8LinearMethod by 0.25), so every import is lazy + guarded and any failure
+        # degrades to whatever the parent returned.
+        from vllm.model_executor.layers.linear import LinearBase
+
+        method = super().get_quant_method(layer, prefix)
+        if not isinstance(layer, LinearBase):
+            return method  # attention / MoE: leave stock behaviour alone
+
+        # SUBSTRING ignore -- vLLM's is_layer_skipped is EXACT prefix match
+        # (`prefix in ignored_layers`), so a bare "lm_head" passed to the parent never
+        # matches a nested prefix. Enforce our substrings here. For LFM2.5 the only layer
+        # kept in bf16 is `lm_head` (tied to the embeddings; small vocab). Every other
+        # linear -- attn qkv/out_proj, MLP w13/w2, and the short-conv in_proj/out_proj --
+        # is an ordinary bf16 GEMM and quantizes to fp8 cleanly (there is no GDN F32 SSM
+        # decay/beta path and no vision tower to protect here).
+        if prefix and any(pat and pat in prefix for pat in self.ignored_layers):
+            try:
+                from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+                return UnquantizedLinearMethod()
+            except Exception:
+                return method  # can't force bf16 -> at least don't crash
+
+        if not channelwise_enabled(os.environ.get(CHANNELWISE_ENV)):
+            return method
+
+        # Upgrade the dynamic/online fp8 linear method to per-CHANNEL weight scales.
+        # Fp8LinearMethod is the stable base present in every version; the "online"
+        # (bf16-checkpoint, dynamic-activation) behaviour is what our config selects.
+        try:
+            from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+            if not isinstance(method, Fp8LinearMethod):
+                return method  # unquantized / ignored / serialized: leave as is
+            return _build_channelwise_method(self, method)
+        except Exception as exc:
+            if not VtlFp8Config._fallback_logged:
+                VtlFp8Config._fallback_logged = True
+                log.warning(
+                    "vtl: channelwise fp8 unavailable (%s); "
+                    "falling back to stock per-tensor fp8",
+                    exc,
+                )
+            return method
+
+
 @register_patch("fp8", default=True)
 def apply() -> None:
     from vllm.model_executor.layers.quantization import register_quantization_config
-    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-    @register_quantization_config("vtl_fp8")
-    class VtlFp8Config(Fp8Config):
-        # One warning per process, not one per layer.
-        _fallback_logged = False
-
-        def __init__(self, ignored_layers: list[str] | None = None) -> None:
-            super().__init__(
-                is_checkpoint_fp8_serialized=False,
-                activation_scheme="dynamic",
-                ignored_layers=(
-                    ignored_layers
-                    if ignored_layers is not None
-                    else parse_ignored_layers(os.environ.get(IGNORE_ENV))
-                ),
-                weight_block_size=None,
-            )
-
-        @classmethod
-        def get_name(cls):
-            return "vtl_fp8"
-
-        @classmethod
-        def get_config_filenames(cls) -> list[str]:
-            # Empty => weight_utils.get_quant_config() constructs us with no args,
-            # which is the bf16-checkpoint path we care about.
-            return []
-
-        @classmethod
-        def from_config(cls, config: dict) -> "VtlFp8Config":
-            return cls()
-
-        def get_quant_method(self, layer, prefix: str):
-            # Runs for EVERY Linear at load time -- it must NEVER raise, or the whole engine
-            # dies at model load. No vLLM symbols are imported at the top: names drift across
-            # versions (e.g. Fp8OnlineLinearMethod existed in <=0.22 but was folded into
-            # Fp8LinearMethod by 0.25), so every import is lazy + guarded and any failure
-            # degrades to whatever the parent returned.
-            from vllm.model_executor.layers.linear import LinearBase
-
-            method = super().get_quant_method(layer, prefix)
-            if not isinstance(layer, LinearBase):
-                return method  # attention / MoE: leave stock behaviour alone
-
-            # SUBSTRING ignore -- vLLM's is_layer_skipped is EXACT prefix match
-            # (`prefix in ignored_layers`), so a bare "lm_head" passed to the parent never
-            # matches a nested prefix. Enforce our substrings here. For LFM2.5 the only layer
-            # kept in bf16 is `lm_head` (tied to the embeddings; small vocab). Every other
-            # linear -- attn qkv/out_proj, MLP w13/w2, and the short-conv in_proj/out_proj --
-            # is an ordinary bf16 GEMM and quantizes to fp8 cleanly (there is no GDN F32 SSM
-            # decay/beta path and no vision tower to protect here).
-            if prefix and any(pat and pat in prefix for pat in self.ignored_layers):
-                try:
-                    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-                    return UnquantizedLinearMethod()
-                except Exception:
-                    return method  # can't force bf16 -> at least don't crash
-
-            if not channelwise_enabled(os.environ.get(CHANNELWISE_ENV)):
-                return method
-
-            # Upgrade the dynamic/online fp8 linear method to per-CHANNEL weight scales.
-            # Fp8LinearMethod is the stable base present in every version; the "online"
-            # (bf16-checkpoint, dynamic-activation) behaviour is what our config selects.
-            try:
-                from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
-                if not isinstance(method, Fp8LinearMethod):
-                    return method  # unquantized / ignored / serialized: leave as is
-                return _build_channelwise_method(self, method)
-            except Exception as exc:
-                if not VtlFp8Config._fallback_logged:
-                    VtlFp8Config._fallback_logged = True
-                    log.warning(
-                        "vtl: channelwise fp8 unavailable (%s); "
-                        "falling back to stock per-tensor fp8",
-                        exc,
-                    )
-                return method
+    register_quantization_config("vtl_fp8")(VtlFp8Config)
 
     log.info(
         "vtl: registered quantization method 'vtl_fp8' (channelwise=%s, ignored=%s)",
