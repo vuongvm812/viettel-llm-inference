@@ -6,20 +6,7 @@ stock kernel in place. Requires ``--no-build-isolation`` so setup.py sees the
 image's torch instead of an empty build env.
 """
 
-import os
-
 from setuptools import setup
-
-# Experimental link-time optimization, OFF by default so the normal (scored) build is untouched.
-# `VTL_LTO=1 make build` turns it on for an on-box A/B. Two reasons it is gated, not default:
-#   - These kernels are memory-bandwidth bound and each is already fully inlined within its own
-#     TU (fp8_common.cuh is header-included), so the only cross-TU boundary is cold host glue --
-#     expected hot-path gain is ~0.
-#   - `-dlto` is DEVICE LTO and needs `-rdc=true` (relocatable device code), which CHANGES device
-#     codegen (can disable some per-kernel opts) and adds a device-link step. Same codegen-risk
-#     class as --use_fast_math above. Validate with Nsight + a TPOT A/B + the gpqa eval before
-#     trusting it; if the image's toolchain rejects the LTO objects at link, just leave VTL_LTO off.
-_LTO = os.environ.get("VTL_LTO", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _cuda_ext():
@@ -29,23 +16,6 @@ def _cuda_ext():
         return None, {}
     if CUDA_HOME is None:
         return None, {}
-
-    cxx = ["-O3", "-std=c++17"]
-    nvcc = [
-        "-O3",
-        "-std=c++17",
-        "-lineinfo",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "-U__CUDA_NO_HALF2_OPERATORS__",
-    ]
-    link = []
-    if _LTO:
-        cxx += ["-flto"]
-        # -rdc=true is required for -dlto; both the compile and the device link must carry -dlto.
-        nvcc += ["-rdc=true", "-dlto"]
-        link += ["-flto"]
 
     ext = CUDAExtension(
         name="vtl._C",
@@ -57,13 +27,26 @@ def _cuda_ext():
             "vtl/csrc/torch_bindings.cpp",
         ],
         extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
             # No --use_fast_math: the kernels do a TARGETED reciprocal-multiply on the fp8
             # output (one true `1.0f / scale` per token); global fast-math would also perturb
             # the SiLU sigmoid and the RMS rsqrt more broadly than intended.
-            "cxx": cxx,
-            "nvcc": nvcc,
+            #
+            # No device LTO (-rdc=true -dlto) either: torch's BuildExtension auto-appends
+            # `-gencode ...,code=sm_90/compute_90`, which nvcc rejects alongside -dlto ("use
+            # code=lto_<arch>"), and a working device-LTO build would need a separate nvcc
+            # device-link step BuildExtension does not do -- for ~0 gain on these memory-bound
+            # kernels (each already fully inlined within its own TU via fp8_common.cuh).
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "-lineinfo",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+            ],
         },
-        extra_link_args=link,
     )
     return ext, {"build_ext": BuildExtension}
 

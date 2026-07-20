@@ -53,13 +53,9 @@ ARG CUDA_ARCHS="8.0;8.6;8.9;9.0+PTX"
 # which OOM-kills a small dev box. Cap it. Big CI hosts override: make build MAX_JOBS=28.
 ARG MAX_JOBS=4
 
-# Experimental device LTO in vtl._C, off by default (see VTL_LTO in setup.py). Codegen-affecting;
-# validate on-box before trusting.  make build VTL_LTO=1
-ARG VTL_LTO=0
-
 # Scoped to the RUN, not ENV: it is a build input and has no business in the served image.
 # --no-build-isolation so setup.py sees the image's torch.
-RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS="${MAX_JOBS}" VTL_LTO="${VTL_LTO}" \
+RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
     pip install --no-cache-dir --no-build-isolation --no-deps /src \
     && rm -rf /src
 
