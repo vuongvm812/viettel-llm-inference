@@ -1,6 +1,6 @@
 --- a/vllm/entrypoints/openai/api_server.py
 +++ b/vllm/entrypoints/openai/api_server.py
-@@ -735,4 +735,21 @@
+@@ -735,4 +735,27 @@
      args = parser.parse_args()
      validate_parsed_serve_args(args)
  
@@ -18,6 +18,12 @@
 +        # across for jsonify_non_default_args to emit.
 +        if getattr(args, "model_tag", None) is None:
 +            args.model_tag = args.model
++        # The Rust frontend hard-rejects frontend-only args it hasn't implemented
++        # (the UnsupportedArgs set in the vllm-rs cli). `--uvicorn-log-level` is
++        # one -- meaningless to Rust (no uvicorn) -- so reset it to the parser
++        # default here to drop it from --args-json, keeping the Python A/B path
++        # (flag off) unchanged. Add any further such args the command grows.
++        args.uvicorn_log_level = parser.get_default("uvicorn_log_level")
 +        if getattr(args, "api_server_count", None) is None:
 +            args.api_server_count = 1
 +        run_multi_api_server(args)
