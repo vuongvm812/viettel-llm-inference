@@ -46,3 +46,6 @@ model/
 flashinfer-competition-codebase/
 vllm/
 flash-attention/
+
+*.pem
+.env
