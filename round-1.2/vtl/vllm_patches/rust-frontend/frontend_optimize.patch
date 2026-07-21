@@ -12,19 +12,19 @@ index 435350c..3a6c246 100644
 +codegen-units = 1
  panic = "abort"
 diff --git a/src/server/Cargo.toml b/src/server/Cargo.toml
-index f3e0386..a1e2f29 100644
+index f3e0386..5cb1044 100644
 --- a/src/server/Cargo.toml
 +++ b/src/server/Cargo.toml
 @@ -24,6 +24,7 @@ prost-types.workspace = true
  rmpv.workspace = true
  serde.workspace = true
  serde_json.workspace = true
-+simd-json = "0.15"
++sonic-rs = "0.5"
  serde_with.workspace = true
  sha2.workspace = true
  socket2.workspace = true
 diff --git a/src/server/src/routes/openai/utils/validated_json.rs b/src/server/src/routes/openai/utils/validated_json.rs
-index d07158c..a91f3af 100644
+index d07158c..e76597e 100644
 --- a/src/server/src/routes/openai/utils/validated_json.rs
 +++ b/src/server/src/routes/openai/utils/validated_json.rs
 @@ -1,9 +1,9 @@
@@ -39,22 +39,21 @@ index d07158c..a91f3af 100644
  use serde::de::DeserializeOwned;
  use validator::Validate;
  
-@@ -17,6 +17,14 @@ use crate::error::{ApiError, invalid_request};
+@@ -17,6 +17,13 @@ use crate::error::{ApiError, invalid_request};
  /// `.validate()` on types that implement the `Validate` trait. If validation
  /// fails, it returns [`ApiError::InvalidRequest`] with details about the
  /// validation errors.
 +///
-+/// Deserialization uses `simd_json` (SIMD-accelerated) rather than axum's
-+/// serde_json-backed `Json` extractor. simd_json parses in place, so we move
-+/// the body `Bytes` into an owned mutable buffer (zero-copy when uniquely
-+/// owned). `Value` fields inside request types stay `serde_json::Value` —
-+/// simd_json's serde bridge handles those subtrees, so nothing downstream
-+/// (templates, schema) changes. Like axum's `Json`, a non-JSON `Content-Type`
-+/// is rejected before the body is read.
++/// Deserialization uses `sonic_rs` (SIMD-accelerated) rather than axum's
++/// serde_json-backed `Json` extractor. sonic_rs parses from an immutable slice,
++/// so we borrow the body `Bytes` directly — no copy. `Value` fields inside
++/// request types stay `serde_json::Value` — sonic_rs's serde bridge handles
++/// those subtrees, so nothing downstream (templates, schema) changes. Like
++/// axum's `Json`, a non-JSON `Content-Type` is rejected before the body is read.
  pub struct ValidatedJson<T>(pub T);
  
  impl<S, T> FromRequest<S> for ValidatedJson<T>
-@@ -27,9 +35,17 @@ where
+@@ -27,9 +34,17 @@ where
      type Rejection = ApiError;
  
      async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
@@ -70,20 +69,18 @@ index d07158c..a91f3af 100644
 -            .map_err(|err: JsonRejection| ApiError::json_parse_error(err.body_text()))?;
 +            .map_err(|err| ApiError::json_parse_error(err.body_text()))?;
 +
-+        let mut data: T = parse_json(bytes.into())?;
++        let mut data: T = parse_json(&bytes)?;
  
          data.normalize();
  
-@@ -40,6 +56,29 @@ where
+@@ -40,6 +55,27 @@ where
      }
  }
  
-+/// Deserialize `T` from a JSON body with simd_json. simd_json parses in place
-+/// (destructive string unescaping), so it needs an owned mutable buffer. The
-+/// caller moves the body `Bytes` in via `Bytes::into` — zero-copy when the body
-+/// is uniquely owned (the common case), copying only if the buffer is shared.
-+fn parse_json<T: DeserializeOwned>(mut buf: Vec<u8>) -> Result<T, ApiError> {
-+    simd_json::serde::from_slice(&mut buf)
++/// Deserialize `T` from the JSON body with sonic_rs (SIMD-accelerated). sonic_rs
++/// parses from an immutable slice, so we borrow the body bytes directly — no copy.
++fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiError> {
++    sonic_rs::from_slice(bytes)
 +        .map_err(|err| ApiError::json_parse_error(err.to_string()))
 +}
 +
@@ -104,7 +101,7 @@ index d07158c..a91f3af 100644
  impl<T> std::ops::Deref for ValidatedJson<T> {
      type Target = T;
  
-@@ -53,3 +92,67 @@ impl<T> std::ops::DerefMut for ValidatedJson<T> {
+@@ -53,3 +89,67 @@ impl<T> std::ops::DerefMut for ValidatedJson<T> {
          &mut self.0
      }
  }
@@ -124,10 +121,10 @@ index d07158c..a91f3af 100644
 +        max_tokens: Option<u32>,
 +    }
 +
-+    // simd_json parse must match serde_json on a representative chat body,
++    // sonic_rs parse must match serde_json on a representative chat body,
 +    // including an embedded serde_json::Value subtree (messages).
 +    #[test]
-+    fn simd_json_matches_serde_json() {
++    fn sonic_rs_matches_serde_json() {
 +        let body = json!({
 +            "model": "LFM2.5-1.2B-Instruct",
 +            "messages": [
@@ -138,17 +135,17 @@ index d07158c..a91f3af 100644
 +        })
 +        .to_string();
 +
-+        let via_simd: Sample = parse_json(body.clone().into_bytes()).unwrap();
++        let via_sonic: Sample = parse_json(body.as_bytes()).unwrap();
 +        let via_serde: Sample = serde_json::from_slice(body.as_bytes()).unwrap();
-+        assert_eq!(via_simd, via_serde);
-+        assert_eq!(via_simd.model, "LFM2.5-1.2B-Instruct");
-+        assert_eq!(via_simd.messages.len(), 2);
-+        assert_eq!(via_simd.max_tokens, Some(128));
++        assert_eq!(via_sonic, via_serde);
++        assert_eq!(via_sonic.model, "LFM2.5-1.2B-Instruct");
++        assert_eq!(via_sonic.messages.len(), 2);
++        assert_eq!(via_sonic.max_tokens, Some(128));
 +    }
 +
 +    #[test]
 +    fn invalid_json_is_an_error() {
-+        let bad = b"{not json".to_vec();
++        let bad = b"{not json";
 +        assert!(parse_json::<Sample>(bad).is_err());
 +    }
 +

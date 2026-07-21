@@ -5,7 +5,7 @@
 # VLLM_RS_PGO=1. There is no GPU here: the frontend serves entirely on CPU by
 # pairing `vllm-rs serve --data-parallel-size-local 0` (frontend-only, owns the
 # ZMQ handshake) with `vllm-mock-engine` (fakes prefill, emits random decode
-# tokens). The real CPU tokenizer + full HTTP→simd_json-parse→stream path are
+# tokens). The real CPU tokenizer + full HTTP→sonic_rs-parse→stream path are
 # exercised by replaying the recorded round-2 trace. That training run steers the
 # final `-Cprofile-use` build.
 #
@@ -27,7 +27,7 @@ HTTP_PORT=8000
 FEAT="--features native-tls-vendored"
 # No -Ctarget-cpu: keep the binary baseline-x86-64 so it runs both on the H200 and
 # under Rosetta/OrbStack (which lacks AVX2 — an AVX2 build crashes at startup during
-# the training run). simd_json runtime-detects SIMD, so the JSON win survives anyway.
+# the training run). sonic_rs runtime-detects SIMD, so the JSON win survives anyway.
 # Override with PGO_TARGET_CPU=x86-64-v3 only when building on native amd64 for H200-only.
 CPU="${PGO_TARGET_CPU:+-Ctarget-cpu=$PGO_TARGET_CPU}"
 
