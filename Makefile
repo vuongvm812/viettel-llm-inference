@@ -70,7 +70,7 @@ TRACE := data/input/trace-round2.jsonl
 COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 DC := docker compose $(COMPOSE_FILES)
 
-.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork
+.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -300,3 +300,51 @@ profile:
 	$(IN) sleep 3   # let the worker finish export_chrome_trace
 	$(IN) python3 bench/profile_trace.py --profile-dir bench-profile --out bench-profile-summary.json
 	$(IN) $(DC) -f docker-compose.profile.yaml down
+
+# --- CI (remote build on self-hosted runner) -----------------------------------------------
+CI_WORKFLOW ?= build.yml
+CI_REPO ?= $(shell git remote get-url origin | sed 's|.*github.com[:/]\(.*\)\.git|\1|')
+
+## Trigger remote CI build, stream logs, print digest. Exits non-zero on CI failure.
+##   make ci-build                           # default ROUND, archs=9.0+PTX
+##   make ci-build ROUND=round-1.1           # different round
+##   make ci-build CUDA_ARCHS='8.6;9.0+PTX'  # custom arch list
+##   make ci-build BUILD_FORK=1              # also rebuild vLLM fork image
+ci-build:
+	@echo "=== Triggering CI: $(ROUND) on $(CI_REPO) ==="
+	gh workflow run $(CI_WORKFLOW) -R $(CI_REPO) \
+	  -f workdir=$(ROUND) \
+	  $(if $(CUDA_ARCHS),-f cuda_archs='$(CUDA_ARCHS)') \
+	  $(if $(TAG),-f tag=$(TAG)) \
+	  $(if $(BUILD_FORK),-f build_fork=true) \
+	  --ref $(shell git rev-parse --abbrev-ref HEAD)
+	@sleep 6
+	@id=$$(gh run list -R $(CI_REPO) -w $(CI_WORKFLOW) --limit 1 --json databaseId -q '.[0].databaseId'); \
+	echo "=== Run $$id ==="; \
+	if gh run watch $$id -R $(CI_REPO) --exit-status; then \
+	  echo ""; \
+	  $(MAKE) ci-digest RUN_ID=$$id; \
+	else \
+	  false; \
+	fi
+
+## Print digest for a specific CI run.
+##   make ci-digest RUN_ID=9876543210
+ci-digest:
+	@[ -n "$(RUN_ID)" ] || { echo "ERROR: RUN_ID required. Usage: make ci-digest RUN_ID=<id>"; exit 1; }
+	@digest=$$(gh run view $(RUN_ID) -R $(CI_REPO) --log 2>/dev/null | grep -oP '::VTL_DIGEST::\K.*' | tail -1); \
+	if [ -n "$$digest" ]; then \
+	  echo "$$digest"; \
+	else \
+	  echo "ERROR: digest not found — run $(RUN_ID) still running, failed, or older CI version"; \
+	  exit 1; \
+	fi
+
+## Stream the most recent CI run log.
+ci-watch:
+	@id=$$(gh run list -R $(CI_REPO) -w $(CI_WORKFLOW) --limit 1 --json databaseId -q '.[0].databaseId'); \
+	gh run watch $$id -R $(CI_REPO)
+
+## List last 5 CI runs.
+ci-status:
+	gh run list -R $(CI_REPO) -w $(CI_WORKFLOW) --limit 5

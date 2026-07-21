@@ -1,0 +1,62 @@
+name: Build & Push
+
+on:
+  workflow_dispatch:
+    inputs:
+      workdir:
+        description: 'Round directory (e.g. round-1.2)'
+        required: true
+        default: 'round-1.2'
+        type: string
+      cuda_archs:
+        description: 'CUDA SM archs for nvcc'
+        required: false
+        default: '9.0+PTX'
+        type: string
+      tag:
+        description: 'Image tag'
+        required: false
+        default: 'dev'
+        type: string
+      build_fork:
+        description: 'Rebuild vLLM fork image first'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    runs-on: [self-hosted, rtx3060]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build vLLM fork
+        if: ${{ inputs.build_fork }}
+        working-directory: ${{ inputs.workdir }}
+        run: make vllm-fork CUDA_ARCHS="${{ inputs.cuda_archs }}" PUSH=1
+
+      - name: Build & push
+        if: ${{ !inputs.build_fork }}
+        working-directory: ${{ inputs.workdir }}
+        run: |
+          make push \
+            CUDA_ARCHS="${{ inputs.cuda_archs }}" \
+            TAG="${{ inputs.tag }}"
+
+      - name: Extract digest (fork)
+        if: ${{ success() && inputs.build_fork }}
+        run: |
+          VLLM_FORK_IMAGE=$(grep -oP '^VLLM_FORK_IMAGE\s*\?=\s*\K\S+' Makefile | head -1)
+          VLLM_FORK_TAG=$(grep -oP '^VLLM_FORK_TAG\s*\?=\s*\K\S+' Makefile | head -1)
+          [ -z "$VLLM_FORK_IMAGE" ] && VLLM_FORK_IMAGE="unseenablefuture/vllm-fork"
+          DIGEST=$(docker buildx imagetools inspect "${VLLM_FORK_IMAGE}:${VLLM_FORK_TAG}" --format '{{.Manifest.Digest}}')
+          echo "::VTL_DIGEST::${VLLM_FORK_IMAGE}:${VLLM_FORK_TAG}@sha256:${DIGEST}"
+
+      - name: Extract digest (main)
+        if: ${{ success() && !inputs.build_fork }}
+        run: |
+          IMAGE=$(grep -oP '^IMAGE\s*\?=\s*\K\S+' Makefile | head -1)
+          [ -z "$IMAGE" ] && IMAGE="unseenablefuture/awesome-badger"
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${{ inputs.tag }}" --format '{{.Manifest.Digest}}')
+          echo "::VTL_DIGEST::${IMAGE}@sha256:${DIGEST}"
