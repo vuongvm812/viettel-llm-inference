@@ -83,7 +83,7 @@ services:
       VTL_FP8_CHANNELWISE: 1                  # 1 = per-channel weight scales; 0 = stock per-tensor
       VTL_FP8_IGNORE: "lm_head"               # inert for lm_head now (it's not a LinearBase); fp8 lm_head
                                               # is gated by VTL_ENABLE_FP8_LM_HEAD below, not this list
-      VTL_ENABLE_FP8_LM_HEAD: 0               # untie + fp8 the lm_head (~15.7% of decode weight traffic).
+      VTL_ENABLE_FP8_LM_HEAD: 1               # untie + fp8 the lm_head (~15.7% of decode weight traffic).
                                               # OFF pending the quality A/B -- flip to 1 to enable.
 
       # Per-patch kill-switches (all default ON). Each = VTL_ENABLE_<patch>.
