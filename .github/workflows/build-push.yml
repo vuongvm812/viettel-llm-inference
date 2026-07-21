@@ -13,11 +13,6 @@ on:
         required: false
         default: '9.0+PTX'
         type: string
-      tag:
-        description: 'Image tag'
-        required: false
-        default: 'dev'
-        type: string
       build_fork:
         description: 'Rebuild vLLM fork image first'
         required: false
@@ -39,10 +34,7 @@ jobs:
       - name: Build & push
         if: ${{ !inputs.build_fork }}
         working-directory: ${{ inputs.workdir }}
-        run: |
-          make push \
-            CUDA_ARCHS="${{ inputs.cuda_archs }}" \
-            TAG="${{ inputs.tag }}"
+        run: make push CUDA_ARCHS="${{ inputs.cuda_archs }}"
 
       - name: Extract digest (fork)
         if: ${{ success() && inputs.build_fork }}
@@ -58,5 +50,5 @@ jobs:
         run: |
           IMAGE=$(grep -oP '^IMAGE\s*\?=\s*\K\S+' Makefile | head -1)
           [ -z "$IMAGE" ] && IMAGE="unseenablefuture/awesome-badger"
-          DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${{ inputs.tag }}" --format '{{.Manifest.Digest}}')
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE}:dev" --format '{{.Manifest.Digest}}')
           echo "::VTL_DIGEST::${IMAGE}@sha256:${DIGEST}"

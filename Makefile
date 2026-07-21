@@ -315,7 +315,6 @@ ci-build:
 	gh workflow run $(CI_WORKFLOW) -R $(CI_REPO) \
 	  -f workdir=$(ROUND) \
 	  $(if $(CUDA_ARCHS),-f cuda_archs='$(CUDA_ARCHS)') \
-	  $(if $(TAG),-f tag=$(TAG)) \
 	  $(if $(BUILD_FORK),-f build_fork=true) \
 	  --ref $(shell git rev-parse --abbrev-ref HEAD)
 	@sleep 6
