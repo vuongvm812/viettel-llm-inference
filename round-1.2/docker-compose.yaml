@@ -118,8 +118,8 @@ services:
       # dispatch handoff also collapses onto the tokio LIFO slot instead of waking a second
       # thread per token. Sweep 1<->2 if TTFT regresses (one zmq thread means a large msgpack
       # decode blocks request submission).
-      VLLM_RS_ZMQ_WORKER_THREADS: "1"
-      VLLM_RS_REQUEST_WORKER_THREADS: "1"
+      VLLM_RS_ZMQ_WORKER_THREADS: "2"
+      VLLM_RS_REQUEST_WORKER_THREADS: "2"
       # Drop the per-request axum TraceLayer span (latency A/B). Left unset here = layer ON
       # (default). Set to 1 to remove it; the optimized compose defaults this to 1.
       VLLM_RS_DISABLE_HTTP_TRACE: "1"
@@ -138,6 +138,12 @@ services:
       VTL_ENABLE_MUL_QUANT: 1                # fused conv-gate mul+fp8-quant, pure-decode fast path
       VTL_ENABLE_KV_CACHE_MANAGER: 1
       VTL_ENABLE_SCHED_POLICY: 1             # SJF prefill reorder
+      # Was missing here, so it defaulted ON (registry falls back to the in-code default when
+      # the var is unset) but could NOT be A/B'd -- compose only injects variables it declares,
+      # so `VTL_ENABLE_GREEDY_SAMPLER=0 make bench` never reached the container. Declared now.
+      # Patches Sampler.forward on the V1 runner and Sampler.__call__ on V2 (model_runner.py
+      # calls `self.sampler(logits, input_batch)`), so this knob covers both runners.
+      VTL_ENABLE_GREEDY_SAMPLER: "1"
 
       # No GDN family here: LFM2.5 has no gated-delta-net and no attn output gate, so the old
       # VTL_ENABLE_GDN_KERNELS / MUL_SIGMOID / GDN_PREFILL_BACKEND flags were removed with their code.
