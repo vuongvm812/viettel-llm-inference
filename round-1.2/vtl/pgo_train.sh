@@ -42,7 +42,7 @@ rm -rf "$PGO_RAW"
 RUSTFLAGS="-Cprofile-generate=$PGO_RAW $CPU" \
     cargo build --release --bin vllm-rs $FEAT
 
-echo "== [pgo 3/6] prepare training trace (inject max_tokens, pin model)"
+echo "== [pgo 3/6] prepare training trace (pin model to the served tokenizer)"
 python3 - <<'PY'
 import json
 src = "/src/trace-round2.jsonl"
@@ -56,8 +56,7 @@ with open(src) as f, open(dst, "w") as out:
             continue
         rec = json.loads(line)
         body = rec.setdefault("body", {})
-        body.setdefault("max_tokens", 64)   # the mock stops by length
-        body["model"] = model               # match the served tokenizer
+        body["model"] = model   # match the served tokenizer; keep the trace's max_tokens
         out.write(json.dumps(rec) + "\n")
         n += 1
 print(f"prepared {n} training requests -> {dst}")
@@ -103,10 +102,13 @@ curl -fsS "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null || { dump_frontend_l
 
 echo "== [pgo 5/6] replay training corpus"
 pip install --no-cache-dir -q aiohttp
+# closed-loop 4 ~= the real workload's steady-state in-flight count (~2-3 by Little's
+# law: ~1.1 req/s aggregate x ~2.4s/response). 16 over-saturated queues and biased the
+# profile toward backpressure paths production never hits.
 ( cd /src/bench && python3 replay.py \
     --target "http://127.0.0.1:${HTTP_PORT}" \
     --trace /tmp/pgo-train.jsonl \
-    --closed-loop 16 \
+    --closed-loop 4 \
     --out /tmp/pgo-replay.json )
 
 # Flush counters: SIGINT lets the instrumented frontend write its .profraw on exit.

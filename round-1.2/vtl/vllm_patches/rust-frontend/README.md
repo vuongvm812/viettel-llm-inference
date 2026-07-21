@@ -11,7 +11,10 @@ frontend binary. They carry our frontend optimizations so a clean checkout (wher
 - `Cargo.toml` — tuned `[profile.release]` (fat LTO, `codegen-units=1`).
 - `src/server/Cargo.toml` — add the `simd-json` dependency.
 - `src/server/.../validated_json.rs` — parse request bodies with `simd_json`
-  instead of axum's serde_json `Json` extractor.
+  instead of axum's serde_json `Json` extractor. The body `Bytes` is *moved*
+  into simd_json's mutable buffer (zero-copy when uniquely owned, not a
+  per-request `to_vec()`), and a non-JSON `Content-Type` is rejected up front —
+  restoring the guard axum's `Json` gave us.
 
 Applied idempotently: the stage skips the patch if the checkout already carries it
 (grep-guard on `simd_json`), so building from a locally-modified checkout is a no-op.
