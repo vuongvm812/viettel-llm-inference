@@ -24,7 +24,9 @@ PGO_RAW=/pgo
 PGO_DATA=/pgo.profdata
 HANDSHAKE_PORT=29550
 HTTP_PORT=8000
-FEAT="--features native-tls-vendored"
+# Array (not a string) so each flag is always a distinct argv token — immune to
+# word-splitting/IFS quirks that made `cargo` see one `--features native-tls-vendored`.
+FEAT=(--features native-tls-vendored)
 # Per-decode-step delay for the mock engine (ms). Set to ~the real model's TPOT so the
 # frontend's streaming/detokenize/backpressure loop is profiled at production cadence
 # instead of at memory speed (which biases the profile toward the wrong hot paths).
@@ -45,7 +47,7 @@ cargo build --release -p vllm-mock-engine
 echo "== [pgo 2/6] instrumented build of vllm-rs"
 rm -rf "$PGO_RAW"
 RUSTFLAGS="-Cprofile-generate=$PGO_RAW $CPU" \
-    cargo build --release --bin vllm-rs $FEAT
+    cargo build --release --bin vllm-rs "${FEAT[@]}"
 
 echo "== [pgo 3/6] prepare training trace (pin model to the served tokenizer)"
 python3 - <<'PY'
@@ -110,13 +112,13 @@ curl -fsS "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null || { dump_frontend_l
 
 echo "== [pgo 5/6] replay training corpus"
 pip install --no-cache-dir -q aiohttp
-# closed-loop 4 ~= the real workload's steady-state in-flight count (~2-3 by Little's
-# law: ~1.1 req/s aggregate x ~2.4s/response). 16 over-saturated queues and biased the
-# profile toward backpressure paths production never hits.
+# closed-loop 8 ~= the trace's PEAK in-flight count (~6, per --max-num-seqs), so the profile
+# covers concurrent-decode/batching paths, not just the ~2-3 steady-state average. Stay well
+# under 16, which over-saturated queues and biased toward backpressure paths production never hits.
 ( cd /src/bench && python3 replay.py \
     --target "http://127.0.0.1:${HTTP_PORT}" \
     --trace /tmp/pgo-train.jsonl \
-    --closed-loop 4 \
+    --closed-loop 8 \
     --out /tmp/pgo-replay.json )
 
 # Flush counters: SIGINT lets the instrumented frontend write its .profraw on exit.
@@ -146,6 +148,6 @@ done
 [ -n "$real" ] || { echo "FATAL: serve profile(s) present but <1KB — counters didn't flush (empty profile)"; exit 1; }
 "$PROFDATA" merge -o "$PGO_DATA" "${serve_profiles[@]}"
 RUSTFLAGS="-Cprofile-use=$PGO_DATA -Cllvm-args=-pgo-warn-missing-function $CPU" \
-    cargo build --release --bin vllm-rs $FEAT
+    cargo build --release --bin vllm-rs "${FEAT[@]}"
 
 echo "== PGO build complete: $BIN/vllm-rs"
