@@ -46,14 +46,29 @@ services:
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
 
-      # - '--speculative-config={"method": "ngram", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
+      # THE TPOT lever. Scoring is quadratic around a 1..10ms TPOT band, so at the current
+      # 4ms one saved millisecond is worth ~7.4 points -- ~32x a millisecond of TTFT, and ~10x
+      # fixing all 5 failed requests. 4ms/token on a 1.2B fp8 model is per-step overhead, not
+      # bandwidth (weights read in ~0.25ms on H200), so emitting >1 token per step is exactly
+      # the right trade: the step costs marginally more and yields 2-4 tokens.
+      # Workload fits prompt-lookup unusually well -- the system prompt orders the model to
+      # answer only from reference material carried in the conversation, so generated spans
+      # recur verbatim from the prompt. A/B with `make bench` and read the acceptance rate off
+      # bench/metrics.py (parse_spec_counters) before submitting; if acceptance is under ~30%
+      # this is a net loss and should go back to a comment.
+      - '--speculative-config={"method": "ngram", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
 
       # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
       # drop the periodic stats logger and quiet uvicorn.
       - --disable-log-stats
       - --uvicorn-log-level=warning
 
-      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
+      # Capture sizes are in TOKENS per step, not sequences. Spec-decode makes a decode step
+      # num_speculative_tokens+1 = 4 tokens wide per sequence, so the old [1..32] set only
+      # covered 8 concurrent seqs; the trace's 20-request bursts (80 tokens) would have fallen
+      # out of the graphs and run eager -- the exact opposite of the intended win. Extended to
+      # cover a full burst. Costs startup time and a little VRAM, both of which we have.
+      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 128]}'
     ports:
       - "8000:8000"
     environment:
@@ -69,6 +84,15 @@ services:
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
 
       VLLM_USE_RUST_FRONTEND: "1"
+      # failed_count=5/420 (HTTP/connection/parse errors) with TTFT p95 at 67ms -- the server is
+      # nowhere near overload, so those are not timeouts. The shape (~1%, scattered) is the
+      # classic keep-alive idle-close race: vllm-rs closes an idle pooled connection at this
+      # timeout (default 5s, cli.rs --http-timeout-keep-alive), and the judge's client hands
+      # that same socket to the next request just as the FIN lands -> connection reset, counted
+      # as a failed request. The trace has 3s scripted think-pauses on top of Poisson arrivals,
+      # so pooled sockets routinely idle past 5s. Long timeout removes the race class entirely;
+      # the judge is a closed client set, so there is no cost to holding sockets open.
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "600"
       # Rust frontend (vllm-rs) tokio worker-thread count. Unset in code auto-sizes to the
       # CFS quota (≈3 on the judge's 3-core budget). Pinned here so it's tunable: lower to 2
       # to reserve a core for the engine's decode/ZMQ loop (TPOT is the scored path) if you
