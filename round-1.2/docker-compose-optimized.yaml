@@ -112,8 +112,8 @@ services:
       # dispatch handoff also collapses onto the tokio LIFO slot instead of waking a second
       # thread per token. Sweep 1<->2 if TTFT regresses (one zmq thread means a large msgpack
       # decode blocks request submission).
-      VLLM_RS_ZMQ_WORKER_THREADS: "2"
-      VLLM_RS_REQUEST_WORKER_THREADS: "2"
+      VLLM_RS_ZMQ_WORKER_THREADS: "3"
+      VLLM_RS_REQUEST_WORKER_THREADS: "3"
       # Drop the per-request axum TraceLayer span (latency A/B). Default 1 = removed for the
       # optimized profile; set VLLM_RS_DISABLE_HTTP_TRACE=0 to restore it and measure the delta.
       # Trade-off: loses rejected-request log visibility (logs are already WARN-pinned anyway).
