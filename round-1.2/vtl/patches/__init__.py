@@ -27,6 +27,7 @@ _MODULES: tuple[str, ...] = (
     "rms_norm_quant",
     "dynamic_per_token_quant",
     "silu_mul_quant",
+    "qk_norm_rope",     # fused QK-RMSNorm+RoPE on the 6 attn layers (stock kernel, unmatched pass)
     "mul_quant",        # conv-gate fused mul+fp8-quant op (opt-in; wired directly in short_conv)
     "kv_cache_manager",
     "sched_policy",
