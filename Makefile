@@ -70,7 +70,13 @@ TRACE := data/input/trace-round2.jsonl
 COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 DC := docker compose $(COMPOSE_FILES)
 
-.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status
+# CI bench lifecycle (remote runner). No build step — image is the pinned digest from ci-build.
+IMAGE_DIGEST ?=
+MODEL_PATH ?= ../hf-model
+CIBENCH_COMPOSE := -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
+_CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
+
+.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -302,7 +308,7 @@ profile:
 	$(IN) $(DC) -f docker-compose.profile.yaml down
 
 # --- CI (remote build on self-hosted runner) -----------------------------------------------
-CI_WORKFLOW ?= build.yml
+CI_WORKFLOW ?= build-push.yml
 CI_REPO ?= $(shell git remote get-url origin | sed 's|.*github.com[:/]\(.*\)\.git|\1|')
 
 ## Trigger remote CI build, stream logs, print digest. Exits non-zero on CI failure.
@@ -347,3 +353,25 @@ ci-watch:
 ## List last 5 CI runs.
 ci-status:
 	gh run list -R $(CI_REPO) -w $(CI_WORKFLOW) --limit 5
+
+## Start server for CI bench — no build, pinned image + model mount. Waits for healthy.
+##    make ci-up IMAGE_DIGEST=sha256:abc...
+ci-up:
+	$(IN) CI_IMAGE='$(_CI_IMAGE)' MODEL_PATH='$(MODEL_PATH)' \
+	  docker compose $(CIBENCH_COMPOSE) up -d --wait
+
+## Stop CI bench server, remove volumes.
+ci-down:
+	$(IN) docker compose $(CIBENCH_COMPOSE) down -v
+
+## Trigger remote CI bench.
+##    make ci-bench                                        # bench :dev
+##    make ci-bench IMAGE_DIGEST=sha256:abc...              # bench specific image
+ci-bench:
+	gh workflow run bench.yml -R $(CI_REPO) \
+	  -f workdir=$(ROUND) \
+	  $(if $(IMAGE_DIGEST),-f image_digest='$(IMAGE_DIGEST)')
+	@sleep 6
+	@id=$$(gh run list -R $(CI_REPO) -w bench.yml --limit 1 --json databaseId -q '.[0].databaseId'); \
+	echo "=== Run $$id ==="; \
+	gh run watch $$id -R $(CI_REPO) --exit-status || true

@@ -1,0 +1,8 @@
+# CI bench overlay — no build, no resource cap. Pin the image and mount the model.
+# Stack behind docker-compose-optimized.yaml:
+#   CI_IMAGE=...@sha256:... MODEL_PATH=../hf-model docker compose -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml up -d --wait
+services:
+  model:
+    image: ${CI_IMAGE:-unseenablefuture/awesome-badger:dev}
+    volumes:
+      - ${MODEL_PATH:-../hf-model}:/model:ro

@@ -31,7 +31,12 @@ jobs:
         working-directory: ${{ inputs.workdir }}
         run: make vllm-fork CUDA_ARCHS="${{ inputs.cuda_archs }}" PUSH=1
 
-      - name: Build & push
+      - name: Build
+        if: ${{ !inputs.build_fork }}
+        working-directory: ${{ inputs.workdir }}
+        run: make build CUDA_ARCHS="${{ inputs.cuda_archs }}"
+
+      - name: Push
         if: ${{ !inputs.build_fork }}
         working-directory: ${{ inputs.workdir }}
         run: make push CUDA_ARCHS="${{ inputs.cuda_archs }}"
