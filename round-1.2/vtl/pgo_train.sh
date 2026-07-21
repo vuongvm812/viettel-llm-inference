@@ -25,9 +25,13 @@ PGO_DATA=/pgo.profdata
 HANDSHAKE_PORT=29550
 HTTP_PORT=8000
 FEAT="--features native-tls-vendored"
-# -Ctarget-cpu (default x86-64-v3 from the build arg): AVX2/BMI2/FMA codegen for the H200
-# host. Applies to BOTH the instrumented and final builds, so build on NATIVE amd64 — an
-# AVX2 instrumented binary crashes at startup under Rosetta/OrbStack during the training
+# Per-decode-step delay for the mock engine (ms). Set to ~the real model's TPOT so the
+# frontend's streaming/detokenize/backpressure loop is profiled at production cadence
+# instead of at memory speed (which biases the profile toward the wrong hot paths).
+PGO_DECODE_STEP_DELAY_MS="${PGO_DECODE_STEP_DELAY_MS:-4}"
+# -Ctarget-cpu (default native from the build arg): full host codegen (AVX-512 on an H200
+# host). Applies to BOTH the instrumented and final builds, so build on NATIVE amd64 — a
+# native/AVX2 instrumented binary crashes at startup under Rosetta/OrbStack during the training
 # run. For an emulated local build, pass PGO_TARGET_CPU= (empty) to fall back to baseline
 # x86-64; sonic_rs runtime-detects SIMD, so the JSON win survives either way.
 CPU="${PGO_TARGET_CPU:+-Ctarget-cpu=$PGO_TARGET_CPU}"
@@ -77,12 +81,15 @@ LLVM_PROFILE_FILE="$PGO_RAW/selfcheck-%p.profraw" "$BIN/vllm-rs" --help >/dev/nu
 
 echo "-- model dir contents ($MODEL):"; ls -la "$MODEL" 2>&1 | head -20 || true
 
-"$BIN/vllm-rs" serve "$MODEL" \
+# Distinct filename for the SERVE profile so the merge/gate can tell it apart from the
+# throwaway --help self-check profraw above (see the [pgo 6/6] gate).
+LLVM_PROFILE_FILE="$PGO_RAW/serve-%p.profraw" "$BIN/vllm-rs" serve "$MODEL" \
     --data-parallel-size 1 --data-parallel-size-local 0 \
     --handshake-port "$HANDSHAKE_PORT" --host 127.0.0.1 --port "$HTTP_PORT" \
     > "$FRONTEND_LOG" 2>&1 &
 FRONTEND_PID=$!
-"$BIN/vllm-mock-engine" --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" &
+"$BIN/vllm-mock-engine" --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" \
+    --decode-step-delay-ms "$PGO_DECODE_STEP_DELAY_MS" &
 MOCK_PID=$!
 
 dump_frontend_log() { echo "--- frontend log (${FRONTEND_LOG}) ---"; cat "$FRONTEND_LOG" 2>/dev/null || echo "(empty)"; echo "--- end frontend log ---"; }
@@ -117,9 +124,27 @@ kill -INT "$FRONTEND_PID" 2>/dev/null || true
 wait "$FRONTEND_PID" 2>/dev/null || true
 kill "$MOCK_PID" 2>/dev/null || true
 
-echo "== [pgo 6/6] merge profiles + final profile-use build"
-ls "$PGO_RAW"/*.profraw >/dev/null   # fail loudly if the run produced nothing
-"$PROFDATA" merge -o "$PGO_DATA" "$PGO_RAW"
+echo "== [pgo 6/6] gate on a real serve profile + merge + final profile-use build"
+# Only the SERVE run's profile is useful. The old `ls *.profraw` guard also matched the
+# --help self-check profraw, so a serve flush failure (SIGINT race / handler never reached)
+# would silently ship a binary PGO-optimized for `--help` alone — slower than a plain -O3
+# build because every real hot function is then treated as cold. Gate on a NON-EMPTY
+# serve-*.profraw so that failure fails the build loudly instead.
+shopt -s nullglob
+serve_profiles=("$PGO_RAW"/serve-*.profraw)
+shopt -u nullglob
+if [ ${#serve_profiles[@]} -eq 0 ]; then
+    echo "FATAL: no serve-*.profraw — the training replay never flushed its counters"
+    dump_frontend_log; exit 1
+fi
+real=""
+for p in "${serve_profiles[@]}"; do
+    sz=$(wc -c < "$p")
+    echo "  serve profile $p: ${sz} bytes"
+    if [ "$sz" -gt 1024 ]; then real=1; fi   # explicit if: `&& real=1` can trip set -e
+done
+[ -n "$real" ] || { echo "FATAL: serve profile(s) present but <1KB — counters didn't flush (empty profile)"; exit 1; }
+"$PROFDATA" merge -o "$PGO_DATA" "${serve_profiles[@]}"
 RUSTFLAGS="-Cprofile-use=$PGO_DATA -Cllvm-args=-pgo-warn-missing-function $CPU" \
     cargo build --release --bin vllm-rs $FEAT
 

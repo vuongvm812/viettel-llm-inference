@@ -30,9 +30,13 @@ ARG RUST_TOOLCHAIN=1.95   # keep in sync with vllm/rust-toolchain.toml
 # /model (only tokenizer/config are read — the mock fakes the forward pass, weights are
 # never loaded). Override with a HF repo id to fetch over the network.
 ARG PGO_MODEL=/model
-# -Ctarget-cpu for the PGO binary. Default x86-64-v3 (AVX2) — build on native amd64.
-# Set empty (PGO_TARGET_CPU=) for an emulated Rosetta/OrbStack build (baseline x86-64).
-ARG PGO_TARGET_CPU=x86-64-v3
+# -Ctarget-cpu for the vllm-rs binary — governs BOTH the plain and PGO builds. Default
+# `native`: best codegen (AVX-512 on an H200 host CPU). It bakes in the BUILD box's ISA,
+# so build on the deploy CPU (the H200) to get the full win; a build box with an OLDER ISA
+# (e.g. a Mac under Rosetta ≈ AVX2) just yields a portable subset that still runs on H200.
+# Set PGO_TARGET_CPU=x86-64-v3 (portable AVX2) or empty (baseline) for an emulated build —
+# a native/AVX2 instrumented binary can crash the PGO training replay under Rosetta/OrbStack.
+ARG PGO_TARGET_CPU=native
 # The final stage copies vllm-rs from this stage. `make vllm-fork VLLM_RS_PGO=1` sets it
 # to rust-builder-pgo so only then is the (heavier, network/model-dependent) PGO stage built.
 ARG RUST_BUILDER=rust-builder
@@ -46,6 +50,7 @@ ARG VLLM_SRC_REF=v0.25.0
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS rust-builder
 ARG RUST_TOOLCHAIN
 ARG VLLM_SRC_REF
+ARG PGO_TARGET_CPU
 ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:${PATH}
 
 # native-tls-vendored compiles openssl from source (needs a C toolchain + perl);
@@ -104,7 +109,10 @@ COPY bench /src/bench
 COPY data/input/trace-round2.jsonl /src/trace-round2.jsonl
 
 WORKDIR /src/rust
+# -Ctarget-cpu applies to the plain build too (not just PGO), so a non-PGO image gets the
+# tuned codegen and PGO can be A/B'd in isolation. See the PGO_TARGET_CPU ARG note re: build host.
 RUN set -eux; \
+    export RUSTFLAGS="${PGO_TARGET_CPU:+-Ctarget-cpu=$PGO_TARGET_CPU}"; \
     cargo build --release --bin vllm-rs --features native-tls-vendored; \
     mkdir -p /out; \
     cp target/release/vllm-rs /out/vllm-rs; \

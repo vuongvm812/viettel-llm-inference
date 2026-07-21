@@ -61,6 +61,11 @@ services:
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
 
       VLLM_USE_RUST_FRONTEND: "1"
+      # Rust frontend (vllm-rs) tokio worker-thread count. Unset in code auto-sizes to the
+      # CFS quota (≈3 on the judge's 3-core budget). Pinned here so it's tunable: lower to 2
+      # to reserve a core for the engine's decode/ZMQ loop (TPOT is the scored path) if you
+      # see contention; sweep 2↔3. MUST be a positive int — empty or 0 panics vllm-rs at boot.
+      TOKIO_WORKER_THREADS: "${TOKIO_WORKER_THREADS:-3}"
 
       # FP8 (vtl_fp8). Load-bearing: --quantization=vtl_fp8 aborts at startup if disabled.
       VTL_ENABLE_FP8: 1

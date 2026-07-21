@@ -46,12 +46,12 @@ VLLM_RS_PGO ?= 1
 PGO_MODEL ?= /model
 # Host path to the local model dir mounted at /model for the PGO training run.
 PGO_HFMODEL ?= ../hf-model
-# -Ctarget-cpu for the PGO binary. Default x86-64-v3 (AVX2/BMI2/FMA) — safe on any
-# H200 host CPU and unlocks better tokenizer/serde/memcpy codegen that PGO compounds.
-# Build on NATIVE amd64: the AVX2 instrumented binary crashes the training replay under
-# Rosetta/OrbStack. For an emulated local PGO build, override with PGO_TARGET_CPU= to
-# fall back to baseline x86-64 (sonic_rs still runtime-detects SIMD, so the JSON win survives).
-PGO_TARGET_CPU ?= x86-64-v3
+# -Ctarget-cpu for the vllm-rs binary (plain AND PGO builds). Default native: full host
+# codegen (AVX-512 on an H200 host CPU). Bakes in the BUILD box's ISA — build on the deploy
+# CPU (the H200) for the full win; an older build box (Mac under Rosetta ≈ AVX2) yields a
+# portable subset that still runs on H200. For an emulated build, override PGO_TARGET_CPU=
+# x86-64-v3 or empty (a native/AVX2 instrumented binary can crash the PGO training replay).
+PGO_TARGET_CPU ?= native
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
@@ -168,7 +168,7 @@ BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 ##   make vllm-fork PUSH=1
 ##   make push VLLM_IMAGE=$(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)@sha256:<digest>
 vllm-fork:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg PGO_MODEL='$(PGO_MODEL)' $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-arg PGO_TARGET_CPU='$(PGO_TARGET_CPU)' --build-context hfmodel=$(PGO_HFMODEL)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg PGO_MODEL='$(PGO_MODEL)' --build-arg PGO_TARGET_CPU='$(PGO_TARGET_CPU)' $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-context hfmodel=$(PGO_HFMODEL)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
 	@echo "forked vLLM base: $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)"
 	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'pin this digest: {{.Manifest.Digest}}'; fi
 

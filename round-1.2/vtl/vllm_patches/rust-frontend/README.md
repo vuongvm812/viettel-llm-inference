@@ -16,8 +16,16 @@ frontend binary. They carry our frontend optimizations so a clean checkout (wher
   copy), and a non-JSON `Content-Type` is rejected up front — restoring the
   guard axum's `Json` gave us.
 
-Applied idempotently: the stage skips the patch if the checkout already carries it
-(grep-guard on `sonic_rs`), so building from a locally-modified checkout is a no-op.
+## `mock_engine_pgo_pacing.patch`
+- `src/mock-engine/...` — adds a `--decode-step-delay-ms` flag (default `0` = unchanged)
+  to the mock engine and paces its decode loop by that delay. `pgo_train.sh` passes
+  `~TPOT` (4 ms) so the frontend's streaming/detokenize loop is profiled at production
+  cadence instead of memory speed — otherwise PGO trains on the wrong hot/cold split and
+  can ship a binary slower than stock.
+
+Applied idempotently: the stage skips **both** patches if the checkout already carries the
+frontend optimization (grep-guard on `sonic_rs`), so building from a locally-modified
+checkout that already has both is a no-op.
 
 ## Regenerating
 Paths are workspace-relative (`patch -p1 -d <rust-workspace>`). To regenerate after
