@@ -101,15 +101,7 @@ services:
       VTL_GIL_SWITCH_INTERVAL: "0.0002"
 
       VLLM_USE_RUST_FRONTEND: "1"
-      # failed_count=5/420 (HTTP/connection/parse errors) with TTFT p95 at 67ms -- the server is
-      # nowhere near overload, so those are not timeouts. The shape (~1%, scattered) is the
-      # classic keep-alive idle-close race: vllm-rs closes an idle pooled connection at this
-      # timeout (default 5s, cli.rs --http-timeout-keep-alive), and the judge's client hands
-      # that same socket to the next request just as the FIN lands -> connection reset, counted
-      # as a failed request. The trace has 3s scripted think-pauses on top of Poisson arrivals,
-      # so pooled sockets routinely idle past 5s. Long timeout removes the race class entirely;
-      # the judge is a closed client set, so there is no cost to holding sockets open.
-      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "600"
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "60"
       # Rust frontend (vllm-rs) tokio worker-thread count. Unset in code auto-sizes to the
       # CFS quota (≈3 on the judge's 3-core budget). Pinned here so it's tunable: lower to 2
       # to reserve a core for the engine's decode/ZMQ loop (TPOT is the scored path) if you
