@@ -24,6 +24,7 @@ def _cuda_ext():
             "vtl/csrc/dynamic_per_token_quant.cu",
             "vtl/csrc/silu_mul_quant.cu",
             "vtl/csrc/mul_quant.cu",
+            "vtl/csrc/bcx_conv_gate_quant.cu",
             "vtl/csrc/torch_bindings.cpp",
         ],
         extra_compile_args={

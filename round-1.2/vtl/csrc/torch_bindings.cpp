@@ -25,6 +25,13 @@
 //                                                 Called directly from the patched ShortConv decode
 //                                                 path (no FX pattern -- short_conv is an opaque op);
 //                                                 its fake kernel is registered in Python.
+//   bcx_conv_gate_quant / _supported           -- NEW ops, vllm_cuda only. The whole short-conv
+//                                                 DECODE block in one launch: `B*x` -> depthwise
+//                                                 conv1d + state rotation -> `C*` -> fp8 quant,
+//                                                 replacing mul_dynamic_per_token_quant AND the
+//                                                 Triton causal_conv1d_update on that half of the
+//                                                 batch. `_supported` is the shape predicate the
+//                                                 Python gate queries instead of re-hardcoding it.
 
 #include <torch/extension.h>
 #include <torch/library.h>
@@ -47,6 +54,14 @@ void silu_and_mul_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor& 
 void mul_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor& scale,
                                  torch::Tensor const& a, torch::Tensor const& b,
                                  std::optional<torch::Tensor> const& scale_ub);
+
+void bcx_conv_gate_quant(torch::Tensor& y_fp8, torch::Tensor& y_scale, torch::Tensor& conv_state,
+                         torch::Tensor const& bcx, torch::Tensor const& conv_weight,
+                         std::optional<torch::Tensor> const& conv_bias,
+                         torch::Tensor const& state_indices, int64_t null_block_id,
+                         std::optional<torch::Tensor> const& scale_ub);
+
+bool bcx_conv_gate_supported(int64_t dim, int64_t width, int64_t state_len);
 }  // namespace vtl
 
 TORCH_LIBRARY(vllm_cuda, m) {
@@ -63,6 +78,14 @@ TORCH_LIBRARY(vllm_cuda, m) {
   m.def(
       "mul_dynamic_per_token_quant(Tensor! result, Tensor! scale, "
       "Tensor a, Tensor b, Tensor? scale_ub) -> ()");
+  m.def(
+      "bcx_conv_gate_quant(Tensor! y_fp8, Tensor! y_scale, Tensor! conv_state, "
+      "Tensor bcx, Tensor conv_weight, Tensor? conv_bias, Tensor state_indices, "
+      "int null_block_id, Tensor? scale_ub) -> ()");
+  // Shape predicate: no tensor arguments, so it cannot be dispatched by device key -- register
+  // the implementation right here as a catch-all instead of in the CUDA block below.
+  m.def("bcx_conv_gate_supported(int dim, int width, int state_len) -> bool",
+        TORCH_FN(vtl::bcx_conv_gate_supported));
 }
 
 TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
@@ -72,6 +95,7 @@ TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
   m.impl("silu_and_mul_dynamic_per_token_quant",
          TORCH_FN(vtl::silu_and_mul_dynamic_per_token_quant));
   m.impl("mul_dynamic_per_token_quant", TORCH_FN(vtl::mul_dynamic_per_token_quant));
+  m.impl("bcx_conv_gate_quant", TORCH_FN(vtl::bcx_conv_gate_quant));
 }
 
 // Overrides of vLLM's own _C ops (schemas defined by vllm._C_stable_libtorch, imported first).

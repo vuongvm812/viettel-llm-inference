@@ -133,13 +133,14 @@ services:
                                              # calls stock _C::fused_qk_norm_rope directly
                                              # (vLLM's own pass can't match Lfm2Attention)
       VTL_ENABLE_SHORTCONV_QUANT: 1          # fp8 the short-conv in_proj/out_proj (the TPOT lever)
-      VTL_ENABLE_MUL_QUANT: 1                # fused conv-gate mul+fp8-quant, pure-decode fast path
+      VTL_ENABLE_MUL_QUANT: 1                # fused conv-gate mul+fp8-quant; also gives out_proj a
+                                             # shared fp8 staging buffer, so decode|prefill|mixed
+                                             # all skip the bf16 vstack (not just pure decode)
+      VTL_ENABLE_BCX_CONV_GATE: 1            # whole short-conv DECODE block in one kernel: B*x ->
+                                             # conv1d + state rotation -> C* -> fp8 quant. Inert
+                                             # unless MUL_QUANT=1 (it fills that staging buffer).
       VTL_ENABLE_KV_CACHE_MANAGER: 1
       VTL_ENABLE_SCHED_POLICY: 1             # SJF prefill reorder
-      # Was missing here, so it defaulted ON (registry falls back to the in-code default when
-      # the var is unset) but could NOT be A/B'd -- compose only injects variables it declares,
-      # so `VTL_ENABLE_GREEDY_SAMPLER=0 make bench` never reached the container. Declared now.
-      VTL_ENABLE_GREEDY_SAMPLER: "1"
 
       # No GDN family here: LFM2.5 has no gated-delta-net and no attn output gate, so the old
       # VTL_ENABLE_GDN_KERNELS / MUL_SIGMOID / GDN_PREFILL_BACKEND flags were removed with their code.
