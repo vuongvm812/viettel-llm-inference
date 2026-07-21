@@ -109,7 +109,7 @@ services:
       # CFS quota (≈3 on the judge's 3-core budget). Pinned here so it's tunable: lower to 2
       # to reserve a core for the engine's decode/ZMQ loop (TPOT is the scored path) if you
       # see contention; sweep 2↔3. MUST be a positive int — empty or 0 panics vllm-rs at boot.
-      TOKIO_WORKER_THREADS: "2"
+      TOKIO_WORKER_THREADS: "3"
       # TOKIO_WORKER_THREADS sizes ONLY the HTTP runtime. vllm-rs starts two more that ignore
       # it: the ZMQ runtime is hard-coded to 4 threads regardless of CPU quota
       # (engine-core-client/src/runtime.rs) to run 3 IO-bound tasks, and the request runtime
