@@ -1,0 +1,30 @@
+--- a/src/server/src/routes.rs
++++ b/src/server/src/routes.rs
+@@ -42,6 +42,16 @@
+         .is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true"))
+ }
+ 
++/// Per-request HTTP tracing (`TraceLayer`) is on by default. Set
++/// `VLLM_RS_DISABLE_HTTP_TRACE=1` to drop the layer entirely — a latency A/B knob.
++/// The axum/tower/hyper logs are already WARN-pinned via `RUST_LOG`, so the span is
++/// filter-disabled anyway; this removes even its per-request construction cost.
++fn http_trace_enabled() -> bool {
++    !std::env::var("VLLM_RS_DISABLE_HTTP_TRACE")
++        .ok()
++        .is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true"))
++}
++
+ /// Build the minimal OpenAI-compatible router for one configured model.
+ pub fn build_router(state: Arc<AppState>) -> Router {
+     build_router_with_options(
+@@ -143,7 +153,9 @@
+ 
+     // Later layers wrap earlier ones. Keep tracing outside auth so rejected
+     // requests are visible, while metrics/load only see authenticated traffic.
+-    router = router.layer(TraceLayer::new_for_http());
++    if http_trace_enabled() {
++        router = router.layer(TraceLayer::new_for_http());
++    }
+ 
+     if enable_request_id_headers {
+         router = router.layer(from_fn(middleware::set_request_id_header));

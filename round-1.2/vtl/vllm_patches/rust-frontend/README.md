@@ -23,7 +23,12 @@ frontend binary. They carry our frontend optimizations so a clean checkout (wher
   cadence instead of memory speed — otherwise PGO trains on the wrong hot/cold split and
   can ship a binary slower than stock.
 
-Applied idempotently: the stage skips **both** patches if the checkout already carries the
+## `http_trace_toggle.patch`
+- `src/server/src/routes.rs` — gate the per-request `TraceLayer` behind
+  `VLLM_RS_DISABLE_HTTP_TRACE` (default off = layer stays on). Set the env to `1` to drop
+  the layer entirely — a latency A/B knob. The optimized compose defaults it to `1`.
+
+Applied idempotently: the stage skips **all** patches if the checkout already carries the
 frontend optimization (grep-guard on `sonic_rs`), so building from a locally-modified
 checkout that already has both is a no-op.
 
