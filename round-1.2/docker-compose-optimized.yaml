@@ -86,9 +86,9 @@ services:
       # never does. A cgroup CPU quota does not change hardware_concurrency(), so torch would
       # otherwise size its pools to the HOST's core count (64+) inside our 3-core budget and
       # libgomp would busy-spin after every parallel region. PASSIVE stops the spin-wait.
-      OMP_NUM_THREADS: "1"
-      MKL_NUM_THREADS: "1"
-      OMP_WAIT_POLICY: "PASSIVE"
+      OMP_NUM_THREADS: "3"
+      MKL_NUM_THREADS: "3"
+      OMP_WAIT_POLICY: "ACTIVE"
 
       # CPython hands the GIL to a waiting thread only after sys.getswitchinterval() -- 5ms by
       # default, longer than a whole decode step. The engine-core main loop is tight pure
