@@ -91,6 +91,15 @@ def _build_method_cls():
                 return super().apply(layer, x, bias)  # quant skipped/failed -> bf16
             from vllm import _custom_ops as ops
 
+            # H200 fast path, memory-bound. The whole cost is the 134 MB fp8 weight read
+            # inside the GEMM (~28us/step at HBM3e roofline; compute is ~300x under it). We
+            # delegate to CUTLASS's Hopper fp8 kernel, which already coalesces/tiles/wgmma at
+            # that roofline -- a hand-written kernel cannot read the weight faster than HBM.
+            # Fast-path invariants (no padding / no fallback): weight is col-major [K=2048,
+            # N=65536] fp8-e4m3, per-channel scale [N,1], N and K both 16-aligned.
+            # ponytail: do NOT hand-roll this GEMM; the activation quant below is a non-
+            # bottleneck (~us) eager launch and fusing it (crosses the compiled/eager
+            # boundary) is not worth it -- the weight read dominates.
             x_fp8, x_scale = ops.scaled_fp8_quant(
                 x, scale=None, use_per_token_if_dynamic=True
             )
