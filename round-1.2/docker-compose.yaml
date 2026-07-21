@@ -77,15 +77,12 @@ services:
       # TPOT. SGLang publishes 2.2ms for this exact model on H200 at concurrency 1, so ~1.8ms
       # (~13 score points) is on the table. Every knob below is one env var to revert.
       #
-      # Model Runner V2 = vLLM's per-step-CPU-overhead rewrite (input prep moved to GPU Triton
-      # kernels, persistent state table with incremental diffs instead of a per-step rebuild).
-      # In v0.25.0 it is default for DENSE models only: config/vllm.py returns False for
-      # is_hybrid, and LFM2 is hybrid. That is a conservative DEFAULT, not a capability gate --
-      # v1/worker/gpu/model_states/mamba_hybrid.py handles mamba_cache_mode=align (our exact
-      # config) and upstream CI covers hybrid+prefix-cache under this flag. Forcing it runs
-      # _validate_v2_model_runner(), which RAISES on anything unsupported rather than silently
-      # degrading, so a bad combination fails at boot instead of scoring badly.
-      VLLM_USE_V2_MODEL_RUNNER: "1"
+      # Model Runner V2 (VLLM_USE_V2_MODEL_RUNNER=1) was TRIED AND REJECTED on 2026-07-21.
+      # It is vLLM's per-step-CPU-overhead rewrite, gated off for hybrid models by a
+      # conservative default; forcing it on LFM2 boots and is correct, but measured SLOWER
+      # open-loop on the round-2 trace: TPOT 5.0 -> 5.6ms, TTFT 62 -> 80ms (~-4 score points).
+      # Verified independent of the vtl greedy sampler (5.6ms with it both on and off).
+      # Do not re-add without re-measuring on a vLLM that has re-tuned the hybrid path.
 
       # vLLM only pins torch's CPU thread count in set_multiprocessing_worker_envs(), which the
       # MULTIPROC executor calls. At --tensor-parallel-size=1 we get UniProcExecutor, which
@@ -141,8 +138,6 @@ services:
       # Was missing here, so it defaulted ON (registry falls back to the in-code default when
       # the var is unset) but could NOT be A/B'd -- compose only injects variables it declares,
       # so `VTL_ENABLE_GREEDY_SAMPLER=0 make bench` never reached the container. Declared now.
-      # Patches Sampler.forward on the V1 runner and Sampler.__call__ on V2 (model_runner.py
-      # calls `self.sampler(logits, input_batch)`), so this knob covers both runners.
       VTL_ENABLE_GREEDY_SAMPLER: "1"
 
       # No GDN family here: LFM2.5 has no gated-delta-net and no attn output gate, so the old
