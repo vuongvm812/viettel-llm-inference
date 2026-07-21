@@ -34,6 +34,22 @@ RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
     && rm -rf /var/lib/apt/lists/* \
     && test -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 
+# Route the pinned `python -m ...api_server` entrypoint into vLLM's Rust frontend
+# when VLLM_USE_RUST_FRONTEND=1 (see the patch header). Applied here (not only in
+# Dockerfile.vllm-fork) so it lands on the stock base too. No-op while the flag is
+# unset. dry-run first so a drifted patch fails the build loudly, not at the judge's run.
+COPY vtl/vllm_patches/v0.25.0/api_server_rust_frontend.patch /tmp/rustfe.patch
+RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))") \
+ && F="$SITE/vllm/entrypoints/openai/api_server.py" \
+ && if grep -q run_multi_api_server "$F"; then \
+      echo "rust-frontend routing already present (fork base carries it); skipping"; \
+    else \
+      patch -p1 -d "$SITE" --dry-run < /tmp/rustfe.patch \
+      && patch -p1 -d "$SITE" < /tmp/rustfe.patch; \
+    fi \
+ && rm /tmp/rustfe.patch \
+ && python3 -c "import vllm.entrypoints.openai.api_server; print('rust-frontend routing patch OK')"
+
 COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
 

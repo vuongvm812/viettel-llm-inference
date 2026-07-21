@@ -11,3 +11,7 @@
 !data
 !data/input
 !data/input/trace-round1.jsonl
+# PGO training corpus + replayer for the fork's rust-builder stage (VLLM_RS_PGO=1).
+!data/input/trace-round2.jsonl
+!bench
+!bench/*

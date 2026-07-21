@@ -32,10 +32,26 @@ VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
 # Forked vLLM base = VLLM_STOCK + vtl tree-spec source patches, built by $(ROUND)/Dockerfile.vllm-fork
 # (Python-only overlay -> no CUDA rebuild). Pin VLLM_FORK_TAG to the pushed digest. See make vllm-fork.
 VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
-VLLM_FORK_TAG ?= v0.25.0-tree@sha256:aeb54152859e338fc83c0880a50dd250dd15a654c7a1e0fab2b2b0715de0088e
+VLLM_FORK_TAG ?= v0.25.0-tree@sha256:b828f4a4541db322092e1befc193167fe5facc2de9e66bbe025e0e6276ff110b
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
+# 1 = the fork's rust-builder stage does a profile-guided-optimization build of vllm-rs
+# (CPU-only training run against the mock engine). 0 = plain optimized (fat-LTO) build.
+VLLM_RS_PGO ?= 1
+# Tokenizer the PGO training run boots the frontend with. Defaults to the local model
+# (hf-model/, bind-mounted at /model in the fork's PGO stage — only tokenizer/config are
+# read, the mock fakes the forward pass so the 5.9 GB of weights are never loaded).
+# Override with a HF repo id to fetch a stand-in over the network, e.g. PGO_MODEL=Qwen/Qwen3-0.6B.
+PGO_MODEL ?= /model
+# Host path to the local model dir mounted at /model for the PGO training run.
+PGO_HFMODEL ?= ../hf-model
+# -Ctarget-cpu for the vllm-rs binary (plain AND PGO builds). Default native: full host
+# codegen (AVX-512 on an H200 host CPU). Bakes in the BUILD box's ISA — build on the deploy
+# CPU (the H200) for the full win; an older build box (Mac under Rosetta ≈ AVX2) yields a
+# portable subset that still runs on H200. For an emulated build, override PGO_TARGET_CPU=
+# x86-64-v3 or empty (a native/AVX2 instrumented binary can crash the PGO training replay).
+PGO_TARGET_CPU ?= native
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
@@ -143,12 +159,16 @@ verify:
 NOCACHE ?=
 BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 
-## Build (PUSH=1 to push) the forked vLLM base image: stock v0.25.0 + vtl/vllm_patches, Python-only
-## overlay (no CUDA rebuild). Then point the main image at it and pin by digest:
+## Build (PUSH=1 to push) the forked vLLM base image: stock v0.25.0 + vtl/vllm_patches +
+## an optimized rebuild of the Rust frontend `vllm-rs` (fat-LTO release; VLLM_RS_PGO=1 adds a
+## CPU-only PGO training run via the mock engine). The rust-builder stage reads the vllm/rust/
+## workspace at repo root via the named build context. Then point the main image at it, pin by digest:
+##   make vllm-fork                 # plain optimized rebuild
+##   make vllm-fork VLLM_RS_PGO=1   # + profile-guided optimization
 ##   make vllm-fork PUSH=1
 ##   make push VLLM_IMAGE=$(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)@sha256:<digest>
 vllm-fork:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg PGO_MODEL='$(PGO_MODEL)' --build-arg PGO_TARGET_CPU='$(PGO_TARGET_CPU)' $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-context hfmodel=$(PGO_HFMODEL)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
 	@echo "forked vLLM base: $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)"
 	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'pin this digest: {{.Manifest.Digest}}'; fi
 
