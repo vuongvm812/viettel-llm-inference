@@ -34,12 +34,42 @@ def fp8_lm_head_enabled() -> bool:
     return os.environ.get(ENABLE_ENV, "").strip().lower() in _TRUTHY
 
 
-def _fp8_quantize_lm_head(layer, scaled_fp8_quant, replace_parameter) -> bool:
-    """Untie + per-output-channel fp8-quantize ``layer.weight`` in place on ``layer``.
+def _lm_head_fp8_mm(x, weight_fp8, weight_scale, bias, ops, torch_mod):
+    """fp8 logits GEMM: per-token quant x, then unfused ``torch._scaled_mm`` + manual DQ.
+
+    Mirrors vLLM's ``ChannelWiseTorchFP8ScaledMMLinearKernel`` -- the CUDA-safe per-channel
+    fp8 path the rest of the stack uses when the cutlass sm90 fp8 kernel isn't compiled in
+    (as in this forked build; ``cutlass_scaled_mm`` there falls through to the int8 sm80
+    kernel and rejects fp8). ``_scaled_mm`` on CUDA can't take a vector ``scale_b``, so the
+    GEMM runs unscaled in fp32 and the per-token/per-channel scales are applied after.
+
+    ``weight_fp8`` is column-major ``[K, N]`` fp8-e4m3; ``weight_scale`` is ``[N, 1]``.
+    Memory-bound: the cost is the fp8 weight read (halved vs bf16), which is the TPOT win.
+    """
+    x_fp8, x_scale = ops.scaled_fp8_quant(x, scale=None, use_per_token_if_dynamic=True)
+    dummy = torch_mod.ones(1, dtype=torch_mod.float32, device=x.device)
+    out = torch_mod._scaled_mm(
+        x_fp8, weight_fp8, scale_a=dummy, scale_b=dummy, out_dtype=torch_mod.float32
+    )
+    if isinstance(out, tuple):  # torch < 2.5 returned (out, amax)
+        out = out[0]
+    out = out * x_scale * weight_scale.t()  # [M,N] * [M,1] * [1,N]
+    if bias is not None:
+        out = out + bias
+    return out.to(x.dtype)
+
+
+def _fp8_quantize_lm_head(layer, scaled_fp8_quant, replace_parameter, probe) -> bool:
+    """Untie + per-output-channel fp8-quantize ``layer.weight``, committing only if it runs.
 
     ``scaled_fp8_quant`` is out-of-place, so ``qweight`` is fresh storage: replacing the
-    parameter breaks any ``embed_tokens`` alias without mutating the shared tensor. Idempotent.
-    Returns True if it quantized, False if it was already done.
+    parameter breaks any ``embed_tokens`` alias without mutating the shared tensor.
+
+    ``probe(weight_fp8, weight_scale) -> bool`` runs the actual logits GEMM on a dummy row
+    BEFORE we swap the parameter. If it returns False (the fp8 primitive isn't available on
+    this build), we leave ``layer.weight`` as the loaded bf16 alias and stay stock -- the
+    engine boots either way, and we never keep a dead fp8 weight we can't matmul. Idempotent;
+    returns True only if it committed the fp8 weight.
     """
     if getattr(layer, "_vtl_fp8_lm_head_done", False):
         return False
@@ -50,15 +80,20 @@ def _fp8_quantize_lm_head(layer, scaled_fp8_quant, replace_parameter) -> bool:
     )
     # Fresh storage guarantees the shared embedding weight was not touched.
     assert qweight.data_ptr() != orig_ptr, "fp8 lm_head quant aliased the shared weight"
-    # CUTLASS wants B column-major [K, N] = [hidden, vocab].
-    replace_parameter(layer, "weight", qweight.t().data)
-    replace_parameter(layer, "weight_scale", weight_scale.data)
+    weight_fp8 = qweight.t().data  # column-major [K=hidden, N=vocab] for the GEMM
+    weight_scale = weight_scale.data  # [N, 1]
+    if not probe(weight_fp8, weight_scale):
+        return False  # fp8 GEMM unavailable -> stay bf16, don't strand an unusable weight
+    replace_parameter(layer, "weight", weight_fp8)
+    replace_parameter(layer, "weight_scale", weight_scale)
     layer._vtl_fp8_lm_head_done = True
     return True
 
 
 def _build_method_cls():
     """Build the fp8 lm_head quant method (lazy: needs vLLM symbols)."""
+    import torch
+
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         UnquantizedEmbeddingMethod,
     )
@@ -75,14 +110,31 @@ def _build_method_cls():
         def process_weights_after_loading(self, layer) -> None:
             from vllm import _custom_ops as ops
 
+            def probe(weight_fp8, weight_scale) -> bool:
+                # Run the real GEMM on one dummy row so a missing/unusable fp8 primitive is
+                # caught here (leaving lm_head bf16) instead of crashing at the first decode.
+                try:
+                    dummy = torch.zeros(
+                        2, weight_fp8.shape[0], dtype=layer.weight.dtype,
+                        device=weight_fp8.device,
+                    )
+                    _lm_head_fp8_mm(dummy, weight_fp8, weight_scale, None, ops, torch)
+                    return True
+                except Exception:
+                    log.exception("vtl: fp8 lm_head GEMM probe failed; leaving bf16")
+                    return False
+
             try:
-                _fp8_quantize_lm_head(layer, ops.scaled_fp8_quant, replace_parameter)
-                log.info(
-                    "vtl: fp8 lm_head installed (untied), weight=%s",
-                    tuple(layer.weight.shape),
+                committed = _fp8_quantize_lm_head(
+                    layer, ops.scaled_fp8_quant, replace_parameter, probe
                 )
+                if committed:
+                    log.info(
+                        "vtl: fp8 lm_head installed (untied), weight=%s",
+                        tuple(layer.weight.shape),
+                    )
             except Exception:
-                # Quant runs only after a successful call, so a failure leaves the bf16
+                # Quant/probe runs before the parameter swap, so a failure leaves the bf16
                 # alias intact; apply() falls back on the missing done-flag.
                 log.exception("vtl: fp8 lm_head quantize failed; leaving bf16")
 
@@ -91,26 +143,11 @@ def _build_method_cls():
                 return super().apply(layer, x, bias)  # quant skipped/failed -> bf16
             from vllm import _custom_ops as ops
 
-            # H200 fast path, memory-bound. The whole cost is the 134 MB fp8 weight read
-            # inside the GEMM (~28us/step at HBM3e roofline; compute is ~300x under it). We
-            # delegate to CUTLASS's Hopper fp8 kernel, which already coalesces/tiles/wgmma at
-            # that roofline -- a hand-written kernel cannot read the weight faster than HBM.
-            # Fast-path invariants (no padding / no fallback): weight is col-major [K=2048,
-            # N=65536] fp8-e4m3, per-channel scale [N,1], N and K both 16-aligned.
-            # ponytail: do NOT hand-roll this GEMM; the activation quant below is a non-
-            # bottleneck (~us) eager launch and fusing it (crosses the compiled/eager
-            # boundary) is not worth it -- the weight read dominates.
-            x_fp8, x_scale = ops.scaled_fp8_quant(
-                x, scale=None, use_per_token_if_dynamic=True
-            )
-            return ops.cutlass_scaled_mm(
-                x_fp8,
-                layer.weight,
-                scale_a=x_scale,
-                scale_b=layer.weight_scale,
-                out_dtype=x.dtype,
-                bias=bias,
-            )
+            # Memory-bound: the cost is the 134 MB fp8 weight read in the GEMM (halved from
+            # bf16's 268 MB -- the TPOT win). The GEMM is vLLM's CUDA per-channel fp8 path
+            # (unfused torch._scaled_mm + manual DQ); the cutlass sm90 fp8 kernel isn't
+            # compiled in this build, so a raw cutlass_scaled_mm would fall to the int8 path.
+            return _lm_head_fp8_mm(x, layer.weight, layer.weight_scale, bias, ops, torch)
 
     return VtlFp8LMHeadMethod
 
@@ -168,23 +205,35 @@ def _self_check() -> None:
     class _Layer:
         pass
 
+    ok_probe = lambda weight_fp8, weight_scale: True  # noqa: E731
+    fail_probe = lambda weight_fp8, weight_scale: False  # noqa: E731
+
     # Shared bf16 weight, aliased by both lm_head and embed_tokens (same object/ptr).
     shared = _FakeTensor(0xB16)
     lm = _Layer()
     lm.weight = shared
     embed_weight = shared  # the tie: same object
 
-    assert _fp8_quantize_lm_head(lm, fake_quant, fake_replace) is True
+    assert _fp8_quantize_lm_head(lm, fake_quant, fake_replace, ok_probe) is True
     # lm_head now points at fresh fp8 storage; the shared embed weight is untouched.
     assert lm.weight.data_ptr() == 0xF8
     assert embed_weight.data_ptr() == 0xB16
     assert lm.weight.data_ptr() != embed_weight.data_ptr()
     assert calls["weight_scale"].shape == (65536, 1)
-    assert lm.weight.shape == (2048, 65536)  # transposed [hidden, vocab] for CUTLASS
+    assert lm.weight.shape == (2048, 65536)  # transposed [hidden, vocab] for the GEMM
     assert getattr(lm, "_vtl_fp8_lm_head_done") is True
 
     # Idempotent: a second call is a no-op.
-    assert _fp8_quantize_lm_head(lm, fake_quant, fake_replace) is False
+    assert _fp8_quantize_lm_head(lm, fake_quant, fake_replace, ok_probe) is False
+
+    # Probe fails (fp8 GEMM unavailable): stay bf16, never strand an unusable fp8 weight.
+    calls.clear()
+    lm2_shared = _FakeTensor(0xB16)
+    lm2 = _Layer()
+    lm2.weight = lm2_shared
+    assert _fp8_quantize_lm_head(lm2, fake_quant, fake_replace, fail_probe) is False
+    assert lm2.weight.data_ptr() == 0xB16  # unchanged bf16 alias
+    assert "weight" not in calls and not getattr(lm2, "_vtl_fp8_lm_head_done", False)
 
     # Gating: disabled by default -> no method.
     os.environ.pop(ENABLE_ENV, None)
