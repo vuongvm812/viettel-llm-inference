@@ -30,8 +30,9 @@ ARG RUST_TOOLCHAIN=1.95   # keep in sync with vllm/rust-toolchain.toml
 # /model (only tokenizer/config are read — the mock fakes the forward pass, weights are
 # never loaded). Override with a HF repo id to fetch over the network.
 ARG PGO_MODEL=/model
-# Optional -Ctarget-cpu for the PGO binary. Empty = baseline (portable to Rosetta + H200).
-ARG PGO_TARGET_CPU=
+# -Ctarget-cpu for the PGO binary. Default x86-64-v3 (AVX2) — build on native amd64.
+# Set empty (PGO_TARGET_CPU=) for an emulated Rosetta/OrbStack build (baseline x86-64).
+ARG PGO_TARGET_CPU=x86-64-v3
 # The final stage copies vllm-rs from this stage. `make vllm-fork VLLM_RS_PGO=1` sets it
 # to rust-builder-pgo so only then is the (heavier, network/model-dependent) PGO stage built.
 ARG RUST_BUILDER=rust-builder

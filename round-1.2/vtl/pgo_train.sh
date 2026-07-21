@@ -25,10 +25,11 @@ PGO_DATA=/pgo.profdata
 HANDSHAKE_PORT=29550
 HTTP_PORT=8000
 FEAT="--features native-tls-vendored"
-# No -Ctarget-cpu: keep the binary baseline-x86-64 so it runs both on the H200 and
-# under Rosetta/OrbStack (which lacks AVX2 — an AVX2 build crashes at startup during
-# the training run). sonic_rs runtime-detects SIMD, so the JSON win survives anyway.
-# Override with PGO_TARGET_CPU=x86-64-v3 only when building on native amd64 for H200-only.
+# -Ctarget-cpu (default x86-64-v3 from the build arg): AVX2/BMI2/FMA codegen for the H200
+# host. Applies to BOTH the instrumented and final builds, so build on NATIVE amd64 — an
+# AVX2 instrumented binary crashes at startup under Rosetta/OrbStack during the training
+# run. For an emulated local build, pass PGO_TARGET_CPU= (empty) to fall back to baseline
+# x86-64; sonic_rs runtime-detects SIMD, so the JSON win survives either way.
 CPU="${PGO_TARGET_CPU:+-Ctarget-cpu=$PGO_TARGET_CPU}"
 
 cd "$RUST_DIR"

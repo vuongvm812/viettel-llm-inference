@@ -46,11 +46,12 @@ VLLM_RS_PGO ?= 1
 PGO_MODEL ?= /model
 # Host path to the local model dir mounted at /model for the PGO training run.
 PGO_HFMODEL ?= ../hf-model
-# Optional -Ctarget-cpu for the PGO binary. Empty = baseline x86-64 (portable: the
-# instrumented binary runs under Rosetta/OrbStack AND the H200; simd_json still runtime-
-# detects SIMD). Set to x86-64-v3 ONLY when building on native amd64 for an H200-only
-# image — AVX2 crashes the training run under Rosetta.
-PGO_TARGET_CPU ?=
+# -Ctarget-cpu for the PGO binary. Default x86-64-v3 (AVX2/BMI2/FMA) — safe on any
+# H200 host CPU and unlocks better tokenizer/serde/memcpy codegen that PGO compounds.
+# Build on NATIVE amd64: the AVX2 instrumented binary crashes the training replay under
+# Rosetta/OrbStack. For an emulated local PGO build, override with PGO_TARGET_CPU= to
+# fall back to baseline x86-64 (sonic_rs still runtime-detects SIMD, so the JSON win survives).
+PGO_TARGET_CPU ?= x86-64-v3
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
