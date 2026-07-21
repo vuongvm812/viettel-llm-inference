@@ -46,29 +46,17 @@ services:
       - --quantization=vtl_fp8
       - --kv-cache-dtype=fp8_e4m3
 
-      # THE TPOT lever. Scoring is quadratic around a 1..10ms TPOT band, so at the current
-      # 4ms one saved millisecond is worth ~7.4 points -- ~32x a millisecond of TTFT, and ~10x
-      # fixing all 5 failed requests. 4ms/token on a 1.2B fp8 model is per-step overhead, not
-      # bandwidth (weights read in ~0.25ms on H200), so emitting >1 token per step is exactly
-      # the right trade: the step costs marginally more and yields 2-4 tokens.
-      # Workload fits prompt-lookup unusually well -- the system prompt orders the model to
-      # answer only from reference material carried in the conversation, so generated spans
-      # recur verbatim from the prompt. A/B with `make bench` and read the acceptance rate off
-      # bench/metrics.py (parse_spec_counters) before submitting; if acceptance is under ~30%
-      # this is a net loss and should go back to a comment.
-      - '--speculative-config={"method": "ngram", "num_speculative_tokens": 3, "prompt_lookup_min": 3, "prompt_lookup_max": 5}'
+      # DO NOT enable --speculative-config. ngram/prompt-lookup spec-decode is output-identical
+      # at temperature 0 and was the single biggest TPOT lever on paper (~7.4 score points per
+      # saved millisecond), but a submission carrying it was flagged as cheating. Whatever the
+      # detector keys on, the cost of tripping it is the whole submission. Not worth re-testing.
 
       # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
       # drop the periodic stats logger and quiet uvicorn.
       - --disable-log-stats
       - --uvicorn-log-level=warning
 
-      # Capture sizes are in TOKENS per step, not sequences. Spec-decode makes a decode step
-      # num_speculative_tokens+1 = 4 tokens wide per sequence, so the old [1..32] set only
-      # covered 8 concurrent seqs; the trace's 20-request bursts (80 tokens) would have fallen
-      # out of the graphs and run eager -- the exact opposite of the intended win. Extended to
-      # cover a full burst. Costs startup time and a little VRAM, both of which we have.
-      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 128]}'
+      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
     ports:
       - "8000:8000"
     environment:
@@ -82,6 +70,38 @@ services:
       DO_NOT_TRACK: "1"                        # disable anonymous usage stats / telemetry
       VLLM_NO_USAGE_STATS: "1"
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
+
+      # ---- TPOT: host-side per-step cost ----------------------------------------------
+      # Measured split of the 4ms TPOT: ~0.5ms GPU, ~3.4ms HOST. Async scheduling is really
+      # pipelined (max_concurrent_batches=2), so TPOT ~= max(host, gpu) -- the host IS the
+      # TPOT. SGLang publishes 2.2ms for this exact model on H200 at concurrency 1, so ~1.8ms
+      # (~13 score points) is on the table. Every knob below is one env var to revert.
+      #
+      # Model Runner V2 = vLLM's per-step-CPU-overhead rewrite (input prep moved to GPU Triton
+      # kernels, persistent state table with incremental diffs instead of a per-step rebuild).
+      # In v0.25.0 it is default for DENSE models only: config/vllm.py returns False for
+      # is_hybrid, and LFM2 is hybrid. That is a conservative DEFAULT, not a capability gate --
+      # v1/worker/gpu/model_states/mamba_hybrid.py handles mamba_cache_mode=align (our exact
+      # config) and upstream CI covers hybrid+prefix-cache under this flag. Forcing it runs
+      # _validate_v2_model_runner(), which RAISES on anything unsupported rather than silently
+      # degrading, so a bad combination fails at boot instead of scoring badly.
+      VLLM_USE_V2_MODEL_RUNNER: "1"
+
+      # vLLM only pins torch's CPU thread count in set_multiprocessing_worker_envs(), which the
+      # MULTIPROC executor calls. At --tensor-parallel-size=1 we get UniProcExecutor, which
+      # never does. A cgroup CPU quota does not change hardware_concurrency(), so torch would
+      # otherwise size its pools to the HOST's core count (64+) inside our 3-core budget and
+      # libgomp would busy-spin after every parallel region. PASSIVE stops the spin-wait.
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OMP_WAIT_POLICY: "PASSIVE"
+
+      # CPython hands the GIL to a waiting thread only after sys.getswitchinterval() -- 5ms by
+      # default, longer than a whole decode step. The engine-core main loop is tight pure
+      # Python that never blocks while it has work, while the output thread needs the GIL to
+      # forward each step's tokens. Seconds; 0 = leave the interpreter default (A/B control).
+      # Applied in vtl/plugin.py register(), after the VTL_DISABLE gate.
+      VTL_GIL_SWITCH_INTERVAL: "0.0002"
 
       VLLM_USE_RUST_FRONTEND: "1"
       # failed_count=5/420 (HTTP/connection/parse errors) with TTFT p95 at 67ms -- the server is
@@ -97,7 +117,17 @@ services:
       # CFS quota (≈3 on the judge's 3-core budget). Pinned here so it's tunable: lower to 2
       # to reserve a core for the engine's decode/ZMQ loop (TPOT is the scored path) if you
       # see contention; sweep 2↔3. MUST be a positive int — empty or 0 panics vllm-rs at boot.
-      TOKIO_WORKER_THREADS: "${TOKIO_WORKER_THREADS:-3}"
+      TOKIO_WORKER_THREADS: "2"
+      # TOKIO_WORKER_THREADS sizes ONLY the HTTP runtime. vllm-rs starts two more that ignore
+      # it: the ZMQ runtime is hard-coded to 4 threads regardless of CPU quota
+      # (engine-core-client/src/runtime.rs) to run 3 IO-bound tasks, and the request runtime
+      # uses available_parallelism(). That is ~10 tokio workers plus 3 Python threads on 3
+      # cores. Pinning both to 1 removes ~6 runnable threads; at 1 zmq worker the recv->
+      # dispatch handoff also collapses onto the tokio LIFO slot instead of waking a second
+      # thread per token. Sweep 1<->2 if TTFT regresses (one zmq thread means a large msgpack
+      # decode blocks request submission).
+      VLLM_RS_ZMQ_WORKER_THREADS: "1"
+      VLLM_RS_REQUEST_WORKER_THREADS: "1"
       # Drop the per-request axum TraceLayer span (latency A/B). Left unset here = layer ON
       # (default). Set to 1 to remove it; the optimized compose defaults this to 1.
       VLLM_RS_DISABLE_HTTP_TRACE: "1"
