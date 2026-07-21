@@ -179,6 +179,15 @@ class VtlFp8Config(_Fp8Config):
         from vllm.model_executor.layers.linear import LinearBase
 
         method = super().get_quant_method(layer, prefix)
+
+        # lm_head is a ParallelLMHead (embedding-derived, not a LinearBase) and is tied to
+        # embed_tokens, so it falls through the branch below untouched. Opt-in fp8 for it
+        # lives in its own module (untie + embedding-aware fp8 method), fully guarded.
+        from vtl.patches.fp8_lm_head import maybe_lm_head_method
+        lm_head_method = maybe_lm_head_method(layer)
+        if lm_head_method is not None:
+            return lm_head_method
+
         if not isinstance(layer, LinearBase):
             return method  # attention / MoE: leave stock behaviour alone
 

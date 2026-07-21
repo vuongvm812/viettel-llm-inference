@@ -79,7 +79,10 @@ services:
       # FP8 (vtl_fp8). Load-bearing: --quantization=vtl_fp8 aborts at startup if disabled.
       VTL_ENABLE_FP8: 1
       VTL_FP8_CHANNELWISE: 1                  # 1 = per-channel weight scales; 0 = stock per-tensor
-      VTL_FP8_IGNORE: "lm_head"               # LFM2 has no vision tower / GDN fp32 projections to skip
+      VTL_FP8_IGNORE: "lm_head"               # inert for lm_head now (it's not a LinearBase); fp8 lm_head
+                                              # is gated by VTL_ENABLE_FP8_LM_HEAD below, not this list
+      VTL_ENABLE_FP8_LM_HEAD: 0               # untie + fp8 the lm_head (~15.7% of decode weight traffic).
+                                              # OFF pending the quality A/B -- flip to 1 to enable.
 
       # Per-patch kill-switches (all default ON). Each = VTL_ENABLE_<patch>.
       VTL_ENABLE_RMS_NORM_QUANT: 1            # needs pass_config.fuse_norm_quant to fire
