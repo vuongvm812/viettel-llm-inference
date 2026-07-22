@@ -23,16 +23,39 @@ FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 
 # jemalloc for host-side malloc: less fragmentation/contention and tighter RSS than
 # glibc for the prefix-cache/KV-manager metadata churn of this prefill-bound workload.
-# GPU allocs are unaffected (those go through PYTORCH_CUDA_ALLOC_CONF). Preloaded via
-# ENV below. The test -f fails the build now if the base ever moves the lib, instead of
-# LD_PRELOAD silently no-op'ing at the judge's run.
+# GPU allocs are unaffected (those go through PYTORCH_CUDA_ALLOC_CONF). Preloaded via ENV below.
 # -o Dir::Etc::sourceparts=- skips sources.list.d/* (the CUDA + deadsnakes repos) for
 # this one update: jemalloc is in the base Ubuntu universe repo, and the NVIDIA mirror
 # is intermittently mid-sync (Packages.gz size mismatch) which otherwise fails the build.
-RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
-    && apt-get install -y --no-install-recommends libjemalloc2 \
-    && rm -rf /var/lib/apt/lists/* \
-    && test -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+#
+# THIS STEP MAY NOT FAIL THE BUILD. It used to end in `test -f`, so that a base image which
+# moved the lib would break the build rather than let LD_PRELOAD silently no-op at the judge's
+# run. That traded the wrong way round: on the hackathon box apt could not reach
+# archive.ubuntu.com at all ("Connection failed [IP: 185.125.190.83 80]") and the whole image
+# build died. A build that fails scores ZERO; a container on glibc malloc just scores slightly
+# worse. So: retry, then try a second mirror in case archive.ubuntu.com is blocked rather than
+# flaky, then carry on regardless. Grep the build log for "jemalloc:" to see which happened.
+#
+# The lost `test -f` is not lost, it moved to runtime: if jemalloc is absent, LD_PRELOAD below
+# names a file that is not there and the dynamic loader prints "cannot be preloaded: ignored"
+# once per process. `make verify` greps the container log for exactly that. Deliberately not
+# made conditional at build time -- that needs an entrypoint shim, and there is no ENTRYPOINT
+# here by design (compose pins the command).
+ARG JEMALLOC_MIRROR=http://azure.archive.ubuntu.com/ubuntu
+RUN JE=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2; \
+    for attempt in 1 2 3; do \
+      if [ -f "$JE" ]; then break; fi; \
+      if [ "$attempt" = 3 ]; then \
+        echo "jemalloc: archive.ubuntu.com unreachable, trying ${JEMALLOC_MIRROR}"; \
+        sed -i "s|http://archive.ubuntu.com/ubuntu|${JEMALLOC_MIRROR}|g" /etc/apt/sources.list; \
+      fi; \
+      apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
+        && apt-get install -y --no-install-recommends libjemalloc2 \
+        || { echo "jemalloc: attempt $attempt failed"; sleep 5; }; \
+    done; \
+    rm -rf /var/lib/apt/lists/*; \
+    if [ -f "$JE" ]; then echo "jemalloc: OK"; \
+    else echo "jemalloc: MISSING -- this image will run on glibc malloc (slower, still correct)"; fi
 
 # Route the pinned `python -m ...api_server` entrypoint into vLLM's Rust frontend
 # when VLLM_USE_RUST_FRONTEND=1 (see the patch header). Applied here (not only in

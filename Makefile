@@ -32,12 +32,12 @@ VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
 # Forked vLLM base = VLLM_STOCK + vtl tree-spec source patches, built by $(ROUND)/Dockerfile.vllm-fork
 # (Python-only overlay -> no CUDA rebuild). Pin VLLM_FORK_TAG to the pushed digest. See make vllm-fork.
 #
-# !! STALE. This digest predates the short_conv in_proj hoist + the paired lfm2 empty_like fix
+# Re-pinned in 66e5882 to include the short_conv in_proj hoist + the paired lfm2 empty_like fix
 # (vtl/vllm_patches/v0.25.0/{short_conv,lfm2}.patch), which are what let RMSNormQuantFusionPass
-# reach the 10 short-conv layers. Until `make vllm-fork PUSH=1` re-runs and this digest is
-# re-pinned, `make up` serves the OLD fork and that fusion silently does not happen -- which
-# looks exactly like success. `make verify` catches it: the "fusion replaced N patterns" count
-# stays at its pre-hoist value instead of rising by the conv-layer count.
+# reach the 10 short-conv layers. Any future edit to those patches needs `make vllm-fork PUSH=1`
+# and a re-pin here, or `make up` silently serves the old fork -- which looks exactly like
+# success. `make verify` is the check: the "fusion replaced N patterns" count drops back to its
+# pre-hoist value instead of covering the conv layers.
 VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
 VLLM_FORK_TAG ?= v0.25.0-tree@sha256:78ab6b65d96a655dabd0d2fdbb4e9250f32a29c28f05e949c1024d370ae8b8a4
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
@@ -174,6 +174,12 @@ verify:
 	@grep -q "channelwise fp8 unavailable" /tmp/vtl-verify.log \
 	  && echo "WARN channelwise fp8 fell back to stock per-tensor" \
 	  || echo "OK   channelwise fp8 active"
+	@# The jemalloc apt step deliberately cannot fail the build (a failed build scores zero,
+	@# glibc malloc only scores worse), so the check it used to do at build time lives here:
+	@# a missing lib makes the loader print this once per process. WARN, not FAIL -- it serves.
+	@grep -q "libjemalloc.so.2.*cannot be preloaded" /tmp/vtl-verify.log \
+	  && echo "WARN jemalloc NOT preloaded -- running on glibc malloc; see the build log for 'jemalloc:'" \
+	  || echo "OK   jemalloc preloaded"
 	@# Expected to fail when you deliberately A/B with VTL_ENABLE_RMS_NORM_QUANT=0.
 	@grep -q "fused rms_norm+fp8-quant CUDA kernel installed" /tmp/vtl-verify.log \
 	  && echo "OK   vtl fused norm+quant kernel installed" \
