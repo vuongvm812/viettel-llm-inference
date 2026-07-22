@@ -149,6 +149,18 @@ verify:
 	@# rather than crashing, so without these three greps `make verify` prints all-OK in exactly
 	@# the world where int4 silently never happened. Check registration, kernel availability,
 	@# and how many layers actually ended up int4.
+	@# The premise of the whole W4A8 patch: a MIG 1g.18gb slice (~19 SMs) is where int4 pays.
+	@# On a FULL H200 (132 SMs) the same saving is ~0.09 ms against a 3.4 ms host term -- i.e.
+	@# invisible, with the TTFT and accuracy costs unchanged, so vtl_fp8 is the better ship.
+	@d=$$(sed -n 's/.*w4a8 device = //p' /tmp/vtl-verify.log | tail -1); \
+	 if [ -z "$$d" ]; then echo "WARN GPU identity unknown -- w4a8 registration never logged"; \
+	 else \
+	   sm=$$(echo "$$d" | sed -n 's/.*, \([0-9]*\) SMs.*/\1/p'); \
+	   if [ -n "$$sm" ] && [ "$$sm" -gt 60 ]; then \
+	     echo "WARN GPU is $$d -- NOT a MIG slice. W4A8 buys ~0.09 ms here and still costs TTFT"; \
+	     echo "     + accuracy: A/B VTL_QUANT=vtl_fp8 before submitting."; \
+	   else echo "OK   GPU is $$d"; fi; \
+	 fi
 	@grep -q "registered quantization method 'vtl_w4a8'" /tmp/vtl-verify.log \
 	  && echo "OK   vtl_w4a8 registered" \
 	  || { echo "FAIL vtl_w4a8 not registered -- the serve flag would abort at startup"; exit 1; }

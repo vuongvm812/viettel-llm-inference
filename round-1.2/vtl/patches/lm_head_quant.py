@@ -123,12 +123,15 @@ def _int4_method_cls():
 
     Cached on the FUNCTION for the same pickle reason as ``quant_w4a8._linear_method_cls``.
 
-    LOAD-TIME PEAK. ``_quantize_and_pack`` works in fp32 and ``quantize_weights`` also builds a
-    dequantized reference, so this layer transiently holds ~1.6 GB on device -- 4x any other
-    layer in the model, because it is 4x the biggest one. It is freed before the KV cache is
-    allocated, so it fits, but it is the largest single allocation the process ever makes and
-    the first thing to look at if load OOMs on the 18 GB slice. The fp8 rung below has no such
-    peak (one fused op, no fp32 round trip).
+    LOAD-TIME PEAK ~2.5 GiB, the largest transient the process ever makes -- 4x the biggest body
+    layer (w13, ~0.6 GiB), because lm_head is 4x its size. ``_quantize_and_pack`` promotes to
+    fp32, and ``quantize_weights`` (quant_utils.py:610-702) then holds roughly five live
+    K*N*4-byte buffers at once: the fp32 transpose, the permute/reshape copy, the ``w / w_s``
+    temporary, ``w_q`` as int32, and the dequantized ``w_ref`` it builds even though we discard
+    it. Freed before the KV cache is sized, so it fits on an 18 GiB MIG slice with room to
+    spare and is a non-event on a full 141 GiB H200 -- but it is the first thing to look at if
+    model load OOMs, and the failure is silent (the parent's try leaves the head bf16). The fp8
+    rung below has no such peak: one fused op, no fp32 round trip.
     """
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         UnquantizedEmbeddingMethod,
