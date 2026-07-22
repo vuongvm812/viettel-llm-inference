@@ -5,7 +5,8 @@
 # 1, nothing was using the extra cores and CPU pinning / NUMA / Rust are all moot.
 #
 # Usage:
-#   COMPOSE="docker compose -f docker-compose-optimized.yaml \
+#   COMPOSE="docker compose -f docker-compose.yaml \
+#                           -f docker-compose-optimized.yaml \
 #                           -f docker-compose.localtest.yaml \
 #                           -f docker-compose.cpucap.yaml"
 #   VTL_CPUS=3 $COMPOSE up -d --wait

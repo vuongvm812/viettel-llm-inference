@@ -1,10 +1,14 @@
-"""Quantize the LFM2 short-conv projections (``in_proj``/``out_proj``) to fp8.
+"""Quantize the LFM2 short-conv projections (``in_proj``/``out_proj``).
 
 TPOT lever. Decode is memory-bandwidth bound, so per-token weight traffic sets the
-decode latency. Every weight in the LFM2.5 body is already fp8 EXCEPT the 10 short-conv
+decode latency. Every weight in the LFM2.5 body is quantized EXCEPT the 10 short-conv
 layers' ``in_proj``/``out_proj`` -- stock ``ShortConv.__init__`` builds them without a
 ``quant_config`` (see vllm ``.../mamba/short_conv.py``), so they stay bf16: ~336 MB/token,
 ~9-11% of decode weight traffic, the single largest un-quantized chunk.
+
+Precision-agnostic: it forwards whatever ``quant_config`` is active, so these layers follow
+the serve flag -- int4 under ``--quantization=vtl_w4a8`` ([[quant_w4a8]]), fp8 under
+``vtl_fp8`` ([[quant_fp8]]).
 
 This patch wraps ``ShortConv.__init__`` and, when a quant_config is active, rebuilds ONLY
 ``in_proj`` and ``out_proj`` with that config. The depthwise ``conv`` weight is left bf16
@@ -12,11 +16,12 @@ This patch wraps ``ShortConv.__init__`` and, when a quant_config is active, rebu
 edit and no change to the caller (``Lfm2ShortConvDecoderLayer``) -- ShortConv already reads
 the global vLLM config in its own ``__init__``.
 
-Nothing else is needed: with ``--quantization=vtl_fp8`` the existing ``VtlFp8Config``
-(see quant_fp8.py) quantizes any ``LinearBase`` whose prefix isn't in ``VTL_FP8_IGNORE``,
-and the existing kernels light up for free -- ``operator_norm``->``in_proj`` fuses via the
-RMSNormQuantFusionPass (rms_norm_quant), and ``out_proj``'s (non-norm) input gets the
-standalone dynamic_per_token_scaled_fp8_quant kernel.
+Nothing else is needed: the active config (``VtlW4A8Config`` / ``VtlFp8Config``) quantizes any
+``LinearBase`` whose prefix isn't in its ignore list, and the existing kernels light up for
+free -- ``operator_norm``->``in_proj`` fuses via the RMSNormQuantFusionPass (rms_norm_quant),
+and ``out_proj``'s (non-norm) input gets the standalone dynamic_per_token_scaled_fp8_quant
+kernel. Both cases feed the GEMM the same fp8-e4m3 activation + per-token scale; only the
+weight side differs.
 
 Rebuild-after-init throws away the just-built bf16 linears; that cost is paid once at model
 load, never at inference. Set ``VTL_ENABLE_SHORTCONV_QUANT=0`` to keep the conv projections bf16.

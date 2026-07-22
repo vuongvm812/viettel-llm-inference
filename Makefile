@@ -57,7 +57,10 @@ PGO_TARGET_CPU ?= native
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
 IN := cd $(ROUND) &&
 TRACE := data/input/trace-round2.jsonl
-COMPOSE_FILES := -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
+# docker-compose.yaml is the SUBMISSION artifact and the single source of truth for every
+# serve flag and env var; the three overlays only carry their differences (dev image tag,
+# local build+mount, judge-box resource caps). Order matters -- later -f wins.
+COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 DC := docker compose $(COMPOSE_FILES)
 
 .PHONY: check stats build up down warm push bench profile test-kernel bench-kernel debug-kernel verify vllm-fork
@@ -134,6 +137,22 @@ verify:
 	@grep -q "registered quantization method 'vtl_fp8'" /tmp/vtl-verify.log \
 	  && echo "OK   vtl_fp8 registered" \
 	  || { echo "FAIL vtl_fp8 not registered"; exit 1; }
+	@# vtl_w4a8 is the shipped --quantization. Every one of its failure modes degrades to fp8
+	@# rather than crashing, so without these three greps `make verify` prints all-OK in exactly
+	@# the world where int4 silently never happened. Check registration, kernel availability,
+	@# and how many layers actually ended up int4.
+	@grep -q "registered quantization method 'vtl_w4a8'" /tmp/vtl-verify.log \
+	  && echo "OK   vtl_w4a8 registered" \
+	  || { echo "FAIL vtl_w4a8 not registered -- the serve flag would abort at startup"; exit 1; }
+	@grep -q "W4A8 CUDA ops absent" /tmp/vtl-verify.log \
+	  && { echo "FAIL W4A8 kernel missing from this image (needs sm90a + CUDA>=12); serving fp8"; exit 1; } \
+	  || echo "OK   W4A8 CUDA ops present"
+	@grep -q "w4a8 quantized 0 layers" /tmp/vtl-verify.log \
+	  && { echo "FAIL 0 layers quantized to int4 -- this is an fp8 server wearing a w4a8 flag"; exit 1; } \
+	  || true
+	@n=$$(sed -n 's/.*w4a8 quantized \([0-9]*\) layers.*/\1/p' /tmp/vtl-verify.log | tail -1); \
+	 if [ -n "$$n" ]; then echo "OK   vtl_w4a8 quantized $$n layers to int4"; \
+	 else echo "WARN w4a8 layer count unknown -- no forward pass ran, or logging below INFO"; fi
 	@grep -q "channelwise fp8 unavailable" /tmp/vtl-verify.log \
 	  && echo "WARN channelwise fp8 fell back to stock per-tensor" \
 	  || echo "OK   channelwise fp8 active"

@@ -10,7 +10,7 @@
  import torch
  
  from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
-@@ -28,8 +31,122 @@
+@@ -28,8 +31,168 @@
  from vllm.v1.attention.backend import AttentionMetadata
  from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
  from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
@@ -35,14 +35,37 @@
 +# into that staging buffer). See round-1.2/vtl/patches/bcx_conv_gate.py.
 +_VTL_BCX_CONV_GATE = _vtl_flag("VTL_ENABLE_BCX_CONV_GATE")
 +
++# The CUTLASS W4A8 kernel supports exactly one group size and rejects anything else in
++# can_implement(), so this cannot drift from round-1.2/vtl/patches/quant_w4a8.py:GROUP_SIZE
++# without the layer failing to build in the first place. Hardcoded rather than imported to
++# keep this file free of vtl imports.
++_VTL_W4A8_GROUP_SIZE = 128
++
++
++def _vtl_w4a8_out_proj(out_proj) -> bool:
++    """True if ``out_proj`` was quantized to int4 by round-1.2/vtl/patches/quant_w4a8.py.
++
++    Keys on the SAME single flag that quant_w4a8's own ``apply()`` keys on, deliberately, rather
++    than duck-typing the three packed attributes. Two predicates that mean "is this layer int4"
++    are two predicates that can disagree: the attributes appear one assignment before the flag
++    is set, and in that window a duck-typing check here would call cutlass_w4a8_mm against a
++    half-installed layer -- wrong numerics, not slow numerics. quant_w4a8 sets the flag last and
++    only inside its try, so the flag is true only when the layer is fully built.
++    """
++    return getattr(out_proj, "_vtl_w4a8_done", False)
++
 +
 +def _vtl_mul_quant_eligible(out_proj) -> bool:
 +    """True if ``out_proj`` can take a pre-quantized fp8 activation for the fused gate path.
 +
-+    Cached per-layer. Requires the flag on, the fused op registered, and ``out_proj`` on our
-+    channelwise vtl_fp8 path: a column-major fp8 weight + per-channel ``weight_scale``, no bias,
-+    not Marlin, and TP=1 (RowParallelLinear's all-reduce is not replicated here). Any miss ->
-+    stock path, so this never changes numerics outside the exact config it checks for.
++    Cached per-layer. Requires the flag on, the fused op registered, no bias, not Marlin, and
++    TP=1 (RowParallelLinear's all-reduce is not replicated here), plus ``out_proj`` on one of
++    our two quantized paths -- both consume the SAME fp8 activation + per-token scale:
++
++      * vtl_w4a8: int4 ``weight_packed`` + group/channel scales -> ops.cutlass_w4a8_mm
++      * vtl_fp8:  column-major fp8 ``weight`` + per-channel ``weight_scale`` -> cutlass_scaled_mm
++
++    Any miss -> stock path, so this never changes numerics outside the configs it checks for.
 +    """
 +    cached = getattr(out_proj, "_vtl_mul_quant_ok", None)
 +    if cached is not None:
@@ -52,13 +75,16 @@
 +        from vllm.distributed import get_tensor_model_parallel_world_size
 +
 +        weight = getattr(out_proj, "weight", None)
++        quantized = _vtl_w4a8_out_proj(out_proj) or (
++            weight is not None
++            and weight.dtype == torch.float8_e4m3fn
++            and getattr(out_proj, "weight_scale", None) is not None
++        )
 +        ok = (
 +            _VTL_MUL_QUANT
 +            and hasattr(torch.ops, "vllm_cuda")
 +            and hasattr(torch.ops.vllm_cuda, "mul_dynamic_per_token_quant")
-+            and weight is not None
-+            and weight.dtype == torch.float8_e4m3fn
-+            and getattr(out_proj, "weight_scale", None) is not None
++            and quantized
 +            and getattr(out_proj, "bias", None) is None
 +            and not getattr(getattr(out_proj, "quant_method", None), "use_marlin", False)
 +            and get_tensor_model_parallel_world_size() == 1
@@ -109,17 +135,37 @@
 +        ok = False
 +    layer._vtl_conv_gate_ok = ok
 +    return ok
- 
- 
-+def _vtl_out_proj_fp8(out_proj, y_fp8, y_scale, out_dtype):
++
++
++def _vtl_out_proj_quantized(out_proj, y_fp8, y_scale, out_dtype):
 +    """out_proj GEMM over an already-quantized activation.
 +
-+    Pre-quantized fp8 GEMM: weight is column-major [K, N] fp8, weight_scale per-channel [N, 1]
-+    -- exactly what the stock Fp8 apply_weights passes to cutlass_scaled_mm (no padding at
-+    dim=2048, no bias, TP=1; all guaranteed by ``_vtl_mul_quant_eligible``).
++    This is the ONE place the fused short-conv path reaches the GEMM: the whole ShortConv
++    forward runs inside an opaque custom op, so no FX fusion pass can rewrite it and the call
++    is made by hand. Both arms take the same pre-quantized fp8 activation + per-token scale
++    that mul_quant/bcx_conv_gate just produced, so nothing upstream cares which one runs.
++    Preconditions (no padding at dim=2048, no bias, TP=1) come from _vtl_mul_quant_eligible.
 +    """
 +    from vllm import _custom_ops as ops
 +
++    if _vtl_w4a8_out_proj(out_proj):
++        # int4 weights: group scales are consumed in the GEMM mainloop, the per-channel fp32
++        # residual and our per-token activation scale in the epilogue. Always emits bf16.
++        return ops.cutlass_w4a8_mm(
++            a=y_fp8,
++            b_q=out_proj.weight_packed,
++            b_group_scales=out_proj.weight_group_scale,
++            b_group_size=_VTL_W4A8_GROUP_SIZE,
++            a_token_scales=y_scale,
++            b_channel_scales=out_proj.weight_chan_scale,
++            # Read off the LAYER, never from os.environ. quant_w4a8.schedule() is the single
++            # process-wide read of VTL_W4A8_SCHEDULE and stamps the validated result here, so a
++            # sweep cannot apply to the other GEMMs but silently miss these ten conv out_projs.
++            maybe_schedule=getattr(out_proj, "_vtl_w4a8_schedule", None),
++        ).to(out_dtype)
+ 
++    # fp8 weights: column-major [K, N], weight_scale per-channel [N, 1] -- exactly what the
++    # stock Fp8 apply_weights passes to cutlass_scaled_mm.
 +    return ops.cutlass_scaled_mm(
 +        y_fp8,
 +        out_proj.weight,
@@ -128,12 +174,12 @@
 +        out_dtype=out_dtype,
 +        bias=None,
 +    )
-+
+ 
 +
  # --8<-- [start:short_conv]
  @CustomOp.register("short_conv")
  class ShortConv(MambaBase, CustomOp):
-@@ -259,7 +376,60 @@
+@@ -259,6 +422,59 @@
              dim=0,
          )
          conv_output_list = []
@@ -145,7 +191,7 @@
 +        # post-sample (vtl.conv_commit). Inactive (None) -> byte-identical stock decode.
 +        # ON-BOX: scratch layout, state_indices, and cudagraph capture of the staged path.
 +        _vtl_stage = globals().get("_VTL_CONV_STAGE")
- 
++
 +        # vtl Phase-3 fused path (opt-in, fail-closed). Both halves quantize their own rows into
 +        # one shared fp8 staging buffer, so the single out_proj GEMM can consume the whole merged
 +        # decode|prefill tensor pre-quantized -- decode-only, prefill-only and mixed batches alike,
@@ -190,11 +236,10 @@
 +                    "vtl: short-conv fp8 staging buffer alloc failed; using stock"
 +                )
 +                use_fused = use_conv_gate = False
-+
+ 
          if has_prefill:
              Bx_p = (B_p * x_p).transpose(0, 1)
-             Bx = causal_conv1d_fn(
-@@ -274,21 +444,61 @@
+@@ -274,21 +490,61 @@
                  query_start_loc=query_start_loc_p,
              ).transpose(0, 1)[:num_prefill_tokens]
  
@@ -259,7 +304,7 @@
 +                    conv_output_list.insert(0, y)
 +
 +        if use_fused:
-+            output[:num_actual_tokens] = _vtl_out_proj_fp8(
++            output[:num_actual_tokens] = _vtl_out_proj_quantized(
 +                self.out_proj, y_fp8, y_scale, BCx.dtype
              )
 -            y = C_d * Bx

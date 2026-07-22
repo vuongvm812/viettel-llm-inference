@@ -46,7 +46,8 @@ This is why the flags look the way they do:
 | `vtl/` | The plugin. `plugin.py` is the entry point, `registry.py` the patch registry, `patches/` the patches. |
 | `bench/` | `trace_stats.py` (workload characterization), `replay.py` (open/closed-loop replay), `metrics.py`, `compare.py`. |
 | `Dockerfile` | Bakes the plugin **wheel** into the vLLM image. A bind-mount would not register the entry point. |
-| `docker-compose-optimized.yaml` | The submission. Registry-only: no build context, judge provides `/model`, serves `:8000`. |
+| `docker-compose.yaml` | **The submission.** Registry-only: no build context, judge provides `/model`, serves `:8000`. Single source of truth for every serve flag and env var. |
+| `docker-compose-optimized.yaml` | Local-dev overlay — swaps the pinned digest for the `:dev` tag. Stacks on top of `docker-compose.yaml`; not standalone. |
 | `docker-compose.localtest.yaml` | Local overlay — builds the image and mounts `hf-model/`. Not submitted. |
 
 ## Patches

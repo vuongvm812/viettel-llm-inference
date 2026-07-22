@@ -26,7 +26,8 @@ log = logging.getLogger("vtl")
 # are model-agnostic and cover LFM2's other fp8 paths (attn qkv/out_proj, MLP w13/w2) directly.
 _MODULES: tuple[str, ...] = (
     "quant_fp8",
-    "shortconv_quant",  # fp8 the short-conv in_proj/out_proj (reuses the kernels above)
+    "quant_w4a8",       # int4 weights + fp8 acts; delegates un-int4-able layers back to quant_fp8
+    "shortconv_quant",  # quantize the short-conv in_proj/out_proj (reuses the kernels above)
     "rms_norm_quant",
     "dynamic_per_token_quant",
     "silu_mul_quant",
