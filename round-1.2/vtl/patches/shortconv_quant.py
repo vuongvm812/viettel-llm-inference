@@ -17,11 +17,22 @@ edit and no change to the caller (``Lfm2ShortConvDecoderLayer``) -- ShortConv al
 the global vLLM config in its own ``__init__``.
 
 Nothing else is needed: the active config (``VtlW4A8Config`` / ``VtlFp8Config``) quantizes any
-``LinearBase`` whose prefix isn't in its ignore list, and the existing kernels light up for
-free -- ``operator_norm``->``in_proj`` fuses via the RMSNormQuantFusionPass (rms_norm_quant),
-and ``out_proj``'s (non-norm) input gets the standalone dynamic_per_token_scaled_fp8_quant
-kernel. Both cases feed the GEMM the same fp8-e4m3 activation + per-token scale; only the
-weight side differs.
+``LinearBase`` whose prefix isn't in its ignore list, and both projections feed the GEMM the
+same fp8-e4m3 activation + per-token scale; only the weight side differs.
+
+Both ends reach a fused kernel, but by DIFFERENT routes, and neither was free:
+
+* ``operator_norm``->``in_proj`` fuses via RMSNormQuantFusionPass into rms_norm_quant -- but
+  only because of two fork patches. ``ShortConv.forward`` dispatches through
+  ``torch.ops.vllm.short_conv`` (direct_register_custom_op), so while ``in_proj`` lived inside
+  that opaque op no FX pass could see its activation quant, and ``operator_norm`` sits outside
+  it. ``short_conv.patch`` hoists ``in_proj`` out; ``lfm2.patch`` changes
+  ``output = torch.empty_like(hidden_states)`` to ``empty_like(residual)`` so the norm output
+  stops having a second consumer (pm.register_replacement will not match an internal node with
+  extra users). Either patch alone is inert. Before them the 6 attention layers fused and these
+  10 did not -- ~671 MB of avoidable prefill traffic at 8192 tokens.
+* ``out_proj``'s input never goes through a pass at all: it is quantized by hand inside the op
+  by mul_quant / bcx_conv_gate_quant, which write fp8 straight into the staging buffer.
 
 Rebuild-after-init throws away the just-built bf16 linears; that cost is paid once at model
 load, never at inference. Set ``VTL_ENABLE_SHORTCONV_QUANT=0`` to keep the conv projections bf16.

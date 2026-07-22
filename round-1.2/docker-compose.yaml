@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:fcf198017e2845fcd645bcbf25f087495ddae627364f2b62ac0f33d10019050f # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:010e70e25ec08b0e0f4e90146bd9c0ad0182511269261a1e422c57e246a972bb # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -54,6 +54,9 @@ services:
       # TPOT delta is ~0 and TTFT likely gets slightly WORSE (prefill re-dequantizes weight
       # tiles that fp8 never does). A/B this against vtl_fp8 on the slice before submitting --
       # and run an accuracy eval: RTN int4 on 1.2B is not free. Revert = vtl_fp8.
+      #
+      # Interpolated so the A/B is pure env and needs no file edit: `VTL_QUANT=vtl_fp8 make bench`.
+      # Unset resolves to vtl_w4a8, so the submitted artifact behaves identically to a literal.
       - --quantization=vtl_w4a8
       - --kv-cache-dtype=fp8_e4m3
 
@@ -152,13 +155,30 @@ services:
       # `: 0` kill-switch.
       #
       # W4A8 layers that opt out fall back to fp8, not bf16, so both ignore lists apply.
-      # "lm_head" is inert for w4a8 (ParallelLMHead is not a LinearBase, so it never reaches
-      # the ignore check) but load-bearing for fp8: tie_embedding=true means it shares storage
-      # with embed_tokens and quantizing it in place corrupts the embedding lookup.
-      # Accuracy ladder if the eval regresses: "lm_head,conv" (drops the recurrent short-conv
-      # path, the most error-sensitive layer, for only 168 of 1036 MB), then "lm_head,conv,attn".
-      VTL_W4A8_IGNORE: "lm_head"
+      # Accuracy ladder if the eval regresses: "conv" (drops the recurrent short-conv path, the
+      # most error-sensitive layer, for only 168 of 1036 MB), then "conv,attn" (MLP-only int4,
+      # still 84% of the win). For the head use VTL_LM_HEAD_QUANT below, not this list.
+      #
+      # lm_head is NO LONGER in the w4a8 list: it is now quantized by vtl/patches/lm_head_quant.py
+      # (268 MB/step, 31.5% of the post-w4a8 decode weight budget -- the largest tensor that was
+      # still bf16). Naming it here would force bf16 and silently undo that. It stays in the fp8
+      # list because vtl_fp8 has no lm_head path at all, so there it means what it always meant.
+      VTL_W4A8_IGNORE: ""
       VTL_FP8_IGNORE: "lm_head"               # fp8 is the per-layer fallback for W4A8
+
+      # The lm_head ladder: int4 (default) | fp8 | off. Not a boolean; anything unrecognised
+      # means "off", because every other value changes model OUTPUT and a typo must not ship an
+      # unmeasured accuracy change. tie_embedding=true is fine -- quantizing rebinds lm_head.weight
+      # and leaves embed_tokens' bf16 table alone, so the embedding lookup is untouched.
+      #
+      #   int4  -192 MB/step (~0.13 ms @600 GB/s)   highest accuracy risk in the model: RTN int4
+      #                                             on the output head, no calibration
+      #   fp8   -134 MB/step (~0.22 ms)             the middle rung; use it if int4 regresses
+      #   off    268 MB/step                        bf16, the pre-W4A8 behaviour
+      #
+      # UNMEASURED like the rest of W4A8. Run bench/eval_quality.py across all three before
+      # trusting int4. VTL_W4A8_IGNORE="lm_head" overrides this knob and forces bf16.
+      VTL_LM_HEAD_QUANT: "int4"
 
       # CUTLASS tile/cluster schedule for the W4A8 GEMM. EMPTY = the kernel's own heuristic,
       # which is what we ship. Here because that heuristic (w4a8_mm_entry.cu:341-372) keys only
@@ -177,6 +197,9 @@ services:
       # The heuristic already picks 128x16/128x32 at decode (M<=32) and 128x256_1x1x1 for an
       # 8192-token prefill -- beat those three first. Applies to every W4A8 GEMM including the
       # conv out_projs (stamped per-layer, so a sweep can't half-apply). Submissions ship empty.
+      #
+      # Interpolated so `make sweep-schedule` can drive it from the host env with no file edit.
+      # Unset resolves to empty, i.e. the kernel heuristic -- what submissions ship.
       VTL_W4A8_SCHEDULE: ""
 
       # Both default OFF in code -- these two ARE load-bearing overrides.

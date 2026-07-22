@@ -1,0 +1,22 @@
+--- a/vllm/model_executor/models/lfm2.py
++++ b/vllm/model_executor/models/lfm2.py
+@@ -283,7 +283,18 @@
+             hidden_states = self.operator_norm(hidden_states)
+         else:
+             hidden_states, residual = self.operator_norm(hidden_states, residual)
+-        output = torch.empty_like(hidden_states)
++        # vtl: `empty_like(residual)`, NOT `empty_like(hidden_states)`.
++        #
++        # `hidden_states` here is the operator_norm OUTPUT. Allocating from it makes this
++        # `aten.empty_like` a second consumer of that node, and pm.register_replacement
++        # (compilation/passes/fusion/rms_quant_fusion.py) will not match an internal pattern node
++        # that has users outside the pattern. So the norm+quant fusion silently never fired for
++        # the 10 short-conv layers, while the 6 attention layers -- which have no such alloc --
++        # fused fine. `residual` is the same shape/dtype/device in BOTH branches above and is
++        # never the norm output, so this allocates identically and leaves the norm with exactly
++        # one consumer: the quant that short_conv.patch just hoisted out of the custom op.
++        # Both patches are required; either alone is inert.
++        output = torch.empty_like(residual)
+         self.short_conv(
+             hidden_states,
+             output,

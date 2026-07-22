@@ -23,6 +23,9 @@ gen() {  # $1 = package-relative path, $2 = patch basename
 gen entrypoints/openai/api_server.py          api_server_rust_frontend
 gen v1/sample/rejection_sampler.py            rejection_sampler
 gen model_executor/layers/mamba/short_conv.py short_conv
+# Paired with short_conv: the in_proj hoist only lets RMSNormQuantFusionPass fire if the
+# operator_norm output also stops having a second consumer. Regenerate them together.
+gen model_executor/models/lfm2.py                lfm2
 gen v1/attention/backends/flash_attn.py       flash_attn
 gen v1/worker/gpu_model_runner.py             gpu_model_runner
 

@@ -15,8 +15,8 @@
  from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
  from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 +from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-+
-+
+ 
+ 
 +def _vtl_flag(name: str) -> bool:
 +    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 +
@@ -163,7 +163,7 @@
 +            # sweep cannot apply to the other GEMMs but silently miss these ten conv out_projs.
 +            maybe_schedule=getattr(out_proj, "_vtl_w4a8_schedule", None),
 +        ).to(out_dtype)
- 
++
 +    # fp8 weights: column-major [K, N], weight_scale per-channel [N, 1] -- exactly what the
 +    # stock Fp8 apply_weights passes to cutlass_scaled_mm.
 +    return ops.cutlass_scaled_mm(
@@ -174,16 +174,87 @@
 +        out_dtype=out_dtype,
 +        bias=None,
 +    )
- 
++
 +
  # --8<-- [start:short_conv]
  @CustomOp.register("short_conv")
  class ShortConv(MambaBase, CustomOp):
-@@ -259,6 +422,59 @@
-             dim=0,
+@@ -88,7 +251,7 @@
+ 
+     def forward_native(
+         self,
+-        hidden_states: torch.Tensor,
++        BCx: torch.Tensor,
+         output: torch.Tensor,
+     ):
+         # Reference torch causal conv1d; runs on all CPU platforms. AMX kernels
+@@ -106,7 +269,6 @@
+             attn_metadata = attn_metadata_raw[self.prefix]
+             assert isinstance(attn_metadata, ShortConvAttentionMetadata)
+ 
+-        BCx, _ = self.in_proj(hidden_states)
+         B, C, x = BCx.chunk(3, dim=-1)
+ 
+         # (dim, kernel_size) — same reshape as forward_cuda
+@@ -118,7 +280,7 @@
+             # Profile run — output value doesn't matter
+             Bx = (B * x).contiguous()
+             output_tensor, _ = self.out_proj(C * Bx)
+-            output[: hidden_states.shape[0]] = output_tensor
++            output[: BCx.shape[0]] = output_tensor  # vtl: BCx has the same token count
+             return
+ 
+         conv_state = (
+@@ -185,15 +347,34 @@
+         hidden_states: torch.Tensor,
+         output: torch.Tensor,
+     ):
++        # vtl: in_proj is applied HERE, outside the custom op, and the op takes BCx.
++        #
++        # `torch.ops.vllm.short_conv` is opaque to every FX pass (direct_register_custom_op
++        # below), so while in_proj lived inside it, RMSNormQuantFusionPass could not see the
++        # QuantFP8 that in_proj's quantized path emits -- `operator_norm` sits OUTSIDE the op
++        # (lfm2.py) and the quant sat inside. Result: the 6 attention layers fused their
++        # norm+quant into our rms_norm_quant CUDA kernel and the 10 short-conv layers did not,
++        # each materializing a bf16 [T, dim] norm output and reading it straight back.
++        # ~671 MB of avoidable prefill traffic at T=8192.
++        #
++        # Hoisting is only half the fix: the norm output also needs to have exactly ONE consumer,
++        # or pm.register_replacement refuses the match. See the companion lfm2.patch, which stops
++        # `output = torch.empty_like(hidden_states)` from being the second one. Either patch
++        # alone is inert.
++        #
++        # out_proj deliberately stays INSIDE the op: the fused mul_quant / bcx_conv_gate_quant
++        # path feeds it an already-quantized activation by hand (_vtl_out_proj_quantized), which
++        # is not something a fusion pass could express anyway.
++        BCx, _ = self.in_proj(hidden_states)
+         torch.ops.vllm.short_conv(
+-            hidden_states,
++            BCx,
+             output,
+             self.prefix,
+         )
+ 
+     def forward_cuda(
+         self,
+-        hidden_states: torch.Tensor,
++        BCx: torch.Tensor,
+         output: torch.Tensor,
+     ):
+         forward_context = get_forward_context()
+@@ -218,8 +399,6 @@
+             has_initial_states_p = attn_metadata.has_initial_states_p
+             query_start_loc_p = attn_metadata.query_start_loc_p
+ 
+-        BCx, _ = self.in_proj(hidden_states)
+-
+         B, C, x = BCx.chunk(3, dim=-1)
+ 
+         conv_weights = self.conv.weight.view(
+@@ -260,6 +439,59 @@
          )
          conv_output_list = []
-+
+ 
 +        # vtl tree-spec P5 seam: during tree verify every draft node arrives as a "decode"
 +        # token and causal_conv1d_update would advance the PERSISTENT conv_state for rejected
 +        # drafts too. When the runner activates staging (_VTL_CONV_STAGE set), we stage each
@@ -236,10 +307,11 @@
 +                    "vtl: short-conv fp8 staging buffer alloc failed; using stock"
 +                )
 +                use_fused = use_conv_gate = False
- 
++
          if has_prefill:
              Bx_p = (B_p * x_p).transpose(0, 1)
-@@ -274,21 +490,61 @@
+             Bx = causal_conv1d_fn(
+@@ -274,21 +506,61 @@
                  query_start_loc=query_start_loc_p,
              ).transpose(0, 1)[:num_prefill_tokens]
  
@@ -313,3 +385,31 @@
  
          # Merge prefill and decode outputs before passing to gated MLP
          hidden_states = torch.vstack(conv_output_list)
+@@ -317,20 +589,23 @@
+ 
+ 
+ def short_conv(
+-    hidden_states: torch.Tensor,
++    BCx: torch.Tensor,
+     output: torch.Tensor,
+     layer_name: str,
+ ) -> None:
++    # vtl: takes the in_proj OUTPUT, not hidden_states -- in_proj is applied by
++    # ShortConv.forward so the fusion pass can reach its activation quant. `mutates_args` and
++    # the fake impl are unchanged: the op still only writes `output`.
+     forward_context: ForwardContext = get_forward_context()
+     self = forward_context.no_compile_layers[layer_name]
+     if not current_platform.is_cpu():
+-        self.forward_cuda(hidden_states=hidden_states, output=output)
++        self.forward_cuda(BCx=BCx, output=output)
+     else:
+-        self.forward_native(hidden_states=hidden_states, output=output)
++        self.forward_native(BCx=BCx, output=output)
+ 
+ 
+ def short_conv_fake(
+-    hidden_states: torch.Tensor,
++    BCx: torch.Tensor,
+     output: torch.Tensor,
+     layer_name: str,
+ ) -> None:

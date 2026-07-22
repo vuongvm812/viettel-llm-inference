@@ -31,6 +31,13 @@ MAX_JOBS ?= 4
 VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
 # Forked vLLM base = VLLM_STOCK + vtl tree-spec source patches, built by $(ROUND)/Dockerfile.vllm-fork
 # (Python-only overlay -> no CUDA rebuild). Pin VLLM_FORK_TAG to the pushed digest. See make vllm-fork.
+#
+# !! STALE. This digest predates the short_conv in_proj hoist + the paired lfm2 empty_like fix
+# (vtl/vllm_patches/v0.25.0/{short_conv,lfm2}.patch), which are what let RMSNormQuantFusionPass
+# reach the 10 short-conv layers. Until `make vllm-fork PUSH=1` re-runs and this digest is
+# re-pinned, `make up` serves the OLD fork and that fusion silently does not happen -- which
+# looks exactly like success. `make verify` catches it: the "fusion replaced N patterns" count
+# stays at its pre-hoist value instead of rising by the conv-layer count.
 VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
 VLLM_FORK_TAG ?= v0.25.0-tree@sha256:811dc148aef863d14d4c077b639afd76a5de5c2dc8e5c1eeb09896ae3b26122c
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
@@ -63,7 +70,7 @@ TRACE := data/input/trace-round2.jsonl
 COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 DC := docker compose $(COMPOSE_FILES)
 
-.PHONY: check stats build up down warm push bench profile test-kernel bench-kernel debug-kernel verify vllm-fork
+.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -75,6 +82,7 @@ check:
 	done
 	$(IN) python3 bench/trace_stats.py --self-check
 	$(IN) python3 bench/metrics.py
+	$(IN) python3 bench/eval_quality.py --self-check
 	$(IN) python3 bench/profile_trace.py --self-check
 	$(IN) [ -f bench/build_trace_round2.py ] && PYTHONPATH=. python3 bench/build_trace_round2.py --self-check || true
 	$(IN) python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
@@ -153,6 +161,16 @@ verify:
 	@n=$$(sed -n 's/.*w4a8 quantized \([0-9]*\) layers.*/\1/p' /tmp/vtl-verify.log | tail -1); \
 	 if [ -n "$$n" ]; then echo "OK   vtl_w4a8 quantized $$n layers to int4"; \
 	 else echo "WARN w4a8 layer count unknown -- no forward pass ran, or logging below INFO"; fi
+	@# lm_head is 268 MB/step, 31.5% of the post-w4a8 decode weight budget, and every one of its
+	@# failure modes leaves it silently bf16 -- indistinguishable from success in every other
+	@# signal. lm_head_quant.py logs the outcome AFTER the weights actually changed.
+	@grep -q "lm_head quantization .* FAILED" /tmp/vtl-verify.log \
+	  && { echo "FAIL lm_head fell back to bf16 -- 268 MB/step of decode traffic we thought was gone"; exit 1; } \
+	  || true
+	@m=$$(sed -n 's/.*lm_head quantized to \([a-z0-9]*\).*/\1/p' /tmp/vtl-verify.log | tail -1); \
+	 if [ -n "$$m" ]; then echo "OK   lm_head quantized to $$m"; \
+	 elif grep -q 'lm_head=off' /tmp/vtl-verify.log; then echo "WARN lm_head is bf16 (VTL_LM_HEAD_QUANT=off)"; \
+	 else echo "WARN lm_head outcome unknown -- no forward pass ran, or VTL_W4A8_IGNORE names it"; fi
 	@grep -q "channelwise fp8 unavailable" /tmp/vtl-verify.log \
 	  && echo "WARN channelwise fp8 fell back to stock per-tensor" \
 	  || echo "OK   channelwise fp8 active"
@@ -233,6 +251,25 @@ bench:
 	  python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	    --closed-loop $$n --out bench-closed-$$n.json; \
 	done
+
+## Sweep the CUTLASS W4A8 tile/cluster schedule (needs the GPU). The kernel's own heuristic
+## (w4a8_mm_entry.cu:341-372) keys ONLY on M/N/K and is blind to SM count -- it was tuned on a
+## full 132-SM Hopper and the judge's MIG 1g.18gb slice has ~19, so its choice is an open
+## question, not a settled one. This is the one already-exposed W4A8 tunable never swept.
+## `heuristic` is the sentinel for "unset", the baseline every other row must beat -- a literal
+## empty word cannot survive make -> shell word splitting. The three named tiles are what the
+## heuristic picks for our shapes (M<=32 decode, 8192-token prefill).
+SCHEDULES ?= heuristic 128x16_1x1x1 128x32_1x1x1 128x256_1x1x1
+sweep-schedule:
+	@for name in $(SCHEDULES); do \
+	  case "$$name" in heuristic) s="";; *) s="$$name";; esac; \
+	  echo "=== VTL_W4A8_SCHEDULE=$${s:-<heuristic>}"; \
+	  ( cd $(ROUND) && VTL_W4A8_SCHEDULE="$$s" $(DC) up -d --force-recreate --wait \
+	    && VTL_W4A8_SCHEDULE="$$s" python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	         --out bench-sched-$$name.json \
+	    ; rc=$$?; VTL_W4A8_SCHEDULE="$$s" $(DC) down; exit $$rc ) || exit 1; \
+	done
+	@echo "compare: $(ROUND)/bench-sched-*.json (heuristic is the baseline)"
 
 ## Phase-0 profiler (needs the H200). Boots with vLLM's torch profiler enabled, drives a small
 ## closed-loop replay, and prints a ranked GPU-kernel cost table. See docs/plans/.

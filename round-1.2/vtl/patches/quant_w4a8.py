@@ -23,8 +23,16 @@ slice's GPU term as bandwidth plus a non-scaling fixed launch cost, and adding t
 of KV traffic W4A8 does not touch, gives roughly 3.1 ms fp8 -> 2.4 ms int4: BOTH under the host
 term, i.e. a measured TPOT delta of ~0. And TTFT can only get worse -- at 8192 batched tokens the
 kernel re-dequantizes each weight tile once per 256-token N-tile, SM work on an SM-starved slice
-that pure-fp8 cutlass_scaled_mm never pays. The base case for this whole patch is "no benefit,
-slightly worse TTFT". It must be A/B'd against vtl_fp8 on the MIG slice before it ships.
+that pure-fp8 cutlass_scaled_mm never pays -- and prefill on 19 SMs is COMPUTE bound, which is
+exactly where that lands. The base case for this whole patch is "no benefit, slightly worse
+TTFT". It must be A/B'd against vtl_fp8 on the MIG slice before it ships: ``VTL_QUANT=vtl_fp8
+make up`` then ``make bench``, plus ``bench/eval_quality.py`` for the accuracy half.
+
+IF THAT A/B SHOWS A REAL TTFT REGRESSION, the fix is to hold BOTH weight formats and dispatch on
+M in apply() -- fp8 for prefill, int4 for decode -- at ~1 GB extra resident, which the 18 GB
+slice can afford. Deliberately NOT built: a shape-dependent Python branch inside a torch.compile
+region guards on the symbolic batch dim and risks a recompile per bucket, which is a real cost
+paid against a regression nobody has measured yet. Measure first.
 
 HOW. vLLM v0.25.0 already ships the SM90 CUTLASS W4A8 kernel (`csrc/libtorch_stable/
 quantization/cutlass_w4a8/w4a8_mm_entry.cu`, `MmaType=float_e4m3_t`, `QuantType=int4b_t`), but
@@ -72,11 +80,18 @@ fall back to fp8 (not bf16 -- see get_quant_method). If the eval regresses, the 
 and only costs 168 of the 1036 MB; then ``"conv,attn"``, i.e. MLP-only int4, which still keeps
 868 MB (84%) of the win.
 
-``lm_head`` is in the shipped default but is INERT: LFM2's lm_head is a ParallelLMHead
-(a VocabParallelEmbedding, not a LinearBase), so the isinstance guard in get_quant_method
-returns before the ignore list is ever consulted. It stays bf16 either way -- which is required,
-because config.json has ``tie_embedding: true`` and it shares storage with ``embed_tokens``.
-Kept in the default only so the intent survives a future vLLM that routes it through LinearBase.
+``lm_head`` is NOT a LinearBase (it is a ParallelLMHead, i.e. a VocabParallelEmbedding), so it
+does not come through the linear path at all. It is handled by [[lm_head_quant]], which this
+file dispatches to from the ParallelLMHead branch of get_quant_method -- 268 MB/step, 31.5% of
+the post-W4A8 decode weight budget, the largest single tensor left in bf16. ``VTL_W4A8_IGNORE``
+still wins over ``VTL_LM_HEAD_QUANT``; that precedence is stated in the branch and nowhere else.
+
+NOTHING IN THIS FILE BELONGS IN A CUDA KERNEL, and the question has been asked once already.
+Everything except ``apply()`` runs at model load: quantize, pack, install. ``apply()`` itself is
+``QuantFP8`` + ``ops.cutlass_w4a8_mm``, both already CUDA, and the fused short-conv path reaches
+``cutlass_w4a8_mm`` by hand. ``pack_int4_rows`` looks like kernel bait and is not -- it runs once
+per layer at startup and already executes on-device. A hand-written packer buys startup seconds,
+not latency.
 """
 
 from __future__ import annotations
@@ -428,6 +443,11 @@ def _linear_method_cls():
                 # Release the bf16 original (4x the packed size). Emptied rather than `del`ed so
                 # the attribute still exists: plenty of vLLM and vtl code does a bare
                 # `layer.weight` lookup.
+                #
+                # Safe for the TIED lm_head too (see [[lm_head_quant]]): this REBINDS
+                # layer.weight, it does not free the storage. embed_tokens.weight is a separate
+                # attribute on a separate module pointing at the same tensor, so the embedding
+                # lookup keeps working. Reads like a use-after-free; is not one.
                 layer.weight = torch.nn.Parameter(
                     torch.empty(0, dtype=layer.weight.dtype, device=layer.weight.device),
                     requires_grad=False,
@@ -557,9 +577,28 @@ class VtlW4A8Config(_QuantizationConfig):
         global _fallback_count, _shape_fallback_count
         try:
             from vllm.model_executor.layers.linear import LinearBase
+            from vllm.model_executor.layers.vocab_parallel_embedding import (
+                ParallelLMHead,
+            )
+
+            # BEFORE the LinearBase check: ParallelLMHead is a VocabParallelEmbedding, so it
+            # would otherwise fall into the "not ours" arm below and stay bf16 -- which is what
+            # it did until [[lm_head_quant]] landed. embed_tokens is a plain
+            # VocabParallelEmbedding and is NOT a ParallelLMHead, so it still returns None here
+            # and keeps its bf16 table (which the tied head needs anyway).
+            if isinstance(layer, ParallelLMHead):
+                # THE precedence rule between the two knobs, stated once. VTL_W4A8_IGNORE means
+                # bf16 for the head, not fp8: unlike the linear path there is no fp8 fallback to
+                # delegate to, and VTL_LM_HEAD_QUANT=fp8 is the explicit way to ask for that rung.
+                if is_ignored(prefix, self.ignored_layers):
+                    return None
+                from vtl.patches.lm_head_quant import lm_head_method
+
+                return lm_head_method(layer)
 
             if not isinstance(layer, LinearBase):
-                # Not ours (embeddings incl. ParallelLMHead, attention, MoE). None is the
+                # Not ours (embed_tokens, attention, MoE -- the lm_head branched off above).
+                # None is the
                 # correct "not ours" signal HERE and only here -- VocabParallelEmbedding maps
                 # it to UnquantizedEmbeddingMethod (vocab_parallel_embedding.py:279-280),
                 # whereas LinearBase raises on it. See the except arm below.
@@ -627,11 +666,15 @@ def apply() -> None:
             "every layer will serve as vtl_fp8. Rebuild the base image to get int4."
         )
 
+    from vtl.patches.lm_head_quant import mode as lm_head_mode
+
     log.info(
-        "vtl: registered quantization method 'vtl_w4a8' (group=%d, ops=%s, schedule=%s, ignored=%s)",
+        "vtl: registered quantization method 'vtl_w4a8' "
+        "(group=%d, ops=%s, schedule=%s, lm_head=%s, ignored=%s)",
         GROUP_SIZE,
         "ok" if available else "MISSING",
         schedule() or "kernel heuristic",
+        lm_head_mode(),
         parse_ignored_layers(os.environ.get(IGNORE_ENV)) or "none",
     )
 
