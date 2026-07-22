@@ -10,19 +10,30 @@
  import torch
  
  from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
-@@ -28,6 +31,86 @@
+@@ -28,8 +31,122 @@
  from vllm.v1.attention.backend import AttentionMetadata
  from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
  from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++
++def _vtl_flag(name: str) -> bool:
++    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
++
 +
 +# vtl Phase-3: fused conv-gate `y = C*Bx` + fp8 quant + out_proj, opt-in and fail-closed.
-+# See round-1.2/vtl/patches/mul_quant.py and round-1.2/vtl/csrc/mul_quant.cu.
-+_VTL_MUL_QUANT = os.environ.get("VTL_ENABLE_MUL_QUANT", "").strip().lower() in {
-+    "1",
-+    "true",
-+    "yes",
-+    "on",
-+}
++# Also enables the shared per-layer fp8 STAGING BUFFER: out_proj is a single GEMM over the merged
++# decode|prefill tensor, so feeding it pre-quantized used to require a decode-only batch. Instead
++# both halves now write their fp8 rows into one `[num_actual_tokens, dim]` buffer and out_proj
++# consumes it whole -- which covers prefill-only and mixed batches too, and drops the bf16
++# `torch.vstack`. See round-1.2/vtl/patches/mul_quant.py and round-1.2/vtl/csrc/mul_quant.cu.
++_VTL_MUL_QUANT = _vtl_flag("VTL_ENABLE_MUL_QUANT")
++
++# vtl: replace the decode half of that path -- `(B_d*x_d).contiguous()`, the Triton
++# `causal_conv1d_update`, and the gate+quant -- with the single fused kernel in
++# round-1.2/vtl/csrc/bcx_conv_gate_quant.cu. Inert unless _VTL_MUL_QUANT is also on (it writes
++# into that staging buffer). See round-1.2/vtl/patches/bcx_conv_gate.py.
++_VTL_BCX_CONV_GATE = _vtl_flag("VTL_ENABLE_BCX_CONV_GATE")
 +
 +
 +def _vtl_mul_quant_eligible(out_proj) -> bool:
@@ -58,79 +69,202 @@
 +    return ok
 +
 +
-+def _vtl_mul_quant_out(layer, C_d, Bx, output, n) -> bool:
-+    """Fused ``y = C_d * Bx`` -> fp8 quant -> out_proj GEMM, writing ``output[:n]`` in place.
++def _vtl_conv_gate_eligible(layer, conv_weights, conv_state, state_indices, bcx) -> bool:
++    """True if the fused short-conv DECODE kernel can serve this layer.
 +
-+    Returns True on the fast path; False (leaving ``output`` untouched) to fall back to stock.
-+    Fail-closed: any error disables this layer's fast path and reverts to ``y = C*Bx`` + out_proj.
++    Cached per-layer. On top of the flag and the op being registered, the shape predicate itself
++    lives in C++ (``bcx_conv_gate_supported``) so the vector width and block-size caps are not
++    re-hardcoded here. The kernel is specialised to conv width 3 / state_len 2 -- LFM2.5's
++    ``conv_L_cache = 3`` with the ``conv_kernel - 1`` state allocation -- and rejects anything else,
++    in which case the caller keeps the stock ``causal_conv1d_update``.
 +    """
-+    out_proj = layer.out_proj
-+    if not _vtl_mul_quant_eligible(out_proj):
-+        return False
++    cached = getattr(layer, "_vtl_conv_gate_ok", None)
++    if cached is not None:
++        return cached
++    ok = False
 +    try:
-+        from vllm import _custom_ops as ops
-+
-+        num_tok, dim = C_d.shape[0], C_d.shape[-1]
-+        y_fp8 = torch.empty((num_tok, dim), dtype=torch.float8_e4m3fn, device=C_d.device)
-+        y_scale = torch.empty((num_tok, 1), dtype=torch.float32, device=C_d.device)
-+        # Fuses the bf16 `y = C_d * Bx` with out_proj's per-token input quant; y never hits HBM.
-+        torch.ops.vllm_cuda.mul_dynamic_per_token_quant(y_fp8, y_scale, C_d, Bx, None)
-+        # Pre-quantized fp8 GEMM: weight is column-major [K, N] fp8, weight_scale per-channel [N,1]
-+        # -- exactly what the stock Fp8 apply_weights passes to cutlass_scaled_mm (no padding at
-+        # dim=2048, no bias, TP=1; all guaranteed by _vtl_mul_quant_eligible).
-+        out = ops.cutlass_scaled_mm(
-+            y_fp8,
-+            out_proj.weight,
-+            scale_a=y_scale,
-+            scale_b=out_proj.weight_scale,
-+            out_dtype=C_d.dtype,
-+            bias=None,
++        ok = (
++            _VTL_BCX_CONV_GATE
++            and hasattr(torch.ops, "vllm_cuda")
++            and hasattr(torch.ops.vllm_cuda, "bcx_conv_gate_quant")
++            and hasattr(torch.ops.vllm_cuda, "bcx_conv_gate_supported")
++            and bcx.dtype in (torch.bfloat16, torch.float16)
++            # The kernel reads B/C/x straight out of the merged in_proj output.
++            and bcx.dim() == 2
++            and bcx.stride(1) == 1
++            and bcx.shape[1] == 3 * conv_weights.shape[0]
++            # Same dtype for state and weights: stock does `x.to(conv_state.dtype)`, we don't.
++            and conv_state.dtype == bcx.dtype
++            and conv_weights.dtype == bcx.dtype
++            and conv_weights.stride(1) == 1
++            and conv_state.dim() == 3
++            and conv_state.shape[1] == conv_weights.shape[0]
++            and state_indices is not None
++            and state_indices.dtype == torch.int32
++            and torch.ops.vllm_cuda.bcx_conv_gate_supported(
++                conv_weights.shape[0], conv_weights.shape[1], conv_state.shape[2]
++            )
 +        )
-+        output[:n] = out
-+        return True
 +    except Exception:
-+        out_proj._vtl_mul_quant_ok = False  # stop retrying this layer; no log-spam
-+        logging.getLogger("vtl").exception(
-+            "vtl: mul_quant out_proj fast path failed; using stock"
-+        )
-+        return False
++        ok = False
++    layer._vtl_conv_gate_ok = ok
++    return ok
  
  
++def _vtl_out_proj_fp8(out_proj, y_fp8, y_scale, out_dtype):
++    """out_proj GEMM over an already-quantized activation.
++
++    Pre-quantized fp8 GEMM: weight is column-major [K, N] fp8, weight_scale per-channel [N, 1]
++    -- exactly what the stock Fp8 apply_weights passes to cutlass_scaled_mm (no padding at
++    dim=2048, no bias, TP=1; all guaranteed by ``_vtl_mul_quant_eligible``).
++    """
++    from vllm import _custom_ops as ops
++
++    return ops.cutlass_scaled_mm(
++        y_fp8,
++        out_proj.weight,
++        scale_a=y_scale,
++        scale_b=out_proj.weight_scale,
++        out_dtype=out_dtype,
++        bias=None,
++    )
++
++
  # --8<-- [start:short_conv]
-@@ -279,14 +362,35 @@
+ @CustomOp.register("short_conv")
+ class ShortConv(MambaBase, CustomOp):
+@@ -259,7 +376,60 @@
+             dim=0,
+         )
+         conv_output_list = []
++
++        # vtl tree-spec P5 seam: during tree verify every draft node arrives as a "decode"
++        # token and causal_conv1d_update would advance the PERSISTENT conv_state for rejected
++        # drafts too. When the runner activates staging (_VTL_CONV_STAGE set), we stage each
++        # node's Bx and update a SCRATCH clone instead; the accepted path is committed
++        # post-sample (vtl.conv_commit). Inactive (None) -> byte-identical stock decode.
++        # ON-BOX: scratch layout, state_indices, and cudagraph capture of the staged path.
++        _vtl_stage = globals().get("_VTL_CONV_STAGE")
+ 
++        # vtl Phase-3 fused path (opt-in, fail-closed). Both halves quantize their own rows into
++        # one shared fp8 staging buffer, so the single out_proj GEMM can consume the whole merged
++        # decode|prefill tensor pre-quantized -- decode-only, prefill-only and mixed batches alike,
++        # with no bf16 `torch.vstack` in between. Skipped entirely while tree-spec staging is
++        # active, to avoid interacting with the deferred conv-state commit.
++        # ON-BOX: validate under cudagraph capture. On miss/failure -> stock path below.
++        use_fused = (
++            _vtl_stage is None
++            and _VTL_MUL_QUANT
++            and _vtl_mul_quant_eligible(self.out_proj)
++        )
++        # The fused decode kernel additionally replaces `(B_d*x_d).contiguous()` and the Triton
++        # causal_conv1d_update; it writes its rows of the same staging buffer.
++        use_conv_gate = (
++            use_fused
++            and has_decode
++            and _vtl_conv_gate_eligible(
++                self, conv_weights, conv_state, state_indices_tensor_d, BCx
++            )
++        )
++        # FAIL-CLOSED SCOPE. Every precondition is validated by the two `_eligible` helpers above,
++        # before anything mutates conv_state -- and only the allocation below is retryable. Once
++        # `causal_conv1d_fn` or `bcx_conv_gate_quant` has advanced the ring buffer, falling back to
++        # the stock path would DOUBLE-APPLY that update, so a failure past this point must not be
++        # swallowed: silently wrong state is worse than a raised exception. Hence the try/except
++        # covers the alloc only.
++        y_fp8 = y_scale = None
++        if use_fused:
++            try:
++                dim = conv_weights.shape[0]
++                y_fp8 = torch.empty(
++                    (num_actual_tokens, dim),
++                    dtype=torch.float8_e4m3fn,
++                    device=BCx.device,
++                )
++                y_scale = torch.empty(
++                    (num_actual_tokens, 1), dtype=torch.float32, device=BCx.device
++                )
++            except Exception:
++                self.out_proj._vtl_mul_quant_ok = False  # stop retrying; no log-spam
++                logging.getLogger("vtl").exception(
++                    "vtl: short-conv fp8 staging buffer alloc failed; using stock"
++                )
++                use_fused = use_conv_gate = False
++
+         if has_prefill:
+             Bx_p = (B_p * x_p).transpose(0, 1)
+             Bx = causal_conv1d_fn(
+@@ -274,21 +444,61 @@
+                 query_start_loc=query_start_loc_p,
+             ).transpose(0, 1)[:num_prefill_tokens]
+ 
+-            y = C_p * Bx
+-            conv_output_list.append(y)
++            if use_fused:
++                # `Bx` is already [T, dim] with row stride dim -- causal_conv1d_fn allocates with
++                # `empty_like` on the (dim, T) transposed view, and preserve_format keeps its
++                # strides, so the transpose back is contiguous. C_p is a chunk view with row
++                # stride 3*dim. Both are last-dim contiguous, which is all mul_quant needs; the
++                # `.contiguous()` is a no-op that only bites if a future vLLM changes that layout.
++                torch.ops.vllm_cuda.mul_dynamic_per_token_quant(
++                    y_fp8[num_decodes:], y_scale[num_decodes:], C_p, Bx.contiguous(), None
++                )
++            else:
++                y = C_p * Bx
++                conv_output_list.append(y)
  
          if has_decode:
-             Bx_d = (B_d * x_d).contiguous()
-+            # vtl tree-spec P5 seam: during tree verify every draft node arrives as a "decode"
-+            # token and causal_conv1d_update would advance the PERSISTENT conv_state for rejected
-+            # drafts too. When the runner activates staging (_VTL_CONV_STAGE set), we stage each
-+            # node's Bx and update a SCRATCH clone instead; the accepted path is committed
-+            # post-sample (vtl.conv_commit). Inactive (None) -> byte-identical stock decode.
-+            # ON-BOX: scratch layout, state_indices, and cudagraph capture of the staged path.
-+            _vtl_stage = globals().get("_VTL_CONV_STAGE")
-+            _conv_state_d = conv_state
-+            if _vtl_stage is not None:
-+                _conv_state_d = _vtl_stage(id(self), Bx_d, conv_state, state_indices_tensor_d)
-             Bx = causal_conv1d_update(
-                 Bx_d,
+-            Bx_d = (B_d * x_d).contiguous()
+-            Bx = causal_conv1d_update(
+-                Bx_d,
 -                conv_state,
-+                _conv_state_d,
-                 conv_weights,
-                 self.conv.bias,
-                 activation=None,
-                 conv_state_indices=state_indices_tensor_d,
+-                conv_weights,
+-                self.conv.bias,
+-                activation=None,
+-                conv_state_indices=state_indices_tensor_d,
++            if use_conv_gate:
++                # B*x -> conv1d + state rotation -> C* -> fp8 quant, in one launch.
++                torch.ops.vllm_cuda.bcx_conv_gate_quant(
++                    y_fp8[:num_decodes],
++                    y_scale[:num_decodes],
++                    conv_state,
++                    BCx[:num_decodes],
++                    conv_weights,
++                    self.conv.bias,
++                    state_indices_tensor_d,
++                    NULL_BLOCK_ID,
++                    None,
++                )
++            else:
++                Bx_d = (B_d * x_d).contiguous()
++                _conv_state_d = conv_state
++                if _vtl_stage is not None:
++                    _conv_state_d = _vtl_stage(
++                        id(self), Bx_d, conv_state, state_indices_tensor_d
++                    )
++                Bx = causal_conv1d_update(
++                    Bx_d,
++                    _conv_state_d,
++                    conv_weights,
++                    self.conv.bias,
++                    activation=None,
++                    conv_state_indices=state_indices_tensor_d,
++                )
++                if use_fused:
++                    torch.ops.vllm_cuda.mul_dynamic_per_token_quant(
++                        y_fp8[:num_decodes], y_scale[:num_decodes], C_d, Bx, None
++                    )
++                else:
++                    y = C_d * Bx
++                    conv_output_list.insert(0, y)
++
++        if use_fused:
++            output[:num_actual_tokens] = _vtl_out_proj_fp8(
++                self.out_proj, y_fp8, y_scale, BCx.dtype
              )
-+            # vtl Phase-3 fused fast path (opt-in, fail-closed): out_proj is a single GEMM over
-+            # the merged decode|prefill tensor, so we can only feed it pre-quantized when there is
-+            # no prefill half. Skipped while tree-spec staging is active (_vtl_stage not None) to
-+            # avoid interacting with the deferred conv-state commit. ON-BOX: validate under
-+            # cudagraph capture. On miss/failure -> stock `y = C*Bx` + vstack + out_proj below.
-+            if (
-+                _vtl_stage is None
-+                and not has_prefill
-+                and _vtl_mul_quant_out(self, C_d, Bx, output, num_actual_tokens)
-+            ):
-+                return
-             y = C_d * Bx
-             conv_output_list.insert(0, y)
+-            y = C_d * Bx
+-            conv_output_list.insert(0, y)
++            return
  
+         # Merge prefill and decode outputs before passing to gated MLP
+         hidden_states = torch.vstack(conv_output_list)

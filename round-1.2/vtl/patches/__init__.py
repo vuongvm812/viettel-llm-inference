@@ -19,15 +19,20 @@ log = logging.getLogger("vtl")
 # rebuilds LFM2's short-conv in_proj/out_proj with the fp8 quant_config (stock builds them bf16);
 # the existing kernels then cover them for free -- operator_norm->in_proj via rms_norm_quant, and
 # out_proj's (non-norm) `C * Bx` input via the standalone dynamic_per_token_quant kernel. The
-# depthwise conv weight stays bf16. The remaining patches are model-agnostic and cover LFM2's
-# other fp8 paths (attn qkv/out_proj, MLP w13/w2) directly.
+# depthwise conv weight stays bf16. `mul_quant` then fuses that gate multiply into the quant AND
+# gives every short-conv layer a single fp8 staging buffer for out_proj (so decode, prefill and
+# mixed batches all skip the bf16 vstack), and `bcx_conv_gate` replaces the decode half of that
+# path -- B*x, causal_conv1d_update and the gate+quant -- with one kernel. The remaining patches
+# are model-agnostic and cover LFM2's other fp8 paths (attn qkv/out_proj, MLP w13/w2) directly.
 _MODULES: tuple[str, ...] = (
     "quant_fp8",
     "shortconv_quant",  # fp8 the short-conv in_proj/out_proj (reuses the kernels above)
     "rms_norm_quant",
     "dynamic_per_token_quant",
     "silu_mul_quant",
+    "qk_norm_rope",     # fused QK-RMSNorm+RoPE on the 6 attn layers (stock kernel, unmatched pass)
     "mul_quant",        # conv-gate fused mul+fp8-quant op (opt-in; wired directly in short_conv)
+    "bcx_conv_gate",    # whole short-conv DECODE block in one kernel (needs mul_quant's staging buf)
     "kv_cache_manager",
     "sched_policy",
     "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)
