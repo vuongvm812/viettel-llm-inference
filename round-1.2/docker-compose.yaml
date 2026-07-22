@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:010e70e25ec08b0e0f4e90146bd9c0ad0182511269261a1e422c57e246a972bb # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:68c23d55c15c57ccb5519d743020cbc63a9f77fc9d3b1bc34ca1aab4cfb6229d # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -200,7 +200,7 @@ services:
       #
       # Interpolated so `make sweep-schedule` can drive it from the host env with no file edit.
       # Unset resolves to empty, i.e. the kernel heuristic -- what submissions ship.
-      VTL_W4A8_SCHEDULE: "${VTL_W4A8_SCHEDULE:-}"
+      VTL_W4A8_SCHEDULE: "128x64_1x1x1"
 
       # Both default OFF in code -- these two ARE load-bearing overrides.
       VTL_ENABLE_MUL_QUANT: 1                # fused conv-gate mul+fp8-quant; also gives out_proj a

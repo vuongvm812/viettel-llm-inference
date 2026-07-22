@@ -112,6 +112,35 @@ def _log_outcome(requested: str, ok: bool) -> None:
         )
 
 
+def _quant_act_fp8(x_2d):
+    """Per-token fp8-e4m3 activation quant, via the CUDA op -- NEVER via ``QuantFP8``.
+
+    ``QuantFP8`` is a ``CustomOp``, and under ``-O3`` vLLM disables custom ops so inductor can
+    see through them into ``forward_native`` (that is exactly what lets RMSNormQuantFusionPass
+    match norm+quant in the model graph). ``compute_logits`` is a SEPARATE compile region that
+    no fusion pass reaches, so here the decomposition buys nothing and costs everything: inductor
+    lowers the ``.to(float8_e4m3fn)`` to ``tl.float8e4nv`` and Triton refuses it --
+
+        ValueError("type fp8e4nv not supported in this architecture.
+                    The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')")
+
+    -- which is an InductorError during ``profile_run``, i.e. the engine never boots. That is
+    the sm_80 dtype list; if the box is really sm_90 then Triton is being handed stale device
+    properties, which points at the AOT-compile cache baked in by ``COPY docker/cache/``
+    (Dockerfile:145) plus ``VLLM_USE_AOT_COMPILE=1``. Worth chasing separately -- a stale target
+    miscompiles any NEW graph shape, not just this one -- but this path should not depend on it
+    either way.
+
+    ``ops.scaled_fp8_quant`` is a registered custom op, so inductor emits an extern call and
+    never codegens fp8. Same op the weight side of this file already uses, and the same kernel
+    [[dynamic_per_token_quant]] overrides for ``o_proj``. Output is identical to QuantFP8's
+    PER_TOKEN dynamic mode.
+    """
+    from vllm import _custom_ops as ops
+
+    return ops.scaled_fp8_quant(x_2d, scale=None, use_per_token_if_dynamic=True)
+
+
 @functools.cache
 def _int4_method_cls():
     """int4 rung: [[quant_w4a8]]'s linear method with an embedding-shaped create_weights.
@@ -140,6 +169,15 @@ def _int4_method_cls():
     from vtl.patches.quant_w4a8 import _linear_method_cls
 
     class VtlW4A8LMHeadMethod(_linear_method_cls()):
+        def __init__(self) -> None:
+            super().__init__()
+            # The inherited apply() calls `self.quant_fp8(x_2d)`. In the model graph that is
+            # correct -- it is the node RMSNormQuantFusionPass matches. Here it runs in
+            # compute_logits, a separate compile region no pass reaches, where the CustomOp
+            # decomposition is a Triton fp8 codegen that can fail the boot outright. Rebinding
+            # the attribute reuses the parent's apply() verbatim; see _quant_act_fp8.
+            self.quant_fp8 = _quant_act_fp8
+
         def create_weights(self, layer, *args, **kwargs) -> None:
             # Called UNBOUND. VocabParallelEmbedding wants a plain Parameter with
             # input_dim=1/output_dim=0 and its own vocab weight_loader, not the
@@ -167,16 +205,11 @@ def _fp8_method_cls():
     import torch
     from vllm import _custom_ops as ops
     from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-    from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
-    from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         UnquantizedEmbeddingMethod,
     )
 
     class VtlFp8LMHeadMethod(QuantizeMethodBase):
-        def __init__(self) -> None:
-            self.quant_fp8 = QuantFP8(static=False, group_shape=GroupShape.PER_TOKEN)
-
         def create_weights(self, layer, *args, **kwargs) -> None:
             UnquantizedEmbeddingMethod.create_weights(self, layer, *args, **kwargs)
 
@@ -217,7 +250,7 @@ def _fp8_method_cls():
                 return torch.nn.functional.linear(x, layer.weight, bias)  # bf16 fallback
 
             x_2d = x.reshape(-1, x.shape[-1])
-            xq, x_scales = self.quant_fp8(x_2d)
+            xq, x_scales = _quant_act_fp8(x_2d)
             out = ops.cutlass_scaled_mm(
                 xq,
                 layer.weight_fp8,
