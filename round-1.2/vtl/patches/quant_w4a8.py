@@ -65,6 +65,17 @@ scale, which is exactly the activation format W4A8 wants -- the "A8" in W4A8 *is
 the ``kFp8DynamicTokenSym`` op that ``compilation/passes/fusion/rms_quant_fusion.py`` matches,
 and it gets hoisted into the preceding norm exactly as before.
 
+ENGINE FAILURE, ALREADY PAID FOR ONCE. ``VtlW4A8LinearMethod.apply`` runs inside the region
+``support_torch_compile`` traces with **fullgraph=True**. Anything Dynamo cannot put in the
+graph -- a ``logging`` call, a module-global mutation, a print, a ``.item()``, a data-dependent
+Python branch -- is a graph break, and a graph break under fullgraph is a raised exception at
+COMPILE time, not a slow path. The first on-box run of this patch died exactly there: a
+once-only ``log_fallback_summary()`` at the top of ``apply()`` killed the engine while compiling
+``model.layers.0.feed_forward.w13``, the first quantized layer Dynamo reached. The summary now
+fires from ``_install_load_summary()``, a ``BaseModelLoader.load_model`` wrapper. Everything
+else in this file is load-time and may log freely; ``apply()`` may not. Note this is a
+compile-time trap, so an off-box ``make check`` cannot catch it -- only a real boot can.
+
 SAFETY. ``--quantization=vtl_w4a8`` is a *serve flag*: if this name fails to register, vLLM
 aborts at startup with "Invalid quantization method" and we score zero. So registration is
 trivial and everything fragile is guarded:
@@ -100,7 +111,7 @@ import functools
 import logging
 import os
 
-from vtl.registry import register_patch
+from vtl.registry import already_patched, mark_patched, register_patch
 
 log = logging.getLogger("vtl")
 
@@ -157,7 +168,15 @@ def log_fallback_summary() -> None:
 
     Deliberately WARNs when nothing quantized: booting fp8 while believing you booted int4 is
     indistinguishable from success in every other signal we emit.
+
+    Idempotent: called from the load_model wrapper, which runs once per process, but the guard
+    costs nothing and a duplicated summary would read as two different models being loaded.
     """
+    global _summary_logged
+    if _summary_logged:
+        return
+    _summary_logged = True
+
     fell_back = _shape_fallback_count + _fallback_count + _load_fallback_count
     if _w4a8_layer_count == 0:
         log.warning(
@@ -469,14 +488,10 @@ def _linear_method_cls():
                 layer._vtl_w4a8_done = False
 
         def apply(self, layer, x, bias=None):
-            # First forward = loading is definitely finished, so the per-layer tallies are
-            # final. One log line, once, off the steady-state path (the flag check is a global
-            # bool read; it does not survive into the cudagraph-captured steady state anyway).
-            global _summary_logged
-            if not _summary_logged:
-                _summary_logged = True
-                log_fallback_summary()
-
+            # NOTHING HERE MAY GRAPH-BREAK. This body is traced by support_torch_compile with
+            # fullgraph=True, so a plain `log.info(...)` is not a slow path, it is an engine
+            # crash -- see the ENGINE FAILURE note in the module docstring. The load summary
+            # that used to live here now fires from _install_load_summary().
             if not getattr(layer, "_vtl_w4a8_done", False):
                 return torch.nn.functional.linear(x, layer.weight, bias)  # bf16 fallback
 
@@ -648,11 +663,53 @@ class VtlW4A8Config(_QuantizationConfig):
                 return UnquantizedLinearMethod()
 
 
+def _install_load_summary() -> None:
+    """Emit ``log_fallback_summary()`` once after model load, from OUTSIDE the compiled graph.
+
+    It used to be emitted lazily from the first ``apply()``. That looked free -- one global bool
+    read, and cudagraph capture would elide it from the steady state -- and it took the engine
+    down on the first on-box run: ``apply()`` is traced by ``support_torch_compile`` with
+    fullgraph=True, where a ``logging`` call is a graph break and a graph break is an exception.
+    The engine died compiling ``model.layers.0.feed_forward.w13``, the first quantized layer
+    Dynamo reached, long before any of the fallback counters could have been interesting.
+
+    ``BaseModelLoader.load_model`` is the seam: it is what calls the module-level
+    ``process_weights_after_loading``, so by the time it returns every per-layer tally is final,
+    and it runs exactly once per process. Patched at the CLASS, not at
+    ``model_loader.utils.process_weights_after_loading``, because ``base_loader.py`` does
+    ``from ...utils import process_weights_after_loading`` -- a by-value import that rebinding
+    the module attribute would never reach.
+    """
+    from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+
+    if already_patched(BaseModelLoader, "load_model"):
+        return
+    original = BaseModelLoader.load_model
+
+    def load_model(self, *args, **kwargs):
+        model = original(self, *args, **kwargs)
+        # A broken summary must never cost us a loaded model.
+        try:
+            log_fallback_summary()
+        except Exception:
+            log.exception("vtl: w4a8 fallback summary failed")
+        return model
+
+    BaseModelLoader.load_model = mark_patched(load_model, original)
+
+
 @register_patch("w4a8", default=True)
 def apply() -> None:
     from vllm.model_executor.layers.quantization import register_quantization_config
 
     register_quantization_config("vtl_w4a8")(VtlW4A8Config)
+
+    # Best-effort: without it we lose the one line that says how much of the model is really
+    # int4, which is a reporting loss, not a serving one.
+    try:
+        _install_load_summary()
+    except Exception:
+        log.exception("vtl: could not install the w4a8 load summary hook")
 
     # Say plainly, once, whether this image can actually do W4A8. Without it the only symptom
     # of a kernel-less build is a per-layer shape warning that reads like a tuning problem.
@@ -710,6 +767,29 @@ def _self_check() -> None:
             reshaped = [j * PACK_FACTOR + i for j in range(size_k // PACK_FACTOR)]
             strided = list(range(i, size_k, PACK_FACTOR))
             assert reshaped == strided, (size_k, i, reshaped[:4], strided[:4])
+
+    # THE REGRESSION THAT KILLED THE ENGINE ON THE BOX. VtlW4A8LinearMethod.apply is traced with
+    # fullgraph=True, so a logging call or a global mutation inside it is a compile-time
+    # exception, not a slow path -- and no off-box check can see that, because the class is only
+    # built when vLLM is importable and the failure only happens under Dynamo. Reading our own
+    # source is crude, and it is the only thing here that would have caught it.
+    import pathlib
+    import re
+
+    src = pathlib.Path(__file__).read_text()
+    body = re.search(
+        r"\n( +)def apply\(self, layer, x, bias=None\):\n(.*?)(?=\n\1def |\n\1return )",
+        src, re.S,
+    )
+    assert body, "could not locate VtlW4A8LinearMethod.apply -- update this guard"
+    code = "\n".join(
+        line for line in body.group(2).splitlines() if not line.lstrip().startswith("#")
+    )
+    for banned in ("log.", "logger.", "print(", "global "):
+        assert banned not in code, (
+            f"{banned!r} in the compiled apply() -- fullgraph=True makes that a graph break, "
+            "i.e. an engine crash at compile time. Move it to load time."
+        )
 
     try:
         import torch

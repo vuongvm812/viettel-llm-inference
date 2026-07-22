@@ -57,7 +57,7 @@ services:
       #
       # Interpolated so the A/B is pure env and needs no file edit: `VTL_QUANT=vtl_fp8 make bench`.
       # Unset resolves to vtl_w4a8, so the submitted artifact behaves identically to a literal.
-      - --quantization=vtl_w4a8
+      - --quantization=${VTL_QUANT:-vtl_w4a8}
       - --kv-cache-dtype=fp8_e4m3
 
       # DO NOT enable --speculative-config. ngram/prompt-lookup spec-decode is output-identical
@@ -200,7 +200,7 @@ services:
       #
       # Interpolated so `make sweep-schedule` can drive it from the host env with no file edit.
       # Unset resolves to empty, i.e. the kernel heuristic -- what submissions ship.
-      VTL_W4A8_SCHEDULE: ""
+      VTL_W4A8_SCHEDULE: "${VTL_W4A8_SCHEDULE:-}"
 
       # Both default OFF in code -- these two ARE load-bearing overrides.
       VTL_ENABLE_MUL_QUANT: 1                # fused conv-gate mul+fp8-quant; also gives out_proj a

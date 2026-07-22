@@ -160,7 +160,7 @@ verify:
 	  || true
 	@n=$$(sed -n 's/.*w4a8 quantized \([0-9]*\) layers.*/\1/p' /tmp/vtl-verify.log | tail -1); \
 	 if [ -n "$$n" ]; then echo "OK   vtl_w4a8 quantized $$n layers to int4"; \
-	 else echo "WARN w4a8 layer count unknown -- no forward pass ran, or logging below INFO"; fi
+	 else echo "WARN w4a8 layer count unknown -- model load never finished, or logging below INFO"; fi
 	@# lm_head is 268 MB/step, 31.5% of the post-w4a8 decode weight budget, and every one of its
 	@# failure modes leaves it silently bf16 -- indistinguishable from success in every other
 	@# signal. lm_head_quant.py logs the outcome AFTER the weights actually changed.
@@ -170,7 +170,7 @@ verify:
 	@m=$$(sed -n 's/.*lm_head quantized to \([a-z0-9]*\).*/\1/p' /tmp/vtl-verify.log | tail -1); \
 	 if [ -n "$$m" ]; then echo "OK   lm_head quantized to $$m"; \
 	 elif grep -q 'lm_head=off' /tmp/vtl-verify.log; then echo "WARN lm_head is bf16 (VTL_LM_HEAD_QUANT=off)"; \
-	 else echo "WARN lm_head outcome unknown -- no forward pass ran, or VTL_W4A8_IGNORE names it"; fi
+	 else echo "WARN lm_head outcome unknown -- model load never finished, or VTL_W4A8_IGNORE names it"; fi
 	@grep -q "channelwise fp8 unavailable" /tmp/vtl-verify.log \
 	  && echo "WARN channelwise fp8 fell back to stock per-tensor" \
 	  || echo "OK   channelwise fp8 active"
