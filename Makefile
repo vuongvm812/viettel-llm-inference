@@ -32,7 +32,7 @@ VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
 # Forked vLLM base = VLLM_STOCK + vtl tree-spec source patches, built by $(ROUND)/Dockerfile.vllm-fork
 # (Python-only overlay -> no CUDA rebuild). Pin VLLM_FORK_TAG to the pushed digest. See make vllm-fork.
 VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
-VLLM_FORK_TAG ?= v0.25.0-tree@sha256:f0e249d7b4616cbee7a49108eff48493379cfbd5de3abd02b76a94fc9bedb9bf
+VLLM_FORK_TAG ?= v0.25.0-tree@sha256:811dc148aef863d14d4c077b639afd76a5de5c2dc8e5c1eeb09896ae3b26122c
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
