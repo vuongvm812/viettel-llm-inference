@@ -120,7 +120,15 @@ services:
       # postprocess. RE-MEASURE {V1,V2}x{stock,+patches} on the slice before trusting either
       # way; revert to V1 = VLLM_USE_V2_MODEL_RUNNER "0" (which also makes the VTL_V2_* flags
       # inert). Each VTL_V2_* fails closed to the stock V2 path, so default-on cannot crash.
-      VLLM_USE_V2_MODEL_RUNNER: "1"
+      #
+      # MUTUALLY EXCLUSIVE WITH ngram/suffix spec-decode. V2 supports ONLY the trained-drafter
+      # methods (eagle/eagle3/mtp/dflash/dspark); ngram/ngram_gpu/suffix hard-fail config
+      # validation under V2 (vllm/config/vllm.py:2068-2079, "Model Runner V2 does not yet
+      # support: ngram/ngram_gpu speculative decoding"). Both V2 and spec-decode attack the SAME
+      # host-bound per-step cost, so they're an either/or A/B, not a stack: V2 cuts per-step host
+      # work; spec-decode cuts the number of steps per token. Set to "0" so the --speculative-config
+      # above can boot. To A/B the other way, comment out --speculative-config and flip this to "1".
+      VLLM_USE_V2_MODEL_RUNNER: "0"
       VTL_V2_GREEDY_FASTPATH: "1"        # argmax short-circuit for provably-greedy batches
       VTL_V2_GREEDY_ARGMAX_KERNEL: "0"   # reserved: fused argmax .cu not built; torch.argmax is
                                          #   already a fused reduction -- flip on only if a profile wins
