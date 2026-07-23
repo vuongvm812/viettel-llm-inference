@@ -32,21 +32,56 @@ before a full run, confirm SpecForge captures exactly those (a short smoke run +
 ```bash
 python ./scripts/prepare_data.py --dataset sharegpt      # -> ./cache/dataset/sharegpt_train.jsonl
 ```
-Best practice (do before a production head): **self-distill** — regenerate responses with the *served
-target* so the draft learns what THIS model says, ideally the W4A8 build you actually serve:
+Best practice (do before a production head): **self-distill** — regenerate the responses with the target
+so the draft learns what THIS model actually says. Serve the target under SGLang, then regenerate:
 ```bash
-python ./scripts/regenerate_train_data.py ...            # see script --help; produces *_regen.jsonl
+# a) serve the target for capture (bf16 is the simple path; SGLang captures via its own runtime, so an
+#    exact W4A8 match isn't achievable here anyway — a small train(bf16)/serve(W4A8) gap remains).
+python3 -m sglang.launch_server \
+  --model LiquidAI/LFM2.5-1.2B-Instruct \
+  --tp 1 --dtype bfloat16 --trust-remote-code \
+  --host 0.0.0.0 --port 30000
+
+# b) regenerate ShareGPT answers with that target. temperature 0 matches the greedy deployment
+#    (the judge runs temp 0); raise it only if the head generalizes poorly.
+python scripts/regenerate_train_data.py \
+  --model LiquidAI/LFM2.5-1.2B-Instruct \
+  --server-address localhost:30000 \
+  --input-file-path ./cache/dataset/sharegpt_train.jsonl \
+  --output-file-path ./cache/dataset/sharegpt_lfm2.5-1.2b_regen.jsonl \
+  --temperature 0.0 \
+  --max-tokens 4096 \
+  --concurrency 64 \
+  --reasoning none \
+  --resume
 ```
-Then point `data.train_data_path` at the regenerated file. Add a few-k multilingual-chat slice (LFM2.5
+Then set `data.train_data_path: ./cache/dataset/sharegpt_lfm2.5-1.2b_regen.jsonl` in the yaml. Add a few-k multilingual-chat slice (LFM2.5
 covers en/ar/zh/fr/de/ja/ko/es/pt) and, if possible, a few hundred samples shaped like the judge trace
 (multi-turn, ~4k context). Keep it small first (~15–20k conversations); scale only if acceptance is low.
 
-**2. Shared vocab mapping** (required for online/disaggregated — producer & consumer must agree):
+**2. Shared vocab mapping** (required for online/disaggregated — producer & consumer must agree). The
+eagle3 capture script derives the reduced 32k draft vocab (`d2t`/`t2d`) from the corpus and writes
+`<output-path>/vocab_mapping/vocab_mapping.pt`:
 ```bash
-python ./scripts/prepare_hidden_states.py ...            # writes <out>/vocab_mapping/vocab_mapping.pt
+torchrun --nproc_per_node=1 \
+  scripts/prepare_hidden_states.py \
+  --target-model-path LiquidAI/LFM2.5-1.2B-Instruct \
+  --data-path ./cache/dataset/sharegpt_lfm2.5-1.2b_regen.jsonl \
+  --output-path ./cache/hidden_states/lfm2.5-1.2b-eagle3 \
+  --chat-template lfm \
+  --max-length 4096 \
+  --tp-size 1 \
+  --batch-size 32 \
+  --strategy eagle3 \
+  --draft-model-config configs/lfm2.5-1.2b-instruct-eagle3.json
+# then make it the path the yaml expects:
+mkdir -p cache/vocab_mapping
+cp ./cache/hidden_states/lfm2.5-1.2b-eagle3/vocab_mapping/vocab_mapping.pt \
+   cache/vocab_mapping/lfm2.5-1.2b-eagle3.pt
 ```
-Copy/point it to the `model.vocab_mapping_path` in the yaml (`cache/vocab_mapping/lfm2.5-1.2b-eagle3.pt`).
-(Offline/local eagle3 auto-derives this when the path is empty; online does not.)
+(Offline/local eagle3 auto-derives this when `vocab_mapping_path` is empty; online/disaggregated does
+not. This same run also produces the offline hidden-state features under `--output-path` — reuse them if
+you switch to an offline recipe.)
 
 **3. Train** (online = live SGLang capture of the target's hidden states; disaggregated producer/consumer):
 ```bash
