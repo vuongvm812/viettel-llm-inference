@@ -4,7 +4,7 @@
 
 | Spec | Value |
 |------|-------|
-| GPU | MiG H200 profile — 18 GB VRAM |
+| GPU | MiG H200 profile — 18 GB VRAM, 16 SMs, ~600 GB/s bandwidth |
 | CPU | 3 vCPU (CFS quota) |
 | RAM | 8 GB (no swap) |
 | Driver | NVIDIA 590.x (CUDA 13.x) |
@@ -96,8 +96,8 @@ For each successful request:
 
 ### Quantization (load-bearing)
 
-- **W8A8 FP8** with per-channel weight scales (`vtl_fp8` quant method). Stock vLLM uses per-tensor scales; per-channel improves accuracy at zero runtime cost.
-- **FP8 KV cache** (`fp8_e4m3`) — halves KV memory, allowing 2× more concurrent sequences.
+- **W4A8** with per-channel weight scales (`vtl_fp8` quant method, INT4 weights + FP8 activations). Stock vLLM uses per-tensor scales; per-channel improves accuracy at zero runtime cost.
+- **FP8 KV cache** (`fp8_e4m3`) — halves KV memory vs BF16, allowing more concurrent sequences.
 - Ignored layers: `lm_head` stays in BF16 (tied to embeddings, small vocab).
 - Short-conv projections (`in_proj`/`out_proj` across 10 layers) must be explicitly rebuilt with FP8 quant config — stock builds them BF16.
 
@@ -138,7 +138,6 @@ For each successful request:
 
 - **Jemalloc** — `LD_PRELOAD` with latency tuning: no decay (never returns pages), metadata THP, percpu arenas. Watch RSS under 8 GB cap.
 - **AOT + standalone compile** — `VLLM_USE_AOT_COMPILE=1`, `VLLM_USE_STANDALONE_COMPILE=1`.
-- **CUDA lazy loading** — `CUDA_MODULE_LOADING=LAZY` reduces startup time.
 - **CUDA graph** — `FULL_AND_PIECEWISE` with capture sizes tuned per batch shape.
 
 ### Memory & KV
