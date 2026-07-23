@@ -75,7 +75,7 @@ IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench
+.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -374,3 +374,15 @@ ci-bench:
 	@id=$$(gh run list -R $(CI_REPO) -w bench.yml --limit 1 --json databaseId -q '.[0].databaseId'); \
 	echo "=== Run $$id ==="; \
 	gh run watch $$id -R $(CI_REPO) --exit-status || true
+
+## Trigger remote bootstrap smoke test — starts server, checks health, stops.
+##    make ci-bootstrap                                        # test :dev
+##    make ci-bootstrap IMAGE_DIGEST=sha256:abc...              # test specific image
+ci-bootstrap:
+	gh workflow run bootstrap.yml -R $(CI_REPO) \
+	  -f workdir=$(ROUND) \
+	  $(if $(IMAGE_DIGEST),-f image_digest='$(IMAGE_DIGEST)')
+	@sleep 6
+	@id=$$(gh run list -R $(CI_REPO) -w bootstrap.yml --limit 1 --json databaseId -q '.[0].databaseId'); \
+	echo "=== Run $$id ==="; \
+	gh run watch $$id -R $(CI_REPO) --exit-status
