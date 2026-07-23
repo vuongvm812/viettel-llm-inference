@@ -1,0 +1,71 @@
+--- a/src/engine-core-client/src/client/state.rs
++++ b/src/engine-core-client/src/client/state.rs
+@@ -1,4 +1,5 @@
+-use std::collections::{BTreeMap, BTreeSet, HashMap};
++use rustc_hash::FxHashMap;
++use std::collections::{BTreeMap, BTreeSet};
+ use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ use tokio::sync::{mpsc, oneshot};
+@@ -99,7 +100,7 @@
+ #[derive(Debug)]
+ pub struct RequestRegistry {
+     closed: bool,
+-    requests: HashMap<String, TrackedRequest>,
++    requests: FxHashMap<String, TrackedRequest>,
+     active_lora_requests: usize,
+     routing_per_engine: BTreeMap<EngineId, EngineRoutingState>,
+ }
+@@ -108,7 +109,7 @@
+     pub fn new(engines: &[ConnectedEngine]) -> Self {
+         Self {
+             closed: false,
+-            requests: HashMap::default(),
++            requests: FxHashMap::default(),
+             active_lora_requests: 0,
+             routing_per_engine: engines
+                 .iter()
+--- a/src/engine-core-client/src/protocol/sampling.rs
++++ b/src/engine-core-client/src/protocol/sampling.rs
+@@ -1,4 +1,5 @@
+-use std::collections::{BTreeSet, HashMap};
++use rustc_hash::FxHashMap;
++use std::collections::BTreeSet;
+ 
+ use serde::{Deserialize, Serialize};
+ use serde_default::DefaultFromSerde;
+@@ -121,7 +122,7 @@
+     pub all_stop_token_ids: BTreeSet<u32>,
+     /// Logit biases to apply during sampling.
+     /// Keys are token IDs
+-    pub logit_bias: Option<HashMap<u32, f32>>,
++    pub logit_bias: Option<FxHashMap<u32, f32>>,
+     /// Restrict output to these token IDs only.
+     pub allowed_token_ids: Option<Vec<u32>>,
+     /// Tokenized bad words to avoid during generation.
+@@ -141,7 +142,7 @@
+     /// defers to engine-core defaults.
+     pub skip_reading_prefix_cache: Option<bool>,
+     /// Additional request parameters for custom extensions (from `vllm_xargs`).
+-    pub extra_args: Option<HashMap<String, serde_json::Value>>,
++    pub extra_args: Option<FxHashMap<String, serde_json::Value>>,
+ }
+ 
+ impl EngineCoreSamplingParams {
+--- a/src/server/src/config.rs
++++ b/src/server/src/config.rs
+@@ -1,4 +1,4 @@
+-use std::collections::HashMap;
++use rustc_hash::FxHashMap;
+ use std::fmt;
+ use std::time::Duration;
+ 
+@@ -180,7 +180,7 @@
+     /// template.
+     pub chat_template: Option<String>,
+     /// Server-default keyword arguments merged into every chat-template render.
+-    pub default_chat_template_kwargs: Option<HashMap<String, Value>>,
++    pub default_chat_template_kwargs: Option<FxHashMap<String, Value>>,
+     /// How to serialize `message.content` for chat-template rendering.
+     pub chat_template_content_format: ChatTemplateContentFormatOption,
+     /// Optional maximum number of top log probabilities accepted by the

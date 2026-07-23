@@ -23,6 +23,16 @@ frontend binary. They carry our frontend optimizations so a clean checkout (wher
   cadence instead of memory speed — otherwise PGO trains on the wrong hot/cold split and
   can ship a binary slower than stock.
 
+## `fxhash_hot_paths.patch`
+- `src/engine-core-client/src/client/state.rs` — replace `HashMap` with `FxHashMap` for
+  `RequestRegistry.requests` (the hot-path request lookup used per decode step).
+- `src/engine-core-client/src/protocol/sampling.rs` — `FxHashMap` for `logit_bias`
+  and `extra_args` DTO fields (per-request, small maps with integer keys).
+- `src/server/src/config.rs` — `FxHashMap` for `default_chat_template_kwargs`
+  (init-only, consistency with the other maps).
+  `rustc-hash = "1.1.0"` is already a workspace dependency — no Cargo.toml
+  changes needed.
+
 ## `http_trace_toggle.patch`
 - `src/server/src/routes.rs` — gate the per-request `TraceLayer` behind
   `VLLM_RS_DISABLE_HTTP_TRACE` (default off = layer stays on). Set the env to `1` to drop
