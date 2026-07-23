@@ -12,6 +12,19 @@ and the `"lfm"` chat template at `specforge/data/template.py:123`), so no target
 only the eagle3 draft config + recipe above, combining that dflash target block with the eagle3 strategy
 from `llama3.1-8b-eagle3-online.yaml`.
 
+## Prerequisites — CUDA Linux GPU box (NOT your Mac)
+SpecForge pins `torch==2.11.0` + `sglang==0.5.14` (CUDA-Linux only) and needs Python 3.11. None of the
+steps below — SGLang capture server, `torchrun`, `specforge train` — run on macOS/CPU. Your Mac is only
+for editing/committing these config files. On the GPU box:
+```bash
+git clone https://github.com/sgl-project/SpecForge.git && cd SpecForge
+uv venv -p 3.11 && source .venv/bin/activate
+uv pip install -v . --prerelease=allow      # pulls torch 2.11.0 + sglang 0.5.14 (no separate sglang install)
+# then copy this dir's files in:
+cp <repo>/round-1.2/eagle3-training/lfm2.5-1.2b-instruct-eagle3.json        configs/
+cp <repo>/round-1.2/eagle3-training/lfm2.5-1.2b-instruct-eagle3-online.yaml examples/configs/
+```
+
 ## Draft config — how the dims were chosen (all from `hf-model/config.json`)
 `hidden_size 2048`, `num_attention_heads 32`, `num_key_value_heads 8`, `head_dim 64`,
 `intermediate_size 12288`, `vocab_size 65536`, `rope_theta 1e6`, `rms_norm_eps 1e-5`,
