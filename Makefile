@@ -72,7 +72,6 @@ DC := docker compose $(COMPOSE_FILES)
 
 # CI bench lifecycle (remote runner). No build step — image is the pinned digest from ci-build.
 IMAGE_DIGEST ?=
-MODEL_PATH ?= ../hf-model
 CIBENCH_COMPOSE := -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
@@ -357,7 +356,7 @@ ci-status:
 ## Start server for CI bench — no build, pinned image + model mount. Waits for healthy.
 ##    make ci-up IMAGE_DIGEST=sha256:abc...
 ci-up:
-	$(IN) CI_IMAGE='$(_CI_IMAGE)' MODEL_PATH='$(MODEL_PATH)' \
+	$(IN) CI_IMAGE='$(_CI_IMAGE)' \
 	  docker compose $(CIBENCH_COMPOSE) up -d --wait
 
 ## Stop CI bench server, remove volumes.

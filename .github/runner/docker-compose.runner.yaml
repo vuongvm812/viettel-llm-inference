@@ -13,4 +13,3 @@ services:
       EPHEMERAL: 0
       LABELS: rtx3060
       DOCKER_HOST: unix:///var/run/docker.sock
-      MODEL_PATH: ${HOME}/ci-runner/model
