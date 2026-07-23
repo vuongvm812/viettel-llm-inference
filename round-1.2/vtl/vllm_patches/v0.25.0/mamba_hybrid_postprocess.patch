@@ -1,0 +1,63 @@
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from dataclasses import dataclass
+ from typing import Any
+ 
+@@ -76,6 +77,18 @@
+     ) -> None:
+         super().__init__(vllm_config, model, encoder_cache, device)
+         self.cache_config = vllm_config.cache_config
++        # vtl: without spec-decode, postprocess_state would only ever scatter the
++        # constant 1 (num_sampled is 1 on decode; 0 on chunked-prefill -> max(0,1)=1)
++        # over a buffer that __init__/add_request already hold at 1. The buffer IS
++        # read every step (preprocess_mamba_align_fused_kernel + run_fused_postprocess_align),
++        # but its value is invariantly 1 here, so the write is a no-op -- skip the
++        # launch. Fail-closed: any spec-decode config keeps the writes. Kill-switch
++        # wired in docker-compose (default on).
++        self._vtl_skip_dead_scatter = (
++            os.environ.get("VTL_V2_FUSED_POSTPROCESS", "1").strip().lower()
++            not in ("0", "false", "no", "off", "")
++            and vllm_config.num_speculative_tokens == 0
++        )
+         self.num_accepted_tokens_gpu = torch.ones(
+             self.max_num_reqs, dtype=torch.int32, device=self.device
+         )
+@@ -300,19 +313,22 @@
+     ) -> None:
+         # Chunked prefill does not sample a token, so num_sampled can be 0.
+         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
+-        if not isinstance(num_sampled, int):
+-            # idx_mapping may contain -1 sentinels (filtered rows) under PP; the
+-            # kernel skips them rather than scattering with a host-side gather.
+-            n = idx_mapping.shape[0]
+-            if n:
+-                _scatter_num_accepted_kernel[(n,)](
+-                    idx_mapping, num_sampled, self.num_accepted_tokens_gpu
++        # vtl: the buffer stays constant 1 without spec-decode, so both writes
++        # below are dead -- skip the launch entirely (see __init__).
++        if not self._vtl_skip_dead_scatter:
++            if not isinstance(num_sampled, int):
++                # idx_mapping may contain -1 sentinels (filtered rows) under PP; the
++                # kernel skips them rather than scattering with a host-side gather.
++                n = idx_mapping.shape[0]
++                if n:
++                    _scatter_num_accepted_kernel[(n,)](
++                        idx_mapping, num_sampled, self.num_accepted_tokens_gpu
++                    )
++            else:
++                # Fill with single value.
++                self.num_accepted_tokens_gpu.index_fill_(
++                    0, idx_mapping, max(num_sampled, 1)
+                 )
+-        else:
+-            # Fill with single value.
+-            self.num_accepted_tokens_gpu.index_fill_(
+-                0, idx_mapping, max(num_sampled, 1)
+-            )
+ 
+         # Align: save the running state to the block-aligned position when
+         # spec-decode acceptance leaves the sequence non-block-aligned (mirrors

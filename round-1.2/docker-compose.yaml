@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:fcf198017e2845fcd645bcbf25f087495ddae627364f2b62ac0f33d10019050f # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:aa427bc0d0ec92ef8e46d97ddfefe0a2193dbd064326baf308e55a092d7d2a2c # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -30,7 +30,7 @@ services:
       # Any tighter cap truncates the judge's long-context probe -> flagged as
       # "truncation / dual-path" cheating.
       - --max-model-len=32768
-      - --gpu-memory-utilization=0.95
+      - --gpu-memory-utilization=0.90
       - --tensor-parallel-size=1
 
       # Intra-conversation prefix reuse is the biggest win now (turn N reuses turns 0..N-1).
@@ -43,7 +43,21 @@ services:
                           # capture set + VRAM and leaves OOM headroom. Sweep with bench/replay.py.
       - --max-num-batched-tokens=8192 # small prefill chunks: a new turn's ~4k prefill no longer
                           # spikes in-flight decode ITL (gamma=2 punishes that tail); TTFT has slack.
-      - --quantization=vtl_fp8
+      # W4A8: int4 weights (group-128, symmetric, RTN at load) + fp8-e4m3 per-token activations,
+      # via vLLM's SM90 CUTLASS w4a8 kernel. Cuts decode weight traffic 1306 -> 852 MB/step
+      # (-35%, ~0.76 ms at the ~600 GB/s of an H200 MIG 1g.18gb slice). Note the int4 group
+      # scales cost 64.8 MB, not 8: cutlass_pack_scale_fp8 stores 8 copies of each scale.
+      # See vtl/patches/quant_w4a8.py; falls back to vtl_fp8 per-layer on any rejected shape.
+      #
+      # UNPROVEN ON THIS BOX. TPOT ~= max(host, gpu); the host term (~3.4 ms) is unaffected by
+      # MIG and the modelled GPU term stays under it both before and after, so the expected
+      # TPOT delta is ~0 and TTFT likely gets slightly WORSE (prefill re-dequantizes weight
+      # tiles that fp8 never does). A/B this against vtl_fp8 on the slice before submitting --
+      # and run an accuracy eval: RTN int4 on 1.2B is not free. Revert = vtl_fp8.
+      #
+      # Interpolated so the A/B is pure env and needs no file edit: `VTL_QUANT=vtl_fp8 make bench`.
+      # Unset resolves to vtl_w4a8, so the submitted artifact behaves identically to a literal.
+      - --quantization=vtl_w4a8
       - --kv-cache-dtype=fp8_e4m3
 
       # DO NOT enable --speculative-config. ngram/prompt-lookup spec-decode is output-identical
@@ -72,17 +86,36 @@ services:
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
 
       # ---- TPOT: host-side per-step cost ----------------------------------------------
+      # STALE -- every number below was measured on a FULL H200. The judge runs an MIG
+      # 1g.18gb slice (1/7 SMs, 1/8 memory slices), which scales the GPU term ~8x and leaves
+      # the 3-core host term alone. Re-measure the split before trusting any of it.
+      #
       # Measured split of the 4ms TPOT: ~0.5ms GPU, ~3.4ms HOST. Async scheduling is really
       # pipelined (max_concurrent_batches=2), so TPOT ~= max(host, gpu) -- the host IS the
       # TPOT. SGLang publishes 2.2ms for this exact model on H200 at concurrency 1, so ~1.8ms
       # (~13 score points) is on the table. Every knob below is one env var to revert.
       #
-      # Model Runner V2 (VLLM_USE_V2_MODEL_RUNNER=1) was TRIED AND REJECTED on 2026-07-21.
-      # It is vLLM's per-step-CPU-overhead rewrite, gated off for hybrid models by a
-      # conservative default; forcing it on LFM2 boots and is correct, but measured SLOWER
-      # open-loop on the round-2 trace: TPOT 5.0 -> 5.6ms, TTFT 62 -> 80ms (~-4 score points).
-      # Verified independent of the vtl greedy sampler (5.6ms with it both on and off).
-      # Do not re-add without re-measuring on a vLLM that has re-tuned the hybrid path.
+      # ---- Model Runner V2 ------------------------------------------------------------
+      # V2 is vLLM's per-step-CPU-overhead rewrite (GPU-resident batch prep + sampling),
+      # attractive on this host-bound slice. Stock V2 was REJECTED on 2026-07-21 (TPOT
+      # 5.0 -> 5.6ms, TTFT 62 -> 80ms) -- but that was STOCK V2: its Sampler runs a full
+      # 65k-vocab FP32 logit copy + bias/penalty/badwords/temp/min_p kernels + gumbel every
+      # step even at temp 0, because the vtl greedy fast path only patched the *V1* Sampler
+      # class. The flags below add a V2-native greedy fast path (fork edit in
+      # vllm/v1/worker/gpu/sample/sampler.py) plus a dead-launch elision in the hybrid
+      # postprocess. RE-MEASURE {V1,V2}x{stock,+patches} on the slice before trusting either
+      # way; revert to V1 = VLLM_USE_V2_MODEL_RUNNER "0" (which also makes the VTL_V2_* flags
+      # inert). Each VTL_V2_* fails closed to the stock V2 path, so default-on cannot crash.
+      VLLM_USE_V2_MODEL_RUNNER: "1"
+      VTL_V2_GREEDY_FASTPATH: "1"        # argmax short-circuit for provably-greedy batches
+      VTL_V2_GREEDY_ARGMAX_KERNEL: "0"   # reserved: fused argmax .cu not built; torch.argmax is
+                                         #   already a fused reduction -- flip on only if a profile wins
+      VTL_V2_FUSED_POSTPROCESS: "1"      # skip the dead num_accepted scatter when no spec-decode
+      VTL_V2_FORCE_CUTLASS_FP8: "1"      # force fp8 layers off Marlin (its stable-ABI aten::empty
+                                         #   crashes under V2's dynamic-shape graph) onto CUTLASS.
+                                         #   Only matters under V2; "0" reverts. See quant_fp8.py.
+      # VTL_V2_FUSED_CONV_ALIGN reserved for the on-box fused conv+align kernel (Part B Target 1);
+      # inert until that .cu is built and parity-checked -- stock precopy runs meanwhile.
 
       # vLLM only pins torch's CPU thread count in set_multiprocessing_worker_envs(), which the
       # MULTIPROC executor calls. At --tensor-parallel-size=1 we get UniProcExecutor, which
@@ -96,9 +129,8 @@ services:
       # CPython hands the GIL to a waiting thread only after sys.getswitchinterval() -- 5ms by
       # default, longer than a whole decode step. The engine-core main loop is tight pure
       # Python that never blocks while it has work, while the output thread needs the GIL to
-      # forward each step's tokens. Seconds; 0 = leave the interpreter default (A/B control).
-      # Applied in vtl/plugin.py register(), after the VTL_DISABLE gate.
-      VTL_GIL_SWITCH_INTERVAL: "0.0002"
+      # forward each step's tokens. vtl/plugin.py already defaults this to 0.0002s; set
+      # VTL_GIL_SWITCH_INTERVAL: "0" here to restore the interpreter default (the A/B control).
 
       VLLM_USE_RUST_FRONTEND: "1"
       VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "60"
@@ -117,35 +149,87 @@ services:
       # decode blocks request submission).
       VLLM_RS_ZMQ_WORKER_THREADS: "3"
       VLLM_RS_REQUEST_WORKER_THREADS: "3"
-      # Drop the per-request axum TraceLayer span (latency A/B). Left unset here = layer ON
-      # (default). Set to 1 to remove it; the optimized compose defaults this to 1.
+      # Drop the per-request axum TraceLayer span (latency A/B). Unset = layer ON (default);
+      # 1 removes it, which is what we ship. Set to 0 to restore it and measure the delta.
+      # Trade-off: loses rejected-request log visibility (logs are already WARN-pinned anyway).
       VLLM_RS_DISABLE_HTTP_TRACE: "1"
 
-      # FP8 (vtl_fp8). Load-bearing: --quantization=vtl_fp8 aborts at startup if disabled.
-      VTL_ENABLE_FP8: 1
-      VTL_FP8_CHANNELWISE: 1                  # 1 = per-channel weight scales; 0 = stock per-tensor
-      VTL_FP8_IGNORE: "lm_head"               # LFM2 has no vision tower / GDN fp32 projections to skip
+      # ---- Quantization --------------------------------------------------------------
+      # Only the OVERRIDES live here. Every VTL_ENABLE_<patch> not listed below already
+      # defaults ON in code (`register_patch(..., default=True)` in vtl/patches/*.py --
+      # that file list IS the switch list). Setting them to 1 here was pure duplication and
+      # drifted from the code. Same for VTL_FP8_CHANNELWISE (defaults on,
+      # quant_fp8.channelwise_enabled), VTL_SILU_MUL_FUSION (defaults "1") and
+      # VTL_GIL_SWITCH_INTERVAL (plugin.py default).
+      #
+      # !! DO NOT set VTL_ENABLE_W4A8=0 or VTL_ENABLE_FP8=0 to A/B them. Those two patches
+      # REGISTER the quantization methods, and --quantization=vtl_w4a8 is a serve flag: with
+      # the patch off, vLLM aborts at startup with "Invalid quantization method" and the
+      # container never binds :8000. To A/B quantization, change the --quantization flag
+      # itself (vtl_w4a8 <-> vtl_fp8 <-> omit for bf16). Every OTHER VTL_ENABLE_* is a safe
+      # `: 0` kill-switch.
+      #
+      # W4A8 layers that opt out fall back to fp8, not bf16, so both ignore lists apply.
+      # Accuracy ladder if the eval regresses: "conv" (drops the recurrent short-conv path, the
+      # most error-sensitive layer, for only 168 of 1036 MB), then "conv,attn" (MLP-only int4,
+      # still 84% of the win). For the head use VTL_LM_HEAD_QUANT below, not this list.
+      #
+      # lm_head is NO LONGER in the w4a8 list: it is now quantized by vtl/patches/lm_head_quant.py
+      # (268 MB/step, 31.5% of the post-w4a8 decode weight budget -- the largest tensor that was
+      # still bf16). Naming it here would force bf16 and silently undo that.
+      VTL_W4A8_IGNORE: ""
+      # INERT for lm_head, kept only as documentation of intent. Both ignore lists are consulted
+      # ONLY for LinearBase layers, and lm_head is a ParallelLMHead (a VocabParallelEmbedding):
+      # VtlFp8Config.get_quant_method early-returns at quant_fp8.py:182 before reading this list,
+      # and under vtl_w4a8 the ParallelLMHead branch never delegates to the fp8 fallback at all.
+      # The head is bf16 under vtl_fp8 because stock Fp8Config has no lm_head path, not because
+      # of this entry. To keep the head out of int4 use VTL_LM_HEAD_QUANT; to force it bf16 under
+      # w4a8 use VTL_W4A8_IGNORE. Nothing else in LFM2 matches the substring.
+      VTL_FP8_IGNORE: "lm_head"               # fp8 is the per-layer fallback for W4A8
 
-      # Per-patch kill-switches (all default ON). Each = VTL_ENABLE_<patch>.
-      VTL_ENABLE_RMS_NORM_QUANT: 1            # needs pass_config.fuse_norm_quant to fire
-      VTL_ENABLE_DYNAMIC_PER_TOKEN_QUANT: 1
-      VTL_ENABLE_SILU_MUL_QUANT: 1           # down_proj silu-mul + fp8 quant fusion
-      VTL_SILU_MUL_FUSION: 1                  # 1 = register the down_proj pattern; 0 = op only, unfused
-      VTL_ENABLE_QK_NORM_ROPE: 1             # fused QK-RMSNorm+RoPE on the 6 attn layers;
-                                             # calls stock _C::fused_qk_norm_rope directly
-                                             # (vLLM's own pass can't match Lfm2Attention)
-      VTL_ENABLE_SHORTCONV_QUANT: 1          # fp8 the short-conv in_proj/out_proj (the TPOT lever)
+      # The lm_head ladder: int4 (default) | fp8 | off. Not a boolean; anything unrecognised
+      # means "off", because every other value changes model OUTPUT and a typo must not ship an
+      # unmeasured accuracy change. tie_embedding=true is fine -- quantizing rebinds lm_head.weight
+      # and leaves embed_tokens' bf16 table alone, so the embedding lookup is untouched.
+      #
+      #   int4  -192 MB/step (~0.13 ms @600 GB/s)   highest accuracy risk in the model: RTN int4
+      #                                             on the output head, no calibration
+      #   fp8   -134 MB/step (~0.22 ms)             the middle rung; use it if int4 regresses
+      #   off    268 MB/step                        bf16, the pre-W4A8 behaviour
+      #
+      # UNMEASURED like the rest of W4A8. Run bench/eval_quality.py across all three before
+      # trusting int4. VTL_W4A8_IGNORE="lm_head" overrides this knob and forces bf16.
+      VTL_LM_HEAD_QUANT: "int4"
+
+      # CUTLASS tile/cluster schedule for the W4A8 GEMM. EMPTY = the kernel's own heuristic,
+      # which is what we ship. Here because that heuristic (w4a8_mm_entry.cu:341-372) keys only
+      # on M/N/K and is blind to SM count -- tuned on a full 132-SM Hopper, while the judge's
+      # MIG 1g.18gb slice has ~19 -- so its tile choice is an open question on this box.
+      #
+      # Name = "<TileM>x<TileN>_<ClusterMxNxK>". The kernel passes the WEIGHT as CUTLASS operand
+      # A, so TileM tiles output channels and TileN tiles TOKENS: a decode-shaped schedule has a
+      # small second number. TileK is fixed at 128.
+      #
+      # The ten legal values -- anything else is ignored with a warning (vtl validates so a typo
+      # can't STD_TORCH_CHECK the server mid-benchmark):
+      #   256x128_1x1x1  256x64_1x1x1  256x32_1x1x1  256x16_1x1x1  128x256_2x1x1
+      #   128x256_1x1x1  128x128_1x1x1 128x64_1x1x1  128x32_1x1x1  128x16_1x1x1
+      #
+      # The heuristic already picks 128x16/128x32 at decode (M<=32) and 128x256_1x1x1 for an
+      # 8192-token prefill -- beat those three first. Applies to every W4A8 GEMM including the
+      # conv out_projs (stamped per-layer, so a sweep can't half-apply). Submissions ship empty.
+      #
+      # Interpolated so `make sweep-schedule` can drive it from the host env with no file edit.
+      # Unset resolves to empty, i.e. the kernel heuristic -- what submissions ship.
+      VTL_W4A8_SCHEDULE: ""
+
+      # Both default OFF in code -- these two ARE load-bearing overrides.
       VTL_ENABLE_MUL_QUANT: 1                # fused conv-gate mul+fp8-quant; also gives out_proj a
                                              # shared fp8 staging buffer, so decode|prefill|mixed
                                              # all skip the bf16 vstack (not just pure decode)
       VTL_ENABLE_BCX_CONV_GATE: 1            # whole short-conv DECODE block in one kernel: B*x ->
                                              # conv1d + state rotation -> C* -> fp8 quant. Inert
                                              # unless MUL_QUANT=1 (it fills that staging buffer).
-      VTL_ENABLE_KV_CACHE_MANAGER: 1
-      VTL_ENABLE_SCHED_POLICY: 1             # SJF prefill reorder
-
-      # No GDN family here: LFM2.5 has no gated-delta-net and no attn output gate, so the old
-      # VTL_ENABLE_GDN_KERNELS / MUL_SIGMOID / GDN_PREFILL_BACKEND flags were removed with their code.
 
       VTL_KERNEL_SYNC: 0                       # DEBUG only: 1 = cudaStreamSynchronize per kernel (slow)
 

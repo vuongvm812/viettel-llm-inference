@@ -31,8 +31,15 @@ MAX_JOBS ?= 4
 VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
 # Forked vLLM base = VLLM_STOCK + vtl tree-spec source patches, built by $(ROUND)/Dockerfile.vllm-fork
 # (Python-only overlay -> no CUDA rebuild). Pin VLLM_FORK_TAG to the pushed digest. See make vllm-fork.
+#
+# Re-pinned in 66e5882 to include the short_conv in_proj hoist + the paired lfm2 empty_like fix
+# (vtl/vllm_patches/v0.25.0/{short_conv,lfm2}.patch), which are what let RMSNormQuantFusionPass
+# reach the 10 short-conv layers. Any future edit to those patches needs `make vllm-fork PUSH=1`
+# and a re-pin here, or `make up` silently serves the old fork -- which looks exactly like
+# success. `make verify` is the check: the "fusion replaced N patterns" count drops back to its
+# pre-hoist value instead of covering the conv layers.
 VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
-VLLM_FORK_TAG ?= v0.25.0-tree@sha256:f0e249d7b4616cbee7a49108eff48493379cfbd5de3abd02b76a94fc9bedb9bf
+VLLM_FORK_TAG ?= v0.25.0-tree@sha256:45ee1a65d96e9e65c54296273629e7a1ac6824dbe69611e104bb7073c799f91e
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
@@ -57,10 +64,13 @@ PGO_TARGET_CPU ?= native
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
 IN := cd $(ROUND) &&
 TRACE := data/input/trace-round2.jsonl
-COMPOSE_FILES := -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
+# docker-compose.yaml is the SUBMISSION artifact and the single source of truth for every
+# serve flag and env var; the three overlays only carry their differences (dev image tag,
+# local build+mount, judge-box resource caps). Order matters -- later -f wins.
+COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 DC := docker compose $(COMPOSE_FILES)
 
-.PHONY: check stats build up down warm push bench profile test-kernel bench-kernel debug-kernel verify vllm-fork
+.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -72,6 +82,7 @@ check:
 	done
 	$(IN) python3 bench/trace_stats.py --self-check
 	$(IN) python3 bench/metrics.py
+	$(IN) python3 bench/eval_quality.py --self-check
 	$(IN) python3 bench/profile_trace.py --self-check
 	$(IN) [ -f bench/build_trace_round2.py ] && PYTHONPATH=. python3 bench/build_trace_round2.py --self-check || true
 	$(IN) python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
@@ -134,9 +145,53 @@ verify:
 	@grep -q "registered quantization method 'vtl_fp8'" /tmp/vtl-verify.log \
 	  && echo "OK   vtl_fp8 registered" \
 	  || { echo "FAIL vtl_fp8 not registered"; exit 1; }
+	@# vtl_w4a8 is the shipped --quantization. Every one of its failure modes degrades to fp8
+	@# rather than crashing, so without these three greps `make verify` prints all-OK in exactly
+	@# the world where int4 silently never happened. Check registration, kernel availability,
+	@# and how many layers actually ended up int4.
+	@# The premise of the whole W4A8 patch: a MIG 1g.18gb slice (~19 SMs) is where int4 pays.
+	@# On a FULL H200 (132 SMs) the same saving is ~0.09 ms against a 3.4 ms host term -- i.e.
+	@# invisible, with the TTFT and accuracy costs unchanged, so vtl_fp8 is the better ship.
+	@d=$$(sed -n 's/.*w4a8 device = //p' /tmp/vtl-verify.log | tail -1); \
+	 if [ -z "$$d" ]; then echo "WARN GPU identity unknown -- w4a8 registration never logged"; \
+	 else \
+	   sm=$$(echo "$$d" | sed -n 's/.*, \([0-9]*\) SMs.*/\1/p'); \
+	   if [ -n "$$sm" ] && [ "$$sm" -gt 60 ]; then \
+	     echo "WARN GPU is $$d -- NOT a MIG slice. W4A8 buys ~0.09 ms here and still costs TTFT"; \
+	     echo "     + accuracy: A/B VTL_QUANT=vtl_fp8 before submitting."; \
+	   else echo "OK   GPU is $$d"; fi; \
+	 fi
+	@grep -q "registered quantization method 'vtl_w4a8'" /tmp/vtl-verify.log \
+	  && echo "OK   vtl_w4a8 registered" \
+	  || { echo "FAIL vtl_w4a8 not registered -- the serve flag would abort at startup"; exit 1; }
+	@grep -q "W4A8 CUDA ops absent" /tmp/vtl-verify.log \
+	  && { echo "FAIL W4A8 kernel missing from this image (needs sm90a + CUDA>=12); serving fp8"; exit 1; } \
+	  || echo "OK   W4A8 CUDA ops present"
+	@grep -q "w4a8 quantized 0 layers" /tmp/vtl-verify.log \
+	  && { echo "FAIL 0 layers quantized to int4 -- this is an fp8 server wearing a w4a8 flag"; exit 1; } \
+	  || true
+	@n=$$(sed -n 's/.*w4a8 quantized \([0-9]*\) layers.*/\1/p' /tmp/vtl-verify.log | tail -1); \
+	 if [ -n "$$n" ]; then echo "OK   vtl_w4a8 quantized $$n layers to int4"; \
+	 else echo "WARN w4a8 layer count unknown -- model load never finished, or logging below INFO"; fi
+	@# lm_head is 268 MB/step, 31.5% of the post-w4a8 decode weight budget, and every one of its
+	@# failure modes leaves it silently bf16 -- indistinguishable from success in every other
+	@# signal. lm_head_quant.py logs the outcome AFTER the weights actually changed.
+	@grep -q "lm_head quantization .* FAILED" /tmp/vtl-verify.log \
+	  && { echo "FAIL lm_head fell back to bf16 -- 268 MB/step of decode traffic we thought was gone"; exit 1; } \
+	  || true
+	@m=$$(sed -n 's/.*lm_head quantized to \([a-z0-9]*\).*/\1/p' /tmp/vtl-verify.log | tail -1); \
+	 if [ -n "$$m" ]; then echo "OK   lm_head quantized to $$m"; \
+	 elif grep -q 'lm_head=off' /tmp/vtl-verify.log; then echo "WARN lm_head is bf16 (VTL_LM_HEAD_QUANT=off)"; \
+	 else echo "WARN lm_head outcome unknown -- model load never finished, or VTL_W4A8_IGNORE names it"; fi
 	@grep -q "channelwise fp8 unavailable" /tmp/vtl-verify.log \
 	  && echo "WARN channelwise fp8 fell back to stock per-tensor" \
 	  || echo "OK   channelwise fp8 active"
+	@# The jemalloc apt step deliberately cannot fail the build (a failed build scores zero,
+	@# glibc malloc only scores worse), so the check it used to do at build time lives here:
+	@# a missing lib makes the loader print this once per process. WARN, not FAIL -- it serves.
+	@grep -q "libjemalloc.so.2.*cannot be preloaded" /tmp/vtl-verify.log \
+	  && echo "WARN jemalloc NOT preloaded -- running on glibc malloc; see the build log for 'jemalloc:'" \
+	  || echo "OK   jemalloc preloaded"
 	@# Expected to fail when you deliberately A/B with VTL_ENABLE_RMS_NORM_QUANT=0.
 	@grep -q "fused rms_norm+fp8-quant CUDA kernel installed" /tmp/vtl-verify.log \
 	  && echo "OK   vtl fused norm+quant kernel installed" \
@@ -214,6 +269,25 @@ bench:
 	  python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	    --closed-loop $$n --out bench-closed-$$n.json; \
 	done
+
+## Sweep the CUTLASS W4A8 tile/cluster schedule (needs the GPU). The kernel's own heuristic
+## (w4a8_mm_entry.cu:341-372) keys ONLY on M/N/K and is blind to SM count -- it was tuned on a
+## full 132-SM Hopper and the judge's MIG 1g.18gb slice has ~19, so its choice is an open
+## question, not a settled one. This is the one already-exposed W4A8 tunable never swept.
+## `heuristic` is the sentinel for "unset", the baseline every other row must beat -- a literal
+## empty word cannot survive make -> shell word splitting. The three named tiles are what the
+## heuristic picks for our shapes (M<=32 decode, 8192-token prefill).
+SCHEDULES ?= heuristic 128x16_1x1x1 128x32_1x1x1 128x256_1x1x1
+sweep-schedule:
+	@for name in $(SCHEDULES); do \
+	  case "$$name" in heuristic) s="";; *) s="$$name";; esac; \
+	  echo "=== VTL_W4A8_SCHEDULE=$${s:-<heuristic>}"; \
+	  ( cd $(ROUND) && VTL_W4A8_SCHEDULE="$$s" $(DC) up -d --force-recreate --wait \
+	    && VTL_W4A8_SCHEDULE="$$s" python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	         --out bench-sched-$$name.json \
+	    ; rc=$$?; VTL_W4A8_SCHEDULE="$$s" $(DC) down; exit $$rc ) || exit 1; \
+	done
+	@echo "compare: $(ROUND)/bench-sched-*.json (heuristic is the baseline)"
 
 ## Phase-0 profiler (needs the H200). Boots with vLLM's torch profiler enabled, drives a small
 ## closed-loop replay, and prints a ranked GPU-kernel cost table. See docs/plans/.

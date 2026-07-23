@@ -16,9 +16,12 @@ log = logging.getLogger("vtl")
 # no GDN / gated-delta-net, no attn output gate, no MTP, no vision. The old GDN family
 # (gdn_kernels, gdn_prefill_backend) and the attn sigmoid-gate fusion (mul_sigmoid_quant) were
 # removed -- they targeted the previous qwen3_5 VL hybrid and are dead here. `shortconv_quant`
-# rebuilds LFM2's short-conv in_proj/out_proj with the fp8 quant_config (stock builds them bf16);
-# the existing kernels then cover them for free -- operator_norm->in_proj via rms_norm_quant, and
-# out_proj's (non-norm) `C * Bx` input via the standalone dynamic_per_token_quant kernel. The
+# rebuilds LFM2's short-conv in_proj/out_proj with the active quant_config (stock builds them
+# bf16); the existing kernels then cover them -- operator_norm->in_proj via rms_norm_quant (which
+# needed the in_proj hoist in short_conv.patch plus the empty_like fix in lfm2.patch before the
+# fusion pass could see it at all), and out_proj's (non-norm) `C * Bx` input via the standalone
+# dynamic_per_token_quant kernel. `lm_head_quant` covers the last big bf16 tensor, the output
+# head, which is not a LinearBase and so never reached the quant configs at all. The
 # depthwise conv weight stays bf16. `mul_quant` then fuses that gate multiply into the quant AND
 # gives every short-conv layer a single fp8 staging buffer for out_proj (so decode, prefill and
 # mixed batches all skip the bf16 vstack), and `bcx_conv_gate` replaces the decode half of that
@@ -26,7 +29,8 @@ log = logging.getLogger("vtl")
 # are model-agnostic and cover LFM2's other fp8 paths (attn qkv/out_proj, MLP w13/w2) directly.
 _MODULES: tuple[str, ...] = (
     "quant_fp8",
-    "shortconv_quant",  # fp8 the short-conv in_proj/out_proj (reuses the kernels above)
+    "quant_w4a8",       # int4 weights + fp8 acts; delegates un-int4-able layers back to quant_fp8
+    "shortconv_quant",  # quantize the short-conv in_proj/out_proj (reuses the kernels above)
     "rms_norm_quant",
     "dynamic_per_token_quant",
     "silu_mul_quant",
