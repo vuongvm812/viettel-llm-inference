@@ -111,6 +111,9 @@ services:
       VTL_V2_GREEDY_ARGMAX_KERNEL: "0"   # reserved: fused argmax .cu not built; torch.argmax is
                                          #   already a fused reduction -- flip on only if a profile wins
       VTL_V2_FUSED_POSTPROCESS: "1"      # skip the dead num_accepted scatter when no spec-decode
+      VTL_V2_FORCE_CUTLASS_FP8: "1"      # force fp8 layers off Marlin (its stable-ABI aten::empty
+                                         #   crashes under V2's dynamic-shape graph) onto CUTLASS.
+                                         #   Only matters under V2; "0" reverts. See quant_fp8.py.
       # VTL_V2_FUSED_CONV_ALIGN reserved for the on-box fused conv+align kernel (Part B Target 1);
       # inert until that .cu is built and parity-checked -- stock precopy runs meanwhile.
 

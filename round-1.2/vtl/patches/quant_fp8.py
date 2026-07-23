@@ -36,11 +36,17 @@ log = logging.getLogger("vtl")
 
 IGNORE_ENV = "VTL_FP8_IGNORE"
 CHANNELWISE_ENV = "VTL_FP8_CHANNELWISE"
+# V2 model runner: vLLM's fp8 kernel priority picks Marlin first on CUDA, but Marlin's
+# stable-ABI output alloc (aten::empty + memory_format) crashes under V2's dynamic-shape
+# compiled graph. When set, force the CUTLASS fp8 kernel instead. Default off -> V1 untouched.
+FORCE_CUTLASS_ENV = "VTL_V2_FORCE_CUTLASS_FP8"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # One-shot warning latch for the channelwise weight-load fallback (per process).
 _load_fallback_logged = False
+# One-shot warning latch for the force-CUTLASS path (per process).
+_force_cutlass_logged = False
 
 
 def parse_ignored_layers(raw: str | None) -> list[str]:
@@ -54,6 +60,11 @@ def channelwise_enabled(raw: str | None) -> bool:
     if raw is None:
         return True
     return raw.strip().lower() in _TRUTHY
+
+
+def _force_cutlass_fp8() -> bool:
+    """VTL_V2_FORCE_CUTLASS_FP8 -- default OFF (unset => V1/shipped is byte-identical)."""
+    return os.environ.get(FORCE_CUTLASS_ENV, "0").strip().lower() in _TRUTHY
 
 
 def _build_channelwise_method(quant_config, stock_method):
@@ -81,6 +92,47 @@ def _build_channelwise_method(quant_config, stock_method):
             # Must be set before create_weights() calls init_fp8_linear_kernel(),
             # which selects the kernel from this key.
             self.weight_quant_key = kFp8StaticChannelSym
+
+        def create_weights(self, layer, *args, **kwargs) -> None:
+            # Base create_weights() sets self.fp8_linear + self.use_marlin via
+            # init_fp8_linear_kernel(); Marlin wins on CUDA (it's first in
+            # _POSSIBLE_FP8_KERNELS). Under V2 that Marlin GEMM crashes at runtime
+            # (stable-ABI aten::empty+memory_format under the dynamic-shape graph), so
+            # re-select CUTLASS via the kernel's own force_kernel path. force_kernel
+            # no-ops if CUTLASS can't implement the layer, so worst case is the
+            # original Marlin -- no regression. Gated + fail-closed: never raise at load.
+            super().create_weights(layer, *args, **kwargs)
+            if not (self.use_marlin and _force_cutlass_fp8()):
+                return
+            global _force_cutlass_logged
+            try:
+                from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
+                from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+                    CutlassFP8ScaledMMLinearKernel,
+                )
+
+                forced = init_fp8_linear_kernel(
+                    activation_quant_key=self.activation_quant_key,
+                    weight_quant_key=self.weight_quant_key,
+                    weight_shape=layer.weight.shape,
+                    input_dtype=self.input_dtype,
+                    out_dtype=self.out_dtype,
+                    module_name=self.__class__.__name__,
+                    force_kernel=CutlassFP8ScaledMMLinearKernel,
+                )
+                if isinstance(forced, CutlassFP8ScaledMMLinearKernel):
+                    self.fp8_linear = forced
+                    self.use_marlin = False  # -> process_weights takes the CUTLASS branch
+                elif not _force_cutlass_logged:
+                    _force_cutlass_logged = True
+                    log.warning(
+                        "vtl: CUTLASS fp8 can't implement %s; keeping Marlin",
+                        self.__class__.__name__,
+                    )
+            except Exception as exc:
+                if not _force_cutlass_logged:
+                    _force_cutlass_logged = True
+                    log.warning("vtl: force-cutlass-fp8 failed (%s); keeping Marlin", exc)
 
         def process_weights_after_loading(self, layer) -> None:
             # Runs during weight loading -- OUTSIDE get_quant_method's guard -- so it must not
