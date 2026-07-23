@@ -57,7 +57,7 @@ services:
       #
       # Interpolated so the A/B is pure env and needs no file edit: `VTL_QUANT=vtl_fp8 make bench`.
       # Unset resolves to vtl_w4a8, so the submitted artifact behaves identically to a literal.
-      - --quantization=${VTL_QUANT:-vtl_w4a8}
+      - --quantization=vtl_w4a8
       - --kv-cache-dtype=fp8_e4m3
 
       # DO NOT enable --speculative-config. ngram/prompt-lookup spec-decode is output-identical
@@ -161,9 +161,15 @@ services:
       #
       # lm_head is NO LONGER in the w4a8 list: it is now quantized by vtl/patches/lm_head_quant.py
       # (268 MB/step, 31.5% of the post-w4a8 decode weight budget -- the largest tensor that was
-      # still bf16). Naming it here would force bf16 and silently undo that. It stays in the fp8
-      # list because vtl_fp8 has no lm_head path at all, so there it means what it always meant.
+      # still bf16). Naming it here would force bf16 and silently undo that.
       VTL_W4A8_IGNORE: ""
+      # INERT for lm_head, kept only as documentation of intent. Both ignore lists are consulted
+      # ONLY for LinearBase layers, and lm_head is a ParallelLMHead (a VocabParallelEmbedding):
+      # VtlFp8Config.get_quant_method early-returns at quant_fp8.py:182 before reading this list,
+      # and under vtl_w4a8 the ParallelLMHead branch never delegates to the fp8 fallback at all.
+      # The head is bf16 under vtl_fp8 because stock Fp8Config has no lm_head path, not because
+      # of this entry. To keep the head out of int4 use VTL_LM_HEAD_QUANT; to force it bf16 under
+      # w4a8 use VTL_W4A8_IGNORE. Nothing else in LFM2 matches the substring.
       VTL_FP8_IGNORE: "lm_head"               # fp8 is the per-layer fallback for W4A8
 
       # The lm_head ladder: int4 (default) | fp8 | off. Not a boolean; anything unrecognised
@@ -200,7 +206,7 @@ services:
       #
       # Interpolated so `make sweep-schedule` can drive it from the host env with no file edit.
       # Unset resolves to empty, i.e. the kernel heuristic -- what submissions ship.
-      VTL_W4A8_SCHEDULE: "128x64_1x1x1"
+      VTL_W4A8_SCHEDULE: ""
 
       # Both default OFF in code -- these two ARE load-bearing overrides.
       VTL_ENABLE_MUL_QUANT: 1                # fused conv-gate mul+fp8-quant; also gives out_proj a
