@@ -131,7 +131,7 @@ For each successful request:
 
 - **msgspec JSON** — replaces stdlib `json` for request parsing and non-streaming response serialization.
 - **msgspec SSE** — per-token streaming chunks use `msgspec.json.encode` instead of pydantic `model_dump_json`.
-- **Rust frontend** — vllm-rs rebuilt with fat-LTO, codegen-units=1, sonic_rs parser. Optional PGO via CPU mock engine.
+- **Rust frontend** — vllm-rs rebuilt with fat-LTO, codegen-units=1, sonic_rs parser. Optional PGO via CPU mock engine. Stick with stack-allocated unions only — heap boxing defeats the purpose.
 - **Greedy sampler fast path** — argmax shortcut when no logprobs/penalties/tools are active (100% of this workload).
 
 ### System/Runtime
