@@ -28,6 +28,10 @@ gen model_executor/layers/mamba/short_conv.py short_conv
 gen model_executor/models/lfm2.py                lfm2
 gen v1/attention/backends/flash_attn.py       flash_attn
 gen v1/worker/gpu_model_runner.py             gpu_model_runner
+# V2 model runner (VLLM_USE_V2_MODEL_RUNNER=1): greedy argmax fast path in the V2
+# sampler, and the dead-num_accepted-scatter elision in the hybrid model state.
+gen v1/worker/gpu/sample/sampler.py             v2_greedy_sampler
+gen v1/worker/gpu/model_states/mamba_hybrid.py  mamba_hybrid_postprocess
 
 echo "dry-run applying all patches against pristine v0.25.0..."
 TMP=$(mktemp -d); cp -r "$V025/vllm" "$TMP/vllm"

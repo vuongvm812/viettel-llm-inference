@@ -1,0 +1,166 @@
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
++
+ import numpy as np
+ import torch
+ 
+@@ -27,6 +29,47 @@
+ from vllm.v1.worker.gpu.states import RequestState
+ 
+ 
++def _vtl_env_on(name: str, default: str = "1") -> bool:
++    return os.environ.get(name, default).strip().lower() not in (
++        "0",
++        "false",
++        "no",
++        "off",
++        "",
++    )
++
++
++def _vtl_greedy_eligible(
++    num_draft_tokens: int,
++    temperature_np: np.ndarray,
++    max_num_logprobs: int,
++    max_per_req_token_ids: int,
++    use_penalty_np: np.ndarray,
++    use_logit_bias_np: np.ndarray,
++    num_bad_words_np: np.ndarray,
++) -> bool:
++    """Pure predicate: True iff a bare ``logits.argmax`` equals the token the
++    full sampler would produce for the *whole* batch.
++
++    ``temperature == 0`` is greedy, and ``min_p`` / ``top_k`` / ``top_p`` only
++    prune below the running max, so the argmax is invariant to them. Anything
++    that rewrites the logits -- penalties, logit bias (incl. min-tokens and
++    allowed-token-ids masks), bad-words -- or that needs processed logits
++    (logprobs) or introduces >1 candidate per row (spec-decode draft rows)
++    disqualifies the batch. Mirrors the V1 vtl ``_should_fastpath``. All args are
++    already sliced to the batch's request order (``idx_mapping_np``).
++    """
++    return (
++        num_draft_tokens == 0
++        and bool(np.all(temperature_np == 0.0))
++        and max_num_logprobs == NO_LOGPROBS
++        and max_per_req_token_ids == 0
++        and not bool(np.any(use_penalty_np))
++        and not bool(np.any(use_logit_bias_np))
++        and not bool(np.any(num_bad_words_np > 0))
++    )
++
++
+ class Sampler:
+     def __init__(
+         self,
+@@ -53,6 +96,22 @@
+         self.num_speculative_tokens = num_speculative_tokens
+         self.use_flashinfer = flashinfer_sampler_supported()
+ 
++        # vtl: greedy argmax fast path. Skips the full-vocab FP32 logit copy plus
++        # the bias/penalty/bad-words/temperature/min_p kernels and gumbel_sample
++        # when the batch is provably plain greedy (see _vtl_greedy_eligible). Env
++        # kill-switches are wired in docker-compose (default on); flip to 0 for an
++        # A/B against the stock sampler with no file edit.
++        self.vtl_greedy_fastpath = _vtl_env_on("VTL_V2_GREEDY_FASTPATH")
++        # ponytail: torch.argmax is already a single fused reduction; the custom
++        # kernel only helps if a profile proves it a bottleneck (it won't at
++        # batch<=8 / vocab 65k). Default off in compose until the .cu lands.
++        self.vtl_greedy_argmax_kernel = _vtl_env_on(
++            "VTL_V2_GREEDY_ARGMAX_KERNEL", default="0"
++        )
++        # Resolved once on first use (see _vtl_argmax) so the greedy hot path never
++        # pays a per-step attribute lookup / caught exception.
++        self._vtl_argmax_fn = None
++
+     def add_request(
+         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
+     ) -> None:
+@@ -68,12 +127,83 @@
+         self.logit_bias_state.apply_staged_writes()
+         self.bad_words_state.apply_staged_writes()
+         self.logprob_token_ids_state.apply_staged_writes()
++
++    @staticmethod
++    def _torch_argmax(logits: torch.Tensor) -> torch.Tensor:
++        return logits.argmax(dim=-1)
++
++    def _vtl_resolve_argmax(self):
++        """Pick the argmax backend once: the vtl fused op if the plugin registered
++        it, else torch's fused reduction (identical int64 result)."""
++        if self.vtl_greedy_argmax_kernel:
++            try:
++                return torch.ops.vllm_cuda.greedy_argmax_i64
++            except (AttributeError, RuntimeError):
++                pass
++        return self._torch_argmax
+ 
++    def _vtl_argmax(self, logits: torch.Tensor) -> torch.Tensor:
++        """int64 argmax over the vocab, via the once-resolved backend."""
++        fn = self._vtl_argmax_fn
++        if fn is None:
++            fn = self._vtl_argmax_fn = self._vtl_resolve_argmax()
++        return fn(logits)
++
++    def _vtl_try_greedy(
++        self, logits: torch.Tensor, input_batch: InputBatch
++    ) -> SamplerOutput | None:
++        """Return a SamplerOutput via a bare argmax when the batch is a plain
++        greedy step, else None to fall through to the full ``sample`` path.
++
++        Output-identical to the stock path at temperature 0 -- gumbel_sample adds
++        no noise there, so it already reduces to argmax -- modulo the tie-break
++        direction on an exact-max logit tie, which torch.argmax and stock's Triton
++        tl.max both resolve to the first index (rare in fp32 over 65k; confirm with
++        the eval_quality trace diff). We just skip the wasted FP32 logit copy and
++        modifier kernels that precede it. num_sampled / num_rejected reuse the
++        stock helper so chunked-prefill rows (which sample no token) are still
++        counted correctly.
++        """
++        idx = input_batch.idx_mapping_np
++        ss = self.sampling_states
++        if not _vtl_greedy_eligible(
++            input_batch.num_draft_tokens,
++            ss.temperature.np[idx],
++            ss.max_num_logprobs(idx),
++            self.logprob_token_ids_state.max_num_token_ids(idx),
++            self.penalties_state.use_penalty[idx],
++            self.logit_bias_state.use_logit_bias[idx],
++            self.bad_words_state.num_bad_words.np[idx],
++        ):
++            return None
++
++        num_nans = get_num_nans(logits) if self.compute_nans else None
++        sampled = self._vtl_argmax(logits)
++        num_sampled, num_rejected = get_num_sampled_and_rejected(
++            input_batch.seq_lens.new_ones(input_batch.num_reqs),
++            input_batch.seq_lens,
++            input_batch.cu_num_logits,
++            input_batch.idx_mapping,
++            self.req_states.prefill_len.gpu,
++        )
++        return SamplerOutput(
++            sampled_token_ids=sampled.view(-1, 1),
++            logprobs_tensors=None,
++            num_nans=num_nans,
++            num_sampled=num_sampled,
++            num_rejected=num_rejected,
++        )
++
+     def __call__(
+         self,
+         logits: torch.Tensor,
+         input_batch: InputBatch,
+     ) -> SamplerOutput:
++        if self.vtl_greedy_fastpath:
++            fast = self._vtl_try_greedy(logits, input_batch)
++            if fast is not None:
++                return fast
++
+         expanded_idx_mapping = input_batch.expanded_idx_mapping
+         idx_mapping_np = input_batch.idx_mapping_np
+         cu_num_logits_np = input_batch.cu_num_logits_np

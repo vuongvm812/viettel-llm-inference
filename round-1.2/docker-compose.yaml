@@ -95,12 +95,24 @@ services:
       # TPOT. SGLang publishes 2.2ms for this exact model on H200 at concurrency 1, so ~1.8ms
       # (~13 score points) is on the table. Every knob below is one env var to revert.
       #
-      # Model Runner V2 (VLLM_USE_V2_MODEL_RUNNER=1) was TRIED AND REJECTED on 2026-07-21.
-      # It is vLLM's per-step-CPU-overhead rewrite, gated off for hybrid models by a
-      # conservative default; forcing it on LFM2 boots and is correct, but measured SLOWER
-      # open-loop on the round-2 trace: TPOT 5.0 -> 5.6ms, TTFT 62 -> 80ms (~-4 score points).
-      # Verified independent of the vtl greedy sampler (5.6ms with it both on and off).
-      # Do not re-add without re-measuring on a vLLM that has re-tuned the hybrid path.
+      # ---- Model Runner V2 ------------------------------------------------------------
+      # V2 is vLLM's per-step-CPU-overhead rewrite (GPU-resident batch prep + sampling),
+      # attractive on this host-bound slice. Stock V2 was REJECTED on 2026-07-21 (TPOT
+      # 5.0 -> 5.6ms, TTFT 62 -> 80ms) -- but that was STOCK V2: its Sampler runs a full
+      # 65k-vocab FP32 logit copy + bias/penalty/badwords/temp/min_p kernels + gumbel every
+      # step even at temp 0, because the vtl greedy fast path only patched the *V1* Sampler
+      # class. The flags below add a V2-native greedy fast path (fork edit in
+      # vllm/v1/worker/gpu/sample/sampler.py) plus a dead-launch elision in the hybrid
+      # postprocess. RE-MEASURE {V1,V2}x{stock,+patches} on the slice before trusting either
+      # way; revert to V1 = VLLM_USE_V2_MODEL_RUNNER "0" (which also makes the VTL_V2_* flags
+      # inert). Each VTL_V2_* fails closed to the stock V2 path, so default-on cannot crash.
+      VLLM_USE_V2_MODEL_RUNNER: "1"
+      VTL_V2_GREEDY_FASTPATH: "1"        # argmax short-circuit for provably-greedy batches
+      VTL_V2_GREEDY_ARGMAX_KERNEL: "0"   # reserved: fused argmax .cu not built; torch.argmax is
+                                         #   already a fused reduction -- flip on only if a profile wins
+      VTL_V2_FUSED_POSTPROCESS: "1"      # skip the dead num_accepted scatter when no spec-decode
+      # VTL_V2_FUSED_CONV_ALIGN reserved for the on-box fused conv+align kernel (Part B Target 1);
+      # inert until that .cu is built and parity-checked -- stock precopy runs meanwhile.
 
       # vLLM only pins torch's CPU thread count in set_multiprocessing_worker_envs(), which the
       # MULTIPROC executor calls. At --tensor-parallel-size=1 we get UniProcExecutor, which
