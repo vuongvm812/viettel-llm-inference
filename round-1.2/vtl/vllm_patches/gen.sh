@@ -32,6 +32,12 @@ gen v1/worker/gpu_model_runner.py             gpu_model_runner
 # sampler, and the dead-num_accepted-scatter elision in the hybrid model state.
 gen v1/worker/gpu/sample/sampler.py             v2_greedy_sampler
 gen v1/worker/gpu/model_states/mamba_hybrid.py  mamba_hybrid_postprocess
+# Hybrid draft-model spec-decode (vLLM issue #49112; PRs #44296/#35062/#49138). short_conv +
+# mamba_utils = target-side short_conv rollback + wider conv state; kv_cache_utils = isolate
+# drafter layers into per-spec-type KV groups; llm_base_proposer = draft layers across >1 group.
+gen model_executor/layers/mamba/mamba_utils.py  mamba_utils
+gen v1/core/kv_cache_utils.py                   kv_cache_utils
+gen v1/spec_decode/llm_base_proposer.py         llm_base_proposer
 
 echo "dry-run applying all patches against pristine v0.25.0..."
 TMP=$(mktemp -d); cp -r "$V025/vllm" "$TMP/vllm"

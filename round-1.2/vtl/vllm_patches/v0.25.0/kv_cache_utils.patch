@@ -1,0 +1,108 @@
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1107,6 +1107,7 @@
+ 
+ def _get_kv_cache_groups_uniform_page_size(
+     kv_cache_spec: dict[str, KVCacheSpec],
++    drafter_layers: set[str] | None = None,
+ ) -> list[KVCacheGroupSpec]:
+     """
+     Generates the KV cache groups for hybrid models with multiple
+@@ -1177,6 +1178,32 @@
+     for layer_name, layer_spec in kv_cache_spec.items():
+         same_type_layers[layer_spec].append(layer_name)
+ 
++    # Separate speculative-decode drafter layers into their OWN dedicated
++    # group(s) before the sizing heuristic runs, so they don't get scattered
++    # across the target's groups (which trips validate_same_kv_cache_group).
++    # A HYBRID draft (attention + short_conv) has >1 spec type, so create one
++    # dedicated drafter group PER spec type -- a single mixed group would fail
++    # FullAttentionSpec.merge. See vLLM issue #49112.
++    drafter_groups: list[list[str]] = []
++    if drafter_layers:
++        for spec in list(same_type_layers.keys()):
++            layers = same_type_layers[spec]
++            spec_in_group = [n for n in layers if n in drafter_layers]
++            if not spec_in_group:
++                continue
++            non_spec = [n for n in layers if n not in drafter_layers]
++            if non_spec:
++                same_type_layers[spec] = non_spec
++            else:
++                del same_type_layers[spec]
++            drafter_groups.append(spec_in_group)
++        if drafter_groups:
++            logger.info(
++                "Separated %d drafter layers into %d dedicated KV cache group(s)",
++                sum(len(g) for g in drafter_groups),
++                len(drafter_groups),
++            )
++
+     # Split each group into smaller groups, to make the number of layers in each
+     # group identical. Add padding to the last group of each type if necessary.
+     # E.g., (full.0, full.1), (sw.0, sw.1, sw.2)
+@@ -1224,6 +1251,11 @@
+         # instead of layers[i * group_size: (i + 1) * group_size]
+         for i in range(num_groups):
+             grouped_layers.append(layers[i::num_groups])
++    # Prepend each dedicated drafter group (already spec-uniform). Each becomes
++    # its own KVCacheGroup so a hybrid draft's attention and short_conv layers
++    # land in separate, spec-uniform groups.
++    for group in reversed(drafter_groups):
++        grouped_layers.insert(0, group)
+     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+ 
+ 
+@@ -1694,6 +1726,40 @@
+             break
+ 
+ 
++def _identify_drafter_layers(
++    vllm_config: VllmConfig, all_layer_names: list[str]
++) -> set[str] | None:
++    """Identify speculative-decode drafter layers so they can be isolated into
++    their own KV cache group(s).
++
++    Two conventions:
++    - EAGLE-style drafters append layers after the target's, so their global
++      index exceeds the target's total layer count.
++    - A classical (separate) draft model loads with prefix ``draft_model`` and
++      LOCAL 0-based indices (see vllm/v1/spec_decode/draft_model.py), which the
++      index rule misses -- detect those by name. (vLLM issue #49112 wall 1.)
++    """
++    if vllm_config.speculative_config is None:
++        return None
++    # Lazy import to avoid a core<-models import cycle at module load.
++    from vllm.model_executor.models.utils import extract_layer_index
++
++    target_num_layers = vllm_config.model_config.get_total_num_hidden_layers()
++    drafter_layers: set[str] = set()
++    for name in all_layer_names:
++        if "draft_model" in name:
++            drafter_layers.add(name)
++            continue
++        try:
++            if extract_layer_index(name) >= target_num_layers:
++                drafter_layers.add(name)
++        except (AssertionError, ValueError):
++            lowered = name.lower()
++            if "drafter" in lowered or "eagle" in lowered or "mtp" in lowered:
++                drafter_layers.add(name)
++    return drafter_layers or None
++
++
+ def get_kv_cache_groups(
+     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
+ ) -> list[KVCacheGroupSpec]:
+@@ -1749,7 +1815,10 @@
+     # the page size of the layers. For cases cannot be unified, this function
+     # will raise an error.
+     filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
++    # Isolate drafter layers so a (possibly hybrid) draft model's layers stay in
++    # dedicated, spec-uniform group(s) instead of scattering across target groups.
++    drafter_layers = _identify_drafter_layers(vllm_config, list(filtered_spec.keys()))
++    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, drafter_layers)
+ 
+     # Add hidden-state layers back with page aligned to the common page.
+     if hidden_specs:

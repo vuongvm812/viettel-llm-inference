@@ -1,0 +1,20 @@
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -136,6 +136,9 @@
+     BailingLinearAttentionMetadataBuilder,
+ )
+ from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
++from vllm.v1.attention.backends.short_conv_attn import (
++    ShortConvAttentionMetadataBuilder,
++)
+ from vllm.v1.attention.backends.utils import (
+     NULL_BLOCK_ID,
+     create_fast_prefill_custom_backend,
+@@ -2451,6 +2454,7 @@
+                     Mamba2AttentionMetadataBuilder,
+                     GDNAttentionMetadataBuilder,
+                     BailingLinearAttentionMetadataBuilder,
++                    ShortConvAttentionMetadataBuilder,
+                 ),
+             ):
+                 assert ubid is None, (

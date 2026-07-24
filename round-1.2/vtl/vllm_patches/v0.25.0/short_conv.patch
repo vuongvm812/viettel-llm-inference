@@ -179,7 +179,20 @@
  # --8<-- [start:short_conv]
  @CustomOp.register("short_conv")
  class ShortConv(MambaBase, CustomOp):
-@@ -88,7 +251,7 @@
+@@ -76,7 +239,11 @@
+             prefix=f"{prefix}.out_proj",
+         )
+ 
+-        compilation_config = get_current_vllm_config().compilation_config
++        vllm_config = get_current_vllm_config()
++        # Capture here (config context is set during model build); get_state_shape
++        # runs later outside that context. Widens conv state for spec-decode rollback.
++        self.num_spec = vllm_config.num_speculative_tokens
++        compilation_config = vllm_config.compilation_config
+         if prefix in compilation_config.static_forward_context:
+             raise ValueError(f"Duplicate layer name: {prefix}")
+         compilation_config.static_forward_context[prefix] = self
+@@ -88,7 +255,7 @@
  
      def forward_native(
          self,
@@ -188,7 +201,7 @@
          output: torch.Tensor,
      ):
          # Reference torch causal conv1d; runs on all CPU platforms. AMX kernels
-@@ -106,7 +269,6 @@
+@@ -106,7 +273,6 @@
              attn_metadata = attn_metadata_raw[self.prefix]
              assert isinstance(attn_metadata, ShortConvAttentionMetadata)
  
@@ -196,7 +209,7 @@
          B, C, x = BCx.chunk(3, dim=-1)
  
          # (dim, kernel_size) — same reshape as forward_cuda
-@@ -118,7 +280,7 @@
+@@ -118,7 +284,7 @@
              # Profile run — output value doesn't matter
              Bx = (B * x).contiguous()
              output_tensor, _ = self.out_proj(C * Bx)
@@ -205,7 +218,7 @@
              return
  
          conv_state = (
-@@ -185,15 +347,34 @@
+@@ -185,15 +351,34 @@
          hidden_states: torch.Tensor,
          output: torch.Tensor,
      ):
@@ -242,7 +255,7 @@
          output: torch.Tensor,
      ):
          forward_context = get_forward_context()
-@@ -218,8 +399,6 @@
+@@ -218,8 +403,6 @@
              has_initial_states_p = attn_metadata.has_initial_states_p
              query_start_loc_p = attn_metadata.query_start_loc_p
  
@@ -251,7 +264,7 @@
          B, C, x = BCx.chunk(3, dim=-1)
  
          conv_weights = self.conv.weight.view(
-@@ -240,6 +419,15 @@
+@@ -240,6 +423,15 @@
          has_decode = num_decodes > 0
          num_actual_tokens = num_decodes + num_prefill_tokens
  
@@ -267,7 +280,7 @@
          # NOTE: V1 puts decode before prefill
          # Separate prefill and decode by splitting varlen input
          # Split along token dimension
-@@ -260,6 +448,60 @@
+@@ -260,6 +452,60 @@
          )
          conv_output_list = []
  
@@ -328,7 +341,7 @@
          if has_prefill:
              Bx_p = (B_p * x_p).transpose(0, 1)
              Bx = causal_conv1d_fn(
-@@ -274,21 +516,76 @@
+@@ -274,21 +520,76 @@
                  query_start_loc=query_start_loc_p,
              ).transpose(0, 1)[:num_prefill_tokens]
  
@@ -417,7 +430,21 @@
  
          # Merge prefill and decode outputs before passing to gated MLP
          hidden_states = torch.vstack(conv_output_list)
-@@ -317,20 +614,23 @@
+@@ -305,10 +606,13 @@
+         )
+ 
+     def get_state_shape(self) -> tuple[tuple[int, ...]]:
++        # num_spec widens the conv state for speculative-decode rollback
++        # (see short_conv_state_shape / mamba2 parity). Captured in __init__.
+         return MambaStateShapeCalculator.short_conv_state_shape(
+             tp_world_size=get_tensor_model_parallel_world_size(),
+             intermediate_size=self.conv_dim,
+             conv_kernel=self.L_cache,
++            num_spec=self.num_spec,
+         )
+ 
+     @property
+@@ -317,20 +621,23 @@
  
  
  def short_conv(
