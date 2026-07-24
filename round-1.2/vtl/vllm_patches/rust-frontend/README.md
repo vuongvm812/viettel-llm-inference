@@ -26,12 +26,15 @@ frontend binary. They carry our frontend optimizations so a clean checkout (wher
 ## `fxhash_hot_paths.patch`
 - `src/engine-core-client/src/client/state.rs` — replace `HashMap` with `FxHashMap` for
   `RequestRegistry.requests` (the hot-path request lookup used per decode step).
-- `src/engine-core-client/src/protocol/sampling.rs` — `FxHashMap` for `logit_bias`
-  and `extra_args` DTO fields (per-request, small maps with integer keys).
-- `src/server/src/config.rs` — `FxHashMap` for `default_chat_template_kwargs`
-  (init-only, consistency with the other maps).
-  `rustc-hash = "1.1.0"` is already a workspace dependency — no Cargo.toml
-  changes needed.
+- `src/engine-core-client/Cargo.toml` — add `rustc-hash.workspace = true`. The workspace
+  root only declares the *version* (`[workspace.dependencies]`); each member crate still
+  has to opt in, and only `src/tokenizer` did.
+
+  Deliberately NOT converted: `protocol/sampling.rs` (`logit_bias`, `extra_args`) and
+  `server/src/config.rs` (`default_chat_template_kwargs`). Those are deserialized DTO
+  fields — swapping the hasher changes the public type and breaks `src/text/src/lower.rs`,
+  which constructs them as `std::HashMap`. All three are per-request `Option`s that are
+  `None` on this workload, so there is nothing to win for the ripple.
 
 ## `sse_static_strings.patch`
 - `src/server/.../chat_completions/types.rs` — replace `String` with `Arc<str>` for
