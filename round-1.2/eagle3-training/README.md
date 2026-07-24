@@ -31,6 +31,9 @@ purge any `cuda-compat-*`, export `CUDA_HOME=/usr/local/cuda-12.9` + `PATH=$CUDA
 `~/.cache/flashinfer`, and confirm `python -c "import torch;print(torch.cuda.is_available())"` prints
 True before launching SGLang. (If the driver's max CUDA < 12.8, upgrade the driver first, ≈570+.)
 Alternatively skip flashinfer JIT with `--attention-backend triton`, if SGLang supports it for the hybrid.
+After any driver up/downgrade, **reboot** — otherwise `nvidia-smi` fails with `NVML: Driver/library
+version mismatch` (new userspace libs vs the still-loaded old kernel module). A recent driver (580+)
+supports CUDA 13 and lifts the ceiling so torch's bundled runtime + a 12.9/13 toolkit both fit.
 
 On the GPU box:
 ```bash
