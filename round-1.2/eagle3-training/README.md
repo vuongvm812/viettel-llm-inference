@@ -15,7 +15,15 @@ from `llama3.1-8b-eagle3-online.yaml`.
 ## Prerequisites — CUDA Linux GPU box (NOT your Mac)
 SpecForge pins `torch==2.11.0` + `sglang==0.5.14` (CUDA-Linux only) and needs Python 3.11. None of the
 steps below — SGLang capture server, `torchrun`, `specforge train` — run on macOS/CPU. Your Mac is only
-for editing/committing these config files. On the GPU box:
+for editing/committing these config files.
+
+Also required: the **CUDA toolkit (`nvcc` + headers)**, not just the driver. SGLang's FlashInfer backend
+JIT-compiles its attention kernels at launch and fails with `Could not find nvcc / cuda_home
+'/usr/local/cuda' doesn't exist` if only the driver is present. Install a toolkit ≤ the CUDA version
+`nvidia-smi` reports (e.g. `apt-get install cuda-toolkit-12-6`) and export
+`CUDA_HOME=/usr/local/cuda` + `PATH=$CUDA_HOME/bin:$PATH` before launching any SGLang server.
+
+On the GPU box:
 ```bash
 git clone https://github.com/sgl-project/SpecForge.git && cd SpecForge
 uv python install 3.11 && uv venv -p 3.11 --python-preference only-managed && source .venv/bin/activate
