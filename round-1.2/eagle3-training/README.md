@@ -19,13 +19,18 @@ for editing/committing these config files.
 
 Also required: the **CUDA toolkit (`nvcc` + headers)**, not just the driver. SGLang's FlashInfer backend
 JIT-compiles its attention kernels at launch and fails with `Could not find nvcc / cuda_home
-'/usr/local/cuda' doesn't exist` if only the driver is present. Install a toolkit that is **both** ≤ the
-CUDA version `nvidia-smi` reports **and ≥ 12.8 if the box has glibc ≥ 2.41** — an older toolkit (e.g.
-12.6) fails the flashinfer compile with `rsqrt/rsqrtf ... exception specification does not match`
-(glibc 2.41 added those with `noexcept`; NVIDIA fixed the headers in CUDA 12.8). So `apt-get install
-cuda-toolkit-12-9`, then export `CUDA_HOME=/usr/local/cuda-12.9` + `PATH=$CUDA_HOME/bin:$PATH` and
-`rm -rf ~/.cache/flashinfer` before launching any SGLang server. (Alternatively skip flashinfer JIT with
-`--attention-backend triton` on the server, if SGLang supports it for the LFM2 hybrid.)
+'/usr/local/cuda' doesn't exist` if only the driver is present. Install a toolkit inside a **version window** — `12.8 ≤ toolkit ≤ (the CUDA version nvidia-smi reports)`:
+- **too old** (e.g. 12.6, on glibc ≥ 2.41): flashinfer compile fails with `rsqrt/rsqrtf ... exception
+  specification does not match` (glibc 2.41 added those `noexcept`; NVIDIA fixed the headers in 12.8);
+- **too new** (e.g. 13 when the driver only supports 12.x): CUDA error `804 forward compatibility was
+  attempted on non supported HW` — torch can't see the GPU at all (Ampere/consumer cards don't do
+  forward-compat). The `cuda-compat-*` package pulled in alongside a too-new toolkit is the trigger.
+
+So `cuda-toolkit-12-9` (or 12-8) is the safe pick on a recent-glibc box whose driver supports ≥12.8;
+purge any `cuda-compat-*`, export `CUDA_HOME=/usr/local/cuda-12.9` + `PATH=$CUDA_HOME/bin:$PATH`, clear
+`~/.cache/flashinfer`, and confirm `python -c "import torch;print(torch.cuda.is_available())"` prints
+True before launching SGLang. (If the driver's max CUDA < 12.8, upgrade the driver first, ≈570+.)
+Alternatively skip flashinfer JIT with `--attention-backend triton`, if SGLang supports it for the hybrid.
 
 On the GPU box:
 ```bash
