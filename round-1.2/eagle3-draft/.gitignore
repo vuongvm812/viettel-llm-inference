@@ -1,0 +1,4 @@
+# Generated weights (mock via make_mock_checkpoint.py, or the real SpecForge export).
+# Never commit — ~580MB. Regenerate the mock with `python make_mock_checkpoint.py`.
+*.safetensors
+*.bin

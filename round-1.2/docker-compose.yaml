@@ -79,6 +79,14 @@ services:
       # A/B -- no code change per method. (Tree drafters EAGLE/Medusa need the deferred tree path.)
       - '--speculative-config={"method":"ngram","num_speculative_tokens":3,"prompt_lookup_max":4}'
 
+      # EAGLE-3 (trained draft head; see round-1.2/eagle3-draft/ + eagle3-training/). Higher acceptance
+      # than ngram on non-repetitive chat, but needs a trained 1.2B head (Workstream 2) and the lfm2.py
+      # SupportsEagle3 patch (Workstream 1). Stage the exported (or mock) draft dir into the image at
+      # /draft. UNLIKE ngram, eagle3 is Model Runner V2-compatible (vllm/config/vllm.py:2072), so it can
+      # run with VLLM_USE_V2_MODEL_RUNNER=1 -- A/B V1 vs V2. Same gates as ngram: greedy-lossless at
+      # temp 0, then TPOT go/no-go on the MIG slice. Swap the ngram line above for:
+      # - '--speculative-config={"method":"eagle3","model":"/draft","num_speculative_tokens":2}'
+
       # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
       # drop the periodic stats logger and quiet uvicorn.
       - --disable-log-stats
