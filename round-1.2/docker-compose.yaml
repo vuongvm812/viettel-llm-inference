@@ -82,6 +82,9 @@ services:
       #       (sweep num_speculative_tokens; the draft is a full 350M fwd/step, not free).
       # NOTE: the runtime per-group block-table routing is upstream-incomplete (#49138 is a closed
       # RFC); if drafting misbehaves past boot, that is the remaining work, not a config error.
+      # The drafter is baked into the image's HF cache at build time (round-1.2/Dockerfile,
+      # ARG DRAFT_MODEL) and resolved OFFLINE by this HF name (HF_HUB_OFFLINE=1 below) -- the judge
+      # provides only /model and has no run-time network.
       - '--speculative-config={"model":"LiquidAI/LFM2.5-350M","num_speculative_tokens":3}'
 
       # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
@@ -102,6 +105,12 @@ services:
       RUST_LOG: "tower_http=warn,tower=warn,axum=warn,hyper=warn,hyper_util=warn,h2=warn"
       DO_NOT_TRACK: "1"                        # disable anonymous usage stats / telemetry
       VLLM_NO_USAGE_STATS: "1"
+      # The draft model (--speculative-config model=LiquidAI/LFM2.5-350M) is baked into the image's
+      # HF cache at /opt/hf-cache (round-1.2/Dockerfile: ENV HF_HOME + DRAFT_MODEL). Resolve it from
+      # that cache without a network round-trip -- the judge host has none. The target loads from the
+      # /model PATH, so offline mode does not affect it. Drop both if you build with DRAFT_MODEL=.
+      HF_HOME: /opt/hf-cache
+      HF_HUB_OFFLINE: "1"
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
 
       # ---- TPOT: host-side per-step cost ----------------------------------------------
