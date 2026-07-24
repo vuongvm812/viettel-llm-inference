@@ -38,6 +38,10 @@ gen v1/worker/gpu/model_states/mamba_hybrid.py  mamba_hybrid_postprocess
 gen model_executor/layers/mamba/mamba_utils.py  mamba_utils
 gen v1/core/kv_cache_utils.py                   kv_cache_utils
 gen v1/spec_decode/llm_base_proposer.py         llm_base_proposer
+# worker_mamba_utils = let the runner's mamba state-copy buffers accept a drafter mamba group
+# whose state SHAPES differ from the target's (conv_dim 1024 vs 2048). Distinct from the
+# mamba_utils above -- that one is model_executor/layers/mamba/, this one is v1/worker/.
+gen v1/worker/mamba_utils.py                    worker_mamba_utils
 
 echo "dry-run applying all patches against pristine v0.25.0..."
 TMP=$(mktemp -d); cp -r "$V025/vllm" "$TMP/vllm"
