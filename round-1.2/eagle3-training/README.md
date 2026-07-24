@@ -19,9 +19,13 @@ for editing/committing these config files.
 
 Also required: the **CUDA toolkit (`nvcc` + headers)**, not just the driver. SGLang's FlashInfer backend
 JIT-compiles its attention kernels at launch and fails with `Could not find nvcc / cuda_home
-'/usr/local/cuda' doesn't exist` if only the driver is present. Install a toolkit ≤ the CUDA version
-`nvidia-smi` reports (e.g. `apt-get install cuda-toolkit-12-6`) and export
-`CUDA_HOME=/usr/local/cuda` + `PATH=$CUDA_HOME/bin:$PATH` before launching any SGLang server.
+'/usr/local/cuda' doesn't exist` if only the driver is present. Install a toolkit that is **both** ≤ the
+CUDA version `nvidia-smi` reports **and ≥ 12.8 if the box has glibc ≥ 2.41** — an older toolkit (e.g.
+12.6) fails the flashinfer compile with `rsqrt/rsqrtf ... exception specification does not match`
+(glibc 2.41 added those with `noexcept`; NVIDIA fixed the headers in CUDA 12.8). So `apt-get install
+cuda-toolkit-12-9`, then export `CUDA_HOME=/usr/local/cuda-12.9` + `PATH=$CUDA_HOME/bin:$PATH` and
+`rm -rf ~/.cache/flashinfer` before launching any SGLang server. (Alternatively skip flashinfer JIT with
+`--attention-backend triton` on the server, if SGLang supports it for the LFM2 hybrid.)
 
 On the GPU box:
 ```bash
