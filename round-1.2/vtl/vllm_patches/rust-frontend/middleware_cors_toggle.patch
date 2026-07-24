@@ -1,0 +1,36 @@
+--- a/src/server/src/routes.rs
++++ b/src/server/src/routes.rs
+@@ -42,6 +42,16 @@ fn runtime_lora_updating_enabled() -> bool {
+         .is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true"))
+ }
+
++/// CORS support (`CorsLayer` + the no-`Origin` header strip) is on by default.
++/// Set `VLLM_RS_DISABLE_CORS=1` to drop both layers — a latency A/B knob for
++/// server-to-server deployments (e.g. the judge harness) where no browser
++/// preflight ever occurs, so the two per-request layers are pure overhead.
++fn cors_enabled() -> bool {
++    !std::env::var("VLLM_RS_DISABLE_CORS")
++        .ok()
++        .is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true"))
++}
++
+ /// Per-request HTTP tracing (`TraceLayer`) is on by default. Set
+ /// `VLLM_RS_DISABLE_HTTP_TRACE=1` to drop the layer entirely — a latency A/B knob.
+ /// The axum/tower/hyper logs are already WARN-pinned via `RUST_LOG`, so the span is
+@@ -140,9 +150,13 @@ fn build_router_with_options(
+             state.clone(),
+             middleware::track_server_load,
+         ))
+-        .layer(from_fn(middleware::track_http_metrics))
+-        .layer(middleware::cors_layer(&state.cors))
+-        .layer(from_fn(middleware::strip_cors_on_no_origin));
++        .layer(from_fn(middleware::track_http_metrics));
++
++    if cors_enabled() {
++        router = router
++            .layer(middleware::cors_layer(&state.cors))
++            .layer(from_fn(middleware::strip_cors_on_no_origin));
++    }
+
+     if enable_api_key_auth {
+         router = router.layer(from_fn_with_state(

@@ -153,6 +153,10 @@ services:
       # 1 removes it, which is what we ship. Set to 0 to restore it and measure the delta.
       # Trade-off: loses rejected-request log visibility (logs are already WARN-pinned anyway).
       VLLM_RS_DISABLE_HTTP_TRACE: "1"
+      # Drop the two per-request CORS layers (CorsLayer + no-Origin header strip). The judge
+      # hits the server directly server-to-server, so no browser preflight ever occurs and the
+      # layers are pure overhead. Unset = ON (default, browser-safe); 1 removes them.
+      VLLM_RS_DISABLE_CORS: "1"
 
       # ---- Quantization --------------------------------------------------------------
       # Only the OVERRIDES live here. Every VTL_ENABLE_<patch> not listed below already

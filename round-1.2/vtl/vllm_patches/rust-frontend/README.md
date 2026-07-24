@@ -64,6 +64,17 @@ suite passes, but that is the one place where order is observable.
   `VLLM_RS_DISABLE_HTTP_TRACE` (default off = layer stays on). Set the env to `1` to drop
   the layer entirely — a latency A/B knob. The optimized compose defaults it to `1`.
 
+## `middleware_cors_toggle.patch`
+- `src/server/src/routes.rs` — gate the two per-request CORS layers (`cors_layer` +
+  `strip_cors_on_no_origin`) behind `VLLM_RS_DISABLE_CORS` (default off = layers stay on).
+  Set the env to `1` to drop both — a latency A/B knob for server-to-server deployments (the
+  judge harness) where no browser preflight occurs. The optimized compose defaults it to `1`.
+- Sorts **after** `http_trace_toggle.patch` in the glob apply order; its context is anchored
+  on the trace-toggle output (the `http_trace_enabled` helper), so it must apply second.
+
+Note: `--api-key` auth is already a no-op here — the `authenticate_api_key` layer is only
+added when keys are configured (`enable_api_key_auth`), and the compose sets none.
+
 Applied idempotently: the stage skips **all** patches if the checkout already carries the
 frontend optimization (grep-guard on `sonic_rs`), so building from a locally-modified
 checkout that already has both is a no-op.
