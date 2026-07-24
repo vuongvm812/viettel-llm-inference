@@ -1,6 +1,304 @@
+--- a/src/chat/Cargo.toml
++++ b/src/chat/Cargo.toml
+@@ -17,6 +17,7 @@ minijinja.workspace = true
+ minijinja-contrib.workspace = true
+ openai-harmony.workspace = true
+ reqwest.workspace = true
++rustc-hash.workspace = true
+ serde.workspace = true
+ serde-json-fmt.workspace = true
+ serde_json.workspace = true
+--- a/src/chat/src/backend/hf.rs
++++ b/src/chat/src/backend/hf.rs
+@@ -146,7 +146,7 @@ fn resolve_multimodal_render_info(
+ 
+ #[cfg(test)]
+ mod tests {
+-    use std::collections::HashMap;
++    use rustc_hash::FxHashMap;
+     use std::path::PathBuf;
+     use std::sync::Arc;
+ 
+@@ -214,7 +214,7 @@ mod tests {
+                 language_model_only: false,
+                 chat_template_content_format: Default::default(),
+                 chat_template: None,
+-                default_chat_template_kwargs: HashMap::new(),
++                default_chat_template_kwargs: FxHashMap::default(),
+             },
+             test_tokenizer(),
+         )
+@@ -312,7 +312,7 @@ mod tests {
+                 language_model_only: true,
+                 chat_template_content_format: Default::default(),
+                 chat_template: None,
+-                default_chat_template_kwargs: HashMap::new(),
++                default_chat_template_kwargs: FxHashMap::default(),
+                 ..Default::default()
+             },
+             test_tokenizer(),
+@@ -330,7 +330,7 @@ mod tests {
+             LoadModelBackendsOptions {
+                 chat_template_content_format: Default::default(),
+                 chat_template: None,
+-                default_chat_template_kwargs: HashMap::new(),
++                default_chat_template_kwargs: FxHashMap::default(),
+                 ..Default::default()
+             },
+             test_tokenizer(),
+--- a/src/chat/src/backend/mod.rs
++++ b/src/chat/src/backend/mod.rs
+@@ -1,4 +1,4 @@
+-use std::collections::HashMap;
++use rustc_hash::FxHashMap;
+ use std::sync::Arc;
+ 
+ use serde_json::Value;
+@@ -70,7 +70,7 @@ pub struct LoadModelBackendsOptions {
+     pub chat_template: Option<String>,
+     /// Optional server-default keyword arguments merged into every
+     /// chat-template render before request-level `chat_template_kwargs`.
+-    pub default_chat_template_kwargs: HashMap<String, Value>,
++    pub default_chat_template_kwargs: FxHashMap<String, Value>,
+ }
+ 
+ /// Shared backends loaded from a model id.
+--- a/src/chat/src/lib.rs
++++ b/src/chat/src/lib.rs
+@@ -189,7 +189,9 @@ impl ChatLlm {
+                 .structured_outputs
+                 .is_some()
+                 .then(|| ReasoningParserKwargs {
+-                    chat_template_kwargs: rendered.effective_template_kwargs.clone(),
++                    chat_template_kwargs: rendered.effective_template_kwargs.iter()
++                        .map(|(k, v)| (k.clone(), v.clone()))
++                        .collect(),
+                 });
+ 
+         let (prompt, mm_features) = multimodal::finalize_rendered_prompt(
+--- a/src/chat/src/renderer/hf/mod.rs
++++ b/src/chat/src/renderer/hf/mod.rs
+@@ -1,4 +1,4 @@
+-use std::collections::HashMap;
++use rustc_hash::FxHashMap;
+ 
+ use serde::Serialize;
+ use serde_json::Value as JsonValue;
+@@ -40,7 +40,7 @@ pub struct MultimodalRenderInfo {
+ /// state.
+ pub struct HfChatRenderer {
+     default_template: Option<CompiledChatTemplate>,
+-    default_template_kwargs: HashMap<String, JsonValue>,
++    default_template_kwargs: FxHashMap<String, JsonValue>,
+     content_format: ContentFormatOption,
+     special_tokens: Option<HfSpecialTokens>,
+     multimodal: Option<MultimodalRenderInfo>,
+@@ -50,7 +50,7 @@ impl HfChatRenderer {
+     /// Create a renderer from the given template string.
+     pub fn new(
+         template: Option<String>,
+-        default_template_kwargs: HashMap<String, JsonValue>,
++        default_template_kwargs: FxHashMap<String, JsonValue>,
+         content_format: ContentFormatOption,
+     ) -> Result<Self> {
+         Ok(Self {
+@@ -446,7 +446,7 @@ fn to_template_tools(tools: &[ChatTool]) -> Vec<TemplateTool> {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use std::collections::HashMap;
++    use rustc_hash::FxHashMap;
+ 
+     use expect_test::expect;
+     use serde_json::Value;
+@@ -474,7 +474,7 @@ mod tests {
+     fn render(template: Option<&str>, request: &ChatRequest) -> Result<String> {
+         HfChatRenderer::new(
+             template.map(str::to_owned),
+-            HashMap::new(),
++            FxHashMap::default(),
+             ChatTemplateContentFormatOption::Auto,
+         )?
+         .render(request)?
+@@ -488,7 +488,7 @@ mod tests {
+         request: &ChatRequest,
+         content_format: ChatTemplateContentFormatOption,
+     ) -> Result<crate::RenderedPrompt> {
+-        HfChatRenderer::new(Some(template.to_string()), HashMap::new(), content_format)?
++        HfChatRenderer::new(Some(template.to_string()), FxHashMap::default(), content_format)?
+             .with_multimodal(Some(MultimodalRenderInfo {
+                 placeholder_token: "<image>".to_string(),
+             }))
+@@ -682,7 +682,7 @@ mod tests {
+ 
+         let rendered = HfChatRenderer::new(
+             Some("{{ bos_token }}|{{ bos_token is defined }}".to_string()),
+-            HashMap::new(),
++            FxHashMap::default(),
+             ChatTemplateContentFormatOption::Auto,
+         )
+         .unwrap()
+@@ -724,7 +724,7 @@ mod tests {
+             Some(
+                 "{%- if messages[0].content is string -%}{{ messages[0].content }}{%- else -%}{%- for item in messages[0].content %}{{ item.text }}|{%- endfor -%}{%- endif -%}".to_string(),
+             ),
+-            HashMap::new(),
++            FxHashMap::default(),
+             ChatTemplateContentFormatOption::String,
+         )
+         .unwrap()
+@@ -744,7 +744,7 @@ mod tests {
+ 
+         let rendered = HfChatRenderer::new(
+             Some("{{ messages[0].content[0].text }}{{ messages[0].content[1].text }}".to_string()),
+-            HashMap::new(),
++            FxHashMap::default(),
+             ChatTemplateContentFormatOption::OpenAi,
+         )
+         .unwrap()
+@@ -765,7 +765,7 @@ mod tests {
+ 
+         let renderer = HfChatRenderer::new(
+             Some("{{ enable_thinking }}|{{ default_only }}".to_string()),
+-            HashMap::from([
++            FxHashMap::from_iter([
+                 ("enable_thinking".to_string(), Value::Bool(false)),
+                 ("default_only".to_string(), Value::String("x".to_string())),
+             ]),
+@@ -789,7 +789,7 @@ mod tests {
+ 
+         let renderer = HfChatRenderer::new(
+             Some("{{ reasoning_effort }}".to_string()),
+-            HashMap::from([(
++            FxHashMap::from_iter([(
+                 "reasoning_effort".to_string(),
+                 Value::String("medium".to_string()),
+             )]),
+@@ -821,7 +821,7 @@ mod tests {
+ 
+         let renderer = HfChatRenderer::new(
+             Some("{{ reasoning_effort }}|{{ enable_thinking }}".to_string()),
+-            HashMap::new(),
++            FxHashMap::default(),
+             ChatTemplateContentFormatOption::Auto,
+         )
+         .unwrap();
+--- a/src/chat/src/renderer/hf/template.rs
++++ b/src/chat/src/renderer/hf/template.rs
+@@ -4,7 +4,7 @@
+ //! - thinking-related detection/state is removed
+ //! - special tokens are wired to `vllm_text::backends::hf::HfSpecialTokens`
+ 
+-use std::collections::HashMap;
++use rustc_hash::FxHashMap;
+ use std::fs;
+ use std::path::Path;
+ 
+@@ -48,7 +48,7 @@ pub(super) struct TemplateContext<'a> {
+     #[serde(flatten)]
+     pub(super) special_tokens: Option<&'a HfSpecialTokens>,
+     #[serde(flatten)]
+-    pub(super) template_kwargs: Option<&'a HashMap<String, serde_json::Value>>,
++    pub(super) template_kwargs: Option<&'a FxHashMap<String, serde_json::Value>>,
+ }
+ 
+ /// Load chat template from a file (`.jinja` or `.json` containing Jinja).
+@@ -228,7 +228,7 @@ mod tests {
+             ChatTemplateContentFormatOption::Auto,
+         )
+         .unwrap();
+-        let mut kwargs = HashMap::new();
++        let mut kwargs = FxHashMap::default();
+         kwargs.insert("payload".to_string(), serde_json::json!({"b": 1, "a": 2}));
+ 
+         let result = template
+--- a/src/chat/src/renderer/mod.rs
++++ b/src/chat/src/renderer/mod.rs
+@@ -1,4 +1,4 @@
+-use std::collections::HashMap;
++use rustc_hash::FxHashMap;
+ use std::sync::Arc;
+ 
+ use serde_json::{Value, json};
+@@ -27,7 +27,7 @@ pub struct RenderedPrompt {
+     pub prompt: Prompt,
+     /// Effective chat-template kwargs visible to the renderer after applying
+     /// server defaults, request overrides, and typed reasoning controls.
+-    pub effective_template_kwargs: HashMap<String, Value>,
++    pub effective_template_kwargs: FxHashMap<String, Value>,
+ }
+ 
+ /// Minimal chat-prompt renderer used by `vllm-chat`.
+@@ -43,9 +43,9 @@ pub type DynChatRenderer = Arc<dyn ChatRenderer>;
+ /// Extract the effective chat-template kwargs visible to the renderer from the request,
+ /// using the provided defaults as the base.
+ pub(crate) fn effective_template_kwargs(
+-    default_template_kwargs: &HashMap<String, Value>,
++    default_template_kwargs: &FxHashMap<String, Value>,
+     request: &ChatRequest,
+-) -> HashMap<String, Value> {
++) -> FxHashMap<String, Value> {
+     let mut kwargs = default_template_kwargs.clone();
+     kwargs.extend(request.chat_options.template_kwargs.clone());
+ 
+@@ -66,6 +66,6 @@ pub(crate) fn effective_template_kwargs(
+ }
+ 
+ /// Extract the effective chat-template kwargs visible to the renderer from the request.
+-pub(crate) fn request_template_kwargs(request: &ChatRequest) -> HashMap<String, Value> {
+-    effective_template_kwargs(&HashMap::new(), request)
++pub(crate) fn request_template_kwargs(request: &ChatRequest) -> FxHashMap<String, Value> {
++    effective_template_kwargs(&FxHashMap::default(), request)
+ }
+--- a/src/chat/tests/chat.rs
++++ b/src/chat/tests/chat.rs
+@@ -261,7 +261,9 @@ impl ChatRenderer for FakeChatBackend {
+ 
+         Ok(RenderedPrompt {
+             prompt: Prompt::Text(prompt),
+-            effective_template_kwargs: request.chat_options.template_kwargs.clone(),
++            effective_template_kwargs: request.chat_options.template_kwargs.iter()
++                .map(|(k, v)| (k.clone(), v.clone()))
++                .collect(),
+         })
+     }
+ }
+--- a/src/cmd/Cargo.toml
++++ b/src/cmd/Cargo.toml
+@@ -19,6 +19,7 @@ educe.workspace = true
+ itertools.workspace = true
+ mimalloc.workspace = true
+ native-tls-vendored = { workspace = true, optional = true }
++rustc-hash.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+ serde_with.workspace = true
+--- a/src/cmd/src/cli.rs
++++ b/src/cmd/src/cli.rs
+@@ -6,7 +6,7 @@
+ 
+ mod unsupported;
+ 
+-use std::collections::HashMap;
++use rustc_hash::FxHashMap;
+ use std::ffi::{OsStr, OsString};
+ use std::path::PathBuf;
+ use std::time::Duration;
+@@ -174,9 +174,9 @@ pub struct SharedRuntimeArgs {
+     ///
+     /// Example: `{"enable_thinking": false}` to disable thinking mode by
+     /// default for Qwen3/DeepSeek models.
+-    #[arg(long, value_parser = parse_json::<HashMap<String, Value>>, value_name = "JSON")]
++    #[arg(long, value_parser = parse_json::<FxHashMap<String, Value>>, value_name = "JSON")]
+     #[serde(default)]
+-    pub default_chat_template_kwargs: Option<HashMap<String, Value>>,
++    pub default_chat_template_kwargs: Option<FxHashMap<String, Value>>,
+ 
+     /// The format to render message content within a chat template.
+     ///
 --- a/src/engine-core-client/Cargo.toml
 +++ b/src/engine-core-client/Cargo.toml
-@@ -21,6 +21,7 @@
+@@ -21,6 +21,7 @@ itertools.workspace = true
  parking_lot.workspace = true
  rmp-serde.workspace = true
  rmpv.workspace = true
@@ -15,9 +313,9 @@
 +use rustc_hash::FxHashMap;
 +use std::collections::{BTreeMap, BTreeSet};
  use std::sync::atomic::{AtomicU64, Ordering};
-
+ 
  use tokio::sync::{mpsc, oneshot};
-@@ -99,7 +100,7 @@
+@@ -99,7 +100,7 @@ impl EngineRoutingState {
  #[derive(Debug)]
  pub struct RequestRegistry {
      closed: bool,
@@ -26,7 +324,7 @@
      active_lora_requests: usize,
      routing_per_engine: BTreeMap<EngineId, EngineRoutingState>,
  }
-@@ -108,7 +109,7 @@
+@@ -108,7 +109,7 @@ impl RequestRegistry {
      pub fn new(engines: &[ConnectedEngine]) -> Self {
          Self {
              closed: false,
@@ -35,3 +333,215 @@
              active_lora_requests: 0,
              routing_per_engine: engines
                  .iter()
+--- a/src/engine-core-client/src/protocol/sampling.rs
++++ b/src/engine-core-client/src/protocol/sampling.rs
+@@ -1,4 +1,5 @@
+-use std::collections::{BTreeSet, HashMap};
++use rustc_hash::FxHashMap;
++use std::collections::BTreeSet;
+ 
+ use serde::{Deserialize, Serialize};
+ use serde_default::DefaultFromSerde;
+@@ -121,7 +122,7 @@ pub struct EngineCoreSamplingParams {
+     pub all_stop_token_ids: BTreeSet<u32>,
+     /// Logit biases to apply during sampling.
+     /// Keys are token IDs
+-    pub logit_bias: Option<HashMap<u32, f32>>,
++    pub logit_bias: Option<FxHashMap<u32, f32>>,
+     /// Restrict output to these token IDs only.
+     pub allowed_token_ids: Option<Vec<u32>>,
+     /// Tokenized bad words to avoid during generation.
+@@ -141,7 +142,7 @@ pub struct EngineCoreSamplingParams {
+     /// defers to engine-core defaults.
+     pub skip_reading_prefix_cache: Option<bool>,
+     /// Additional request parameters for custom extensions (from `vllm_xargs`).
+-    pub extra_args: Option<HashMap<String, serde_json::Value>>,
++    pub extra_args: Option<FxHashMap<String, serde_json::Value>>,
+ }
+ 
+ impl EngineCoreSamplingParams {
+--- a/src/server/Cargo.toml
++++ b/src/server/Cargo.toml
+@@ -22,6 +22,7 @@ openssl.workspace = true
+ prost.workspace = true
+ prost-types.workspace = true
+ rmpv.workspace = true
++rustc-hash.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+ sonic-rs = "0.5"
+--- a/src/server/src/config.rs
++++ b/src/server/src/config.rs
+@@ -1,4 +1,4 @@
+-use std::collections::HashMap;
++use rustc_hash::FxHashMap;
+ use std::fmt;
+ use std::time::Duration;
+ 
+@@ -180,7 +180,7 @@ pub struct Config {
+     /// template.
+     pub chat_template: Option<String>,
+     /// Server-default keyword arguments merged into every chat-template render.
+-    pub default_chat_template_kwargs: Option<HashMap<String, Value>>,
++    pub default_chat_template_kwargs: Option<FxHashMap<String, Value>>,
+     /// How to serialize `message.content` for chat-template rendering.
+     pub chat_template_content_format: ChatTemplateContentFormatOption,
+     /// Optional maximum number of top log probabilities accepted by the
+--- a/src/server/src/grpc/convert.rs
++++ b/src/server/src/grpc/convert.rs
+@@ -152,7 +152,7 @@ fn build_sampling_params(
+             params.repetition_penalty = Some(d.repetition_penalty);
+         }
+         if !d.logit_bias.is_empty() {
+-            params.logit_bias = Some(d.logit_bias.clone());
++            params.logit_bias = Some(d.logit_bias.iter().map(|(k, v)| (*k, *v)).collect());
+         }
+         if !d.allowed_token_ids.is_empty() {
+             params.allowed_token_ids = Some(d.allowed_token_ids.clone());
+--- a/src/server/src/routes/inference/generate/types.rs
++++ b/src/server/src/routes/inference/generate/types.rs
+@@ -1,3 +1,4 @@
++use rustc_hash::FxHashMap;
+ use std::collections::HashMap;
+ 
+ use serde::{Deserialize, Serialize};
+@@ -21,7 +22,7 @@ pub struct GenerateRequest {
+     pub cache_salt: Option<String>,
+     #[serde(default)]
+     pub priority: i32,
+-    pub kv_transfer_params: Option<HashMap<String, Value>>,
++    pub kv_transfer_params: Option<FxHashMap<String, Value>>,
+     #[serde(flatten)]
+     pub other: Map<String, Value>,
+ }
+--- a/src/server/src/routes/openai/chat_completions/types.rs
++++ b/src/server/src/routes/openai/chat_completions/types.rs
+@@ -1,3 +1,4 @@
++use rustc_hash::FxHashMap;
+ use std::collections::HashMap;
+ use std::fmt;
+ 
+@@ -230,11 +231,11 @@ pub struct ChatCompletionRequest {
+     pub cache_salt: Option<String>,
+ 
+     /// KV transfer parameters for disaggregated serving
+-    pub kv_transfer_params: Option<HashMap<String, Value>>,
++    pub kv_transfer_params: Option<FxHashMap<String, Value>>,
+ 
+     /// Additional request parameters with string or numeric values for custom
+     /// extensions
+-    pub vllm_xargs: Option<HashMap<String, Value>>,
++    pub vllm_xargs: Option<FxHashMap<String, Value>>,
+ 
+     /// Parameters for detecting repetitive N-gram patterns in output tokens
+     pub repetition_detection: Option<RepetitionDetectionParams>,
+--- a/src/server/src/routes/openai/completions/types.rs
++++ b/src/server/src/routes/openai/completions/types.rs
+@@ -1,3 +1,4 @@
++use rustc_hash::FxHashMap;
+ use std::collections::HashMap;
+ 
+ use serde::{Deserialize, Serialize};
+@@ -172,11 +173,11 @@ pub struct CompletionRequest {
+     pub cache_salt: Option<String>,
+ 
+     /// KV transfer parameters for disaggregated serving
+-    pub kv_transfer_params: Option<HashMap<String, Value>>,
++    pub kv_transfer_params: Option<FxHashMap<String, Value>>,
+ 
+     /// Additional request parameters with string or numeric values for custom
+     /// extensions
+-    pub vllm_xargs: Option<HashMap<String, Value>>,
++    pub vllm_xargs: Option<FxHashMap<String, Value>>,
+ 
+     /// Additional fields
+     #[serde(flatten)]
+--- a/src/server/src/utils.rs
++++ b/src/server/src/utils.rs
+@@ -1,3 +1,4 @@
++use rustc_hash::FxHashMap;
+ use std::collections::HashMap;
+ use std::time::{SystemTime, UNIX_EPOCH};
+ 
+@@ -31,11 +32,11 @@ pub fn utility_call_error(method: &str, error: impl AsReport) -> ApiError {
+ /// vLLM behavior where `kv_transfer_params` is injected into `extra_args` for
+ /// engine-core consumption.
+ pub fn merge_kv_transfer_params(
+-    mut xargs: Option<HashMap<String, Value>>,
+-    kv_transfer_params: Option<&HashMap<String, Value>>,
+-) -> Option<HashMap<String, Value>> {
++    mut xargs: Option<FxHashMap<String, Value>>,
++    kv_transfer_params: Option<&FxHashMap<String, Value>>,
++) -> Option<FxHashMap<String, Value>> {
+     if let Some(kv_params) = kv_transfer_params {
+-        let map = xargs.get_or_insert_with(HashMap::new);
++        let map = xargs.get_or_insert_with(FxHashMap::default);
+         map.insert(
+             "kv_transfer_params".to_string(),
+             // This is safe because we know that `kv_params` is already valid JSON.
+@@ -50,7 +51,7 @@ pub fn merge_kv_transfer_params(
+ /// parses as a `u32`.
+ pub fn convert_logit_bias(
+     logit_bias: Option<HashMap<String, f32>>,
+-) -> Result<Option<HashMap<u32, f32>>, ApiError> {
++) -> Result<Option<FxHashMap<u32, f32>>, ApiError> {
+     logit_bias
+         .map(|bias| {
+             bias.into_iter()
+--- a/src/text/Cargo.toml
++++ b/src/text/Cargo.toml
+@@ -13,6 +13,7 @@ futures.workspace = true
+ hf-hub.workspace = true
+ itertools.workspace = true
+ reqwest.workspace = true
++rustc-hash.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+ serde_with.workspace = true
+--- a/src/text/src/lower.rs
++++ b/src/text/src/lower.rs
+@@ -307,7 +307,8 @@ fn merge_unique_token_ids(
+ 
+ #[cfg(test)]
+ mod tests {
+-    use std::collections::{BTreeSet, HashMap};
++    use rustc_hash::FxHashMap;
++    use std::collections::BTreeSet;
+ 
+     use serial_test::file_serial;
+     use vllm_engine_core_client::protocol::multimodal::{MmFeatureSpec, PlaceholderRange};
+@@ -1051,7 +1052,7 @@ mod tests {
+     fn lower_sampling_params_rejects_out_of_vocab_logit_bias() {
+         let error = lower_sampling_params_with_limits(
+             SamplingParams {
+-                logit_bias: Some(HashMap::from([(1000, 1.0)])),
++                logit_bias: Some(FxHashMap::from_iter([(1000, 1.0)])),
+                 ..Default::default()
+             },
+             sample_sampling_limits(),
+--- a/src/text/src/request.rs
++++ b/src/text/src/request.rs
+@@ -1,4 +1,4 @@
+-use std::collections::HashMap;
++use rustc_hash::FxHashMap;
+ 
+ use enum_as_inner::EnumAsInner;
+ use serde::{Deserialize, Serialize};
+@@ -94,7 +94,7 @@ pub struct SamplingParams {
+     pub ignore_eos: bool,
+     /// Modify the likelihood of specified tokens appearing in the completion.
+     /// Keys are token IDs.
+-    pub logit_bias: Option<HashMap<u32, f32>>,
++    pub logit_bias: Option<FxHashMap<u32, f32>>,
+     /// Restrict output to these token IDs only.
+     pub allowed_token_ids: Option<Vec<u32>>,
+     /// Words to avoid during generation (tokenized to IDs during lowering).
+@@ -114,7 +114,7 @@ pub struct SamplingParams {
+     /// engine-core defaults.
+     pub skip_reading_prefix_cache: Option<bool>,
+     /// Additional request parameters for custom extensions.
+-    pub vllm_xargs: Option<HashMap<String, Value>>,
++    pub vllm_xargs: Option<FxHashMap<String, Value>>,
+ }
+ 
+ #[allow(clippy::derivable_impls)] // more explicit

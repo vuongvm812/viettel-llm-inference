@@ -26,15 +26,26 @@ frontend binary. They carry our frontend optimizations so a clean checkout (wher
 ## `fxhash_hot_paths.patch`
 - `src/engine-core-client/src/client/state.rs` — replace `HashMap` with `FxHashMap` for
   `RequestRegistry.requests` (the hot-path request lookup used per decode step).
-- `src/engine-core-client/Cargo.toml` — add `rustc-hash.workspace = true`. The workspace
-  root only declares the *version* (`[workspace.dependencies]`); each member crate still
-  has to opt in, and only `src/tokenizer` did.
+- `src/engine-core-client/src/protocol/sampling.rs` — `logit_bias`, `extra_args`.
+- `src/server/src/config.rs` — `default_chat_template_kwargs`.
+- `{engine-core-client,text,server,chat,cmd}/Cargo.toml` — add `rustc-hash.workspace = true`.
+  The workspace root only declares the *version* (`[workspace.dependencies]`); each member
+  crate still has to opt in, and only `src/tokenizer` did.
 
-  Deliberately NOT converted: `protocol/sampling.rs` (`logit_bias`, `extra_args`) and
-  `server/src/config.rs` (`default_chat_template_kwargs`). Those are deserialized DTO
-  fields — swapping the hasher changes the public type and breaks `src/text/src/lower.rs`,
-  which constructs them as `std::HashMap`. All three are per-request `Option`s that are
-  `None` on this workload, so there is nothing to win for the ripple.
+The last three are deserialized DTO fields, so the hasher is part of the public type and
+the change propagates to every producer and consumer — 23 files across five crates
+(`vllm-text` request/lowering, the OpenAI + gRPC + inference route DTOs, `merge_kv_transfer_params`
+/ `convert_logit_bias`, and the chat-template renderer chain down to `TemplateContext`).
+Most sites resolve by inference (`.collect()`); only the declared types needed editing.
+
+Two boundaries are foreign types that cannot be converted, so the patch rehashes there:
+- `src/server/src/grpc/convert.rs` — prost generates `HashMap` for the protobuf `logit_bias`.
+- `src/chat/src/lib.rs` — `ReasoningParserKwargs` comes from the external `reasoning-parser`
+  crate.
+
+Note `TemplateContext.template_kwargs` is `#[serde(flatten)]`, so the hasher changes
+chat-template kwarg iteration order. Jinja resolves by key, and the `expect_test` snapshot
+suite passes, but that is the one place where order is observable.
 
 ## `sse_static_strings.patch`
 - `src/server/.../chat_completions/types.rs` — replace `String` with `Arc<str>` for
