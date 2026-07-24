@@ -90,7 +90,41 @@ def test_committing_all_drafts_is_wrong_when_rejected():
         )
 
 
+def _page_sizes(num_spec_layer: int, num_spec_padding: int) -> tuple[int, int]:
+    """(layer conv page bytes, mamba_page_size_padded) for LFM2.5-1.2B + fp8 KV.
+
+    Mirrors Platform._align_hybrid_block_size: the attention block size is grown until one
+    attention page covers one mamba page, and mamba_page_size_padded is set to that attention
+    page. ``num_spec_padding`` is the num_spec the CLASSMETHOD
+    (Lfm2ForCausalLM.get_mamba_state_shape_from_config) passes; ``num_spec_layer`` the one the
+    LAYER (ShortConv.get_state_shape) passes. They must be the same value.
+    """
+    conv_dim, state_dtype = 2048, 2  # hf_config.conv_dim, bf16 conv state
+    attn_page_1tok = 2 * 8 * 64 * 1  # K+V * num_kv_heads * head_size * fp8_e4m3
+    align = 16  # min kernel block size
+    padding_page = conv_dim * (WIDTH - 1 + num_spec_padding) * state_dtype
+    block = align * -(-padding_page // (align * attn_page_1tok))  # cdiv
+    return conv_dim * (WIDTH - 1 + num_spec_layer) * state_dtype, block * attn_page_1tok
+
+
+def test_conv_page_fits_padded_page_when_num_spec_is_threaded():
+    """MambaSpec.page_size_bytes asserts page_size_padded >= page_size, or the engine dies in
+    determine_available_memory. Holds only while both sides see the same num_spec."""
+    for num_spec in range(0, 9):
+        page, padded = _page_sizes(num_spec, num_spec)
+        assert padded >= page, f"num_spec={num_spec}: padded {padded} < page {page}"
+
+
+def test_num_spec_missing_from_classmethod_breaks_boot():
+    """The actual failure: mamba_utils widens the conv state by num_spec, but the padding was
+    sized from the narrow state because lfm2.py's classmethod didn't pass num_spec."""
+    page, padded = _page_sizes(num_spec_layer=3, num_spec_padding=0)
+    assert padded < page, "expected the un-threaded pairing to violate the assert"
+
+
 if __name__ == "__main__":
     test_commit_accepted_prefix_matches_fresh_decode()
     test_committing_all_drafts_is_wrong_when_rejected()
+    test_conv_page_fits_padded_page_when_num_spec_is_threaded()
+    test_num_spec_missing_from_classmethod_breaks_boot()
     print("ok: short-conv spec rollback contract holds")
