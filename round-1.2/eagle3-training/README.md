@@ -18,8 +18,12 @@ steps below — SGLang capture server, `torchrun`, `specforge train` — run on 
 for editing/committing these config files. On the GPU box:
 ```bash
 git clone https://github.com/sgl-project/SpecForge.git && cd SpecForge
-uv venv -p 3.11 && source .venv/bin/activate
+uv python install 3.11 && uv venv -p 3.11 --python-preference only-managed && source .venv/bin/activate
 uv pip install -v . --prerelease=allow      # pulls torch 2.11.0 + sglang 0.5.14 (no separate sglang install)
+# NOTE: use uv's managed Python. A pyenv-built 3.11 often lacks _bz2/_lzma/_sqlite3 (skipped at
+# build time if the system dev libs were missing) -> `datasets` import fails with No module named
+# '_bz2'. Fix = the managed interpreter above, or `apt-get install libbz2-dev liblzma-dev libsqlite3-dev`
+# then rebuild the pyenv Python.
 # then copy this dir's files in:
 cp <repo>/round-1.2/eagle3-training/lfm2.5-1.2b-instruct-eagle3.json        configs/
 cp <repo>/round-1.2/eagle3-training/lfm2.5-1.2b-instruct-eagle3-online.yaml examples/configs/
