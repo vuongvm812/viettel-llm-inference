@@ -20,8 +20,6 @@ for editing/committing these config files.
 Also required: the **CUDA toolkit (`nvcc` + headers)**, not just the driver. SGLang's FlashInfer backend
 JIT-compiles its attention kernels at launch and fails with `Could not find nvcc / cuda_home
 '/usr/local/cuda' doesn't exist` if only the driver is present. Install a toolkit inside a **version window** — `12.8 ≤ toolkit ≤ (the CUDA version nvidia-smi reports)`:
-- **too old** (e.g. 12.6, on glibc ≥ 2.41): flashinfer compile fails with `rsqrt/rsqrtf ... exception
-  specification does not match` (glibc 2.41 added those `noexcept`; NVIDIA fixed the headers in 12.8);
 - **too new** (e.g. 13 when the driver only supports 12.x): CUDA error `804 forward compatibility was
   attempted on non supported HW` — torch can't see the GPU at all (Ampere/consumer cards don't do
   forward-compat). The `cuda-compat-*` package pulled in alongside a too-new toolkit is the trigger.
@@ -30,7 +28,32 @@ So `cuda-toolkit-12-9` (or 12-8) is the safe pick on a recent-glibc box whose dr
 purge any `cuda-compat-*`, export `CUDA_HOME=/usr/local/cuda-12.9` + `PATH=$CUDA_HOME/bin:$PATH`, clear
 `~/.cache/flashinfer`, and confirm `python -c "import torch;print(torch.cuda.is_available())"` prints
 True before launching SGLang. (If the driver's max CUDA < 12.8, upgrade the driver first, ≈570+.)
-Alternatively skip flashinfer JIT with `--attention-backend triton`, if SGLang supports it for the hybrid.
+### glibc ≥ 2.41: `rsqrt/rsqrtf ... exception specification does not match`
+Launch dies during CUDA-graph capture, in the FlashInfer JIT, with a `Capture cuda graph failed: Ninja
+build failed` wrapping that error. It is **not** a memory problem and **not** fixed by a newer toolkit —
+verified still broken on CUDA 13.1 + glibc 2.43. It is a bug in NVIDIA's header:
+- glibc declares C23 `rsqrt`/`rsqrtf` (as `noexcept`) under `__GLIBC_USE (IEC_60559_FUNCS_EXT_C23)`,
+  which `bits/libc-header-start.h` turns on for **`__USE_GNU`** — and libstdc++ always sets `_GNU_SOURCE`;
+- `crt/math_functions.h:123` tests only `__GLIBC_USE_ISOC23 || __STDC_WANT_IEC_60559_FUNCS_EXT__`, misses
+  `__USE_GNU`, so it thinks glibc has no `rsqrt` and declares its own at lines 629/653 — the only two
+  math decls in that file lacking `__THROW`.
+
+Fix = give those two lines the `__THROW` every neighbour already has (do **not** instead flip NVIDIA's
+`__NV_GLIBC_PROVIDES_IEC_60559_FUNCS` to 1 — that also deletes the device-side `sinpi`/`cospi` bodies in
+`math_functions.hpp`). Redo after any CUDA reinstall:
+```bash
+H=/usr/local/cuda-13/include/crt/math_functions.h
+sudo cp -n $H $H.orig
+sudo sed -i -E "629s/(double[[:space:]]+rsqrt\(double x\));/\1 __THROW;/;
+                653s/(float[[:space:]]+rsqrtf\(float x\));/\1 __THROW;/" $H
+sed -n "629p;653p" $H       # both lines must now end in __THROW;
+rm -rf ~/.cache/flashinfer  # the failed build is cached
+```
+Non-fixes, for the record: `--attention-backend triton` (SGLang asserts `Lfm2ForCausalLM does not support
+triton attention backend, as the first layer might not be an attention layer` — LFM2 layer 0 is a
+short-conv); `--cuda-graph-backend-decode=disabled` (the JIT just moves to the first real decode);
+swapping the `-ccbin clang` host compiler for g++ (same redeclaration, same error).
+
 After any driver up/downgrade, **reboot** — otherwise `nvidia-smi` fails with `NVML: Driver/library
 version mismatch` (new userspace libs vs the still-loaded old kernel module). A recent driver (580+)
 supports CUDA 13 and lifts the ceiling so torch's bundled runtime + a 12.9/13 toolkit both fit.
