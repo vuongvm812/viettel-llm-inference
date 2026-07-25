@@ -14,10 +14,17 @@ REPLAY captured, not warmup. So `make profile` boots + waits for healthy, then
 ``touch $VTL_PROFILE_DIR/.arm`` right before the load replay; the worker starts profiling
 on the next step, captures ``VTL_PROFILE_STEPS`` steps, writes the trace, and disarms.
 
+A chrome trace only names ATen ops, and on this workload those account for 2.3 of the
+6.5 ms host time per decode step -- the other ~4 ms is interpreter frames the C++ profiler
+cannot see (with_stack only decorates ops that exist). So the same window optionally drives
+``cProfile`` on the engine-core thread and dumps a tottime-ranked ``vtl-pyprof-<pid>.txt``
+next to the trace. Both profilers inflate absolute time; the RANKING is what's usable.
+
 Env (all read directly; the patch is inert unless the dir is set):
   VTL_ENABLE_PROFILER   registry gate (overlay sets =1; default OFF)
   VTL_PROFILE_DIR       output dir for the chrome trace (also the .arm trigger dir)
   VTL_PROFILE_STEPS     execute_model calls to capture after arming (default 20)
+  VTL_PROFILE_PY        also run cProfile over the window (default 1; "0" = trace only)
 
 Fail-closed: any profiler error disables further profiling and NEVER breaks execute_model.
 """
@@ -34,7 +41,7 @@ log = logging.getLogger("vllm.vtl")
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # One-shot state machine for the single worker process.
-_state = {"prof": None, "started": False, "since": 0, "done": False}
+_state = {"prof": None, "pyprof": None, "started": False, "since": 0, "done": False}
 
 
 def _profile_dir() -> str | None:
@@ -47,6 +54,27 @@ def _steps() -> int:
         return max(1, int(os.environ.get("VTL_PROFILE_STEPS", "20")))
     except ValueError:
         return 20
+
+
+def _py_enabled() -> bool:
+    return os.environ.get("VTL_PROFILE_PY", "1").strip().lower() in _TRUTHY
+
+
+def _new_pyprofiler():  # split out so the self-check can drive it with a fake
+    import cProfile
+
+    return cProfile.Profile()
+
+
+def _dump_pyprof(pyprof, path: str) -> None:
+    """tottime-ranked text dump. tottime (self, excluding callees) is the one that
+    localises interpreter cost; cumtime just re-reports the call stack."""
+    import pstats
+
+    with open(path, "w") as f:
+        st = pstats.Stats(pyprof, stream=f)
+        st.sort_stats("tottime").print_stats(60)
+        st.sort_stats("cumtime").print_stats(40)
 
 
 def _arm_path(d: str) -> str:
@@ -92,6 +120,12 @@ def _make_wrapper(original):
             try:
                 _state["prof"] = _new_profiler()
                 _state["prof"].start()
+                if _py_enabled():
+                    # After the torch profiler so its own startup is not attributed to
+                    # the model. enable() is per-thread and this IS the engine-core
+                    # busy-loop thread (scheduler + runner), which is what we want.
+                    _state["pyprof"] = _new_pyprofiler()
+                    _state["pyprof"].enable()
                 _state["started"] = True
                 _state["since"] = 0
                 log.info("vtl: profiler ARMED -> capturing %d execute_model steps", _steps())
@@ -107,15 +141,22 @@ def _make_wrapper(original):
             _state["since"] += 1
             if _state["since"] >= _steps():
                 try:
+                    if _state["pyprof"] is not None:
+                        _state["pyprof"].disable()
                     _state["prof"].stop()
                     path = os.path.join(d, f"vtl-trace-{os.getpid()}.json")
                     _state["prof"].export_chrome_trace(path)
                     log.info("vtl: profiler wrote %s (%d steps)", path, _state["since"])
+                    if _state["pyprof"] is not None:
+                        py_path = os.path.join(d, f"vtl-pyprof-{os.getpid()}.txt")
+                        _dump_pyprof(_state["pyprof"], py_path)
+                        log.info("vtl: python profiler wrote %s", py_path)
                 except Exception:
                     log.exception("vtl: profiler export failed")
                 finally:
                     _state["done"] = True
                     _state["prof"] = None
+                    _state["pyprof"] = None
                     if d:
                         _disarm(d)
         return out
@@ -176,8 +217,9 @@ def _self_check() -> None:
     d = tempfile.mkdtemp()
     os.environ["VTL_PROFILE_DIR"] = d
     os.environ["VTL_PROFILE_STEPS"] = "3"
+    _fresh = {"prof": None, "pyprof": None, "started": False, "since": 0, "done": False}
     for k in _state:
-        _state[k] = {"prof": None, "started": False, "since": 0, "done": False}[k]
+        _state[k] = _fresh[k]
 
     events: list[str] = []
 
@@ -193,10 +235,25 @@ def _self_check() -> None:
             with open(path, "w") as f:
                 f.write("{}")
 
-    # inject the fake profiler + a no-op original
-    global _new_profiler
-    saved = _new_profiler
+    class FakePyProf:
+        def enable(self):
+            events.append("py-enable")
+
+        def disable(self):
+            events.append("py-disable")
+
+    # inject the fakes + a no-op original
+    global _new_profiler, _new_pyprofiler, _dump_pyprof
+    saved, saved_py, saved_dump = _new_profiler, _new_pyprofiler, _dump_pyprof
     _new_profiler = lambda: FakeProf()  # noqa: E731
+    _new_pyprofiler = lambda: FakePyProf()  # noqa: E731
+
+    def _fake_dump(p, path):
+        events.append("py-dump")
+        with open(path, "w") as f:
+            f.write("")
+
+    _dump_pyprof = _fake_dump
     try:
         wrapped = _make_wrapper(lambda self, *a, **k: "out")
         obj = object()
@@ -208,19 +265,33 @@ def _self_check() -> None:
 
         # Arm, then drive: start on the next call, capture exactly STEPS calls, export once.
         open(_arm_path(d), "w").close()
+        expected = ["start", "py-enable", "py-disable", "stop", "export", "py-dump"]
         for _ in range(5):
             assert wrapped(obj) == "out"
-        assert events == ["start", "stop", "export"], events
+        assert events == expected, events
         assert _state["done"] is True
         assert not os.path.exists(_arm_path(d)), "should disarm after export"
         assert os.path.exists(os.path.join(d, f"vtl-trace-{os.getpid()}.json"))
+        assert os.path.exists(os.path.join(d, f"vtl-pyprof-{os.getpid()}.txt"))
 
         # Re-arming after done is a no-op (one-shot per process).
         open(_arm_path(d), "w").close()
         wrapped(obj)
+        assert events == expected, events
+
+        # VTL_PROFILE_PY=0 keeps the chrome trace but skips cProfile entirely.
+        for k in _state:
+            _state[k] = _fresh[k]
+        events.clear()
+        os.environ["VTL_PROFILE_PY"] = "0"
+        wrapped = _make_wrapper(lambda self, *a, **k: "out")
+        open(_arm_path(d), "w").close()
+        for _ in range(4):
+            wrapped(obj)
         assert events == ["start", "stop", "export"], events
     finally:
-        _new_profiler = saved
+        _new_profiler, _new_pyprofiler, _dump_pyprof = saved, saved_py, saved_dump
+        os.environ.pop("VTL_PROFILE_PY", None)
         os.environ.pop("VTL_PROFILE_DIR", None)
         os.environ.pop("VTL_PROFILE_STEPS", None)
 

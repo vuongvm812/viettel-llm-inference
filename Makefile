@@ -256,6 +256,14 @@ warm:
 	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	  --closed-loop $(WARM_CONCURRENCY) --limit $(WARM_REQS) --out /dev/null
 	$(IN) docker cp "$$($(DC) ps -q model)":/opt/vtl/cache/. docker/cache/
+	$(IN) du -sh docker/cache/*
+	@# The harvest is silent when it comes back short, and a missing triton/ is invisible until
+	@# the judge box JIT-compiles every Triton kernel inline (measured 2026-07-25: ~0.25s of a
+	@# 0.70s decode window went to code_generator.visit + make_ptx + a forked ptxas). The image
+	@# built on 2026-07-25 baked ONLY cache/vllm -- triton/ and inductor/ were never harvested.
+	@# NOTE both caches are keyed on GPU arch: a harvest from a dev box (sm_86) MISSES on the
+	@# judge's H200 (sm_90). `make warm` has to run on the target arch to be worth anything.
+	$(IN) test -d docker/cache/triton || { echo "make warm: NOTHING harvested into docker/cache/triton -- the image would ship an empty Triton cache"; exit 1; }
 	$(IN) $(DC) down
 	$(MAKE) build ROUND=$(ROUND)
 

@@ -153,23 +153,33 @@ def host_summary(events: list, steps: int | None = None) -> dict:
     wall = (max(e for _, e in spans) - min(s for s, _ in spans)) if spans else 0.0
 
     self_us: dict[str, float] = defaultdict(float)
-    for evs in cpu_by_tid.values():
-        stack: list[tuple[float, str]] = []  # (end, name)
-        for ts, dur, name in sorted(evs, key=lambda t: (t[0], -t[1])):
-            while stack and stack[-1][0] <= ts:
-                stack.pop()
-            if stack:
-                self_us[stack[-1][1]] -= dur  # charge the child to its parent
-            self_us[name] += dur
-            stack.append((ts + dur, name))
+    # Only the busiest thread: that is the engine-core loop (scheduler + runner), and
+    # summing self time across threads can exceed wall, which makes the residual below
+    # meaningless.
+    busiest = max(cpu_by_tid.values(), key=lambda evs: sum(d for _, d, _ in evs), default=[])
+    stack: list[tuple[float, str]] = []  # (end, name)
+    for ts, dur, name in sorted(busiest, key=lambda t: (t[0], -t[1])):
+        while stack and stack[-1][0] <= ts:
+            stack.pop()
+        if stack:
+            self_us[stack[-1][1]] -= dur  # charge the child to its parent
+        self_us[name] += dur
+        stack.append((ts + dur, name))
 
     ranked = sorted(self_us.items(), key=lambda kv: -kv[1])
+    aten_self = sum(self_us.values())
     return {
         "wall_us": wall,
         "gpu_busy_us": gpu_busy,
         "host_gap_us": wall - gpu_busy,
         "gpu_busy_pct": 100 * gpu_busy / wall if wall else 0.0,
         "steps": steps,
+        "cpu_op_self_us": aten_self,
+        # Engine-thread time inside no ATen op at all: interpreter frames, vLLM's own
+        # Python, ZMQ/msgpack. with_stack=False cannot see it and neither can a chrome
+        # trace -- if this dominates, the tool to reach for is VTL_PROFILE_PY=1
+        # (cProfile in vtl/patches/profiler.py), not a finer kernel bucket.
+        "python_residual_us": max(0.0, wall - aten_self),
         "top_cpu_ops": [{"name": n, "self_us": us} for n, us in ranked[:20] if us > 0],
     }
 
@@ -181,6 +191,9 @@ def print_host_report(h: dict) -> None:
           + (f", {steps} steps" if steps else "") + ") ===")
     print(f"{'':<14}{'ms':>12}{'%':>8}{'ms/step':>11}")
     for label, us in (("gpu busy", h["gpu_busy_us"]), ("host gap", h["host_gap_us"])):
+        print(f"{label:<14}{us / 1e3:>12.1f}{100 * us / wall if wall else 0:>7.1f}%{per(us)}")
+    print("\n--- engine-thread host time breakdown ---")
+    for label, us in (("aten ops", h["cpu_op_self_us"]), ("python/other", h["python_residual_us"])):
         print(f"{label:<14}{us / 1e3:>12.1f}{100 * us / wall if wall else 0:>7.1f}%{per(us)}")
     if h["top_cpu_ops"]:
         print("\n--- top CPU ops by SELF time (python frames not captured) ---")
@@ -336,6 +349,8 @@ def _selfcheck() -> None:
     assert h["wall_us"] == 70.0 and h["host_gap_us"] == 40.0, h
     self_by_name = {r["name"]: r["self_us"] for r in h["top_cpu_ops"]}
     assert self_by_name == {"aten::mm": 80.0, "aten::linear": 20.0}, self_by_name
+    # 100us of aten inside a 70us wall window -> residual clamps at 0, never negative.
+    assert h["cpu_op_self_us"] == 100.0 and h["python_residual_us"] == 0.0, h
     print("profile_trace self-check ok")
 
 

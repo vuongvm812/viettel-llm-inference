@@ -110,6 +110,33 @@ services:
       # SAMPLE INTERVALS in which any kernel was resident, not a duty cycle -- it reads ~90% on
       # a stream that is idle most of each step. Do not use it as a host/GPU split again.
       #
+      # DECOMPOSED 2026-07-25 (same box, `make profile` + the new VTL_PROFILE_PY=1 cProfile
+      # dump; see bench-profile/vtl-pyprof-*.txt). Per decode step, 6.5 ms wall:
+      #   0.26 ms  cudaGraphLaunch -- ONE launch covering ~235 kernels. FULL cudagraph IS
+      #            engaged for decode; the model forward is not the host cost.
+      #   2.30 ms  ATen dispatch (self time, busiest thread) -- ~510 tiny ops/step
+      #   ~4.0 ms  PURE PYTHON, inside no ATen op at all
+      # So the lever is interpreter work in the runner/scheduler, not kernels and not
+      # op-level micro-fusion. Top named cost: gpu/attn_utils.py build_attn_metadata, and
+      # the mamba/short-conv builder (mamba_attn._compute_common_metadata) runs TWICE per
+      # step (40 calls / 20 steps) against ONE flashinfer build. Root cause is vLLM's group
+      # sizing in kv_cache_utils._get_kv_cache_groups_uniform_page_size: LFM2.5 is 6 attn +
+      # 10 short-conv, and because 10 >= 6*1.5 the heuristic takes group_size = min = 6, so
+      # the conv layers split into TWO groups of 5 (padded to 6) while attention stays one.
+      # Three groups -> two SSM metadata builds and ~20% of the conv state memory lost to
+      # padding, every step, forever. Forcing the 10 conv layers into one group would drop a
+      # whole build (~0.85 of 6.5 ms/step here) but violates the "same layer count per group"
+      # assumption the block-table/slot-mapping tensors are shaped on. Unexplored, sized.
+      #
+      # Also caught in that capture: a Triton kernel JIT-compiling INSIDE the decode loop
+      # (~0.25 s of a 0.70 s window). Two independent causes, both now addressed:
+      #   1. warmup_healthcheck.py primed strictly sequentially, so the engine only ever saw
+      #      batch 1 before real traffic. It now primes request 0 alone (shared prefix) then
+      #      the rest concurrently.
+      #   2. the built image bakes ONLY /opt/vtl/cache/vllm -- cache/triton (7.6 MB at
+      #      runtime) and cache/inductor were never harvested by `make warm`, which now
+      #      fails loudly instead. Both caches are GPU-arch-keyed: harvest on the H200.
+      #
       # So the ~3.4 ms host term the knobs below assume is roughly RIGHT, and if anything
       # UNDERSTATED as a share: this box spends 67.8% of its GPU time in Marlin (sm_86 has no
       # fp8 tensor cores, so `make verify` shows w4a8 quantized 0 layers and both fusion passes
