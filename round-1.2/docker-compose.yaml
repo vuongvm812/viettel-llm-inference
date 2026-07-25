@@ -125,6 +125,7 @@ services:
       OMP_NUM_THREADS: "3"
       MKL_NUM_THREADS: "3"
       OMP_WAIT_POLICY: "ACTIVE"
+      RAYON_NUM_THREADS: "3"
 
       # CPython hands the GIL to a waiting thread only after sys.getswitchinterval() -- 5ms by
       # default, longer than a whole decode step. The engine-core main loop is tight pure

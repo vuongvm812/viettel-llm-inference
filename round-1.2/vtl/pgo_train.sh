@@ -74,7 +74,11 @@ export RUST_BACKTRACE=full
 # Match the production env (docker-compose.yaml) — PGO weights whatever it profiles, so a
 # router/runtime shape that differs from the served one trains the wrong hot/cold split.
 export VLLM_RS_DISABLE_HTTP_TRACE=1 VLLM_RS_DISABLE_CORS=1
-export VLLM_RS_ZMQ_WORKER_THREADS=3 VLLM_RS_REQUEST_WORKER_THREADS=3
+export TOKIO_WORKER_THREADS=3 VLLM_RS_ZMQ_WORKER_THREADS=3 VLLM_RS_REQUEST_WORKER_THREADS=3
+export OMP_NUM_THREADS=3 MKL_NUM_THREADS=3 OMP_WAIT_POLICY=ACTIVE
+# rayon backs the `tokenizers` crate's batch encode — the one real thread pool inside vllm-rs
+# that none of the tokio/VLLM_RS knobs above size.
+export RAYON_NUM_THREADS=3
 BIN="$RUST_DIR/target/release"
 FRONTEND_LOG=/tmp/pgo-frontend.log
 
