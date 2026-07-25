@@ -234,6 +234,9 @@ services:
       VTL_KERNEL_SYNC: 0                       # DEBUG only: 1 = cudaStreamSynchronize per kernel (slow)
 
       VTL_DISABLE_WARMUP: 0                     # 1 = pure /health check, skip system-prefix priming
+
+      # ---- Scheduler ----------------------------------------------------------------
+      VTL_ENABLE_SCHED_CUSTOM: 1                # conversation-aware + aged-SJF reorder (round-1.2/vtl/patches/sched_custom.py)
     shm_size: "2g" # tmpfs counts against the 8GB cgroup; 2g helped push it into OOMKill. TP=1 needs little.
     # The healthcheck doubles as a one-shot KV-prefix warm-up: the first passing run replays the
     # first few round-2 trace requests (shared system prefix + real multi-turn threads) so the prefix
