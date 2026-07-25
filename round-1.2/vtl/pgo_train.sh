@@ -71,6 +71,10 @@ PY
 
 echo "== [pgo 4/6] boot frontend (CPU-only) + mock engine"
 export RUST_BACKTRACE=full
+# Match the production env (docker-compose.yaml) — PGO weights whatever it profiles, so a
+# router/runtime shape that differs from the served one trains the wrong hot/cold split.
+export VLLM_RS_DISABLE_HTTP_TRACE=1 VLLM_RS_DISABLE_CORS=1
+export VLLM_RS_ZMQ_WORKER_THREADS=3 VLLM_RS_REQUEST_WORKER_THREADS=3
 BIN="$RUST_DIR/target/release"
 FRONTEND_LOG=/tmp/pgo-frontend.log
 
