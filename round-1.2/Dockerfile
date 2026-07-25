@@ -63,7 +63,11 @@ RUN JE=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2; \
 # when VLLM_USE_RUST_FRONTEND=1 (see the patch header). Applied here (not only in
 # Dockerfile.vllm-fork) so it lands on the stock base too. No-op while the flag is
 # unset. dry-run first so a drifted patch fails the build loudly, not at the judge's run.
-COPY vtl/vllm_patches/v0.26.0/api_server_rust_frontend.patch /tmp/rustfe.patch
+# Version-derived so this path cannot drift from the base. It matters mainly on the STOCK-base
+# path: against the fork the grep below short-circuits, so a stale literal here would stay
+# invisible until the one build you reach for when something is already wrong.
+ARG VLLM_VER=0.26.0
+COPY vtl/vllm_patches/v${VLLM_VER}/api_server_rust_frontend.patch /tmp/rustfe.patch
 RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))") \
  && F="$SITE/vllm/entrypoints/openai/api_server.py" \
  && if grep -q run_multi_api_server "$F"; then \

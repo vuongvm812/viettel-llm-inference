@@ -78,14 +78,25 @@ def _self_check() -> None:
         from transformers import AutoConfig
 
         from vllm.model_executor.models.lfm2 import Lfm2Attention
-    except ImportError as e:
+    except Exception as e:
+        # Not just ImportError: importing vLLM on a CPU-only box commonly raises OSError or
+        # RuntimeError out of the CUDA loader, and `make check` is contracted to run anywhere.
         print(f"qk_norm_rope self-check skipped (needs vllm/torch/transformers: {e})")
         return
-    if not torch.cuda.is_available() or not os.path.isdir("/hf-model"):
-        print("qk_norm_rope self-check skipped (needs a GPU and /hf-model)")
+    if not torch.cuda.is_available():
+        print("qk_norm_rope self-check skipped (no GPU)")
         return
+    # Only the GPU-less case is a legitimate skip. Once there IS a GPU this check must run
+    # or fail loudly -- it is the only numerical guard on a patch that replaces
+    # Lfm2Attention.forward outright, whose failure mode is wrong tokens, not a crash.
+    # /model is where every compose overlay mounts the weights; ../hf-model is the host path.
+    model_dir = next(
+        (d for d in (os.environ.get("VTL_MODEL_DIR"), "/model", "../hf-model") if d and os.path.isdir(d)),
+        None,
+    )
+    assert model_dir, "GPU present but no model dir (set VTL_MODEL_DIR); self-check cannot run"
 
-    cfg = AutoConfig.from_pretrained("/hf-model")
+    cfg = AutoConfig.from_pretrained(model_dir)
     layer = Lfm2Attention(
         config=cfg,
         layer_idx=2,

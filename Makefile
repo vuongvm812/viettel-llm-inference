@@ -29,6 +29,10 @@ MAX_JOBS ?= 4
 
 # Upstream stock vLLM. The forked image is built FROM this (make vllm-fork); never FROM the fork.
 VLLM_STOCK ?= vllm/vllm-openai:v0.26.0
+# The bare version ("0.26.0"), derived from VLLM_STOCK so there is ONE place to bump. Passed to
+# the fork build as VLLM_VER, where it drives both the `vllm.__version__` assert and the
+# vtl/vllm_patches/v$(VLLM_VER)/ directory -- the patch set can no longer disagree with the base.
+VLLM_VER := $(patsubst v%,%,$(lastword $(subst :, ,$(VLLM_STOCK))))
 # Forked vLLM base = VLLM_STOCK + vtl source patches, built by $(ROUND)/Dockerfile.vllm-fork
 # (Python-only overlay -> no CUDA rebuild). Pin VLLM_FORK_TAG to the pushed digest. See make vllm-fork.
 #
@@ -39,13 +43,24 @@ VLLM_STOCK ?= vllm/vllm-openai:v0.26.0
 # success. `make verify` is the check: the "fusion replaced N patterns" count drops back to its
 # pre-hoist value instead of covering the conv layers.
 VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
-# ROLLBACK (vLLM v0.25.0, last known-good before the 2026-07-25 v0.26.0 upgrade):
-#   VLLM_FORK_TAG = v0.25.0-tree@sha256:45ee1a65d96e9e65c54296273629e7a1ac6824dbe69611e104bb7073c799f91e
-# TODO: re-pin to the pushed digest after `make vllm-fork PUSH=1` on the H200.
+# TAG and DIGEST are split because they have incompatible uses: `docker buildx build -t` REFUSES
+# a digest reference ("refusing to create a tag with a digest reference"), so the build target can
+# only ever use the bare tag, while consumption must be digest-pinned for reproducibility. Folding
+# both into one variable is why the pre-upgrade tree's `make vllm-fork` could not run.
 VLLM_FORK_TAG ?= v0.26.0
+# ROLLBACK (vLLM v0.25.0, last known-good before the 2026-07-26 v0.26.0 upgrade):
+#   VLLM_FORK_TAG=v0.25.0-tree VLLM_FORK_DIGEST=@sha256:45ee1a65d96e9e65c54296273629e7a1ac6824dbe69611e104bb7073c799f91e
+# Note that is an IMAGE-level rollback only: vtl/vllm_patches/v0.25.0/ was deleted in the upgrade,
+# so rebuilding a v0.25.0 fork from source needs `git revert` first. VTL_DISABLE=1 does NOT undo
+# it either -- that only bypasses the plugin, never the .patch-applied source baked into the image.
+#
+# UNPINNED until `make vllm-fork PUSH=1` runs on the H200. Empty = resolve by mutable tag, which
+# means two "identical" A/B boots can silently be different images -- the one failure the
+# boot-to-boot noise methodology cannot detect. `make push` refuses to ship while it is empty.
+VLLM_FORK_DIGEST ?=
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # patched vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
-VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
+VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)$(VLLM_FORK_DIGEST)
 # 1 = the fork's rust-builder stage does a profile-guided-optimization build of vllm-rs
 # (CPU-only training run against the mock engine). 0 = plain optimized (fat-LTO) build.
 VLLM_RS_PGO ?= 1
@@ -226,9 +241,9 @@ BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 ##   make vllm-fork PUSH=1
 ##   make push VLLM_IMAGE=$(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)@sha256:<digest>
 vllm-fork:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg PGO_MODEL='$(PGO_MODEL)' --build-arg PGO_TARGET_CPU='$(PGO_TARGET_CPU)' $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-context hfmodel=$(PGO_HFMODEL)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg VLLM_VER='$(VLLM_VER)' --build-arg VLLM_SRC_REF='v$(VLLM_VER)' --build-arg PGO_MODEL='$(PGO_MODEL)' --build-arg PGO_TARGET_CPU='$(PGO_TARGET_CPU)' $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-context hfmodel=$(PGO_HFMODEL)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
 	@echo "forked vLLM base: $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)"
-	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'pin this digest: {{.Manifest.Digest}}'; fi
+	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'set VLLM_FORK_DIGEST=@{{.Manifest.Digest}}'; fi
 
 build:
 	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --load -t $(IMAGE):$(TAG) .
@@ -255,12 +270,22 @@ warm:
 	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	  --closed-loop $(WARM_CONCURRENCY) --limit $(WARM_REQS) --out /dev/null
 	$(IN) docker cp "$$($(DC) ps -q model)":/opt/vtl/cache/. docker/cache/
+	@# Never bake a startup plan (VLLM_ENABLE_STARTUP_PLAN). Its fingerprint covers VllmConfig +
+	@# device + torch build but NOT the VTL_* env knobs that change resident weight bytes, and the
+	@# apply gate samples free memory BEFORE weights load -- so a plan recorded under one vtl
+	@# config gets replayed under another and sizes the KV cache for memory that isn't there.
+	$(IN) rm -rf docker/cache/vllm/startup_plan
 	$(IN) $(DC) down
 	$(MAKE) build ROUND=$(ROUND)
 
 ## buildx --push writes the manifest straight to the registry, so the pushed image
 ## is $(PLATFORM) regardless of what this machine is.
 push:
+	@# A pushed image is what the judge runs, so refuse to build one on top of a mutable tag.
+	@case '$(VLLM_IMAGE)' in *@sha256:*) ;; *) \
+	  echo "FAIL base image '$(VLLM_IMAGE)' is not digest-pinned."; \
+	  echo "     run 'make vllm-fork PUSH=1', then set VLLM_FORK_DIGEST=@sha256:<digest>."; \
+	  exit 1;; esac
 	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --push -t $(IMAGE):$(TAG) .
 	@echo "pin this digest in $(ROUND)/docker-compose.yaml:"
 	@docker buildx imagetools inspect $(IMAGE):$(TAG) --format '{{.Manifest.Digest}}'

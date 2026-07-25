@@ -1,5 +1,29 @@
 # HANDOFF — Round 1.2 Mission Brief
 
+## OPEN: on-box verification owed for the vLLM v0.26.0 upgrade (2026-07-26)
+
+The upgrade landed with only the off-box gates run. Everything below needs the H200 and is
+**not** optional — the fork image has not been built even once on v0.26.0.
+
+| # | Command | Catches |
+|---|---|---|
+| 1 | `make vllm-fork PUSH=1` | patch/version drift; the `patch --dry-run` gate. Then set `VLLM_FORK_DIGEST=@sha256:<digest>` in the Makefile — `make push` refuses to ship without it. |
+| 2 | `make build && make up && make verify` | plugin loaded, quant methods registered, async scheduling on, **fusion-replaced-N-patterns count** (a drop = a fusion patch silently stopped matching) |
+| 3 | `make test-kernel` | the `vtl._C` kernels and the two hijacked `_C` op schemas |
+| 4 | `bench/eval_quality.py`, capturing against the **v0.25.0 image** then the v0.26.0 one | **The important one.** Greedy temp-0 output parity. Several vtl patches reimplement vLLM internals verbatim (`qk_norm_rope` replaces `Lfm2Attention.forward`; `greedy_sampler` replaces `Sampler.forward`), and their failure mode is wrong tokens with no exception. Nothing else catches that. |
+| 5 | `make bench` / `make ab` vs the v0.25.0 image | whether the upgrade is latency-neutral. Add **boots, not reps** — the noise floor is boot-to-boot (~0.5 ms TPOT). |
+| 6 | peak RSS under the 8 GB cap | jemalloc runs `decay:-1` (never returns pages) and v0.26.0 bumps Transformers to 5.13.0 |
+| 7 | `python3 -m pytest` of `vtl/patches/qk_norm_rope.py` inside the image | its numeric parity check only runs where there is a GPU **and** a model dir; confirm it actually executes rather than printing "skipped" |
+
+**Expectation management:** the upgrade's original justification (#46384 `--prefix-match-unit`)
+was found to be a **no-op on this model** — see the derivation in `docker-compose.yaml`. Do not
+expect a TTFT win. What v0.26.0 actually buys is incidental host-side work (#48641 drops an fp32
+logit copy from the sample path, #48143 an allocation from the SSM metadata build, #46647 moves
+iteration logging off the engine-core loop) plus staying current. If step 5 shows a regression,
+the rollback is the digest in `Makefile` (image-level only — `vtl/vllm_patches/v0.25.0/` was
+deleted, so a source-level rollback needs `git revert`).
+
+
 ## Hardware
 
 | Spec | Value |

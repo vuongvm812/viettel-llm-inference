@@ -24,8 +24,10 @@ OUT="$REPO/round-1.2/vtl/vllm_patches/$VER"
 [ -d "$LOCAL/.git" ] || { echo "$LOCAL is not a git checkout -- see the upgrade recipe above"; exit 1; }
 mkdir -p "$OUT"
 
+CAPTURED=()
 gen() {  # $1 = package-relative path, $2 = patch basename
   git -C "$LOCAL" diff HEAD -- "vllm/$1" > "$OUT/$2.patch"
+  CAPTURED+=("vllm/$1")
   echo "wrote $2.patch ($(wc -l < "$OUT/$2.patch") lines)"
 }
 
@@ -39,12 +41,35 @@ gen model_executor/models/lfm2.py               lfm2
 gen v1/worker/gpu/sample/sampler.py             v2_greedy_sampler
 gen v1/worker/gpu/model_states/mamba_hybrid.py  mamba_hybrid_postprocess
 
+# THE guard. A hardcoded gen() list silently drops any edit to a file not named above -- that is
+# how three files' worth of spec-decode work sat unshipped in the checkout while notes claimed it
+# had landed (see not-applied/README.md). The checkout knows what changed; ask it.
+MODIFIED=$(git -C "$LOCAL" diff HEAD --name-only -- vllm/ | sort)
+EXPECTED=$(printf '%s\n' "${CAPTURED[@]}" | sort)
+if [ "$MODIFIED" != "$EXPECTED" ]; then
+  echo "ERROR: modified files in $LOCAL do not match what gen.sh captures."
+  comm -23 <(echo "$MODIFIED") <(echo "$EXPECTED") | sed 's/^/  NOT CAPTURED (add a gen line, or park under not-applied\/): /'
+  comm -13 <(echo "$MODIFIED") <(echo "$EXPECTED") | sed 's/^/  captured but unmodified (stale gen line): /'
+  exit 1
+fi
+
 echo "dry-run applying all patches against pristine $VER..."
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 git -C "$LOCAL" archive "$VER" | tar -x -C "$TMP"
 for p in "$OUT"/*.patch; do
-  [ -s "$p" ] || { echo "skip empty $p"; continue; }
+  # Empty is a FAILURE, not a skip: `git diff HEAD` goes empty the moment someone commits in the
+  # checkout, which would blank every patch here and still print a green result.
+  [ -s "$p" ] || { echo "  EMPTY $(basename "$p") -- nothing captured (did you commit in $LOCAL?)"; exit 1; }
   patch -p1 -d "$TMP" --dry-run -s < "$p" && echo "  OK $(basename "$p")" \
     || { echo "  FAIL $(basename "$p")"; exit 1; }
+done
+
+# Parked work is only worth keeping if it still applies. Stack it on the APPLIED tree so the
+# claim in not-applied/README.md is re-checked here instead of rotting.
+for p in "$OUT"/*.patch; do patch -p1 -d "$TMP" -s < "$p"; done
+for p in "$(dirname "$OUT")"/not-applied/*.patch; do
+  [ -e "$p" ] || continue
+  patch -p1 -d "$TMP" --dry-run -s < "$p" && echo "  OK (parked) $(basename "$p")" \
+    || { echo "  FAIL (parked) $(basename "$p") -- forward-port it or drop it"; exit 1; }
 done
 echo "all patches apply clean."

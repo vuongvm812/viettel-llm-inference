@@ -60,10 +60,14 @@ def _remaining_prefill(request, kv_cache_manager) -> int:
         # fresh lookup. Mirror it so the key matches the work actually left.
         if getattr(request, "num_computed_tokens", 0):
             return max(num_prompt - request.num_computed_tokens, 0)
-        _blocks, num_cached = kv_cache_manager.coordinator.find_longest_cache_hit(
+        # INDEX, do not unpack: this return grew from 2-tuple (v0.25.0) to 3-tuple in
+        # v0.26.0 (+num_uncached_common_prefix_tokens). Unpacking raised ValueError into
+        # the `except` below, silently degrading the whole cache-aware reorder to
+        # shortest-prompt-first with no log line. Indexing survives the next arity change.
+        hit = kv_cache_manager.coordinator.find_longest_cache_hit(
             request.block_hashes, request.num_tokens - 1
         )
-        return max(num_prompt - num_cached, 0)
+        return max(num_prompt - hit[1], 0)
     except Exception:
         return num_prompt  # degrade to shortest-prompt-first; never raise
 
@@ -153,7 +157,10 @@ def _self_check() -> None:
             self.cached = cached
 
         def find_longest_cache_hit(self, block_hashes, max_len):
-            return ([], self.cached.get(block_hashes, 0))
+            # 3-tuple, matching v0.26.0 (blocks, hit_length, uncached_common_prefix).
+            # The fake previously returned the v0.25.0 2-tuple, so `make check` kept
+            # passing while the real call site was raising ValueError in production.
+            return ([], self.cached.get(block_hashes, 0), 0)
 
     class FakeKVM:
         def __init__(self, cached):

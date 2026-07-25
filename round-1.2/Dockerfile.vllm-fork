@@ -86,6 +86,12 @@ RUN git clone --depth 1 --branch "${VLLM_SRC_REF}" --filter=blob:none --sparse \
     && mv /src/vllm-src/rust /src/rust \
     && rm -rf /src/vllm-src
 
+# The rebuilt vllm-rs replaces the base's binary and speaks its ZMQ/frontend protocol to the
+# Python side, so a ref/base mismatch is a RUNTIME protocol failure under the judge, not a build
+# failure. The stage-2 version assert does not cover this stage, so check it here too. (This
+# stage is FROM ${VLLM_IMAGE}, so vllm is importable.)
+RUN python3 -c "import vllm; r='${VLLM_SRC_REF}'.lstrip('v'); v=vllm.__version__; assert v==r, f'rust source ref {r} != base image vllm {v}'; print('rust src ref matches base', v)"
+
 # Our frontend optimizations (sonic_rs parse extractor + tuned release profile) live as a
 # tracked patch — the fetched source is pristine v0.26.0, so this is what makes the build
 # produce the optimized binary instead of stock. Grep-guarded (idempotent) like the
@@ -164,10 +170,10 @@ RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vll
     fi \
  && for p in /tmp/vtl_patches/*.patch; do \
       [ -e "$p" ] || { echo "no patches found"; exit 1; }; \
-      echo "== dry-run $p"; patch -p1 -d "$SITE" --dry-run < "$p" || exit 1; \
+      echo "== dry-run $p"; patch -p1 -F0 --batch -d "$SITE" --dry-run < "$p" || exit 1; \
     done \
  && for p in /tmp/vtl_patches/*.patch; do \
-      echo "== apply   $p"; patch -p1 -d "$SITE" < "$p" || exit 1; \
+      echo "== apply   $p"; patch -p1 -F0 --batch -d "$SITE" < "$p" || exit 1; \
     done \
  && rm -rf /tmp/vtl_patches \
  && python3 -c "import vllm.entrypoints.openai.api_server, vllm.model_executor.layers.mamba.short_conv, vllm.model_executor.models.lfm2, vllm.v1.worker.gpu.sample.sampler, vllm.v1.worker.gpu.model_states.mamba_hybrid; print('patched vllm imports OK')"

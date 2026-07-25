@@ -13,11 +13,12 @@ name: viettel-llm-optimized
 
 services:
   model:
-    # !! STALE PIN -- this digest is the vLLM v0.25.0-based image. It does NOT understand
-    # --prefix-match-unit (added below, v0.26.0 #46384) and will FAIL AT STARTUP against it.
-    # Re-pin after: make vllm-fork PUSH=1 && (pin Makefile VLLM_FORK_TAG) && make push.
-    # Rollback = restore this digest AND drop the --prefix-match-unit flag + the two
-    # VLLM_{PREFIX_CACHE_RETENTION_INTERVAL,ENABLE_STARTUP_PLAN} vars; they are a set.
+    # Still the v0.25.0-based image; re-pin after the v0.26.0 fork is built and pushed on the
+    # H200 (make vllm-fork PUSH=1 -> pin Makefile VLLM_FORK_TAG/DIGEST -> make push). Every
+    # flag and env var below is deliberately version-AGNOSTIC -- nothing here is v0.26.0-only --
+    # so this file boots correctly against both the old and the new image. Keep it that way:
+    # a v0.26.0-only serve flag must land in the SAME commit that re-pins this digest, or the
+    # judge gets an immediate SystemExit (argparse rejects unknown flags) and scores zero.
     image: unseenablefuture/awesome-badger@sha256:aa427bc0d0ec92ef8e46d97ddfefe0a2193dbd064326baf308e55a092d7d2a2c # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
@@ -43,15 +44,21 @@ services:
       # Lfm2ForCausalLM raises NotImplementedError on `all`, so the server won't boot otherwise.
       - --enable-prefix-caching
       - --mamba_cache_mode=align
-      # vLLM v0.26.0 (#46384): decouples prefix-MATCH granularity from the physical KV block
-      # size, and teaches MambaManager to match at these boundaries instead of whole blocks.
-      # Must divide every cache-group block size; unset = derived from their GCD.
-      # SIZING: on the attention side this is worth almost nothing here -- bench/trace_stats.py
-      # says block_size 16 avoids 1,102,736 prefill tokens vs 1,106,010 at block_size 1, i.e.
-      # token-granular matching recovers 3,274 tokens = 0.24% of the 1.34M-token prefill. The
-      # real (unmeasurable off-box) upside is the align-mode short-conv STATE lookup, which is
-      # block-granular in v0.25.0. A/B it against the flag removed before believing any win.
-      - --prefix-match-unit=16
+      # --prefix-match-unit (v0.26.0 #46384) DELIBERATELY NOT SET: on this model it is a no-op.
+      # It sets hash_block_size, which defaults to the GCD of the cache groups' block sizes.
+      # LFM2's conv state is 2048*(3-1)*2B = 8192B/layer; fp8 KV is 2*8*64*1B = 1024B/token, so
+      # Platform._align_hybrid_block_size gives attn_block_size = 16*cdiv(8192, 16*1024) = 16 and
+      # leaves block_size at 16; `align` then sets mamba_block_size = block_size = 16. Groups are
+      # [16,16] -> GCD 16, so --prefix-match-unit=16 IS the default. Worse, the partial-hit paths
+      # gate on mamba block_size > hash_block_size (kv_cache_coordinator.py, scheduler.py,
+      # _cache_partial_tail_block), so 16 keeps all three closed. Going finer is the only way to
+      # arm them and it is a measured loss: bench/trace_stats.py says block_size 1 avoids
+      # 1,106,010 prefill tokens vs 16's 1,102,736 -- 3,274 tokens, 0.24% of a 1.34M-token
+      # prefill -- against doubled per-request hashing plus an extra mandatory chunk-split stop
+      # per request on a Python-bound scheduler. #46384 pays off when the mamba page dwarfs the
+      # attention page (its docstring example: unit 32 vs a 1024-token block); LFM2's conv state
+      # is too small for that to ever happen.
+      #
       # vLLM v0.26.0 (#48012) also adds per-KV-cache-group backend selection:
       #   --attention-config '{"backend_per_kind": {"full_attention": "FLASH_ATTN"}}'
       # DELIBERATELY NOT SET. On the H200 the auto-selector already picks FLASH_ATTN for the
@@ -106,18 +113,27 @@ services:
       VLLM_NO_USAGE_STATS: "1"
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
 
-      # ---- vLLM v0.26.0 additions ------------------------------------------------------
-      # #47782 extended the Marconi retention-interval sparse cache from sliding-window
-      # attention to MAMBA states, which is the path this hybrid runs. 0 = retain at the
-      # latest completed prompt boundary (tuned for long-context / multi-turn sessions).
-      # NOTE: the envs.py docstring still claims "not yet Mamba/linear attention" -- that
-      # comment is stale as of v0.26.0; MambaManager.cache_blocks handles the interval.
-      VLLM_PREFIX_CACHE_RETENTION_INTERVAL: "0"
-      # #47388: persist the memory-profiling + cudagraph-capture plan across boots
-      # (fingerprinted by config hash + device + torch/CUDA build), ~2-5s/boot on H100.
-      # Worth more than it looks: the A/B noise floor here is boot-to-boot, not rep-to-rep,
-      # so cheaper boots buy more boots buy tighter measurements.
-      VLLM_ENABLE_STARTUP_PLAN: "1"
+      # ---- vLLM v0.26.0 knobs evaluated and REJECTED ------------------------------------
+      # VLLM_PREFIX_CACHE_RETENTION_INTERVAL (#47782, Marconi retention extended to mamba
+      # states). Do NOT set it to 0. Per MambaManager.reachable_block_mask: None = dense
+      # (cache every state block, the default); 0 = keep ONLY reachable_boundaries, i.e.
+      # num_prompt_tokens-1 plus shared-prefix junctions -- with segment_tokens None, no
+      # state produced during DECODE is cached at all. This trace is 70 conversations x 6
+      # turns where turn N+1 replays turn N's prompt AND its ~291-token reply, and
+      # find_longest_cache_hit reconciles every group down to the shortest hit, so the mamba
+      # group would cap the whole hybrid at the end of turn N's PROMPT. Est. ~102k extra
+      # prefill tokens (~+43% of the 234k currently computed), straight into the TTFT path
+      # under a gamma=2 penalty. Sparse retention buys eviction headroom, and we have none
+      # to buy: the working set is ~1.4GB fp8 against a ~14GB budget.
+      #
+      # VLLM_ENABLE_STARTUP_PLAN (#47388, persist memory-profiling across boots). Not set:
+      # boot is outside the scored window (180s start_period), and compute_plan_fingerprint
+      # hashes VllmConfig + device + torch build but NOT the process env -- so the VTL_*
+      # knobs that change resident weight bytes (VTL_LM_HEAD_QUANT, VTL_W4A8_IGNORE,
+      # VTL_DISABLE) all share one fingerprint. The apply gate samples free memory BEFORE
+      # weights load, so it cannot catch the mismatch. That makes it actively harmful to the
+      # A/B methodology it was supposed to help: arm B would silently reuse arm A's KV
+      # capacity. If you want it for the dev loop, set it per-shell, not in the submission.
 
       # ---- TPOT: host-side per-step cost ----------------------------------------------
       # STALE -- every number below was measured on a FULL H200. The judge runs an MIG
