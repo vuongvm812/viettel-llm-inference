@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # check=skip=FromPlatformFlagConstDisallowed
 #
-# Forked vLLM base image = stock v0.25.0 + vtl's tree-spec Python source patches
+# Forked vLLM base image = stock v0.26.0 + vtl's Python source patches
 # + an optimized (optionally PGO) rebuild of the Rust frontend binary `vllm-rs`.
 #
 # The Python patches remain a CHEAP overlay (the compiled _C*.so / CUDA kernels in
@@ -21,11 +21,11 @@
 #   make vllm-fork VLLM_RS_PGO=1   # + PGO training run (CPU-only, uses the mock engine)
 #   make vllm-fork PUSH=1          # build + push, then pin the main image by @sha256:<digest>
 #
-# The patches under vtl/vllm_patches/v0.25.0/ are generated from the local
+# The patches under vtl/vllm_patches/v0.26.0/ are generated from the local
 # (gitignored) vllm/ checkout with `git -C vllm diff` — see vtl/vllm_patches/README.md.
 
-ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.0
-ARG RUST_TOOLCHAIN=1.95   # keep in sync with vllm/rust-toolchain.toml
+ARG VLLM_IMAGE=vllm/vllm-openai:v0.26.0
+ARG RUST_TOOLCHAIN=1.95   # keep in sync with vllm/rust-toolchain.toml (v0.26.0: still 1.95)
 # PGO tokenizer for the training run: defaults to the local hf-model bind-mounted at
 # /model (only tokenizer/config are read — the mock fakes the forward pass, weights are
 # never loaded). Override with a HF repo id to fetch over the network.
@@ -42,7 +42,7 @@ ARG PGO_TARGET_CPU=native
 ARG RUST_BUILDER=rust-builder
 # vLLM source tag to fetch the Rust workspace from — must match the base image version so
 # the rebuilt vllm-rs speaks the same frontend/ZMQ protocol the Python side expects.
-ARG VLLM_SRC_REF=v0.25.0
+ARG VLLM_SRC_REF=v0.26.0
 
 # ------------------------------------------------------------------------------
 # Stage 1: plain optimized vllm-rs build (fat-LTO release; linux/amd64, base glibc).
@@ -87,7 +87,7 @@ RUN git clone --depth 1 --branch "${VLLM_SRC_REF}" --filter=blob:none --sparse \
     && rm -rf /src/vllm-src
 
 # Our frontend optimizations (sonic_rs parse extractor + tuned release profile) live as a
-# tracked patch — the fetched source is pristine v0.25.0, so this is what makes the build
+# tracked patch — the fetched source is pristine v0.26.0, so this is what makes the build
 # produce the optimized binary instead of stock. Grep-guarded (idempotent) like the
 # api_server_rust_frontend patch, so a pre-modified source is a no-op too.
 COPY vtl/vllm_patches/rust-frontend/ /tmp/rust_patches/
@@ -146,19 +146,20 @@ FROM ${RUST_BUILDER} AS selected-builder
 # ------------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS vllm-fork
 
-# Load-bearing: patches are line-addressed against v0.25.0. If the base ever moves, the version
-# assert fails the build here instead of the patch silently applying to the wrong lines (or the
-# server misbehaving at the judge's run).
-RUN python3 -c "import vllm; v=vllm.__version__; assert v=='0.25.0', f'expected vllm 0.25.0, got {v}'; print('vllm', v, 'ok')"
+# Load-bearing: patches are line-addressed against ${VLLM_VER}. If the base ever moves, the
+# version assert fails the build here instead of the patch silently applying to the wrong lines
+# (or the server misbehaving at the judge's run).
+ARG VLLM_VER=0.26.0
+RUN python3 -c "import vllm; v=vllm.__version__; assert v=='${VLLM_VER}', f'expected vllm ${VLLM_VER}, got {v}'; print('vllm', v, 'ok')"
 
-COPY vtl/vllm_patches/v0.25.0/ /tmp/vtl_patches/
+COPY vtl/vllm_patches/v${VLLM_VER}/ /tmp/vtl_patches/
 
 # Apply every *.patch to the installed package. `git diff` emits a/vllm/... b/vllm/... paths, so -p1
 # strips the a/ and we apply from the site-packages dir (the parent of the vllm package). --dry-run
 # first so a drifted patch fails the build loudly and atomically, before any half-apply.
 RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))") \
  && echo "site-packages: $SITE" \
- && if grep -q "_vtl_tree_accept" "$SITE/vllm/v1/sample/rejection_sampler.py"; then \
+ && if grep -q "_vtl_greedy_eligible" "$SITE/vllm/v1/worker/gpu/sample/sampler.py"; then \
       echo "ERROR: base already carries vtl patches. Build the fork FROM STOCK vllm (make vllm-fork uses VLLM_STOCK), not FROM the fork."; exit 1; \
     fi \
  && for p in /tmp/vtl_patches/*.patch; do \
@@ -169,7 +170,7 @@ RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vll
       echo "== apply   $p"; patch -p1 -d "$SITE" < "$p" || exit 1; \
     done \
  && rm -rf /tmp/vtl_patches \
- && python3 -c "import vllm.v1.sample.rejection_sampler, vllm.v1.attention.backends.flash_attn, vllm.model_executor.layers.mamba.short_conv, vllm.v1.worker.gpu_model_runner; print('patched vllm imports OK')"
+ && python3 -c "import vllm.entrypoints.openai.api_server, vllm.model_executor.layers.mamba.short_conv, vllm.model_executor.models.lfm2, vllm.v1.worker.gpu.sample.sampler, vllm.v1.worker.gpu.model_states.mamba_hybrid; print('patched vllm imports OK')"
 
 # Replace the stock vllm-rs with the optimized/PGO build. The Python side spawns
 # this exact file (RustFrontendProcessManager) when VLLM_USE_RUST_FRONTEND=1.

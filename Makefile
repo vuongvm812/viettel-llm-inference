@@ -28,20 +28,23 @@ CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 MAX_JOBS ?= 4
 
 # Upstream stock vLLM. The forked image is built FROM this (make vllm-fork); never FROM the fork.
-VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
-# Forked vLLM base = VLLM_STOCK + vtl tree-spec source patches, built by $(ROUND)/Dockerfile.vllm-fork
+VLLM_STOCK ?= vllm/vllm-openai:v0.26.0
+# Forked vLLM base = VLLM_STOCK + vtl source patches, built by $(ROUND)/Dockerfile.vllm-fork
 # (Python-only overlay -> no CUDA rebuild). Pin VLLM_FORK_TAG to the pushed digest. See make vllm-fork.
 #
-# Re-pinned in 66e5882 to include the short_conv in_proj hoist + the paired lfm2 empty_like fix
-# (vtl/vllm_patches/v0.25.0/{short_conv,lfm2}.patch), which are what let RMSNormQuantFusionPass
+# The patches include the short_conv in_proj hoist + the paired lfm2 empty_like fix
+# (vtl/vllm_patches/v0.26.0/{short_conv,lfm2}.patch), which are what let RMSNormQuantFusionPass
 # reach the 10 short-conv layers. Any future edit to those patches needs `make vllm-fork PUSH=1`
 # and a re-pin here, or `make up` silently serves the old fork -- which looks exactly like
 # success. `make verify` is the check: the "fusion replaced N patterns" count drops back to its
 # pre-hoist value instead of covering the conv layers.
 VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
-VLLM_FORK_TAG ?= v0.25.0-tree@sha256:45ee1a65d96e9e65c54296273629e7a1ac6824dbe69611e104bb7073c799f91e
+# ROLLBACK (vLLM v0.25.0, last known-good before the 2026-07-25 v0.26.0 upgrade):
+#   VLLM_FORK_TAG = v0.25.0-tree@sha256:45ee1a65d96e9e65c54296273629e7a1ac6824dbe69611e104bb7073c799f91e
+# TODO: re-pin to the pushed digest after `make vllm-fork PUSH=1` on the H200.
+VLLM_FORK_TAG ?= v0.26.0
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
-# tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
+# patched vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
 # 1 = the fork's rust-builder stage does a profile-guided-optimization build of vllm-rs
 # (CPU-only training run against the mock engine). 0 = plain optimized (fat-LTO) build.
@@ -214,7 +217,7 @@ verify:
 NOCACHE ?=
 BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 
-## Build (PUSH=1 to push) the forked vLLM base image: stock v0.25.0 + vtl/vllm_patches +
+## Build (PUSH=1 to push) the forked vLLM base image: stock v0.26.0 + vtl/vllm_patches +
 ## an optimized rebuild of the Rust frontend `vllm-rs` (fat-LTO release; VLLM_RS_PGO=1 adds a
 ## CPU-only PGO training run via the mock engine). The rust-builder stage reads the vllm/rust/
 ## workspace at repo root via the named build context. Then point the main image at it, pin by digest:

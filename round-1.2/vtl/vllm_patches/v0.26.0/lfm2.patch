@@ -1,6 +1,8 @@
+diff --git a/vllm/model_executor/models/lfm2.py b/vllm/model_executor/models/lfm2.py
+index 601bd22..c40872d 100644
 --- a/vllm/model_executor/models/lfm2.py
 +++ b/vllm/model_executor/models/lfm2.py
-@@ -283,7 +283,18 @@
+@@ -283,7 +283,18 @@ class Lfm2ShortConvDecoderLayer(nn.Module):
              hidden_states = self.operator_norm(hidden_states)
          else:
              hidden_states, residual = self.operator_norm(hidden_states, residual)

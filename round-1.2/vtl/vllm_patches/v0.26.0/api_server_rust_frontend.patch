@@ -1,6 +1,8 @@
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+index 59c7ee8..c9623b2 100644
 --- a/vllm/entrypoints/openai/api_server.py
 +++ b/vllm/entrypoints/openai/api_server.py
-@@ -735,4 +735,27 @@
+@@ -796,4 +796,27 @@ if __name__ == "__main__":
      args = parser.parse_args()
      validate_parsed_serve_args(args)
  

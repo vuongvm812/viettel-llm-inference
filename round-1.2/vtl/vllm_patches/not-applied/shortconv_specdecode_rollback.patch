@@ -1,0 +1,104 @@
+--- a/vllm/model_executor/layers/mamba/short_conv.py
++++ b/vllm/model_executor/layers/mamba/short_conv.py
+@@ -239,7 +239,11 @@
+             prefix=f"{prefix}.out_proj",
+         )
+ 
+-        compilation_config = get_current_vllm_config().compilation_config
++        vllm_config = get_current_vllm_config()
++        # Capture here (config context is set during model build); get_state_shape
++        # runs later outside that context. Widens conv state for spec-decode rollback.
++        self.num_spec = vllm_config.num_speculative_tokens
++        compilation_config = vllm_config.compilation_config
+         if prefix in compilation_config.static_forward_context:
+             raise ValueError(f"Duplicate layer name: {prefix}")
+         compilation_config.static_forward_context[prefix] = self
+@@ -419,6 +423,15 @@
+         has_decode = num_decodes > 0
+         num_actual_tokens = num_decodes + num_prefill_tokens
+ 
++        # Chain speculative decode (ngram/ngram_gpu/suffix): the base builder already
++        # populates num_accepted_tokens + query_start_loc_d + a [reqs, 1+num_spec] state
++        # slot table (inherited from BaseMambaAttentionMetadataBuilder). Passing them to
++        # causal_conv1d_update makes it roll the conv_state back to the accepted prefix
++        # instead of committing rejected drafts -- the fix for the long-context 0% probe.
++        # The custom fused conv-gate kernel has no num_accepted path, so it is bypassed
++        # under spec. ponytail: teach bcx_conv_gate_quant num_accepted = separate .cu work.
++        spec_decode_active = attn_metadata.num_accepted_tokens is not None
++
+         # NOTE: V1 puts decode before prefill
+         # Separate prefill and decode by splitting varlen input
+         # Split along token dimension
+@@ -463,6 +476,7 @@
+         use_conv_gate = (
+             use_fused
+             and has_decode
++            and not spec_decode_active
+             and _vtl_conv_gate_eligible(
+                 self, conv_weights, conv_state, state_indices_tensor_d, BCx
+             )
+@@ -536,10 +550,18 @@
+             else:
+                 Bx_d = (B_d * x_d).contiguous()
+                 _conv_state_d = conv_state
++                # Chain spec: let the kernel roll back to the accepted prefix.
++                _num_accepted = attn_metadata.num_accepted_tokens
++                _qsl_d = attn_metadata.query_start_loc_d
+                 if _vtl_stage is not None:
++                    # Tree-spec (deferred): stage into a scratch clone; the tree runtime
++                    # commits the accepted path post-sample. Tree acceptance is not a
++                    # linear prefix, so the kernel's chain num_accepted rollback is off here.
+                     _conv_state_d = _vtl_stage(
+                         id(self), Bx_d, conv_state, state_indices_tensor_d
+                     )
++                    _num_accepted = None
++                    _qsl_d = None
+                 Bx = causal_conv1d_update(
+                     Bx_d,
+                     _conv_state_d,
+@@ -547,6 +569,13 @@
+                     self.conv.bias,
+                     activation=None,
+                     conv_state_indices=state_indices_tensor_d,
++                    num_accepted_tokens=_num_accepted,
++                    query_start_loc=_qsl_d,
++                    max_query_len=(
++                        state_indices_tensor_d.size(-1)
++                        if _num_accepted is not None
++                        else -1
++                    ),
+                 )
+                 if use_fused:
+                     torch.ops.vllm_cuda.mul_dynamic_per_token_quant(
+@@ -577,10 +606,13 @@
+         )
+ 
+     def get_state_shape(self) -> tuple[tuple[int, ...]]:
++        # num_spec widens the conv state for speculative-decode rollback
++        # (see short_conv_state_shape / mamba2 parity). Captured in __init__.
+         return MambaStateShapeCalculator.short_conv_state_shape(
+             tp_world_size=get_tensor_model_parallel_world_size(),
+             intermediate_size=self.conv_dim,
+             conv_kernel=self.L_cache,
++            num_spec=self.num_spec,
+         )
+ 
+     @property
+--- a/vllm/model_executor/models/lfm2.py
++++ b/vllm/model_executor/models/lfm2.py
+@@ -458,6 +458,15 @@
+             tp_world_size=parallel_config.tensor_parallel_size,
+             intermediate_size=hf_config.conv_dim,
+             conv_kernel=hf_config.conv_L_cache,
++            # vtl: MUST stay in lockstep with ShortConv.get_state_shape (short_conv.patch),
++            # which also passes num_spec. This classmethod is what
++            # Platform._align_hybrid_block_size sizes attn block_size / mamba_page_size_padded
++            # from; the layer's spec is what MambaSpec.page_size_bytes then asserts against.
++            # Without it, spec-decode widens the conv state (num_spec extra columns) but the
++            # padding was computed for the narrow one -> `assert page_size_padded >= page_size`
++            # at boot. Stock mamba2/qwen3_next thread num_spec through both sides for exactly
++            # this reason.
++            num_spec=vllm_config.num_speculative_tokens,
+         )
+ 
+     @classmethod

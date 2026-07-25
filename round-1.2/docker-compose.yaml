@@ -13,6 +13,11 @@ name: viettel-llm-optimized
 
 services:
   model:
+    # !! STALE PIN -- this digest is the vLLM v0.25.0-based image. It does NOT understand
+    # --prefix-match-unit (added below, v0.26.0 #46384) and will FAIL AT STARTUP against it.
+    # Re-pin after: make vllm-fork PUSH=1 && (pin Makefile VLLM_FORK_TAG) && make push.
+    # Rollback = restore this digest AND drop the --prefix-match-unit flag + the two
+    # VLLM_{PREFIX_CACHE_RETENTION_INTERVAL,ENABLE_STARTUP_PLAN} vars; they are a set.
     image: unseenablefuture/awesome-badger@sha256:aa427bc0d0ec92ef8e46d97ddfefe0a2193dbd064326baf308e55a092d7d2a2c # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
@@ -38,6 +43,22 @@ services:
       # Lfm2ForCausalLM raises NotImplementedError on `all`, so the server won't boot otherwise.
       - --enable-prefix-caching
       - --mamba_cache_mode=align
+      # vLLM v0.26.0 (#46384): decouples prefix-MATCH granularity from the physical KV block
+      # size, and teaches MambaManager to match at these boundaries instead of whole blocks.
+      # Must divide every cache-group block size; unset = derived from their GCD.
+      # SIZING: on the attention side this is worth almost nothing here -- bench/trace_stats.py
+      # says block_size 16 avoids 1,102,736 prefill tokens vs 1,106,010 at block_size 1, i.e.
+      # token-granular matching recovers 3,274 tokens = 0.24% of the 1.34M-token prefill. The
+      # real (unmeasurable off-box) upside is the align-mode short-conv STATE lookup, which is
+      # block-granular in v0.25.0. A/B it against the flag removed before believing any win.
+      - --prefix-match-unit=16
+      # vLLM v0.26.0 (#48012) also adds per-KV-cache-group backend selection:
+      #   --attention-config '{"backend_per_kind": {"full_attention": "FLASH_ATTN"}}'
+      # DELIBERATELY NOT SET. On the H200 the auto-selector already picks FLASH_ATTN for the
+      # 6 GQA layers, so it is a no-op there; on the sm_86 dev box fp8 KV is exactly why the
+      # selector falls back to FlashInfer, so pinning FLASH_ATTN risks a hard startup failure
+      # (an invalid backend for a kind raises at startup) on the only box we iterate on.
+      # Use it as a DIAGNOSTIC when you need dev to take the judge's code path, not as a default.
       - --enable-chunked-prefill
       - --max-num-seqs=70 # peak concurrency ~6 in the trace; a small cap shrinks the cudagraph
                           # capture set + VRAM and leaves OOM headroom. Sweep with bench/replay.py.
@@ -84,6 +105,19 @@ services:
       DO_NOT_TRACK: "1"                        # disable anonymous usage stats / telemetry
       VLLM_NO_USAGE_STATS: "1"
       VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
+
+      # ---- vLLM v0.26.0 additions ------------------------------------------------------
+      # #47782 extended the Marconi retention-interval sparse cache from sliding-window
+      # attention to MAMBA states, which is the path this hybrid runs. 0 = retain at the
+      # latest completed prompt boundary (tuned for long-context / multi-turn sessions).
+      # NOTE: the envs.py docstring still claims "not yet Mamba/linear attention" -- that
+      # comment is stale as of v0.26.0; MambaManager.cache_blocks handles the interval.
+      VLLM_PREFIX_CACHE_RETENTION_INTERVAL: "0"
+      # #47388: persist the memory-profiling + cudagraph-capture plan across boots
+      # (fingerprinted by config hash + device + torch/CUDA build), ~2-5s/boot on H100.
+      # Worth more than it looks: the A/B noise floor here is boot-to-boot, not rep-to-rep,
+      # so cheaper boots buy more boots buy tighter measurements.
+      VLLM_ENABLE_STARTUP_PLAN: "1"
 
       # ---- TPOT: host-side per-step cost ----------------------------------------------
       # STALE -- every number below was measured on a FULL H200. The judge runs an MIG

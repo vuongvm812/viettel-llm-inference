@@ -1,3 +1,5 @@
+diff --git a/vllm/model_executor/layers/mamba/short_conv.py b/vllm/model_executor/layers/mamba/short_conv.py
+index e7e36f2..561cd42 100644
 --- a/vllm/model_executor/layers/mamba/short_conv.py
 +++ b/vllm/model_executor/layers/mamba/short_conv.py
 @@ -2,6 +2,9 @@
@@ -10,13 +12,13 @@
  import torch
  
  from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
-@@ -28,8 +31,168 @@
+@@ -28,6 +31,166 @@ from vllm.utils.torch_utils import direct_register_custom_op
  from vllm.v1.attention.backend import AttentionMetadata
  from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
  from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 +from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
- 
- 
++
++
 +def _vtl_flag(name: str) -> bool:
 +    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 +
@@ -174,12 +176,10 @@
 +        out_dtype=out_dtype,
 +        bias=None,
 +    )
-+
-+
+ 
+ 
  # --8<-- [start:short_conv]
- @CustomOp.register("short_conv")
- class ShortConv(MambaBase, CustomOp):
-@@ -88,7 +251,7 @@
+@@ -88,7 +251,7 @@ class ShortConv(MambaBase, CustomOp):
  
      def forward_native(
          self,
@@ -188,7 +188,7 @@
          output: torch.Tensor,
      ):
          # Reference torch causal conv1d; runs on all CPU platforms. AMX kernels
-@@ -106,7 +269,6 @@
+@@ -106,7 +269,6 @@ class ShortConv(MambaBase, CustomOp):
              attn_metadata = attn_metadata_raw[self.prefix]
              assert isinstance(attn_metadata, ShortConvAttentionMetadata)
  
@@ -196,7 +196,7 @@
          B, C, x = BCx.chunk(3, dim=-1)
  
          # (dim, kernel_size) — same reshape as forward_cuda
-@@ -118,7 +280,7 @@
+@@ -118,7 +280,7 @@ class ShortConv(MambaBase, CustomOp):
              # Profile run — output value doesn't matter
              Bx = (B * x).contiguous()
              output_tensor, _ = self.out_proj(C * Bx)
@@ -205,7 +205,7 @@
              return
  
          conv_state = (
-@@ -185,15 +347,34 @@
+@@ -185,15 +347,34 @@ class ShortConv(MambaBase, CustomOp):
          hidden_states: torch.Tensor,
          output: torch.Tensor,
      ):
@@ -242,7 +242,7 @@
          output: torch.Tensor,
      ):
          forward_context = get_forward_context()
-@@ -218,8 +399,6 @@
+@@ -218,8 +399,6 @@ class ShortConv(MambaBase, CustomOp):
              has_initial_states_p = attn_metadata.has_initial_states_p
              query_start_loc_p = attn_metadata.query_start_loc_p
  
@@ -251,7 +251,7 @@
          B, C, x = BCx.chunk(3, dim=-1)
  
          conv_weights = self.conv.weight.view(
-@@ -260,6 +439,59 @@
+@@ -260,6 +439,59 @@ class ShortConv(MambaBase, CustomOp):
          )
          conv_output_list = []
  
@@ -311,7 +311,7 @@
          if has_prefill:
              Bx_p = (B_p * x_p).transpose(0, 1)
              Bx = causal_conv1d_fn(
-@@ -274,21 +506,61 @@
+@@ -274,21 +506,61 @@ class ShortConv(MambaBase, CustomOp):
                  query_start_loc=query_start_loc_p,
              ).transpose(0, 1)[:num_prefill_tokens]
  
@@ -385,7 +385,7 @@
  
          # Merge prefill and decode outputs before passing to gated MLP
          hidden_states = torch.vstack(conv_output_list)
-@@ -317,20 +589,23 @@
+@@ -317,20 +589,23 @@ class ShortConv(MambaBase, CustomOp):
  
  
  def short_conv(

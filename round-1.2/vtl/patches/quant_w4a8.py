@@ -500,7 +500,7 @@ def _linear_method_cls():
 
             # NOTE: the fused short-conv path does NOT come through here -- it calls
             # ops.cutlass_w4a8_mm directly with an already-quantized activation (see
-            # _vtl_out_proj_fp8 in vllm_patches/v0.25.0/short_conv.patch). For every other
+            # _vtl_out_proj_fp8 in vllm_patches/v0.26.0/short_conv.patch). For every other
             # layer the quant below is what RMSNormQuantFusionPass hoists into the norm.
             xq, x_scales = self.quant_fp8(x_2d)
             out = ops.cutlass_w4a8_mm(

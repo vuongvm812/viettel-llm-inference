@@ -12,7 +12,8 @@ untouched -- only the kernel behind the CUDA dispatch key changes.
 
 `vllm._C_stable_libtorch` must be imported BEFORE `vtl._C` (it defines the `_C` schema;
 registering a kernel for an undefined op is silently deferred and the later definition wins).
-The schema is byte-identical between vLLM v0.22.1 and v0.25.0 (verified against tag v0.25.0),
+The schema is byte-identical from vLLM v0.22.1 through v0.26.0 (re-verified against tag
+v0.26.0 in csrc/libtorch_stable/torch_bindings.cpp on 2026-07-25),
 so this override binds unchanged.
 
 Set `VTL_ENABLE_DYNAMIC_PER_TOKEN_QUANT=0` to keep the stock kernel (the .so is then still

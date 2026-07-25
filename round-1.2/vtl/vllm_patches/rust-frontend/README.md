@@ -1,6 +1,6 @@
 # Rust frontend source patches
 
-Unlike the patches in `../v0.25.0/` (which apply to the **installed Python package**
+Unlike the patches in `../v0.26.0/` (which apply to the **installed Python package**
 in `site-packages` at fork-image build time), these apply to the **vLLM Rust
 workspace source** (`vllm/rust/`) inside the `rust-builder` stage of
 `round-1.2/Dockerfile.vllm-fork`, before `cargo build` compiles the `vllm-rs`
@@ -33,7 +33,11 @@ frontend optimization (grep-guard on `sonic_rs`), so building from a locally-mod
 checkout that already has both is a no-op.
 
 ## Regenerating
-Paths are workspace-relative (`patch -p1 -d <rust-workspace>`). To regenerate after
-editing the checkout, diff the modified files against pristine v0.25.0 sources, e.g.
-`git diff --no-index` between a pristine tree and the modified one, with the `a/`/`b/`
-prefixes normalized to the workspace root.
+Paths are workspace-relative (`patch -p1 -d <rust-workspace>`), NOT package-relative like
+`../v0.26.0/*.patch`. Since `vllm/` is now a real git clone pinned to the tag, edit
+`vllm/rust/` in place and regenerate with:
+
+    git -C vllm diff HEAD -- rust/<file> | sed 's|/rust/|/|g' > <patch>
+
+(the `sed` strips the leading `rust/` so the paths are workspace-root-relative). Verified
+to apply against `v0.26.0` on 2026-07-25.

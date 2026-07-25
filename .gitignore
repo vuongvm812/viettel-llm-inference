@@ -46,3 +46,6 @@ model/
 flashinfer-competition-codebase/
 vllm/
 flash-attention/
+
+# Pre-upgrade v0.25.0 source tree, kept for cross-checking during the v0.26.0 port.
+vllm-v0.25.0-edited/

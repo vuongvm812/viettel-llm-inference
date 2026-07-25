@@ -65,12 +65,25 @@ def apply() -> None:
 
 
 def _self_check() -> None:
-    """Compare patched forward against the stock one on a real Lfm2Attention. Needs a GPU."""
-    import torch
+    """Compare patched forward against the stock one on a real Lfm2Attention. Needs a GPU.
 
-    from transformers import AutoConfig
+    `make check` is contracted to run anywhere (no GPU, no vLLM), so skip rather than fail
+    when the pieces are absent -- this one only has teeth inside the image.
+    """
+    import os
 
-    from vllm.model_executor.models.lfm2 import Lfm2Attention
+    try:
+        import torch
+
+        from transformers import AutoConfig
+
+        from vllm.model_executor.models.lfm2 import Lfm2Attention
+    except ImportError as e:
+        print(f"qk_norm_rope self-check skipped (needs vllm/torch/transformers: {e})")
+        return
+    if not torch.cuda.is_available() or not os.path.isdir("/hf-model"):
+        print("qk_norm_rope self-check skipped (needs a GPU and /hf-model)")
+        return
 
     cfg = AutoConfig.from_pretrained("/hf-model")
     layer = Lfm2Attention(

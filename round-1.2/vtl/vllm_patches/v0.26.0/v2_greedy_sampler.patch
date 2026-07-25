@@ -1,3 +1,5 @@
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index d9d6754..02e9770 100644
 --- a/vllm/v1/worker/gpu/sample/sampler.py
 +++ b/vllm/v1/worker/gpu/sample/sampler.py
 @@ -1,6 +1,8 @@
@@ -9,7 +11,7 @@
  import numpy as np
  import torch
  
-@@ -27,6 +29,47 @@
+@@ -27,6 +29,47 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
  from vllm.v1.worker.gpu.states import RequestState
  
  
@@ -57,7 +59,7 @@
  class Sampler:
      def __init__(
          self,
-@@ -53,6 +96,22 @@
+@@ -51,6 +94,22 @@ class Sampler:
          self.num_speculative_tokens = num_speculative_tokens
          self.use_flashinfer = flashinfer_sampler_supported()
  
@@ -80,11 +82,10 @@
      def add_request(
          self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
      ) -> None:
-@@ -68,12 +127,83 @@
-         self.logit_bias_state.apply_staged_writes()
+@@ -67,11 +126,82 @@ class Sampler:
          self.bad_words_state.apply_staged_writes()
          self.logprob_token_ids_state.apply_staged_writes()
-+
+ 
 +    @staticmethod
 +    def _torch_argmax(logits: torch.Tensor) -> torch.Tensor:
 +        return logits.argmax(dim=-1)
@@ -98,7 +99,7 @@
 +            except (AttributeError, RuntimeError):
 +                pass
 +        return self._torch_argmax
- 
++
 +    def _vtl_argmax(self, logits: torch.Tensor) -> torch.Tensor:
 +        """int64 argmax over the vocab, via the once-resolved backend."""
 +        fn = self._vtl_argmax_fn

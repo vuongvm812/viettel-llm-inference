@@ -1,3 +1,5 @@
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index d04400a..36ec742 100644
 --- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
 +++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
 @@ -1,5 +1,6 @@
@@ -7,7 +9,7 @@
  from dataclasses import dataclass
  from typing import Any
  
-@@ -76,6 +77,18 @@
+@@ -76,6 +77,18 @@ class MambaHybridModelState(DefaultModelState):
      ) -> None:
          super().__init__(vllm_config, model, encoder_cache, device)
          self.cache_config = vllm_config.cache_config
@@ -26,7 +28,7 @@
          self.num_accepted_tokens_gpu = torch.ones(
              self.max_num_reqs, dtype=torch.int32, device=self.device
          )
-@@ -300,19 +313,22 @@
+@@ -301,19 +314,22 @@ class MambaHybridModelState(DefaultModelState):
      ) -> None:
          # Chunked prefill does not sample a token, so num_sampled can be 0.
          # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.

@@ -9,15 +9,17 @@
 #
 # vllm/vllm-openai is multi-arch. Without the explicit --platform, building on an
 # arm64 machine silently yields an arm64 image that the amd64 H200 box cannot run.
-# v0.25.0: first base that registers Qwen3_5ForConditionalGeneration (the served
-# Qwen3.5-2B is a qwen3_5 VL hybrid — linear-attn/GDN + full-attn + MTP + vision).
-# v0.22.1 could not load it. The fp8 _C ops + _C_stable_libtorch registration our
-# override depends on are byte-identical in v0.25.0 (verified against tag v0.25.0).
-# Tree-spec deployment: override to the forked base (stock v0.25.0 + vtl source patches) built by
-# Dockerfile.vllm-fork, e.g. --build-arg VLLM_IMAGE=unseenablefuture/vllm-fork:v0.25.0-tree@sha256:...
-# The forked patches are behavior-neutral for the width-1 chain path, so the default stock base is
-# fine until the width>1 tree verify is enabled on-box (see vtl/vllm_patches/INTEGRATION.md).
-ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.0
+# v0.26.0 (upgraded from v0.25.0 on 2026-07-25): taken for #46384, which adds
+# --prefix-match-unit — token-granular prefix-cache matching for hybrid models, on the
+# mamba_cache_mode=align path this server runs. Re-verify the two _C op schemas our
+# vtl._C override hijacks (rms_norm_dynamic_per_token_quant,
+# dynamic_per_token_scaled_fp8_quant) whenever this base moves; a silent schema drift
+# surfaces as a mid-request cudaErrorNoKernelImageForDevice, not a boot failure.
+#
+# The default here is the STOCK base. Normal builds override it to the forked base
+# (stock + vtl source patches + the optimized/PGO vllm-rs) built by Dockerfile.vllm-fork;
+# `make build` passes --build-arg VLLM_IMAGE=$(VLLM_IMAGE), which defaults to the fork.
+ARG VLLM_IMAGE=vllm/vllm-openai:v0.26.0
 
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 
@@ -61,7 +63,7 @@ RUN JE=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2; \
 # when VLLM_USE_RUST_FRONTEND=1 (see the patch header). Applied here (not only in
 # Dockerfile.vllm-fork) so it lands on the stock base too. No-op while the flag is
 # unset. dry-run first so a drifted patch fails the build loudly, not at the judge's run.
-COPY vtl/vllm_patches/v0.25.0/api_server_rust_frontend.patch /tmp/rustfe.patch
+COPY vtl/vllm_patches/v0.26.0/api_server_rust_frontend.patch /tmp/rustfe.patch
 RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))") \
  && F="$SITE/vllm/entrypoints/openai/api_server.py" \
  && if grep -q run_multi_api_server "$F"; then \
