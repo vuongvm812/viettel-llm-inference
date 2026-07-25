@@ -165,6 +165,74 @@ services:
       # becomes an even larger fraction of TPOT. Re-run `make profile` on the slice to size it,
       # but host-side work is back to being the primary lever.
       #
+      # RE-PROFILED 2026-07-25 against the SCORED workload. Every capture before this one was
+      # driven by `--closed-loop 8 --limit 48`, which saturates the server: most steps are then
+      # prefill-mixed, mamba cannot use a FULL cudagraph on those, and the model forward runs
+      # PIECEWISE -- so `vllm::short_conv` (0.84 ms/step), `_C::marlin_gemm` and
+      # `unified_attention_with_output` showed up as HOST self time and the ranking was of a
+      # workload the judge never produces. `make profile` now replays the real trace open-loop
+      # and arms mid-run (see the Makefile), which is decode-steady and FULL-cudagraph.
+      #
+      # The wall-clock split flips when you profile the right workload. Same box, same image,
+      # 20 steps, chrome trace (`make profile`):
+      #                     closed-loop 8 (old driver)   real trace open-loop (new)
+      #   wall/step               12.10 ms                      7.29 ms
+      #   GPU busy                 5.29 ms (43.7%)              4.72 ms (64.8%)
+      #   host gap                 6.81 ms (56.3%)              2.57 ms (35.2%)
+      # So on the SCORED workload this box is GPU-bound, not host-bound, and the top host ops
+      # are all small runner ops (copy_, slice, is_pinned, empty_strided, index) with no
+      # short_conv / marlin_gemm / unified_attention -- i.e. FULL cudagraph decode, confirmed.
+      # The 4.72 ms GPU term is an sm_86 artefact (Marlin fp8 fallback); it collapses on the
+      # H200, which is what puts host work back in front THERE. Do not quote the closed-loop
+      # 56%-host figure as the judge's split.
+      #
+      # Engine-thread cProfile, 20 consecutive decode steps, 6.0 ms/step (profiler-inflated):
+      #   2.00 ms/step (33%)  prepare_attn  -> build_attn_metadata
+      #                        0.90 mamba/short-conv builder  (0.40 of that is ONE helper,
+      #                             utils.mamba_get_block_table_tensor -- see below)
+      #                        0.85 flashinfer builder        (DEV BOX ONLY, see next block)
+      #   1.20 ms/step (20%)  sample_tokens
+      #   1.10 ms/step (18%)  prepare_inputs   (0.25 of that is two pin_memory() per step
+      #                        inside buffer_utils.async_copy_to_gpu -- an obvious target, but
+      #                        a shared pinned staging pool needs a provable depth bound or it
+      #                        silently corrupts in-flight H2D copies. Left alone deliberately.)
+      #   0.35 ms/step        add_requests     (mamba_hybrid.add_request is ~0.5 ms per NEW
+      #                        request: two single-element GPU stores. TTFT-only.)
+      #   0.30 ms/step        block-table gather + slot mappings
+      #   0.30 ms/step        cudagraph replay
+      #   0.30 ms/step        scheduler (of which ~half is vtl/patches/sched_policy.py's
+      #                        reorder; it is a no-op when the waiting queue has <2 entries)
+      #
+      # ATTENTION BACKEND DIVERGES BETWEEN THIS BOX AND THE JUDGE. Nothing pins
+      # --attention-backend, so vLLM picks from platforms/cuda.py's priority list, which is
+      # [FLASH_ATTN, FLASHINFER, ...] on both. But FlashAttentionBackend.supports_kv_cache_dtype
+      # accepts fp8_e4m3 only when `get_flash_attn_version() == 3 and
+      # is_device_capability_family(90)`. So with --kv-cache-dtype=fp8_e4m3:
+      #   dev box (sm_86)  -> FLASH_ATTN rejected -> FLASHINFER
+      #   H200    (sm_90)  -> FLASH_ATTN
+      # The 0.85 ms/step of flashinfer metadata build above therefore does NOT exist on the
+      # judge, and no A/B here can measure anything attention-backend-shaped. Only the mamba /
+      # runner / scheduler half of the profile is portable.
+      #
+      # TRIED AND REVERTED 2026-07-25 -- read this before optimizing off a cProfile ranking.
+      # The 0.40 ms/step above sat in ONE helper, utils.mamba_get_block_table_tensor: seven
+      # ATen dispatches (sub, floor_divide, clamp, arange, add, to(int64), gather) plus a
+      # fresh device allocation for an `offsets` arange that is a COMPILE-TIME CONSTANT, all
+      # to read one int32 per request out of the align block table. A vtl patch replaced the
+      # lot with torch.empty + one Triton launch; the kernel self-checks byte-identical
+      # against stock on random shapes, padded (seq_len=0) rows and short batches, and boot
+      # logs confirmed both `utils` and `mamba_attn` rebound to it.
+      # A/B on the dev box, 3 boots per arm, alternating, closed-loop 8 x 48, warm reps only
+      # (n=6 per arm): TPOT p50 6.50 vs 6.50 ms, throughput 1030 vs 1026 tok/s. NO EFFECT --
+      # the patch was deleted rather than kept as neutral complexity.
+      # Why the profile lied: cProfile charges a fixed per-call cost, so it systematically
+      # over-weights code that makes many tiny calls -- which is exactly the shape of the
+      # thing being targeted. A Triton launch from Python costs about what ~7 small ATen
+      # dispatches cost, so collapsing them buys nothing. Rank host work by cProfile if you
+      # like, but size the prize with a wall-clock A/B BEFORE writing a kernel: op-count
+      # reduction inside the runner is not a TPOT lever at this scale. What did work
+      # (kv_cache_groups) removed a whole duplicated metadata BUILD, not dispatches.
+      #
       # ---- Model Runner V2 ------------------------------------------------------------
       # V2 is vLLM's per-step-CPU-overhead rewrite (GPU-resident batch prep + sampling),
       # attractive on this host-bound slice. Stock V2 was REJECTED on 2026-07-21 (TPOT

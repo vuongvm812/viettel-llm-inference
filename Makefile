@@ -256,11 +256,17 @@ down:
 ## shapes; closed-loop saturates a full batch so the multi-seq kernels compile into the cache too.
 WARM_CONCURRENCY ?= 16
 WARM_REQS ?= 32
+
+## bench/replay.py needs aiohttp, which the GPU boxes do not have (no pip either), so every
+## previous iteration hand-rolled a `docker run` around it. The served image already ships
+## aiohttp 3.14.1 -- run the repo's own driver in it. --network host so $(TARGET)'s localhost
+## resolves; the round dir is mounted at /w so --trace/--out paths stay repo-relative.
+REPLAY ?= docker run --rm --network host -v "$$PWD:/w" -w /w --entrypoint python3 $(IMAGE):$(TAG)
 warm:
 	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)'
 	$(IN) $(DC) up -d --wait   # --wait blocks until the healthcheck passes
-	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --limit 4 --out /dev/null
-	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	$(IN) $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) --limit 4 --out /dev/null
+	$(IN) $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	  --closed-loop $(WARM_CONCURRENCY) --limit $(WARM_REQS) --out /dev/null
 	$(IN) docker cp "$$($(DC) ps -q model)":/opt/vtl/cache/. docker/cache/
 	$(IN) du -sh docker/cache/*
@@ -283,9 +289,9 @@ push:
 
 ## Open-loop replay (honors the trace's arrival times) + a closed-loop sweep.
 bench:
-	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --out bench-open.json
+	$(IN) $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) --out bench-open.json
 	$(IN) for n in 1 8 32 128; do \
-	  python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	  $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	    --closed-loop $$n --out bench-closed-$$n.json; \
 	done
 
@@ -302,7 +308,7 @@ sweep-schedule:
 	  case "$$name" in heuristic) s="";; *) s="$$name";; esac; \
 	  echo "=== VTL_W4A8_SCHEDULE=$${s:-<heuristic>}"; \
 	  ( cd $(ROUND) && VTL_W4A8_SCHEDULE="$$s" $(DC) up -d --force-recreate --wait \
-	    && VTL_W4A8_SCHEDULE="$$s" python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	    && $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	         --out bench-sched-$$name.json \
 	    ; rc=$$?; VTL_W4A8_SCHEDULE="$$s" $(DC) down; exit $$rc ) || exit 1; \
 	done
@@ -313,12 +319,20 @@ sweep-schedule:
 ## (gpu-busy vs idle per step -- the number the TPOT tuning rests on). See docs/plans/.
 ## Must match VTL_PROFILE_STEPS in docker-compose.profile.yaml; only divides totals per step.
 PROFILE_STEPS ?= 20
+## Seconds into the replay at which the capture window opens. Anything that arms BEFORE the
+## replay starts captures the opening prefill burst instead of steady-state decode.
+PROFILE_ARM_DELAY ?= 90
 profile:
 	$(IN) mkdir -p bench-profile
-	$(IN) rm -f bench-profile/vtl-trace-*.json bench-profile/.arm
+	$(IN) rm -f bench-profile/vtl-trace-*.json bench-profile/vtl-pyprof-*.txt bench-profile/.arm
 	$(IN) $(DC) -f docker-compose.profile.yaml up -d --build --force-recreate --wait
-	$(IN) touch bench-profile/.arm   # arm AFTER warmup so the capture is the replay, not warmup
-	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --closed-loop 8 --limit 48 --out /dev/null
+	@# Drive the REAL trace open-loop and arm mid-run. The old driver was
+	@# `--closed-loop 8 --limit 48`, which saturates the server: most steps become
+	@# prefill-mixed, mamba refuses a FULL cudagraph on those, and the model forward runs
+	@# PIECEWISE -- so short_conv/marlin_gemm/unified_attention showed up as host time and the
+	@# ranking was of a workload the judge never generates (trace concurrency is mean 2 / peak 8).
+	$(IN) ( $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) --out /dev/null & \
+	        sleep $(PROFILE_ARM_DELAY); touch bench-profile/.arm; wait )
 	$(IN) sleep 3   # let the worker finish export_chrome_trace
 	$(IN) python3 bench/profile_trace.py --profile-dir bench-profile --steps $(PROFILE_STEPS) --out bench-profile-summary.json
 	$(IN) $(DC) -f docker-compose.profile.yaml down
