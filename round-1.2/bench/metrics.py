@@ -156,4 +156,30 @@ def _selfcheck():
 
 
 if __name__ == "__main__":
-    _selfcheck()
+    import sys
+
+    # `--summarize <replay.json>...`: one line per run, for reading an A/B arm at a glance
+    # (`make ab`). Kept in __main__ so the module itself stays pure/no-I/O.
+    if "--summarize" in sys.argv:
+        import json
+        import os
+
+        for path in sys.argv[sys.argv.index("--summarize") + 1 :]:
+            with open(path) as f:
+                run = json.load(f)
+            # replay.py writes the RAW records + wall clock, not the rollup -- so do the
+            # rollup here with the same aggregate() the driver prints from.
+            d = aggregate(run["records"], run["wall_time"], spec=run.get("spec_decode"))
+            print(
+                "%-34s tpot_p50=%6.2f tpot_mean=%6.2f ttft_p50=%7.1f tok_s=%7.1f err=%d"
+                % (
+                    os.path.basename(path),
+                    d["itl_ms"]["p50"],
+                    d["itl_ms"]["mean"],
+                    d["ttft_ms"]["p50"],
+                    d["output_tok_s"],
+                    d["n_error"],
+                )
+            )
+    else:
+        _selfcheck()

@@ -139,6 +139,40 @@ services:
       # Smaller than the ~0.85 ms/step the cProfile cumtime suggested -- that figure is
       # inflated by the profiler AND covers BOTH builds; dropping one buys ~a quarter of it.
       #
+      # THOSE THREE NUMBERS ARE NOT SUPPORTED BY THE DATA. Re-measured 2026-07-25 on the SCORED
+      # open-loop trace with `make ab AB_ENV=VTL_ENABLE_KV_CACHE_GROUPS` (2 boots per arm,
+      # alternating, 2 warm reps per boot, --limit 150; TPOT p50 ms, merged -> stock):
+      #
+      #                   boot A          boot B        arm median
+      #   delay 2000us    6.69  6.58      6.10  6.10      6.34     merged
+      #                   6.59  6.55      6.71  6.61      6.60     stock
+      #   delay 0us       5.52  5.45      5.42  5.41      5.44     merged
+      #                   5.44  5.43      5.46  5.45      5.45     stock
+      #
+      # Read it in this order:
+      #   1. At delay 0 -- the regime the judge actually drives on this box -- the merge is worth
+      #      0.01 ms, i.e. NOTHING. Exactly what the ~1 ms host-slack finding below predicts.
+      #   2. Delay-biased past the knee, the point estimate is -0.26 ms for merged, the right
+      #      sign and the right size for dropping one metadata build. But the two boots of the
+      #      MERGED arm disagree by 0.53 ms (6.635 vs 6.100) while the two reps inside each boot
+      #      agree to 0.11 ms. The between-boot noise is TWICE the effect, so n=2 boots cannot
+      #      resolve it. Consistent with a real ~0.25 ms saving; not evidence of one.
+      #   3. Iteration 4's -0.23 ms / -3.5 ms / +5.2% sit entirely inside that same noise band,
+      #      and were measured closed-loop besides. Treat them as retracted, not as corroboration.
+      #   4. TTFT p50 is the one consistently-signed reading: merged 28.8-32.6 vs stock 30.2-32.5
+      #      at delay 0 (median 29.5 vs 31.1). Weak, same noise caveat.
+      #
+      # KEPT ON anyway, on expected value rather than on a measurement: the mechanism is real
+      # (one fewer mamba metadata build per step, confirmed in the boot log), the H200 is where
+      # the host is the critical path so a ~0.25 ms host saving there is worth ~1.7 score points,
+      # and the capacity it costs is provably slack (below). Decide it on the slice with
+      # `make ab`, not here. Kill switch: VTL_ENABLE_KV_CACHE_GROUPS=0.
+      #
+      # THE GENERAL LESSON, which outranks the specific result: this box's boot-to-boot spread is
+      # ~0.5 ms of TPOT p50 and its within-boot spread is ~0.05 ms. Every A/B in this file that
+      # ran one boot per arm -- including the ones that concluded "no effect" -- resolves nothing
+      # below ~0.5 ms. Adding reps does not help; only adding boots does.
+      #
       # THE COST, and the thing to re-check on the H200 slice: the pool is cut into
       # `max(len(g.layer_names))` slices, which goes 6 -> 10, so num_blocks drops 40%.
       # Measured here: GPU KV cache 1,520,422 -> 913,140 tokens, max concurrency at
@@ -230,8 +264,11 @@ services:
       # thing being targeted. A Triton launch from Python costs about what ~7 small ATen
       # dispatches cost, so collapsing them buys nothing. Rank host work by cProfile if you
       # like, but size the prize with a wall-clock A/B BEFORE writing a kernel: op-count
-      # reduction inside the runner is not a TPOT lever at this scale. What did work
-      # (kv_cache_groups) removed a whole duplicated metadata BUILD, not dispatches.
+      # reduction inside the runner is not a TPOT lever at this scale.
+      # (Caveat added 2026-07-25: 3 boots per arm resolves ~0.3 ms and the target was 0.40 ms,
+      # so "6.50 vs 6.50" bounds the effect rather than proving it zero. The verdict stands --
+      # the change also sat entirely inside the ~1 ms host slack below, where zero was the only
+      # possible reading -- but the A/B alone was never the proof.)
       #
       # HOST SLACK, MEASURED 2026-07-25 (`make slack`). Read this before spending another
       # iteration on host-side work, and before believing any A/B run on the dev box.

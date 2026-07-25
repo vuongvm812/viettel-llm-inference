@@ -362,6 +362,66 @@ slack:
 	$(IN) rm -f bench-profile/delay_us bench-profile/delay_serial_us
 	$(IN) $(DC) -f docker-compose.profile.yaml down
 
+## A/B one env var against the SCORED open-loop trace. Iterations 4, 5 and 6 each hand-rolled
+## this same driver, so it lives here now, with the three things each of them had to learn:
+##
+##   1. DISCARD THE FIRST REP after a boot. It reads ~8.5-9 ms TPOT vs ~6.5 warm on the same
+##      server, so a single post-boot run measures warm-up, not the change.
+##   2. ALTERNATE THE ARMS ACROSS BOOTS, AND USE ENOUGH OF THEM. Measured 2026-07-25 with this
+##      target: two boots of the SAME arm, same image, same env, differed by 0.53 ms of TPOT p50
+##      (6.64 vs 6.10) while the two reps WITHIN each boot differed by 0.00-0.11 ms. So rep count
+##      buys you almost nothing and boot count is the only thing that shrinks the error bar --
+##      the resolution of an A/B is roughly 0.5 ms / sqrt(boots per arm). Anything measured over
+##      one boot per arm, at this or any earlier iteration, resolves nothing below ~0.5 ms.
+##   3. BIAS PAST THE HOST KNEE. `make slack` measured ~1 ms of host slack on the dev box, so a
+##      host-side change smaller than that is absorbed and reads exactly zero here. Running both
+##      arms at VTL_STEP_DELAY_US=2000 makes both host-critical, where a real saving shows at
+##      slope 1. The delay-0 rows are the control: they say what this box would have measured.
+##
+## Needs the profile overlay (that is what installs the delay probe) but never arms the capture,
+## so no trace is written. Arms are proved by inspecting the container env, because the log line
+## a patch prints is INFO and the submission compose pins WARNING.
+##
+##   make ab AB_ENV=VTL_ENABLE_KV_CACHE_GROUPS                      # patch on vs off
+##   make ab AB_ENV=VTL_QUANT AB_ARMS="vtl_w4a8 vtl_fp8" AB_DELAYS=0
+##
+## ~14 min per boot at the defaults (2.5 boot + 5 reps x ~2.3 min), so the default 4 boots is
+## ~55 min. Resolving 0.25 ms needs ~4 boots per arm (AB_ROUNDS="1 2 3 4"), i.e. ~2 hours.
+##
+## Results: $(ROUND)/bench-ab-<round>-<arm>-<delay>-<rep>.json, one summary line per rep.
+AB_ENV ?=
+AB_ARMS ?= 1 0
+AB_DELAYS ?= 2000 0
+## Reps within a boot. 2 is plenty: within-boot spread is ~0.05 ms, an order of magnitude below
+## the between-boot spread. Add boots (AB_ROUNDS), not reps, when you need resolution.
+AB_REPS ?= 2
+AB_ROUNDS ?= 1 2
+AB_LIMIT ?= 150
+ab:
+	@test -n "$(AB_ENV)" || { echo "make ab: set AB_ENV=<env var to sweep>"; exit 1; }
+	$(IN) mkdir -p bench-profile
+	$(IN) $(BUILD)
+	$(IN) for r in $(AB_ROUNDS); do for a in $(AB_ARMS); do \
+	  printf 'services:\n  model:\n    environment:\n      %s: "%s"\n' "$(AB_ENV)" "$$a" > /tmp/vtl-ab-arm.yaml; \
+	  $(DC) -f docker-compose.profile.yaml -f /tmp/vtl-ab-arm.yaml up -d --force-recreate --wait || exit 1; \
+	  echo "=== round $$r arm $(AB_ENV)=$$(docker inspect $$($(DC) ps -q model) \
+	    --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^$(AB_ENV)=//p')"; \
+	  echo 0 > bench-profile/delay_us; \
+	  $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	    --limit $(AB_LIMIT) --out /dev/null || exit 1; \
+	  for d in $(AB_DELAYS); do echo "$$d" > bench-profile/delay_us; sleep 2; \
+	    i=0; while [ $$i -lt $(AB_REPS) ]; do i=$$((i+1)); \
+	      o=bench-ab-$$r-$$a-$${d}us-$$i.json; \
+	      $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	        --limit $(AB_LIMIT) --out $$o || exit 1; \
+	      python3 bench/metrics.py --summarize $$o || exit 1; \
+	    done; \
+	  done; \
+	done; done
+	$(IN) rm -f bench-profile/delay_us
+	$(IN) $(DC) -f docker-compose.profile.yaml down
+	@echo "compare: $(ROUND)/bench-ab-*.json -- read the $(firstword $(AB_DELAYS))us rows, the 0us rows are the control"
+
 ## Seconds into the replay at which the capture window opens. Anything that arms BEFORE the
 ## replay starts captures the opening prefill burst instead of steady-state decode.
 PROFILE_ARM_DELAY ?= 90
