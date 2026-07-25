@@ -123,10 +123,31 @@ services:
       # sizing in kv_cache_utils._get_kv_cache_groups_uniform_page_size: LFM2.5 is 6 attn +
       # 10 short-conv, and because 10 >= 6*1.5 the heuristic takes group_size = min = 6, so
       # the conv layers split into TWO groups of 5 (padded to 6) while attention stays one.
-      # Three groups -> two SSM metadata builds and ~20% of the conv state memory lost to
-      # padding, every step, forever. Forcing the 10 conv layers into one group would drop a
-      # whole build (~0.85 of 6.5 ms/step here) but violates the "same layer count per group"
-      # assumption the block-table/slot-mapping tensors are shaped on. Unexplored, sized.
+      # Three groups -> two SSM metadata builds every step, forever.
+      #
+      # FIXED 2026-07-25 by vtl/patches/kv_cache_groups.py: it hands back one group per
+      # distinct spec (2 groups: 10 conv + 6 attn), so build_attn_metadata's
+      # `for i in range(num_kv_cache_groups)` runs the mamba builder ONCE. Groups do NOT have
+      # to hold the same layer count -- block tables are per-group lists in the runner and the
+      # shared pool's per-slot `shared_by` already skips short groups. Kill switch:
+      # VTL_ENABLE_KV_CACHE_GROUPS=0.
+      #
+      # A/B on the dev box, 4 boots per arm, closed-loop 8 x 48 reqs, warm reps only (n=6):
+      #   TPOT p50   6.80 -> 6.57 ms   (-3.4%)     cold first rep: 9.03 -> 8.57 ms
+      #   TTFT p50   34.8 -> 31.3 ms   (-10%)
+      #   throughput  982 -> 1033 tok/s (+5.2%)
+      # Smaller than the ~0.85 ms/step the cProfile cumtime suggested -- that figure is
+      # inflated by the profiler AND covers BOTH builds; dropping one buys ~a quarter of it.
+      #
+      # THE COST, and the thing to re-check on the H200 slice: the pool is cut into
+      # `max(len(g.layer_names))` slices, which goes 6 -> 10, so num_blocks drops 40%.
+      # Measured here: GPU KV cache 1,520,422 -> 913,140 tokens, max concurrency at
+      # 32k tokens/request 46.40x -> 27.87x. Harmless for round-2 (peak ~8 concurrent, ~4k
+      # tokens/turn, ~1.4 GB working set) but it is a real capacity cut -- read those two
+      # boot-log lines on the slice before shipping, and flip the kill switch if the slice's
+      # "Maximum concurrency" lands near the workload.
+      # (Iteration 3's "~20% of conv state memory lost to padding" was wrong in sign: every
+      # pool slot is claimed by some layer either way, so merging costs capacity, not saves it.)
       #
       # Also caught in that capture: a Triton kernel JIT-compiling INSIDE the decode loop
       # (~0.25 s of a 0.70 s window). Two independent causes, both now addressed:

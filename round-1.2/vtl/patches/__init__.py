@@ -37,6 +37,7 @@ _MODULES: tuple[str, ...] = (
     "qk_norm_rope",     # fused QK-RMSNorm+RoPE on the 6 attn layers (stock kernel, unmatched pass)
     "mul_quant",        # conv-gate fused mul+fp8-quant op (opt-in; wired directly in short_conv)
     "bcx_conv_gate",    # whole short-conv DECODE block in one kernel (needs mul_quant's staging buf)
+    "kv_cache_groups",  # one kv cache group per spec -> one metadata build per spec per step
     "kv_cache_manager",
     "sched_policy",
     "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)

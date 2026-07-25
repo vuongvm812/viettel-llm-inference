@@ -146,6 +146,13 @@ verify:
 	@grep -q "vtl: applied" /tmp/vtl-verify.log \
 	  && echo "OK   vtl plugin loaded" \
 	  || { echo "FAIL vtl plugin never ran -- you are benchmarking stock vLLM"; exit 1; }
+	@# One kv cache group per spec: the merge drops one SSM metadata build per decode step but
+	@# cuts num_blocks ~40% (the pool is sliced by max layers-per-group). Print the capacity it
+	@# bought/cost so the trade is visible on whatever GPU this is, not just the dev box.
+	@grep -q "vtl: merged .* kv cache groups" /tmp/vtl-verify.log \
+	  && { sed -n 's/.*vtl: \(merged [0-9]* kv cache groups[^;]*\).*/OK   \1/p' /tmp/vtl-verify.log | tail -1; \
+	       sed -n 's/.*\(GPU KV cache size: .*\)/     \1/p;s/.*\(Maximum concurrency for .*\)/     \1/p' /tmp/vtl-verify.log | tail -2; } \
+	  || echo "WARN kv cache groups not merged -- stock 3-group split (VTL_ENABLE_KV_CACHE_GROUPS=0?)"
 	@grep -q "registered quantization method 'vtl_fp8'" /tmp/vtl-verify.log \
 	  && echo "OK   vtl_fp8 registered" \
 	  || { echo "FAIL vtl_fp8 not registered"; exit 1; }
