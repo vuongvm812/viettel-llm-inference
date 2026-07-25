@@ -95,6 +95,17 @@ services:
       # TPOT. SGLang publishes 2.2ms for this exact model on H200 at concurrency 1, so ~1.8ms
       # (~13 score points) is on the table. Every knob below is one env var to revert.
       #
+      # CONTRADICTED 2026-07-25 on the dev box (RTX 3060, 28 SMs / 360 GB/s, this exact image
+      # and env, LFM2.5 + V2 runner). At concurrency 1, ignore_eos, 1199 decode tokens:
+      #   TPOT 5.36 ms, and `nvidia-smi utilization.gpu` reads 89% for the whole run
+      #   -> per-step HOST GAP is ~0.6 ms, not 3.4 ms.
+      # And TPOT is IDENTICAL at cpus=3 and cpus=28 (5.28 vs 5.30 ms), so the host path is not
+      # CPU-starved either. That box falls back to Marlin weight-only fp8 (sm_86 has no fp8
+      # tensor cores; `make verify` shows w4a8 quantized 0 layers and BOTH fusion passes
+      # replaced 0 patterns), so its GPU term is not the H200's -- but "the host IS the TPOT"
+      # is the premise every knob below rests on, and it did not reproduce. Re-measure the
+      # split on the slice before spending another iteration on host-side knobs.
+      #
       # ---- Model Runner V2 ------------------------------------------------------------
       # V2 is vLLM's per-step-CPU-overhead rewrite (GPU-resident batch prep + sampling),
       # attractive on this host-bound slice. Stock V2 was REJECTED on 2026-07-21 (TPOT

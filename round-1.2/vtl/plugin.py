@@ -15,7 +15,7 @@ import logging
 import os
 import sys
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 _REGISTERED = False
 

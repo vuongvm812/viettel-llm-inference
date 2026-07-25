@@ -29,7 +29,7 @@ from collections import deque
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 _HUGE = 1 << 60  # push un-keyable requests to the back, never crash the sort
 _USAGE_TIGHT = 0.90  # KV usage above which we prefer requests that fit over pure SJF

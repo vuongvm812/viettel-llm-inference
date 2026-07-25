@@ -61,7 +61,7 @@ import functools
 import logging
 import os
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 MODE_ENV = "VTL_LM_HEAD_QUANT"
 VALID_MODES = ("int4", "fp8", "off")

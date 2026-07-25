@@ -113,7 +113,7 @@ import os
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 IGNORE_ENV = "VTL_W4A8_IGNORE"
 

@@ -29,7 +29,7 @@ import os
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 

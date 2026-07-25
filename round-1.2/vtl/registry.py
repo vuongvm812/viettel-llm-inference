@@ -11,7 +11,13 @@ import logging
 import os
 from typing import Callable, NamedTuple
 
-log = logging.getLogger("vtl")
+# MUST stay under the "vllm." prefix. vLLM's dictConfig attaches a handler to the "vllm"
+# logger only (propagate=False); the root logger gets none. A bare getLogger("vtl") therefore
+# falls through to logging.lastResort, which drops everything below WARNING -- so every
+# log.info in this tree (patch applied, N layers quantized, lm_head outcome, fusion installed)
+# vanished and `make verify` could never confirm the overlay ran at all. As a child of "vllm"
+# we inherit its handler and its VLLM_LOGGING_LEVEL.
+log = logging.getLogger("vllm.vtl")
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -107,6 +113,15 @@ def _self_check() -> None:
         assert not already_patched(Target, "method")
         Target.method = mark_patched(lambda self: None, Target.method)
         assert already_patched(Target, "method")
+
+        # Every vtl logger must be a "vllm." child or its INFO records are dropped on the
+        # floor (see the comment on `log` above). Guards the whole tree, not just this file.
+        import pathlib
+
+        for py in pathlib.Path(__file__).parent.rglob("*.py"):
+            for lineno, line in enumerate(py.read_text().splitlines(), 1):
+                if "= logging.getLogger(" in line and 'getLogger("vllm.vtl")' not in line:
+                    raise AssertionError(f"{py}:{lineno}: logger must be 'vllm.vtl': {line}")
 
         print("registry self-check ok")
     finally:

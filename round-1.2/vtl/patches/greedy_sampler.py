@@ -20,7 +20,7 @@ import logging
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 
 def _should_fastpath(sm, predict_bonus_token: bool) -> bool:

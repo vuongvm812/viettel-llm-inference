@@ -1,0 +1,18 @@
+# Verification overlay -- never submit. Stack it LAST so it wins.
+#
+# The submission pins VLLM_LOGGING_LEVEL=WARNING because INFO does per-request log work on
+# the hot path. But every assertion `make verify` makes -- patches applied, layers quantized,
+# lm_head outcome, fusion match count -- is logged at INFO or DEBUG. With the shipped level
+# those greps can only ever print WARN/FAIL, so a run that is silently serving stock vLLM
+# looks exactly like one that is not. Boot with this overlay to check, then drop it.
+#
+#   docker compose -f docker-compose.yaml -f docker-compose-optimized.yaml \
+#                  -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml \
+#                  -f docker-compose.debug.yaml up -d --wait
+#   make verify DEBUG=1
+services:
+  model:
+    environment:
+      # DEBUG (not INFO): the rms_norm+quant fusion match count -- the one signal that proves
+      # our CUDA kernel is actually reached -- is emitted by rms_quant_fusion.py at DEBUG.
+      VLLM_LOGGING_LEVEL: DEBUG

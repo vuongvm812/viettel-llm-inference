@@ -68,6 +68,10 @@ TRACE := data/input/trace-round2.jsonl
 # serve flag and env var; the three overlays only carry their differences (dev image tag,
 # local build+mount, judge-box resource caps). Order matters -- later -f wins.
 COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
+# DEBUG=1 stacks the verification overlay (VLLM_LOGGING_LEVEL=DEBUG). Everything `make verify`
+# asserts is logged at INFO/DEBUG, and the submission compose pins WARNING -- so `make up
+# DEBUG=1 && make verify DEBUG=1` is the only combination in which those greps mean anything.
+COMPOSE_FILES += $(if $(DEBUG),-f docker-compose.debug.yaml)
 DC := docker compose $(COMPOSE_FILES)
 
 .PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork
