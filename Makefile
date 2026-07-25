@@ -72,9 +72,14 @@ COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f dock
 # asserts is logged at INFO/DEBUG, and the submission compose pins WARNING -- so `make up
 # DEBUG=1 && make verify DEBUG=1` is the only combination in which those greps mean anything.
 COMPOSE_FILES += $(if $(DEBUG),-f docker-compose.debug.yaml)
+# PYSRC=1 mounts the checkout's pure-Python vtl sources over the image's copies and SKIPS the
+# build, because `COPY vtl /src/vtl` sits above the nvcc RUN and a one-line Python edit would
+# otherwise recompile every kernel. See docker-compose.pysrc.yaml for what it does not cover.
+COMPOSE_FILES += $(if $(PYSRC),-f docker-compose.pysrc.yaml)
 DC := docker compose $(COMPOSE_FILES)
+BUILD := $(if $(PYSRC),echo "PYSRC=1: skipping build; vtl python is mounted",$(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)')
 
-.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork
+.PHONY: check stats build up down warm push bench sweep-schedule profile slack test-kernel bench-kernel debug-kernel verify vllm-fork
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -244,7 +249,7 @@ build:
 
 # `docker compose up --build` cannot take --build-arg, so build first (which honors it) then up.
 up:
-	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)'
+	$(IN) $(BUILD)
 	$(IN) $(DC) up
 
 down:
@@ -263,7 +268,7 @@ WARM_REQS ?= 32
 ## resolves; the round dir is mounted at /w so --trace/--out paths stay repo-relative.
 REPLAY ?= docker run --rm --network host -v "$$PWD:/w" -w /w --entrypoint python3 $(IMAGE):$(TAG)
 warm:
-	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)'
+	$(IN) $(BUILD)
 	$(IN) $(DC) up -d --wait   # --wait blocks until the healthcheck passes
 	$(IN) $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) --limit 4 --out /dev/null
 	$(IN) $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) \
@@ -319,13 +324,52 @@ sweep-schedule:
 ## (gpu-busy vs idle per step -- the number the TPOT tuning rests on). See docs/plans/.
 ## Must match VTL_PROFILE_STEPS in docker-compose.profile.yaml; only divides totals per step.
 PROFILE_STEPS ?= 20
+## Host-slack probe. Answers the ONE question a profile cannot: would saving host time move
+## TPOT at all? Async scheduling overlaps step N+1's host work with step N's GPU work, so the
+## step period is max(host, gpu) and every host micro-optimization is worth exactly zero until
+## host is the longer side. A "GPU busy 65%" figure from `make profile` is a union of kernel
+## spans and reads the same either way -- it does NOT identify the critical path.
+##
+## This burns a known number of microseconds on the engine thread before each step
+## (vtl/patches/profiler.py, VTL_STEP_DELAY_US) and sweeps it. Read the slope of TPOT vs delay:
+##   slope ~= 1   host IS the critical path; 1 ms saved on the host is 1 ms of TPOT
+##   flat, then slope 1 at delay D   there is D of host slack; nothing below D is worth doing
+##
+## One boot for the whole sweep -- boot-to-boot variance is the dominant noise here (see the
+## docker-compose TPOT block), and the delay is a runtime file, not an env var. The repeated
+## first arm at the end is the drift control: if it does not reproduce arm 1, the sweep
+## measured warm-up rather than the delay.
+## Each arm is "<overlapped>/<serial>" us. The two halves are NOT equivalent: execute_model
+## runs for step N+1 while step N is still on the GPU, so it has slack; update_from_output runs
+## after the engine has already blocked on step N's tokens, so it has none. Sweeping only the
+## overlapped half reads "host work is free" and is how you talk yourself out of a real win.
+STEP_DELAYS ?= 0/0 500/0 1000/0 2000/0 0/500 0/1000 0/0
+## First N trace records, arrival times preserved. The full 420 take ~5 min per arm; the point
+## is the SLOPE, and the trace's decode shape (mean 2 concurrent) is stationary after the first
+## few turns, so a prefix measures the same thing in a third of the time.
+SLACK_LIMIT ?= 150
+slack:
+	$(IN) mkdir -p bench-profile
+	$(IN) $(BUILD)
+	$(IN) $(DC) -f docker-compose.profile.yaml up -d --force-recreate --wait
+	$(IN) i=0; for d in $(STEP_DELAYS); do \
+	  i=$$((i+1)); o=$${d%%/*}; ser=$${d##*/}; \
+	  echo "$$o" > bench-profile/delay_us; echo "$$ser" > bench-profile/delay_serial_us; sleep 2; \
+	  echo "=== arm $$i: overlapped=$$o us serial=$$ser us"; \
+	  $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	    --limit $(SLACK_LIMIT) --out bench-slack-$$i-$${o}o-$${ser}s.json || exit 1; \
+	done
+	$(IN) rm -f bench-profile/delay_us bench-profile/delay_serial_us
+	$(IN) $(DC) -f docker-compose.profile.yaml down
+
 ## Seconds into the replay at which the capture window opens. Anything that arms BEFORE the
 ## replay starts captures the opening prefill burst instead of steady-state decode.
 PROFILE_ARM_DELAY ?= 90
 profile:
 	$(IN) mkdir -p bench-profile
 	$(IN) rm -f bench-profile/vtl-trace-*.json bench-profile/vtl-pyprof-*.txt bench-profile/.arm
-	$(IN) $(DC) -f docker-compose.profile.yaml up -d --build --force-recreate --wait
+	$(IN) $(BUILD)
+	$(IN) $(DC) -f docker-compose.profile.yaml up -d --force-recreate --wait
 	@# Drive the REAL trace open-loop and arm mid-run. The old driver was
 	@# `--closed-loop 8 --limit 48`, which saturates the server: most steps become
 	@# prefill-mixed, mamba refuses a FULL cudagraph on those, and the model forward runs

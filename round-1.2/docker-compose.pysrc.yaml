@@ -1,0 +1,25 @@
+# DEV-ONLY overlay -- do NOT submit. Mounts THIS checkout's pure-Python vtl sources over the
+# copies baked into the image, so editing a patch costs a container restart instead of a
+# ~20-minute CUDA wheel rebuild.
+#
+# WHY IT IS NEEDED: the Dockerfile does `COPY vtl /src/vtl` (line 77) ABOVE the nvcc `RUN` that
+# builds the extension (line 97), so touching any file under vtl/ -- including a one-line Python
+# edit -- busts that layer and recompiles the kernels for all four SM archs. Iterations 3 and 4
+# both paid that, and the box's wall clock advances too slowly to poll it.
+#
+# WHAT IT DOES NOT COVER: vtl/_C*.so and vtl/csrc live inside the installed package and are NOT
+# mounted, so a .cu change still needs `make build`. And the mounted tree must stay
+# import-compatible with the .so the image already has.
+#
+# Usage (never for a benchmark you intend to quote as the submission's number -- verify the same
+# code from a real build first):
+#   make up PYSRC=1        # boots without rebuilding
+#   make profile PYSRC=1
+services:
+  model:
+    volumes:
+      - ./vtl/patches:/usr/local/lib/python3.12/dist-packages/vtl/patches:ro
+      - ./vtl/__init__.py:/usr/local/lib/python3.12/dist-packages/vtl/__init__.py:ro
+      - ./vtl/plugin.py:/usr/local/lib/python3.12/dist-packages/vtl/plugin.py:ro
+      - ./vtl/registry.py:/usr/local/lib/python3.12/dist-packages/vtl/registry.py:ro
+      - ./vtl/warmup_healthcheck.py:/opt/vtl/warmup_healthcheck.py:ro

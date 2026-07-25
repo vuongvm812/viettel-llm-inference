@@ -20,11 +20,28 @@ cannot see (with_stack only decorates ops that exist). So the same window option
 ``cProfile`` on the engine-core thread and dumps a tottime-ranked ``vtl-pyprof-<pid>.txt``
 next to the trace. Both profilers inflate absolute time; the RANKING is what's usable.
 
-Env (all read directly; the patch is inert unless the dir is set):
+THE SLACK PROBE. Profiles rank host work but cannot say whether saving any of it would
+move TPOT: with async scheduling the engine thread's step-N+1 work overlaps step N's GPU
+work, so the period is ``max(host, gpu)`` and host savings are worth exactly zero until
+host is the longer of the two. Every host/GPU split this repo has quoted was a *union of
+kernel spans*, which reads identically whichever side is the critical path. So the same
+wrapper can burn a fixed number of microseconds on the engine thread before each step:
+sweep it and read the slope. dTPOT/ddelay == 1 means the host IS the critical path and
+every microsecond saved there is a microsecond of TPOT; a flat region of width S means
+there is S of host slack and host micro-optimization is worth nothing until it is spent.
+
+Env (all read directly; the patch is inert unless the dir or the delay is set):
   VTL_ENABLE_PROFILER   registry gate (overlay sets =1; default OFF)
   VTL_PROFILE_DIR       output dir for the chrome trace (also the .arm trigger dir)
   VTL_PROFILE_STEPS     execute_model calls to capture after arming (default 20)
   VTL_PROFILE_PY        also run cProfile over the window (default 1; "0" = trace only)
+  VTL_STEP_DELAY_US     slack probe, OVERLAPPED half: burn N us before each execute_model.
+                        Overridden at runtime by <VTL_PROFILE_DIR>/delay_us, so ONE boot
+                        sweeps every arm -- boot-to-boot variance is the dominant noise in
+                        this repo's A/Bs (see the docker-compose TPOT block).
+  VTL_STEP_DELAY_SERIAL_US  same probe at a second injection point, Scheduler.
+                        update_from_output (the far side of the engine loop's blocking wait).
+                        Runtime file: <VTL_PROFILE_DIR>/delay_serial_us.
 
 Fail-closed: any profiler error disables further profiling and NEVER breaks execute_model.
 """
@@ -33,6 +50,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
@@ -58,6 +76,65 @@ def _steps() -> int:
 
 def _py_enabled() -> bool:
     return os.environ.get("VTL_PROFILE_PY", "1").strip().lower() in _TRUTHY
+
+
+# Two injection points, one on each side of the engine loop's blocking wait:
+#   "overlapped"  execute_model        -- prepare_inputs/prepare_attn/launch, for step N+1
+#   "serial"      update_from_output   -- bookkeeping for step N, after future.result()
+# The names are a hypothesis the measurement REFUTED: both sweeps read the same slack (see the
+# docker-compose TPOT block). step_with_batch_queue launches step N+1's kernels BEFORE it pops
+# and blocks on step N, so update_from_output(N) also runs against a busy GPU -- there is one
+# host budget per step, not two. Both points are kept because agreeing from two different
+# modules is what makes the number believable, not because they measure different things.
+_DELAY_ENV = {"overlapped": "VTL_STEP_DELAY_US", "serial": "VTL_STEP_DELAY_SERIAL_US"}
+_DELAY_FILE = {"overlapped": "delay_us", "serial": "delay_serial_us"}
+_delay_cache: dict[str, tuple[int, float]] = {}
+
+
+def _env_delay_us() -> int:
+    """Largest delay asked for by env, i.e. "is the probe armed at all"."""
+    out = 0
+    for name in _DELAY_ENV.values():
+        try:
+            out = max(out, int(os.environ.get(name, "0")))
+        except ValueError:
+            pass
+    return max(0, out)
+
+
+def _delay_us(which: str = "overlapped") -> int:
+    """Microseconds to burn on the engine thread at ``which`` point in the step.
+
+    ``<VTL_PROFILE_DIR>/<file>`` overrides the env so one boot can sweep every arm, and is
+    re-read at most once a second: the file read must not itself be a per-step cost that the
+    sweep then measures.
+    """
+    us, checked = _delay_cache.get(which, (None, 0.0))
+    now = time.monotonic()
+    if us is not None and now - checked < 1.0:
+        return us
+    try:
+        us = max(0, int(os.environ.get(_DELAY_ENV[which], "0")))
+    except ValueError:
+        us = 0
+    d = _profile_dir()
+    if d:
+        try:
+            with open(os.path.join(d, _DELAY_FILE[which])) as f:
+                us = max(0, int(f.read().strip()))
+        except (OSError, ValueError):
+            pass
+    _delay_cache[which] = (us, now)
+    return us
+
+
+def _spin(us: int) -> None:
+    """Busy-wait, never sleep. The probe has to consume the engine thread the way real
+    interpreter work does; sleeping releases the GIL and the core, which lets exactly the
+    overlap being measured absorb the delay."""
+    end = time.perf_counter() + us * 1e-6
+    while time.perf_counter() < end:
+        pass
 
 
 def _new_pyprofiler():  # split out so the self-check can drive it with a fake
@@ -114,6 +191,12 @@ def _make_wrapper(original):
     Module-level state + pure-ish control flow so the self-check can drive it with fakes."""
 
     def execute_model(self, *args, **kwargs):
+        # Before anything else: this is the engine-core thread and the delay has to land on
+        # its critical path, not inside the capture window's accounting.
+        us = _delay_us()
+        if us:
+            _spin(us)
+
         d = _profile_dir()
         # Start: armed, not yet running, not already done.
         if d and not _state["done"] and not _state["started"] and _armed(d):
@@ -172,6 +255,31 @@ def _make_wrapper(original):
 # Both are patched rather than the config being read here: the module-level _state machine is
 # one-shot per process and only one of these classes is ever constructed, so double-patching
 # costs nothing and cannot double-capture.
+def _install_serial_probe() -> bool:
+    """Second injection point: the scheduler's post-output bookkeeping.
+
+    ``update_from_output`` runs after the engine-core loop has blocked on the step's sampled
+    tokens, i.e. on the far side of the wait from ``execute_model`` -- a genuinely different
+    module and a different phase, which is what makes it an independent check on the same
+    slack number. Distinct from sched_policy's wrapper (that one is on ``schedule``);
+    ``AsyncScheduler`` does not override this method, so patching the base class is live.
+    """
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if already_patched(Scheduler, "update_from_output"):
+        return True
+    original = Scheduler.update_from_output
+
+    def update_from_output(self, *args, **kwargs):
+        us = _delay_us("serial")
+        if us:
+            _spin(us)
+        return original(self, *args, **kwargs)
+
+    Scheduler.update_from_output = mark_patched(update_from_output, original)
+    return True
+
+
 _RUNNER_MODULES = (
     "vllm.v1.worker.gpu.model_runner",  # V2 -- what we serve
     "vllm.v1.worker.gpu_model_runner",  # V1 -- VLLM_USE_V2_MODEL_RUNNER=0
@@ -180,9 +288,10 @@ _RUNNER_MODULES = (
 
 @register_patch("profiler", default=False)
 def apply() -> None:
-    # Inert unless a profile dir is configured (the overlay sets it). Keeps this a no-op
-    # in every normal serve even if VTL_ENABLE_PROFILER leaks on.
-    if _profile_dir() is None:
+    # Inert unless a profile dir is configured (the overlay sets it) or the slack probe is
+    # armed by env. Keeps this a no-op in every normal serve even if VTL_ENABLE_PROFILER
+    # leaks on.
+    if _profile_dir() is None and _env_delay_us() == 0:
         log.info("vtl: profiler enabled but VTL_PROFILE_DIR unset; nothing to do")
         return
     import importlib
@@ -202,11 +311,18 @@ def apply() -> None:
     if not installed:
         log.warning("vtl: no GPUModelRunner patched; profiler not installed")
         return
+    try:
+        _install_serial_probe()
+    except Exception as exc:  # engine-core-less process, or the class moved
+        log.warning("vtl: serial slack probe not installed (%s)", exc)
+
+    d = _profile_dir()
     log.info(
-        "vtl: profiler installed on %s -> touch %s to capture %d steps",
+        "vtl: profiler installed on %s -> %s; step delay %d us overlapped / %d us serial",
         ", ".join(installed),
-        _arm_path(_profile_dir()),
-        _steps(),
+        f"touch {_arm_path(d)} to capture {_steps()} steps" if d else "capture disabled",
+        _delay_us("overlapped"),
+        _delay_us("serial"),
     )
 
 
@@ -294,6 +410,39 @@ def _self_check() -> None:
         os.environ.pop("VTL_PROFILE_PY", None)
         os.environ.pop("VTL_PROFILE_DIR", None)
         os.environ.pop("VTL_PROFILE_STEPS", None)
+
+    # ---- slack probe --------------------------------------------------------------------
+    # A delay that does not actually elapse measures nothing, and one that outlives its arm
+    # silently poisons every later arm of the sweep.
+    os.environ["VTL_PROFILE_DIR"] = d
+    _delay_cache.clear()
+    assert _delay_us() == 0 and _delay_us("serial") == 0      # no env, no file -> off
+    with open(os.path.join(d, "delay_us"), "w") as f:
+        f.write("1500\n")
+    _delay_cache.clear()
+    assert _delay_us() == 1500                                # file wins over the env default
+    assert _delay_us() == 1500                                # and is cached, not re-read
+    assert _delay_us("serial") == 0                           # the two halves are independent
+    with open(os.path.join(d, "delay_serial_us"), "w") as f:
+        f.write("300")
+    _delay_cache.clear()
+    assert (_delay_us(), _delay_us("serial")) == (1500, 300)
+    with open(os.path.join(d, "delay_us"), "w") as f:
+        f.write("garbage")
+    _delay_cache.clear()
+    assert _delay_us() == 0                                   # unparseable -> off, never raise
+    os.environ["VTL_STEP_DELAY_US"] = "700"
+    _delay_cache.clear()
+    assert _delay_us() == 700                                 # bad file falls back to the env
+    assert _env_delay_us() == 700                             # ...and that arms apply()
+    t0 = time.perf_counter()
+    _spin(2000)
+    assert 0.0018 < time.perf_counter() - t0 < 0.010, "spin must burn ~the asked-for time"
+    os.environ.pop("VTL_STEP_DELAY_US", None)
+    os.environ.pop("VTL_PROFILE_DIR", None)
+    os.remove(os.path.join(d, "delay_us"))
+    os.remove(os.path.join(d, "delay_serial_us"))
+    _delay_cache.clear()
 
     # The runner the compose actually serves (VLLM_USE_V2_MODEL_RUNNER=1) must be covered,
     # or the capture silently produces nothing. Regression guard for the V1-only bug.

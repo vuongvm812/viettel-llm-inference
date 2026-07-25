@@ -233,6 +233,50 @@ services:
       # reduction inside the runner is not a TPOT lever at this scale. What did work
       # (kv_cache_groups) removed a whole duplicated metadata BUILD, not dispatches.
       #
+      # HOST SLACK, MEASURED 2026-07-25 (`make slack`). Read this before spending another
+      # iteration on host-side work, and before believing any A/B run on the dev box.
+      # Every host/GPU figure above is a UNION OF KERNEL SPANS, which cannot identify the
+      # critical path: async scheduling overlaps the engine thread's work with the GPU, so the
+      # step period is max(host, gpu) and "GPU busy 65%" reads identically whether the host has
+      # slack or none. So we stopped inferring it and injected a known delay instead --
+      # vtl/patches/profiler.py burns N us of busy-wait on the engine thread per step and the
+      # slope of TPOT vs N is the answer (1 = host is the critical path, flat = slack).
+      #
+      # Dev box (RTX 3060, 3-core cgroup, real trace open-loop --limit 150, ONE boot per sweep
+      # so boot-to-boot variance cannot leak in; TPOT p50 ms):
+      #   delay us         0(cold)   500   1000   2000   0(control)
+      #   in execute_model    5.7     5.4    5.4    6.0      5.5
+      #   in update_from_output  5.7  5.5    5.5    6.6      5.5
+      # Flat to 1 ms at BOTH injection points, on opposite sides of the engine loop's blocking
+      # wait, then a rise at 2 ms. Extrapolating slope 1 back from the 2 ms point puts the knee
+      # at ~0.9-1.5 ms. So:
+      #
+      #   THIS BOX HAS ~1 ms OF HOST HEADROOM PER DECODE STEP, AND CANNOT MEASURE ANY HOST-SIDE
+      #   OPTIMIZATION SMALLER THAN THAT. A null result here means nothing.
+      #
+      # That retro-explains the reverted mamba_get_block_table_tensor fusion above: it targeted
+      # 0.40 ms of a budget with ~1 ms of slack, so zero was the only possible outcome and no
+      # kernel would have changed it. It also puts a caveat on the kv_cache_groups win: that A/B
+      # ran `--closed-loop 8`, which saturates the host and IS past the knee, so its -0.23 ms is
+      # a saturated-regime number. Re-measure it open-loop on the slice.
+      #
+      # The two injection points were expected to differ ("update_from_output runs after the
+      # engine blocks on the tokens, so nothing hides it") and did not. step_with_batch_queue
+      # launches step N+1's kernels BEFORE it pops and waits on step N, so the bookkeeping also
+      # runs against a busy GPU: there is ONE host budget per step, not an overlapped and a
+      # serial one.
+      #
+      # HOW TO MEASURE A HOST CHANGE ON THIS BOX ANYWAY: run both arms with a fixed
+      # VTL_STEP_DELAY_US large enough to push past the knee (2000+). Both arms are then
+      # host-critical and a real saving shows up at slope 1 instead of being absorbed.
+      #
+      # WHY THIS DOES NOT SAY "GIVE UP ON HOST WORK": the slack is the gap between the host
+      # term and THIS box's GPU term, and 67.8% of that GPU term is the sm_86 Marlin fp8
+      # fallback. On the H200 the GEMM collapses, the gap closes, and the host becomes the
+      # critical path -- which is exactly why the host ranking is still the right thing to work
+      # from and exactly why the dev box cannot score it. Re-run `make slack` on the slice
+      # FIRST: it prints the real headroom there in ~15 minutes and costs no code.
+      #
       # ---- Model Runner V2 ------------------------------------------------------------
       # V2 is vLLM's per-step-CPU-overhead rewrite (GPU-resident batch prep + sampling),
       # attractive on this host-bound slice. Stock V2 was REJECTED on 2026-07-21 (TPOT
