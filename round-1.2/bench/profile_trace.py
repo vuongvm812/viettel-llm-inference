@@ -82,12 +82,15 @@ def bucket_of(kernel_name: str) -> str:
     return "other"
 
 
-def parse_chrome_trace(path: Path) -> dict[str, float]:
-    """Sum GPU-kernel durations (microseconds) by kernel name from a chrome trace."""
+def load_events(path: Path) -> list:
     opener = gzip.open if str(path).endswith(".gz") else open
     with opener(path, "rt") as f:
         doc = json.load(f)
-    events = doc.get("traceEvents", doc) if isinstance(doc, dict) else doc
+    return doc.get("traceEvents", doc) if isinstance(doc, dict) else doc
+
+
+def kernel_totals(events: list) -> dict[str, float]:
+    """Sum GPU-kernel durations (microseconds) by kernel name."""
     by_name: dict[str, float] = defaultdict(float)
     for ev in events:
         if not isinstance(ev, dict):
@@ -96,6 +99,94 @@ def parse_chrome_trace(path: Path) -> dict[str, float]:
         if ev.get("ph") == "X" and ev.get("cat") == "kernel" and "dur" in ev:
             by_name[ev.get("name", "?")] += float(ev["dur"])
     return dict(by_name)
+
+
+def parse_chrome_trace(path: Path) -> dict[str, float]:
+    return kernel_totals(load_events(path))
+
+
+def _union_us(spans: list[tuple[float, float]]) -> float:
+    """Total length of the union of [start, end) spans -- kernels on different streams
+    overlap, so summing durations overstates how long the GPU was actually busy."""
+    total = 0.0
+    cur_s = cur_e = None
+    for s, e in sorted(spans):
+        if cur_e is None or s > cur_e:
+            total += 0.0 if cur_e is None else cur_e - cur_s
+            cur_s, cur_e = s, e
+        elif e > cur_e:
+            cur_e = e
+    if cur_e is not None:
+        total += cur_e - cur_s
+    return total
+
+
+def host_summary(events: list, steps: int | None = None) -> dict:
+    """The host-vs-GPU split: how much of the captured window the GPU was idle.
+
+    ``vtl/patches/profiler.py`` captures ProfilerActivity.CPU as well as CUDA, but this
+    script only ever summed kernel time -- so the one question every remaining tuning
+    decision rests on (is TPOT the host term or the GPU term?) could not be answered from
+    a capture. gpu_busy is the UNION of kernel spans, wall is first-kernel-start to
+    last-kernel-end, and the difference is time the GPU had nothing to run.
+
+    CPU operators are ranked by SELF time (child spans subtracted), so ``aten::linear``
+    does not shadow the ``aten::mm`` inside it. Note ``with_stack=False`` in the capture,
+    so pure-Python frames are invisible: whatever the ranked aten ops do not account for
+    is interpreter/vLLM-Python overhead.
+    """
+    spans: list[tuple[float, float]] = []
+    cpu_by_tid: dict = defaultdict(list)
+    for ev in events:
+        if not isinstance(ev, dict) or ev.get("ph") != "X" or "dur" not in ev:
+            continue
+        ts, dur = float(ev["ts"]), float(ev["dur"])
+        cat = ev.get("cat")
+        # memcpy/memset occupy the device too -- charging them to the host gap would
+        # invent host cost out of a D2H sync.
+        if cat in ("kernel", "gpu_memcpy", "gpu_memset"):
+            spans.append((ts, ts + dur))
+        elif cat == "cpu_op":
+            cpu_by_tid[(ev.get("pid"), ev.get("tid"))].append((ts, dur, ev.get("name", "?")))
+
+    gpu_busy = _union_us(spans)
+    wall = (max(e for _, e in spans) - min(s for s, _ in spans)) if spans else 0.0
+
+    self_us: dict[str, float] = defaultdict(float)
+    for evs in cpu_by_tid.values():
+        stack: list[tuple[float, str]] = []  # (end, name)
+        for ts, dur, name in sorted(evs, key=lambda t: (t[0], -t[1])):
+            while stack and stack[-1][0] <= ts:
+                stack.pop()
+            if stack:
+                self_us[stack[-1][1]] -= dur  # charge the child to its parent
+            self_us[name] += dur
+            stack.append((ts + dur, name))
+
+    ranked = sorted(self_us.items(), key=lambda kv: -kv[1])
+    return {
+        "wall_us": wall,
+        "gpu_busy_us": gpu_busy,
+        "host_gap_us": wall - gpu_busy,
+        "gpu_busy_pct": 100 * gpu_busy / wall if wall else 0.0,
+        "steps": steps,
+        "top_cpu_ops": [{"name": n, "self_us": us} for n, us in ranked[:20] if us > 0],
+    }
+
+
+def print_host_report(h: dict) -> None:
+    wall, steps = h["wall_us"], h["steps"]
+    per = (lambda us: f"{us / steps / 1e3:>10.3f}") if steps else (lambda us: f"{'-':>10}")
+    print(f"\n=== host vs GPU ({wall / 1e3:.1f} ms wall"
+          + (f", {steps} steps" if steps else "") + ") ===")
+    print(f"{'':<14}{'ms':>12}{'%':>8}{'ms/step':>11}")
+    for label, us in (("gpu busy", h["gpu_busy_us"]), ("host gap", h["host_gap_us"])):
+        print(f"{label:<14}{us / 1e3:>12.1f}{100 * us / wall if wall else 0:>7.1f}%{per(us)}")
+    if h["top_cpu_ops"]:
+        print("\n--- top CPU ops by SELF time (python frames not captured) ---")
+        print(f"{'ms':>10}{'ms/step':>11}  op")
+        for row in h["top_cpu_ops"]:
+            print(f"{row['self_us'] / 1e3:>10.1f}{per(row['self_us'])}  {row['name'][:70]}")
 
 
 def summarize(by_name: dict[str, float], top: int = 40) -> dict:
@@ -158,6 +249,9 @@ def main() -> None:
     p.add_argument("--trace-file", type=Path, help="parse this specific chrome trace instead of scanning --profile-dir")
     p.add_argument("--out", type=Path, default=Path("bench-profile-summary.json"))
     p.add_argument("--top", type=int, default=40)
+    p.add_argument("--steps", type=int, default=None,
+                   help="execute_model calls in the capture (VTL_PROFILE_STEPS, default 20). "
+                        "Only used to divide the host/GPU totals into per-step numbers.")
     p.add_argument("--self-check", action="store_true")
     args = p.parse_args()
 
@@ -174,11 +268,15 @@ def main() -> None:
         )
     print(f"parsing {trace_file} ({trace_file.stat().st_size / 1e6:.1f} MB)", file=sys.stderr)
 
-    by_name = parse_chrome_trace(trace_file)
+    events = load_events(trace_file)  # loaded once: the kernel and host passes share it
+    by_name = kernel_totals(events)
     if not by_name:
         sys.exit(f"no GPU kernel events in {trace_file} (wrong file? profiler captured host-only?)")
     s = summarize(by_name, top=args.top)
     print_report(s)
+    h = host_summary(events, steps=args.steps)
+    print_host_report(h)
+    s["host"] = h
     args.out.write_text(json.dumps(s, indent=2))
     print(f"\nsummary -> {args.out}", file=sys.stderr)
 
@@ -221,6 +319,23 @@ def _selfcheck() -> None:
     assert abs(s["total_us"] - 200.0) < 1e-6, s["total_us"]
     top_bucket = s["buckets"][0]
     assert top_bucket["bucket"] == "gdn_scan" and abs(top_bucket["pct"] - 50.0) < 1e-6, s["buckets"]
+
+    # union, not sum: two overlapping streams must not double-count GPU busy time.
+    assert _union_us([(0.0, 10.0), (5.0, 20.0), (30.0, 35.0)]) == 25.0
+    host_events = [
+        # wall 0..100; kernels busy 0-10 and 5-20 (union 20) and 60-70 -> 30 busy, 70 idle.
+        {"ph": "X", "cat": "kernel", "name": "k1", "ts": 0.0, "dur": 10.0},
+        {"ph": "X", "cat": "kernel", "name": "k2", "ts": 5.0, "dur": 15.0},
+        {"ph": "X", "cat": "kernel", "name": "k3", "ts": 60.0, "dur": 10.0},
+        # nested CPU ops on one thread: linear 100us contains mm 80us -> self 20 / 80.
+        {"ph": "X", "cat": "cpu_op", "name": "aten::linear", "ts": 0.0, "dur": 100.0, "pid": 1, "tid": 1},
+        {"ph": "X", "cat": "cpu_op", "name": "aten::mm", "ts": 10.0, "dur": 80.0, "pid": 1, "tid": 1},
+    ]
+    h = host_summary(host_events, steps=2)
+    assert h["gpu_busy_us"] == 30.0, h
+    assert h["wall_us"] == 70.0 and h["host_gap_us"] == 40.0, h
+    self_by_name = {r["name"]: r["self_us"] for r in h["top_cpu_ops"]}
+    assert self_by_name == {"aten::mm": 80.0, "aten::linear": 20.0}, self_by_name
     print("profile_trace self-check ok")
 
 

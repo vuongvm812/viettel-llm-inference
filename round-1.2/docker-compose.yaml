@@ -95,16 +95,27 @@ services:
       # TPOT. SGLang publishes 2.2ms for this exact model on H200 at concurrency 1, so ~1.8ms
       # (~13 score points) is on the table. Every knob below is one env var to revert.
       #
-      # CONTRADICTED 2026-07-25 on the dev box (RTX 3060, 28 SMs / 360 GB/s, this exact image
-      # and env, LFM2.5 + V2 runner). At concurrency 1, ignore_eos, 1199 decode tokens:
-      #   TPOT 5.36 ms, and `nvidia-smi utilization.gpu` reads 89% for the whole run
-      #   -> per-step HOST GAP is ~0.6 ms, not 3.4 ms.
-      # And TPOT is IDENTICAL at cpus=3 and cpus=28 (5.28 vs 5.30 ms), so the host path is not
-      # CPU-starved either. That box falls back to Marlin weight-only fp8 (sm_86 has no fp8
-      # tensor cores; `make verify` shows w4a8 quantized 0 layers and BOTH fusion passes
-      # replaced 0 patterns), so its GPU term is not the H200's -- but "the host IS the TPOT"
-      # is the premise every knob below rests on, and it did not reproduce. Re-measure the
-      # split on the slice before spending another iteration on host-side knobs.
+      # RE-MEASURED 2026-07-25 with a real torch-profiler capture (`make profile`, 20 steps,
+      # 4 concurrent streams) on the dev box (RTX 3060, 3-core cgroup, this exact image + env,
+      # LFM2.5 + V2 runner). Per decode step, 8.56 ms wall -- which matches the client-side
+      # TPOT of 8.55 ms exactly, so the capture window IS the scored path:
+      #   GPU busy  4.98 ms/step (58.2%)   union of kernel spans, not the sum
+      #   HOST gap  3.58 ms/step (41.8%)   time the GPU had nothing to run
+      # Top host ops by SELF time: aten::copy_ 0.63, aten::empty 0.31, vllm::short_conv 0.29,
+      # aten::slice 0.25 ms/step. Those sum to ~1.7 ms; the other ~1.9 ms is pure Python
+      # (the capture runs with_stack=False, so interpreter frames are invisible).
+      #
+      # This SUPERSEDES the 2026-07-25 "CONTRADICTED, host gap is only ~0.6 ms" note, which was
+      # derived from `nvidia-smi utilization.gpu` reading 89%. That counter is the fraction of
+      # SAMPLE INTERVALS in which any kernel was resident, not a duty cycle -- it reads ~90% on
+      # a stream that is idle most of each step. Do not use it as a host/GPU split again.
+      #
+      # So the ~3.4 ms host term the knobs below assume is roughly RIGHT, and if anything
+      # UNDERSTATED as a share: this box spends 67.8% of its GPU time in Marlin (sm_86 has no
+      # fp8 tensor cores, so `make verify` shows w4a8 quantized 0 layers and both fusion passes
+      # replaced 0 patterns). On the H200 slice that GEMM time collapses and the same host gap
+      # becomes an even larger fraction of TPOT. Re-run `make profile` on the slice to size it,
+      # but host-side work is back to being the primary lever.
       #
       # ---- Model Runner V2 ------------------------------------------------------------
       # V2 is vLLM's per-step-CPU-overhead rewrite (GPU-resident batch prep + sampling),

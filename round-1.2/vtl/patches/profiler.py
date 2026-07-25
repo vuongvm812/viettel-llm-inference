@@ -123,6 +123,20 @@ def _make_wrapper(original):
     return execute_model
 
 
+# BOTH runner classes, because gpu_worker.py picks one at construction time from
+# `vllm_config.use_v2_model_runner` and we ship VLLM_USE_V2_MODEL_RUNNER=1. Patching only the
+# V1 module (what this file did until 2026-07-25) meant the wrapper was installed on a class
+# the worker never instantiates: `make profile` armed, captured nothing, and died on "no
+# vtl-trace-*.json" -- i.e. the repo's only profiling tool was dead in the shipped config.
+# Both are patched rather than the config being read here: the module-level _state machine is
+# one-shot per process and only one of these classes is ever constructed, so double-patching
+# costs nothing and cannot double-capture.
+_RUNNER_MODULES = (
+    "vllm.v1.worker.gpu.model_runner",  # V2 -- what we serve
+    "vllm.v1.worker.gpu_model_runner",  # V1 -- VLLM_USE_V2_MODEL_RUNNER=0
+)
+
+
 @register_patch("profiler", default=False)
 def apply() -> None:
     # Inert unless a profile dir is configured (the overlay sets it). Keeps this a no-op
@@ -130,17 +144,26 @@ def apply() -> None:
     if _profile_dir() is None:
         log.info("vtl: profiler enabled but VTL_PROFILE_DIR unset; nothing to do")
         return
-    try:
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except Exception as exc:  # not the worker process, or class moved -> skip cleanly
-        log.warning("vtl: GPUModelRunner not importable (%s); profiler not installed", exc)
+    import importlib
+
+    installed = []
+    for mod_name in _RUNNER_MODULES:
+        try:
+            runner = importlib.import_module(mod_name).GPUModelRunner
+        except Exception as exc:  # not the worker process, or class moved -> skip cleanly
+            log.warning("vtl: %s.GPUModelRunner not importable (%s)", mod_name, exc)
+            continue
+        if already_patched(runner, "execute_model"):
+            continue
+        original = runner.execute_model
+        runner.execute_model = mark_patched(_make_wrapper(original), original)
+        installed.append(mod_name)
+    if not installed:
+        log.warning("vtl: no GPUModelRunner patched; profiler not installed")
         return
-    if already_patched(GPUModelRunner, "execute_model"):
-        return
-    original = GPUModelRunner.execute_model
-    GPUModelRunner.execute_model = mark_patched(_make_wrapper(original), original)
     log.info(
-        "vtl: profiler installed -> touch %s to capture %d steps",
+        "vtl: profiler installed on %s -> touch %s to capture %d steps",
+        ", ".join(installed),
         _arm_path(_profile_dir()),
         _steps(),
     )
@@ -200,6 +223,11 @@ def _self_check() -> None:
         _new_profiler = saved
         os.environ.pop("VTL_PROFILE_DIR", None)
         os.environ.pop("VTL_PROFILE_STEPS", None)
+
+    # The runner the compose actually serves (VLLM_USE_V2_MODEL_RUNNER=1) must be covered,
+    # or the capture silently produces nothing. Regression guard for the V1-only bug.
+    assert "vllm.v1.worker.gpu.model_runner" in _RUNNER_MODULES, _RUNNER_MODULES
+    assert "vllm.v1.worker.gpu_model_runner" in _RUNNER_MODULES, _RUNNER_MODULES
 
     print("profiler self-check ok")
 

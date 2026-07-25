@@ -294,7 +294,10 @@ sweep-schedule:
 	@echo "compare: $(ROUND)/bench-sched-*.json (heuristic is the baseline)"
 
 ## Phase-0 profiler (needs the H200). Boots with vLLM's torch profiler enabled, drives a small
-## closed-loop replay, and prints a ranked GPU-kernel cost table. See docs/plans/.
+## closed-loop replay, and prints a ranked GPU-kernel cost table plus the host-vs-GPU split
+## (gpu-busy vs idle per step -- the number the TPOT tuning rests on). See docs/plans/.
+## Must match VTL_PROFILE_STEPS in docker-compose.profile.yaml; only divides totals per step.
+PROFILE_STEPS ?= 20
 profile:
 	$(IN) mkdir -p bench-profile
 	$(IN) rm -f bench-profile/vtl-trace-*.json bench-profile/.arm
@@ -302,5 +305,5 @@ profile:
 	$(IN) touch bench-profile/.arm   # arm AFTER warmup so the capture is the replay, not warmup
 	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --closed-loop 8 --limit 48 --out /dev/null
 	$(IN) sleep 3   # let the worker finish export_chrome_trace
-	$(IN) python3 bench/profile_trace.py --profile-dir bench-profile --out bench-profile-summary.json
+	$(IN) python3 bench/profile_trace.py --profile-dir bench-profile --steps $(PROFILE_STEPS) --out bench-profile-summary.json
 	$(IN) $(DC) -f docker-compose.profile.yaml down

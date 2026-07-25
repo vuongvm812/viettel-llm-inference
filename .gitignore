@@ -40,6 +40,8 @@ __pycache__/
 docker/cache/*
 !docker/cache/.gitkeep
 bench-*.json
+# `make profile` output: multi-MB chrome traces + the .arm trigger
+bench-profile/
 sndr_core_engine/
 sglang/
 model/
