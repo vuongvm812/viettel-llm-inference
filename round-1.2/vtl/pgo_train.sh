@@ -76,11 +76,25 @@ export RUST_BACKTRACE=full
 export VLLM_RS_DISABLE_HTTP_TRACE=1 VLLM_RS_DISABLE_CORS=1
 export TOKIO_WORKER_THREADS=3 VLLM_RS_ZMQ_WORKER_THREADS=3 VLLM_RS_REQUEST_WORKER_THREADS=3
 export OMP_NUM_THREADS=3 MKL_NUM_THREADS=3 OMP_WAIT_POLICY=ACTIVE
-# rayon backs the `tokenizers` crate's batch encode — the one real thread pool inside vllm-rs
-# that none of the tokio/VLLM_RS knobs above size.
-export RAYON_NUM_THREADS=3
 BIN="$RUST_DIR/target/release"
 FRONTEND_LOG=/tmp/pgo-frontend.log
+
+# The thread pinning above only sizes the pools; production also runs them inside a 3-core
+# cgroup while this builder has 64+, so the same pool sizes see none of the contention,
+# wakeup and run-queue behaviour PGO should be weighting. Pin the two profiled processes
+# (frontend + mock engine, which share the cgroup in production) to $PGO_CPU_COUNT cores. The
+# replay client stays unpinned — the judge drives us from off-box, so it shares no cores.
+# Applied per-process rather than via a buildx --driver-opt cpuset on the whole builder,
+# which would also drop the fat-LTO cargo builds to 3 cores. Explicit `if`: `cmd && VAR=`
+# as the last statement of a line trips set -e when cmd fails.
+PGO_CPU_COUNT="${PGO_CPU_COUNT:-3}"   # judge's core budget; keep in sync with the thread pins above
+PIN=()
+if command -v taskset >/dev/null 2>&1; then
+    PIN=(taskset -c "0-$((PGO_CPU_COUNT - 1))")
+    echo "pinning frontend + mock engine to ${PGO_CPU_COUNT} cores (0-$((PGO_CPU_COUNT - 1)))"
+else
+    echo "WARN: taskset not found — training on all $(nproc) cores; profile will under-weight contention paths"
+fi
 
 # Self-check: does the instrumented binary even run? Isolates a PGO-instrumentation
 # crash from a serve/model-specific one. `vllm-rs` needs a subcommand, so use --help
@@ -93,12 +107,12 @@ echo "-- model dir contents ($MODEL):"; ls -la "$MODEL" 2>&1 | head -20 || true
 
 # Distinct filename for the SERVE profile so the merge/gate can tell it apart from the
 # throwaway --help self-check profraw above (see the [pgo 6/6] gate).
-LLVM_PROFILE_FILE="$PGO_RAW/serve-%p.profraw" "$BIN/vllm-rs" serve "$MODEL" \
+LLVM_PROFILE_FILE="$PGO_RAW/serve-%p.profraw" "${PIN[@]}" "$BIN/vllm-rs" serve "$MODEL" \
     --data-parallel-size 1 --data-parallel-size-local 0 \
     --handshake-port "$HANDSHAKE_PORT" --host 127.0.0.1 --port "$HTTP_PORT" \
     > "$FRONTEND_LOG" 2>&1 &
 FRONTEND_PID=$!
-"$BIN/vllm-mock-engine" --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" \
+"${PIN[@]}" "$BIN/vllm-mock-engine" --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" \
     --decode-step-delay-ms "$PGO_DECODE_STEP_DELAY_MS" &
 MOCK_PID=$!
 

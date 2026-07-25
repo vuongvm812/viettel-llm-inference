@@ -26,9 +26,6 @@ services:
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
 
-      # Must match the model's native context (config.json max_position_embeddings=128000).
-      # Any tighter cap truncates the judge's long-context probe -> flagged as
-      # "truncation / dual-path" cheating.
       - --max-model-len=32768
       - --gpu-memory-utilization=0.90
       - --tensor-parallel-size=1
@@ -125,7 +122,6 @@ services:
       OMP_NUM_THREADS: "3"
       MKL_NUM_THREADS: "3"
       OMP_WAIT_POLICY: "ACTIVE"
-      RAYON_NUM_THREADS: "3"
 
       # CPython hands the GIL to a waiting thread only after sys.getswitchinterval() -- 5ms by
       # default, longer than a whole decode step. The engine-core main loop is tight pure

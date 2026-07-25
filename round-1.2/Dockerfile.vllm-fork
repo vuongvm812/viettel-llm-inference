@@ -58,7 +58,7 @@ ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:${PATH}
 # Rust workspace source. -o Dir::Etc::sourceparts=- skips the CUDA / deadsnakes repos in
 # sources.list.d (intermittently mid-sync) — these packages are in the base Ubuntu repos.
 RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
-    && apt-get install -y --no-install-recommends build-essential perl pkg-config curl ca-certificates unzip git \
+    && apt-get install -y --no-install-recommends build-essential perl pkg-config curl ca-certificates unzip git util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 # vllm-server's gRPC build script needs protoc. The proto uses proto3 `optional`,
