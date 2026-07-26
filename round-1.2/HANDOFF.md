@@ -144,7 +144,41 @@ iteration logging off the engine-core loop) plus staying current. If step 5 show
 the rollback is the digest in `Makefile` (image-level only — `vtl/vllm_patches/v0.25.0/` was
 deleted, so a source-level rollback needs `git revert`).
 
-### Speculative decoding — un-banned, wired, unmeasured (2026-07-26)
+### Speculative decoding — LIVE in the submitted compose, unmeasured (2026-07-26)
+
+**Read this first: the shipped arm is now a hybrid LFM2.5-350M draft model, not ngram.**
+`docker-compose.yaml` carries
+`--speculative-config={"method":"draft_model","model":"LiquidAI/LFM2.5-350M","num_speculative_tokens":3,"quantization":"vtl_w4a8"}`
+as an **active** line, with the `ngram_gpu` variant commented directly beneath it as the
+one-literal revert. `VLLM_USE_V2_MODEL_RUNNER` is already `"0"`, which `draft_model` needs for
+the same reason ngram did. Three things below were corrected on the same day:
+
+1. **The short-conv rollback was INERT until this commit.** Upstream PR #44296 is a three-file
+   fix; only two shipped. `gpu_model_runner` never named `ShortConvAttentionMetadataBuilder` in
+   the `use_spec_decode` gate that injects `num_accepted_tokens`, so the builder saw `None`,
+   `forward_cuda` took the non-spec path, and `mamba_attn`'s `decode_threshold` collapsed to 1
+   (every spec row misclassified as a *prefill*). Fixed in
+   `v0.26.0/gpu_model_runner.patch`; `gen.sh` now captures that file, and
+   `bench/test_shortconv_spec_rollback.py` has a fourth case that fails if it is ever dropped
+   again. **Consequence: any previously-submitted image with the ngram line live was corrupting
+   conv state.** Run go/no-go (1) on the ngram arm before assuming otherwise.
+2. **A hybrid draft model is no longer impossible** (this file used to say it was). vLLM issue
+   #49112 is that blocker; `llm_base_proposer_multigroup.patch` +
+   `mamba_groups_hybrid_draft.patch` + the runner patch fix it — see
+   `vtl/vllm_patches/not-applied/README.md` for what was ported and, more usefully, what turned
+   out **not** to need porting.
+3. **The drafter must be quantized or it cannot win.** A draft model does *not* inherit
+   `--quantization`; without the `"quantization":"vtl_w4a8"` key it loads bf16 at ~0.71 GB of
+   weight traffic per draft token, against a target step of ~0.85 GB in w4a8 — break-even would
+   need ~3.3 of 4 tokens accepted. At w4a8 the drafter is ~0.34 GB and break-even lands near 55%
+   acceptance. Needs no patch: `vllm.config.utils.replace` re-runs `VllmConfig.__post_init__`,
+   which builds `quant_config` from the *draft* `model_config`, and `vtl_w4a8` quantizes RTN at
+   load. Sweep `vtl_w4a8` / `vtl_fp8` / no key, and `num_speculative_tokens_per_batch_size`
+   (adaptive gamma) — all inside the one JSON literal.
+
+The original root-cause writeup follows and is still accurate.
+
+### Speculative decoding — root cause of the old ban (2026-07-26)
 
 **The "truncation / dual-path cheating" flag was never a detector.** It was the judge's
 inference from the long-context probe scoring 0% while the short scored trace looked healthy —
@@ -171,12 +205,11 @@ is active — it has no `num_accepted` path), `lfm2.patch` and `mamba_utils.patc
 not implement ngram/ngram_gpu/suffix at all** — `config/vllm.py:2154-2165` lists them as
 unsupported and `_validate_v2_model_runner` **raises at startup**, so with
 `VLLM_USE_V2_MODEL_RUNNER=1` the process dies before binding `:8000` and every request scores
-zero. Only eagle/eagle3/mtp/dflash/dspark survive V2, and all of those need a draft model that
-a hybrid LFM2 target cannot host. So spec-decode here means the **V1** runner. Two edits in
-`docker-compose.yaml`, and they must move together:
+zero. `draft_model` is in the same rejected set, so this applies to the shipped arm too. Spec-decode
+here means the **V1** runner. Two things in `docker-compose.yaml` must always move together:
 
-1. uncomment the `--speculative-config={"method":"ngram",…}` line in the `command:` block;
-2. set `VLLM_USE_V2_MODEL_RUNNER: "0"` in `environment:`.
+1. the live `--speculative-config=…` line in the `command:` block;
+2. `VLLM_USE_V2_MODEL_RUNNER: "0"` in `environment:`.
 
 (Literal edits, not env interpolation — see the `--max-num-scheduled-tokens` note above for
 why this file carries no `${VAR}`.) Flipping to V1 makes `v2_greedy_sampler.patch` + `mamba_hybrid_postprocess.patch` inert and

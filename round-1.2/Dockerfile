@@ -59,6 +59,31 @@ RUN JE=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2; \
     if [ -f "$JE" ]; then echo "jemalloc: OK"; \
     else echo "jemalloc: MISSING -- this image will run on glibc malloc (slower, still correct)"; fi
 
+# Bake the speculative-decode DRAFT MODEL into the image. The judge host provides only the
+# TARGET at /model and has no network at run time, so the drafter (referenced by its HF NAME in
+# --speculative-config) must resolve from a local cache. Download it into the HF hub cache under
+# a fixed HF_HOME so the same "LiquidAI/LFM2.5-350M" id resolves OFFLINE at the judge's run
+# (compose sets HF_HUB_OFFLINE=1). HF_HOME is an ENV so build and runtime share the cache path.
+# Placed early (depends only on the base) so it caches independently of vtl source churn.
+#
+# The bf16 checkpoint is ~700 MB and is what ships; --speculative-config carries
+# "quantization":"vtl_w4a8", which quantizes RTN at LOAD, so there is no int4 checkpoint to bake.
+#   make build DRAFT_MODEL=            # skip the bake (no-draft-model image)
+#   make build HF_TOKEN=hf_xxx         # only if the repo is gated (LFM2.5 is public; the token
+#                                      # would bake into image history -- prefer a pre-warmed cache)
+ENV HF_HOME=/opt/hf-cache
+ARG DRAFT_MODEL=LiquidAI/LFM2.5-350M
+ARG HF_TOKEN=
+RUN if [ -n "$DRAFT_MODEL" ]; then \
+      echo "baking draft model into $HF_HOME: $DRAFT_MODEL"; \
+      HF_TOKEN="$HF_TOKEN" HF_HUB_DISABLE_TELEMETRY=1 python3 -c \
+        "import os; from huggingface_hub import snapshot_download; \
+p = snapshot_download('$DRAFT_MODEL', ignore_patterns=['*.gguf','*.onnx','*.pth','original/*','*.pt']); \
+assert os.path.isfile(os.path.join(p, 'config.json')), p; \
+assert any(f.endswith(('.safetensors', '.bin')) for f in os.listdir(p)), 'no weights in ' + p; \
+print('draft cached at', p)"; \
+    else echo "DRAFT_MODEL empty -- skipping draft bake (no draft model)"; fi
+
 # Route the pinned `python -m ...api_server` entrypoint into vLLM's Rust frontend
 # when VLLM_USE_RUST_FRONTEND=1 (see the patch header). Applied here (not only in
 # Dockerfile.vllm-fork) so it lands on the stock base too. No-op while the flag is

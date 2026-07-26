@@ -27,6 +27,14 @@ CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
 # Bump on a big-RAM CI host: make build MAX_JOBS=28.
 MAX_JOBS ?= 4
 
+# Speculative-decode draft model, baked into the served image's HF cache ($(ROUND)/Dockerfile;
+# resolved offline by HF name at run time). The judge provides only the target at /model and has
+# no run-time network, so the drafter must ship inside the image. Set DRAFT_MODEL= (empty) to
+# build an image without it; HF_TOKEN only if the repo is gated (LFM2.5 is public).
+DRAFT_MODEL ?= LiquidAI/LFM2.5-350M
+HF_TOKEN ?=
+DRAFT_BUILD_ARGS := --build-arg DRAFT_MODEL='$(DRAFT_MODEL)' --build-arg HF_TOKEN='$(HF_TOKEN)'
+
 # Upstream stock vLLM. The forked image is built FROM this (make vllm-fork); never FROM the fork.
 VLLM_STOCK ?= vllm/vllm-openai:v0.26.0
 # The bare version ("0.26.0"), derived from VLLM_STOCK so there is ONE place to bump. Passed to
@@ -254,7 +262,7 @@ vllm-fork:
 	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'set VLLM_FORK_DIGEST=@{{.Manifest.Digest}}'; fi
 
 build:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --load -t $(IMAGE):$(TAG) .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' $(DRAFT_BUILD_ARGS) --load -t $(IMAGE):$(TAG) .
 	@docker inspect $(IMAGE):$(TAG) --format 'built {{.Os}}/{{.Architecture}}'
 
 # `docker compose up --build` cannot take --build-arg, so build first (which honors it) then up.
@@ -294,7 +302,7 @@ push:
 	  echo "FAIL base image '$(VLLM_IMAGE)' is not digest-pinned."; \
 	  echo "     run 'make vllm-fork PUSH=1', then set VLLM_FORK_DIGEST=@sha256:<digest>."; \
 	  exit 1;; esac
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --push -t $(IMAGE):$(TAG) .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' $(DRAFT_BUILD_ARGS) --push -t $(IMAGE):$(TAG) .
 	@echo "pin this digest in $(ROUND)/docker-compose.yaml:"
 	@docker buildx imagetools inspect $(IMAGE):$(TAG) --format '{{.Manifest.Digest}}'
 
