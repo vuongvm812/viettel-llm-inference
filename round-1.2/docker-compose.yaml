@@ -27,7 +27,7 @@ services:
     # Every OTHER flag and env var here is still deliberately version-agnostic; keep new
     # version-specific ones to a minimum, and land them only in the same commit that re-pins
     # this digest.
-    image: unseenablefuture/awesome-badger@sha256:c0f2f1dcc3e68b579ac7ab676740681275fd1d1ea8c2bc9060dda7b616064e52 # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:030c8c94cf3e099891b5deeb4bda8f6d74ebb831bfb2c928467c204707c36148 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
