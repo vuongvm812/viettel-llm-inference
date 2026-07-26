@@ -8,6 +8,12 @@ already loads us in the worker process, so we wrap ``GPUModelRunner.execute_mode
 run ``torch.profiler`` around a fixed window of engine steps, then dump a chrome trace to
 ``VTL_PROFILE_DIR``. ``bench/profile_trace.py`` buckets that trace unchanged.
 
+There are TWO ``GPUModelRunner`` classes (V1 and V2) and the worker picks one at construction
+time, so ``apply()`` wraps both -- see the comment there. SCOPE: this wraps the WORKER's
+``execute_model``, so the trace covers model execution only. The scheduler runs in the
+engine-core process and does NOT appear here, which is why scheduler-side changes cannot be
+sized with ``make profile``.
+
 Arming is a trigger FILE, not a step counter from process start: startup warmup (the
 healthcheck replay) burns an unknown number of execute_model calls, and we want the
 REPLAY captured, not warmup. So `make profile` boots + waits for healthy, then
@@ -130,17 +136,37 @@ def apply() -> None:
     if _profile_dir() is None:
         log.info("vtl: profiler enabled but VTL_PROFILE_DIR unset; nothing to do")
         return
-    try:
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except Exception as exc:  # not the worker process, or class moved -> skip cleanly
-        log.warning("vtl: GPUModelRunner not importable (%s); profiler not installed", exc)
+    # Patch BOTH runner classes rather than resolving which one is live. There are two
+    # (vllm/v1/worker/gpu/model_runner.py for V2, vllm/v1/worker/gpu_model_runner.py for V1)
+    # and gpu_worker.py:402-410 picks one at construction time -- long after this runs. Until
+    # 2026-07-26 this patched only the V1 class while the server ran
+    # VLLM_USE_V2_MODEL_RUNNER=1, so it logged "installed" every boot and never once fired;
+    # `make profile` produced no trace at all. The worker builds exactly ONE runner, so only
+    # one wrapper can ever be called and the one-shot _state below needs no change.
+    installed = []
+    for mod_path, label in (
+        ("vllm.v1.worker.gpu.model_runner", "V2"),
+        ("vllm.v1.worker.gpu_model_runner", "V1"),
+    ):
+        try:
+            runner = __import__(mod_path, fromlist=["GPUModelRunner"]).GPUModelRunner
+        except Exception as exc:  # not the worker process, or the class moved
+            log.info("vtl: profiler skipping %s runner (%s)", label, exc)
+            continue
+        if already_patched(runner, "execute_model"):
+            installed.append(label)
+            continue
+        original = runner.execute_model
+        runner.execute_model = mark_patched(_make_wrapper(original), original)
+        installed.append(label)
+
+    if not installed:
+        # Loud, not silent: a rename here is exactly how this patch died the first time.
+        log.warning("vtl: no GPUModelRunner importable; profiler NOT installed")
         return
-    if already_patched(GPUModelRunner, "execute_model"):
-        return
-    original = GPUModelRunner.execute_model
-    GPUModelRunner.execute_model = mark_patched(_make_wrapper(original), original)
     log.info(
-        "vtl: profiler installed -> touch %s to capture %d steps",
+        "vtl: profiler installed on %s runner(s) -> touch %s to capture %d steps",
+        "+".join(installed),
         _arm_path(_profile_dir()),
         _steps(),
     )
@@ -196,6 +222,31 @@ def _self_check() -> None:
         open(_arm_path(d), "w").close()
         wrapped(obj)
         assert events == ["start", "stop", "export"], events
+
+        # apply() must wrap BOTH runner classes. Patching only the V1 class while the server
+        # ran VLLM_USE_V2_MODEL_RUNNER=1 is exactly how this patch sat dead and silent, so
+        # stand fake modules up at both import paths and assert both get wrapped.
+        import sys
+        import types
+
+        fakes = {}
+        for path in ("vllm.v1.worker.gpu.model_runner", "vllm.v1.worker.gpu_model_runner"):
+            mod = types.ModuleType(path)
+
+            class _Runner:
+                def execute_model(self, *a, **k):
+                    return "stock"
+
+            mod.GPUModelRunner = _Runner
+            fakes[path] = _Runner
+            sys.modules[path] = mod
+        try:
+            apply()
+            for path, cls in fakes.items():
+                assert already_patched(cls, "execute_model"), f"{path} left unpatched"
+        finally:
+            for path in fakes:
+                sys.modules.pop(path, None)
     finally:
         _new_profiler = saved
         os.environ.pop("VTL_PROFILE_DIR", None)

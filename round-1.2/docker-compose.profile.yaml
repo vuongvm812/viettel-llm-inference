@@ -9,8 +9,18 @@
 # (v0.26.0 also adds capture_torch_profiler, which traces the cudagraph capture itself.)
 # We do NOT wire that here: `command:` in a compose overlay REPLACES the base list rather than
 # appending, so using it would mean duplicating every serve flag and inviting drift. The vtl
-# profiler below needs no serve flag and already works -- prefer it, and reach for
-# --profiler-config only if you need vLLM's own annotations.
+# profiler below needs no serve flag -- prefer it, and reach for --profiler-config only if you
+# need vLLM's own annotations.
+#
+# CORRECTED 2026-07-26 (second time): the vtl profiler did NOT work before this date, despite the
+# claim that used to sit here. It imported the V1 GPUModelRunner while VLLM_USE_V2_MODEL_RUNNER=1
+# makes the worker build vllm.v1.worker.gpu.model_runner.GPUModelRunner (gpu_worker.py:402-410),
+# so it logged "profiler installed" and never fired. It now wraps both classes. If bench-profile/
+# has no vtl-trace-*.json after `make profile`, that is the failure mode recurring -- check the
+# "profiler installed on ... runner(s)" line for which classes were found.
+#
+# SCOPE: this wraps the WORKER's execute_model. The scheduler runs in the engine-core process and
+# does NOT appear in the trace, so scheduler-side changes cannot be sized with `make profile`.
 #
 # So instead of vLLM's profiler we arm vtl/patches/profiler.py, which wraps GPUModelRunner.execute_model
 # in the worker and dumps a chrome trace to the mounted dir. `make profile` drives it:

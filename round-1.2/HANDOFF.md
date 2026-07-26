@@ -75,11 +75,37 @@ v0.26.0 adds `capture_torch_profiler` (traces the cudagraph capture itself) and
 `detailed_trace_annotation`. This is the cheapest way to finally attribute the ~4 ms
 host-bound decode step.
 
-**Small regression to expect:** v0.26.0 adds `KVCacheManager.estimate_cached_tokens()` on the
-step that emits each request's first token (`scheduler.py:1805`), a Python loop over every
-allocated block in every KV group. It is NOT gated by `--disable-log-stats` (`PrefillStats()` is
-built unconditionally at `request.py:197`). At our ~4.7k max context that is ~600 trivial
-iterations once per request, landing in TTFT — tens of microseconds, but one-directional.
+**Dead scheduler work, now elided (2026-07-26).** Three pieces of per-step/per-request work that
+this configuration computed and no consumer read. All are microsecond-scale — this is dead-work
+removal, not a win, and an indistinguishable A/B is the expected result, not a failure.
+
+- `KVCacheManager.estimate_cached_tokens()` on the step that emits each request's first token
+  (`scheduler.py:1798-1806`) — `get_blocks()` plus a loop over every allocated block in every KV
+  group, ~270 blocks for the full-attention group on a 4.3k prompt, landing in TTFT. Earlier
+  notes called this an unavoidable v0.26.0 regression. It is not: `vtl/patches/kv_cache_manager.py`
+  returns 0 when `scheduler.log_stats` is false, which `--disable-log-stats` gives us. See the
+  `--enable-prompt-tokens-details` warning in `docker-compose.yaml` before re-enabling anything.
+- `KVCacheManager.get_num_common_prefix_blocks()` every `schedule()` call
+  (`scheduler.py:1078-1084`) — fills `SchedulerOutput.num_common_prefix_blocks`, whose only
+  consumer is `gpu_model_runner.py:4207`, i.e. **V1** cascade attention. The V2 runner never
+  reads it. Not already free either: prefix caching + 2 groups selects
+  `HybridKVCacheCoordinator`, which does not override the method, so `FullAttentionManager` walks
+  the request's blocks counting `ref_cnt`. Elided only when V2 is *proven* live — `sched_policy`
+  hands the manager the Scheduler's own `use_v2_model_runner`, with an explicit-env fallback and
+  fail-closed-to-stock if neither resolves.
+- Our own waiting-queue reorder ran on every step with no guard. It now skips when the running
+  cap is hit (nothing can be admitted) and when the queue is one we already sorted, bounded by an
+  8-step staleness TTL. Steady-state effect here is ~0 because `waiting` is almost always shorter
+  than 2; the value is the burst case, where a backed-up queue was paying n `find_longest_cache_hit`
+  block-hash walks per step to re-derive the order it already had.
+
+**`make profile` was broken and is fixed (2026-07-26).** `vtl/patches/profiler.py` imported the
+**V1** `GPUModelRunner` while the server runs `VLLM_USE_V2_MODEL_RUNNER=1`, so the worker built
+`vllm.v1.worker.gpu.model_runner.GPUModelRunner` (`gpu_worker.py:402-410`) and the wrapper never
+fired — it logged `"profiler installed"` every boot and captured nothing. It now wraps both runner
+classes (only one is ever constructed). Scope caveat: it wraps the **worker's** `execute_model`, so
+the scheduler — which lives in the engine-core process — still does not appear in the trace. The
+three elisions above therefore ship without direct measurement.
 
 **Expectation management:** the upgrade's original justification (#46384 `--prefix-match-unit`)
 was found to be a **no-op on this model** — see the derivation in `docker-compose.yaml`. Do not

@@ -103,7 +103,7 @@ services:
       # TTFT (worth 1/40th per ms). Sweep 8192/4096/2048/1024, watch the ITL TAIL not the mean.
       # Setting this below the longest prompt is also what first makes --max-num-partial-prefills
       # and --long-prefill-token-threshold meaningful; they are inert while nothing chunks.
-      - --max-num-scheduled-tokens=${VTL_MAX_SCHED_TOKENS:-8192}
+      - --max-num-scheduled-tokens=4096
       # W4A8: int4 weights (group-128, symmetric, RTN at load) + fp8-e4m3 per-token activations,
       # via vLLM's SM90 CUTLASS w4a8 kernel. Cuts decode weight traffic 1306 -> 852 MB/step
       # (-35%, ~0.76 ms at the ~600 GB/s of an H200 MIG 1g.18gb slice). Note the int4 group
@@ -128,6 +128,17 @@ services:
 
       # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
       # drop the periodic stats logger and quiet uvicorn.
+      #
+      # --disable-log-stats is now load-bearing beyond the logger: it sets scheduler.log_stats,
+      # which vtl/patches/kv_cache_manager.py reads to skip estimate_cached_tokens() -- a scan of
+      # every allocated KV block that vLLM otherwise runs once per request INSIDE TTFT, because
+      # PrefillStats() is built unconditionally (request.py:197) and is NOT gated by this flag
+      # upstream. Turn stats back on and the real scan returns automatically; no knob to remember.
+      #
+      # !! DO NOT add --enable-prompt-tokens-details without also setting
+      # VTL_CHEAP_PREFILL_STATS=0. That flag is the one consumer of the cached-token count that
+      # log_stats does NOT gate (output_processor.py:640 -> prompt_tokens_details.cached_tokens),
+      # so the field would silently report 0. It is not set, which is why the elision is invisible.
       - --disable-log-stats
       - --uvicorn-log-level=warning
 
