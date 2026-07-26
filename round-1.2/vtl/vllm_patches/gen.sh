@@ -40,6 +40,19 @@ gen model_executor/models/lfm2.py               lfm2
 # of them pass. Landing any two of the three without the third is a boot-time TypeError or
 # `assert page_size_padded >= page_size`. Regenerate all three together.
 gen model_executor/layers/mamba/mamba_utils.py  mamba_utils
+# The FOURTH file of the same fix (upstream PR #44296), and without it the other three are
+# INERT: the runner only injects num_accepted_tokens into builders named in one isinstance
+# gate, and ShortConvAttentionMetadataBuilder was missing from it. It also carries the
+# multi-KV-group drafter wiring (issue #49112). All four move together.
+gen v1/worker/gpu_model_runner.py               gpu_model_runner
+# Hybrid separate draft model (LFM2.5-350M drafting for the 1.2B target), vLLM issue #49112.
+# The drafter's short_conv layers and attention layers legitimately land in different KV cache
+# groups. These lift v0.26.0's own multi-group drafter (Step3p5MTPProposer, left untouched --
+# its overrides just become redundant) into the base proposer, and relax the single-MambaSpec
+# assert so a draft whose conv_dim differs from the target's is allowed. Regenerate together
+# with gpu_model_runner, which registers the per-group block tables.
+gen v1/spec_decode/llm_base_proposer.py         llm_base_proposer_multigroup
+gen v1/worker/mamba_utils.py                    mamba_groups_hybrid_draft
 # V2 model runner (VLLM_USE_V2_MODEL_RUNNER=1): greedy argmax fast path in the V2
 # sampler, and the dead-num_accepted-scatter elision in the hybrid model state.
 gen v1/worker/gpu/sample/sampler.py             v2_greedy_sampler

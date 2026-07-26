@@ -1,0 +1,58 @@
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index f3f0afb..3d57cac 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -143,6 +143,9 @@ from vllm.v1.attention.backends.linear_attn import (
+     BailingLinearAttentionMetadataBuilder,
+ )
+ from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
++from vllm.v1.attention.backends.short_conv_attn import (
++    ShortConvAttentionMetadataBuilder,
++)
+ from vllm.v1.attention.backends.utils import (
+     NULL_BLOCK_ID,
+     create_fast_prefill_custom_backend,
+@@ -2474,10 +2477,17 @@ class GPUModelRunner(
+                     Mamba2AttentionMetadataBuilder,
+                     GDNAttentionMetadataBuilder,
+                     BailingLinearAttentionMetadataBuilder,
++                    # vtl: upstream PR #44296's third file. Without ShortConv here
++                    # the builder's num_accepted_tokens stays None, so
++                    # ShortConv.forward_cuda takes the non-spec kernel path AND
++                    # mamba_attn's decode_threshold collapses to 1 -- every spec row
++                    # is misclassified as a prefill and the conv_state rollback never
++                    # happens. Moves with short_conv/lfm2/mamba_utils.patch.
++                    ShortConvAttentionMetadataBuilder,
+                 ),
+             ):
+                 assert ubid is None, (
+-                    "UBatching not supported with GDN or linear attn yet"
++                    "UBatching not supported with GDN, linear attn or short_conv yet"
+                 )
+                 extra_attn_metadata_args = dict(
+                     num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
+@@ -2551,6 +2561,13 @@ class GPUModelRunner(
+                         DFlashProposer,
+                         Gemma4Proposer,
+                         ExtractHiddenStatesProposer,
++                        # vtl (issue #49112): without this a separate draft model
++                        # fell through to the `else` and was handed group 0's
++                        # common_attn_metadata unconditionally. For a HYBRID draft
++                        # group 0 is the SSM group, so its attention layers would
++                        # have indexed the conv block table (and vice versa) --
++                        # OOB, or silent cross-request state corruption.
++                        DraftModelProposer,
+                     ),
+                 ):
+                     if self.drafter.kv_cache_gid == kv_cache_gid:
+@@ -2558,7 +2575,9 @@ class GPUModelRunner(
+                 else:
+                     spec_decode_common_attn_metadata = cm
+             # Capture per-group block tables for multi-group proposers.
+-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
++            if self.speculative_config and isinstance(
++                self.drafter, (Step3p5MTPProposer, DraftModelProposer)
++            ):
+                 self.drafter.set_per_group_attn_metadata(
+                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
+                 )

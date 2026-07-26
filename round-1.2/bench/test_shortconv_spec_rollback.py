@@ -8,12 +8,19 @@ advances once per DRAFT token and commits the REJECTED ones too. Corruption
 compounds with sequence length, so the short scored trace still looks fine while
 the judge's long-context probe returns garbage -- which reads as two code paths.
 
-Three things must stay in lockstep or the server does not boot:
+FOUR things must stay in lockstep, or the server either does not boot or -- worse --
+boots and silently corrupts state:
   1. ``short_conv_state_shape`` accepts ``num_spec`` and widens the state,
   2. ``ShortConv.get_state_shape`` passes it (layer side),
   3. ``Lfm2ForCausalLM.get_mamba_state_shape_from_config`` passes it (planner side)
      -- without this the padding is computed for the narrow state and boot trips
      ``assert page_size_padded >= page_size``.
+  4. ``GPUModelRunner._build_attention_metadata`` names
+     ``ShortConvAttentionMetadataBuilder`` in the ``use_spec_decode`` gate that
+     injects ``num_accepted_tokens``. 1-3 shipped without 4 for two releases, which
+     made all of them INERT: the builder's ``num_accepted_tokens`` defaulted to
+     ``None``, so ``forward_cuda`` took the non-spec path and ``mamba_attn``'s
+     ``decode_threshold`` collapsed to 1 (every spec row misclassified as a prefill).
 
 Collected by ``make test-kernel`` (pytest, inside the image) and runnable standalone:
 
@@ -85,6 +92,25 @@ def test_decode_branch_passes_rollback_args():
     assert "spec_decode_active" in fwd, fwd
 
 
+def test_runner_injects_num_accepted_for_shortconv():
+    """The runner must name ShortConv in the gate, or all of the above is dead code.
+
+    ``_build_attn_group_metadata`` is a closure, so inspect the enclosing method.
+    """
+    if _SKIP:
+        import pytest
+
+        pytest.skip(_SKIP)
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    src = inspect.getsource(GPUModelRunner._build_attention_metadata)
+    assert "ShortConvAttentionMetadataBuilder" in src, (
+        "ShortConvAttentionMetadataBuilder missing from the use_spec_decode gate -- "
+        "num_accepted_tokens never reaches the short-conv builder and the rollback "
+        "in ShortConv.forward_cuda can never fire (upstream PR #44296, third file)"
+    )
+
+
 if __name__ == "__main__":
     if _SKIP:
         print(f"SKIP ({_SKIP})")
@@ -92,4 +118,5 @@ if __name__ == "__main__":
         test_state_shape_widens_by_num_spec()
         test_both_callers_pass_num_spec()
         test_decode_branch_passes_rollback_args()
+        test_runner_injects_num_accepted_for_shortconv()
         print("shortconv spec rollback contract ok")
