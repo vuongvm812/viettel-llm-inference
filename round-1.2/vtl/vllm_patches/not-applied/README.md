@@ -23,25 +23,27 @@ now has its own `gen` line — all three files must move together or boot raises
 `TypeError: short_conv_state_shape() got an unexpected keyword argument 'num_spec'` /
 `assert page_size_padded >= page_size`. Still **not runtime-verified**: it has never been booted.
 
-## `hybrid_draft_kv_groups.v0.25.0.patch` (4 files)
+## ~~`hybrid_draft_kv_groups.v0.25.0.patch`~~ — LANDED 2026-07-26, no longer parked
 
-Unfinished work toward letting a *hybrid* draft model (e.g. LFM2.5-350M drafting for the 1.2B
-target) survive vLLM's KV-cache-group assertions: isolates the drafter's layers into their own
-group (`kv_cache_utils.py`), relaxes `validate_same_kv_cache_group` (`llm_base_proposer.py`),
-compares mamba specs on everything except `shapes` (`worker/mamba_utils.py`), and allows
-`ShortConvAttentionMetadataBuilder` in the ubatch allowlist (`gpu_model_runner.py`).
+Superseded by the applied set. The hybrid separate draft model (LFM2.5-350M drafting for the
+1.2B target, vLLM issue #49112) now ships as `v0.26.0/{gpu_model_runner,
+llm_base_proposer_multigroup,mamba_groups_hybrid_draft}.patch`. Two of the parked hunks survived
+essentially verbatim (the `worker/mamba_utils.py` shapes-excluded spec comparison, and the
+`ShortConvAttentionMetadataBuilder` runner gate — which turned out to be upstream PR #44296's
+missing *third file*, not a ubatch allowlist entry, and its absence had made the whole shipped
+short-conv rollback inert). Two were dropped as unnecessary:
 
-**Status:** generated against **v0.25.0**. It happens to still apply to v0.26.0, but all four
-files drifted substantially upstream (+355/-87 lines), so a clean `patch` result here means very
-little — treat this as a design record, not a working patch. Never booted.
-
-## Prerequisite for what is left here
-
-`hybrid_draft_kv_groups` only matters for a *separate draft model*, which needs speculative
-decoding AND a draft whose layers land in one KV-cache group. `docker-compose.yaml` no longer
-forbids spec-decode (`--speculative-config=${VTL_SPEC:-None}`, plus `VTL_V2_RUNNER=0` because
-v0.26.0's V2 runner rejects ngram/suffix), but the no-model drafters — ngram / ngram_gpu /
-suffix — need none of this patch.
+- **`kv_cache_utils.py` drafter-layer isolation** (upstream #35062 / #49138) is a **no-op for this
+  model pair**. Draft and target have identical attention specs (8 KV heads x 64 head_size, same
+  fp8_e4m3, same block size), so `FullAttentionSpec` is `__eq__`-equal and their 12 attention
+  layers already share one `same_type_layers` key; the two conv specs already differ in `shapes`
+  and are already separate keys. The natural grouping is `[attn 12, conv_target 10, conv_draft 10]`
+  — every group spec-uniform, no patch needed. Sharing one attention group is also *desirable*:
+  one block table, one prefix-cache hash chain.
+- **the `llm_base_proposer.py` rewrite** was strictly weaker than what v0.26.0 already ships.
+  `Step3p5MTPProposer` (`v1/spec_decode/step3p5.py`) is a complete multi-group drafter; the applied
+  patch lifts its five members into `SpecDecodeBaseProposer` instead of hand-porting #49138, which
+  only resolved the metadata *builder* per layer and still fed one block table to every group.
 
 ## Re-checking
 

@@ -1,0 +1,32 @@
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index 7f611a2..a7e7504 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -438,7 +438,26 @@ def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSp
+             mamba_group_ids.append(i)
+             mamba_specs.append(kv_cache_spec)
+     assert len(mamba_group_ids) > 0, "no mamba layers in the model"
+-    assert all(mamba_specs[0] == spec for spec in mamba_specs)
++    # vtl (vLLM issue #49112): a HYBRID separate draft model contributes its own mamba
++    # group, and its `shapes` differ from the target's -- LFM2.5-350M drafting for the
++    # 1.2B target is conv_dim 1024 vs 2048. Full spec equality is stricter than any
++    # caller needs: everything read off the returned spec is `block_size` and
++    # `num_speculative_blocks`, which are cache_config/speculative_config globals and
++    # must still agree. Per-layer geometry (base addr, block stride, conv width, element
++    # size) comes from the LIVE state tensors in collect_mamba_copy_meta /
++    # initialize_from_forward_context, never from this spec.
++    #
++    # So compare every field EXCEPT `shapes`, plus the shapes' LENGTH -- one state tensor
++    # per layer for short_conv, two for mamba2 -- because `mamba_state_copy_funcs` is a
++    # single tuple taken from the TARGET model class and zipped against each layer's
++    # kv_cache. That length term is what makes a drafter from a different mamba family
++    # fail loudly here instead of silently mis-copying.
++    spec_keys = {
++        (dataclasses.replace(spec, shapes=()), len(spec.shapes)) for spec in mamba_specs
++    }
++    assert len(spec_keys) == 1, (
++        f"mamba KV cache groups differ in more than their state shapes: {mamba_specs}"
++    )
+     return mamba_group_ids, mamba_specs[0]
+ 
+ 
