@@ -24,12 +24,39 @@ whole, in one step, alongside in-flight decodes. This flag caps the scheduler's 
 8192 (control) / 4096 / 2048 / 1024 with `make ab`; watch the ITL **tail**, not just the mean,
 since gamma=2 punishes it. Adding it drops rollback compatibility with the v0.25.0 image.
 
+**Do NOT set `--stream-interval` > 1.** Its docstring is aimed straight at us ("a larger value
+(e.g. 10) reduces host overhead ... by batching multiple tokens before sending"), and the host
+saving is real. But `bench/replay.py:88-99` counts **SSE deltas**, not tokens
+(`n_tokens += 1` per content chunk), and computes `itl_mean = (last_tok - first_tok) /
+(n_tokens - 1)`. Batching 10 tokens per chunk therefore multiplies *measured* TPOT ~10x: from
+~4-6 ms to 40-60 ms, past the 10 ms ceiling, i.e. `s_tpot = 0` on every request. Note
+`out_tokens` prefers `usage.completion_tokens` but `itl_mean` does not — usage does not rescue
+it. Only revisit if the judge is confirmed to normalise ITL by token count.
+
 **Do NOT set `VLLM_USE_BREAKABLE_CUDAGRAPH=1`.** `vllm/config/vllm.py:1201-1207` maps it to
 `CompilationMode.NONE` ("Equivalent to -cc.mode=none"), which disables the whole torch.compile
 pipeline and takes `fuse_norm_quant` + `fuse_act_quant` — i.e. the custom kernel work — with it.
 LFM2 is not in its auto-enable allowlist. Same for `fuse_attn_quant`: it cannot match our
 dynamic per-token fp8 activation quant, and enabling it downgrades `cudagraph_mode` from
 FULL_AND_PIECEWISE to FULL.
+
+**Inert here, checked so nobody re-checks:** `--prefill-schedule-interval` lives in
+`DPEngineCoreProc`, which asserts `is_moe` — data-parallel only, dead at TP=1.
+`--max-num-partial-prefills` / `--long-prefill-token-threshold` only bite once prefills actually
+chunk, which they never do today (see the `--max-num-batched-tokens` note in compose); they
+become live only if `--max-num-scheduled-tokens` lands. `--mamba-cache-dtype` does control the
+short-conv state (`short_conv.py:576`, `lfm2.py:437`), but fp8 would save ~80 KB/step against
+~850 MB of weight traffic (~0.02%), leaves the derived block size at 16, and the vtl
+`bcx_conv_gate_quant` / `mul_quant` kernels assume a bf16 conv state — negligible upside, real
+risk. `--kv-cache-memory-bytes` / `--num-gpu-blocks-override` don't speed anything up but pin KV
+sizing, which removes memory-profiling variance from the boot-to-boot A/B noise floor.
+
+**Diagnostic worth wiring:** `--profiler-config` takes `delay_iterations`, `warmup_iterations`,
+`max_iterations` and `ignore_frontend`, i.e. a **bounded in-run torch profile** that needs
+neither `VLLM_TORCH_PROFILER_DIR` nor the `/start_profile` endpoint the served build lacks.
+v0.26.0 adds `capture_torch_profiler` (traces the cudagraph capture itself) and
+`detailed_trace_annotation`. This is the cheapest way to finally attribute the ~4 ms
+host-bound decode step.
 
 **Small regression to expect:** v0.26.0 adds `KVCacheManager.estimate_cached_tokens()` on the
 step that emits each request's first token (`scheduler.py:1805`), a Python loop over every
