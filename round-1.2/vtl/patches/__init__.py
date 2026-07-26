@@ -38,8 +38,7 @@ _MODULES: tuple[str, ...] = (
     "mul_quant",        # conv-gate fused mul+fp8-quant op (opt-in; wired directly in short_conv)
     "bcx_conv_gate",    # whole short-conv DECODE block in one kernel (needs mul_quant's staging buf)
     "kv_cache_manager",
-    "sched_policy",     # cache-aware SJF reorder (SGLang-inspired)
-    "sched_custom",     # conversation-aware + aged-SJF reorder (custom)
+    "sched_policy",
     "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)
     "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)

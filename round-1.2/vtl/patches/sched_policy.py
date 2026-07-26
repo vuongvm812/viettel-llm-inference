@@ -25,15 +25,23 @@ Set ``VTL_ENABLE_SCHED_POLICY=0`` to serve stock FCFS.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from collections import deque
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 _HUGE = 1 << 60  # push un-keyable requests to the back, never crash the sort
 _USAGE_TIGHT = 0.90  # KV usage above which we prefer requests that fit over pure SJF
 _mem_aware_engaged = 0  # how many schedule() calls hit the memory-aware branch
+
+# Anti-starvation aging: remaining-uncached-tokens sort key erodes by _ALPHA
+# tokens per second of wait time beyond _GUARD.  _ALPHA=0 disables aging.
+# Tunable via VTL_SCHED_AGING_ALPHA (sweep 0/10/15/20/25 on the box).
+_ALPHA: int = int(os.environ.get("VTL_SCHED_AGING_ALPHA", "0"))
+_GUARD: float = float(os.environ.get("VTL_SCHED_AGING_GUARD", "3.0"))
 
 
 def _safe_usage(kv_cache_manager) -> float:
@@ -76,6 +84,10 @@ def _reorder_waiting(waiting, kv_cache_manager) -> None:
     we don't admit a prompt that immediately forces a preempt/recompute). This is the
     single-node analog of SGLang's "cache-aware if balanced, else shortest-queue."
 
+    When ``VTL_SCHED_AGING_ALPHA`` is set to a non-zero value, the remaining-uncached
+    key erodes by ``_ALPHA`` tokens per second of wait time beyond ``_GUARD`` on each
+    schedule step — similar to the "aging" note in the ponytail below.
+
     Signals come from our custom ``VtlKVCacheManager`` (``plan_request``/``free_blocks``).
     If that patch is disabled, we fall back to the standalone cache-aware key so the two
     patches stay independent. Non-deque queues are left untouched; stable sort keeps FCFS
@@ -84,10 +96,18 @@ def _reorder_waiting(waiting, kv_cache_manager) -> None:
     if not isinstance(waiting, deque) or len(waiting) < 2:
         return
 
+    now = time.time() if _ALPHA else 0.0
+
+    def _aged(remaining: int, arrival: float) -> int:
+        if not _ALPHA or not arrival:
+            return remaining
+        waited = max(0.0, now - arrival - _GUARD)
+        return max(0, remaining - int(waited * _ALPHA))
+
     plan = getattr(kv_cache_manager, "plan_request", None)
     if plan is None:
         # kv_cache_manager patch off: pure cache-aware SJF, no memory signal available.
-        key = lambda r: (0, _remaining_prefill(r, kv_cache_manager))  # noqa: E731
+        key = lambda r: (0, _aged(_remaining_prefill(r, kv_cache_manager), getattr(r, "arrival_time", 0.0)))  # noqa: E731
     else:
         free = getattr(kv_cache_manager, "free_blocks", _HUGE)
         tight = _safe_usage(kv_cache_manager) >= _USAGE_TIGHT
@@ -105,7 +125,7 @@ def _reorder_waiting(waiting, kv_cache_manager) -> None:
             # too-big request sinks below every fitting one without disturbing SJF order
             # among peers. When slack, tight=False -> flag is always 0 -> pure SJF.
             fits = 0 if not tight or blocks_needed <= free else 1
-            return (fits, remaining)
+            return (fits, _aged(remaining, getattr(r, "arrival_time", 0.0)))
 
     ordered = sorted(waiting, key=key)
     waiting.clear()
@@ -133,16 +153,17 @@ def apply() -> None:
 
     Scheduler.schedule = mark_patched(schedule, original)
     log.info(
-        "vtl: sched_policy installed (cache-aware SJF, memory-aware when KV tight)"
+        "vtl: sched_policy installed (cache-aware SJF%s, memory-aware when KV tight)",
+        " + aging" if _ALPHA else "",
     )
 
 
-# ponytail: SJF starves long cold prompts under sustained short-prompt load. The
-# ceiling is bounded here -- the workload is ~82% cache-hit and multi-turn (few truly
-# cold long prompts), and chunked prefill still advances the head each step. Upgrade
-# path if a tail-TTFT regression shows up: add aging -- key = remaining_prefill
-# - alpha * (now - request.arrival_time) -- ~2 lines, no new infra. Not implemented:
-# no evidence it's needed and it adds a tuning knob (alpha) to babysit.
+# ponytail: SJF starves long cold prompts under sustained short-prompt load.
+# Set ``VTL_SCHED_AGING_ALPHA`` > 0 to erode the remaining-prefill key by
+# ``_ALPHA`` tokens per second of wait time beyond ``_GUARD``, so a cold turn-1
+# that has waited long enough sorts ahead of newly-arriving hot turn-2..6 requests.
+# Default 0 = no aging (identical to the original SJF-only behaviour).
+# See _reorder_waiting for the implementation.
 
 
 def _self_check() -> None:
