@@ -11,7 +11,7 @@ import logging
 import os
 from typing import Callable, NamedTuple
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 

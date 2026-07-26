@@ -65,7 +65,7 @@ import os
 
 from vtl.registry import register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _HUGE = 1 << 60  # un-plannable request: pushed to the back / treated as unlimited free

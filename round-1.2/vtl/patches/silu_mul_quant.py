@@ -31,7 +31,7 @@ import os
 
 from vtl.registry import register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 OP = "vllm_cuda::silu_and_mul_dynamic_per_token_quant"
 

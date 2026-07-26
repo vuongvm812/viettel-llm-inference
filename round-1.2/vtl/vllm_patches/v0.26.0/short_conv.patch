@@ -1,5 +1,5 @@
 diff --git a/vllm/model_executor/layers/mamba/short_conv.py b/vllm/model_executor/layers/mamba/short_conv.py
-index e7e36f2..561cd42 100644
+index e7e36f2..06b2656 100644
 --- a/vllm/model_executor/layers/mamba/short_conv.py
 +++ b/vllm/model_executor/layers/mamba/short_conv.py
 @@ -2,6 +2,9 @@
@@ -303,7 +303,7 @@ index e7e36f2..561cd42 100644
 +                )
 +            except Exception:
 +                self.out_proj._vtl_mul_quant_ok = False  # stop retrying; no log-spam
-+                logging.getLogger("vtl").exception(
++                logging.getLogger("vllm.vtl").exception(
 +                    "vtl: short-conv fp8 staging buffer alloc failed; using stock"
 +                )
 +                use_fused = use_conv_gate = False

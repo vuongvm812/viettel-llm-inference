@@ -41,7 +41,7 @@ from collections import deque
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 _HUGE = 1 << 60  # push un-keyable requests to the back, never crash the sort
 _USAGE_TIGHT = 0.90  # KV usage above which we prefer requests that fit over pure SJF
@@ -220,10 +220,17 @@ def apply() -> None:
 
 # ponytail: SJF starves long cold prompts under sustained short-prompt load. The
 # ceiling is bounded here -- the workload is ~82% cache-hit and multi-turn (few truly
-# cold long prompts), and chunked prefill still advances the head each step. Upgrade
-# path if a tail-TTFT regression shows up: add aging -- key = remaining_prefill
-# - alpha * (now - request.arrival_time) -- ~2 lines, no new infra. Not implemented:
-# no evidence it's needed and it adds a tuning knob (alpha) to babysit.
+# cold long prompts), and chunked prefill still advances the head each step. The obvious
+# upgrade -- aging, key = remaining_prefill - alpha * (now - request.arrival_time) -- is
+# NOT the win it looks like, and the ERS scoring function says so (PR #36, rejected):
+#   * s_ttft = clamp((400ms - TTFT) / 390ms, 0, 1)^2 is CONVEX in TTFT, and ERS averages
+#     it per request. Mean-of-convex rewards spread, so {20ms, 380ms} scores 0.476 and the
+#     equalised {200ms, 200ms} scores 0.263. SJF's skew IS the scoring-optimal shape.
+#   * Any request aging can promote has by definition waited long enough to be past the
+#     400ms ceiling, i.e. its s_ttft is already pinned at 0 and unrecoverable. Promoting it
+#     can only steal admission from a request that could still score.
+# Only revisit if the judge's ceiling or gamma changes, or if requests start hitting the
+# 120s timeout (they cannot at mean concurrency 2).
 
 # ponytail: the unchanged-queue guard caches at QUEUE granularity, not per request -- one
 # request joining the queue re-walks the prefix for all of them. Per-request memoisation is

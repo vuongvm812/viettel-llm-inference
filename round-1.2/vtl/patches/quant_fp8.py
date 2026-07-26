@@ -32,7 +32,7 @@ import os
 
 from vtl.registry import register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 IGNORE_ENV = "VTL_FP8_IGNORE"
 CHANNELWISE_ENV = "VTL_FP8_CHANNELWISE"

@@ -9,7 +9,7 @@ from __future__ import annotations
 import importlib
 import logging
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl")
 
 # Patch modules, in apply order. Add names here as they land.
 # The served model is LFM2.5-1.2B (Lfm2ForCausalLM): 16 layers = 10 short-conv + 6 GQA attention,

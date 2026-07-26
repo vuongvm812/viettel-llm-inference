@@ -2,12 +2,14 @@
 
 ## OPEN: on-box verification owed for the vLLM v0.26.0 upgrade (2026-07-26)
 
-The upgrade landed with only the off-box gates run. Everything below needs the H200 and is
-**not** optional — the fork image has not been built even once on v0.26.0.
+Row 1 is DONE (`VLLM_FORK_DIGEST=@sha256:c5bea8bf…` in `Makefile`, main image re-pinned to
+`@sha256:030c8c94…` in `docker-compose.yaml`). Rows 2–7 still need the H200 and are **not**
+optional. Off-box, `make check` and `bash vtl/vllm_patches/gen.sh` both pass as of 2026-07-26
+(all five v0.26.0 patches apply clean to a pristine `v0.26.0` tree, both parked patches too).
 
 | # | Command | Catches |
 |---|---|---|
-| 1 | `make vllm-fork PUSH=1` | patch/version drift; the `patch --dry-run` gate. Then set `VLLM_FORK_DIGEST=@sha256:<digest>` in the Makefile — `make push` refuses to ship without it. |
+| 1 | ~~`make vllm-fork PUSH=1`~~ **done** | patch/version drift; the `patch --dry-run` gate. Digest is pinned; `make push` refuses to ship without it. |
 | 2 | `make build && make up && make verify` | plugin loaded, quant methods registered, async scheduling on, **fusion-replaced-N-patterns count** (a drop = a fusion patch silently stopped matching) |
 | 3 | `make test-kernel` | the `vtl._C` kernels and the two hijacked `_C` op schemas |
 | 4 | `bench/eval_quality.py`, capturing against the **v0.25.0 image** then the v0.26.0 one | **The important one.** Greedy temp-0 output parity. Several vtl patches reimplement vLLM internals verbatim (`qk_norm_rope` replaces `Lfm2Attention.forward`; `greedy_sampler` replaces `Sampler.forward`), and their failure mode is wrong tokens with no exception. Nothing else catches that. |
@@ -17,18 +19,19 @@ The upgrade landed with only the off-box gates run. Everything below needs the H
 
 ### Leading latency candidate to sweep once the above is green
 
-**`--max-num-scheduled-tokens` — WIRED, defaulted to a no-op, needs sweeping.**
+**`--max-num-scheduled-tokens` — LIVE at 4096, still unmeasured. This is the one behavioural
+change in the artifact that no measurement backs.**
 `--max-num-batched-tokens=8192` does **not** chunk our prefills: the longest prompt is 4,281
 tokens, so every turn-1 prefill runs whole, in one step, alongside in-flight decodes. This flag
 caps the scheduler's per-step budget *without* resizing worker buffers / compile ranges /
 `max_in_flight_tokens`.
 
-It is now in `docker-compose.yaml` as `${VTL_MAX_SCHED_TOKENS:-8192}`. The default 8192 equals
-`max_num_batched_tokens`, which is exactly what the scheduler used when the flag was unset
-(`scheduler.py:111-113`) — so **the submitted artifact's behaviour is unchanged until someone
-sweeps it**. Sweep is pure env, no file edit:
+`docker-compose.yaml` now ships `${VTL_MAX_SCHED_TOKENS:-4096}`. 4096 is **below** the longest
+prompt, so it does change behaviour: every turn-1 prefill takes 2 scheduler steps instead of 1.
+It is a weak setting for its own stated purpose — it shaves the worst step from 4,281 to 4,096
+tokens, i.e. 4% — so the sweep should bracket it on both sides. Pure env, no file edit:
 
-    VTL_MAX_SCHED_TOKENS=4096 make ab
+    VTL_MAX_SCHED_TOKENS=8192 make ab   # the "flag absent" arm == pre-v0.26.0 behaviour
     VTL_MAX_SCHED_TOKENS=2048 make ab
     VTL_MAX_SCHED_TOKENS=1024 make ab
 
@@ -59,21 +62,38 @@ FULL_AND_PIECEWISE to FULL.
 
 **Inert here, checked so nobody re-checks:** `--prefill-schedule-interval` lives in
 `DPEngineCoreProc`, which asserts `is_moe` — data-parallel only, dead at TP=1.
-`--max-num-partial-prefills` / `--long-prefill-token-threshold` only bite once prefills actually
-chunk, which they never do today (see the `--max-num-batched-tokens` note in compose); they
-become live only if `--max-num-scheduled-tokens` lands. `--mamba-cache-dtype` does control the
+`--max-num-partial-prefills` / `--long-prefill-token-threshold` bite only once prefills actually
+chunk. `--max-num-scheduled-tokens=4096` landed, so they are now technically live — but barely:
+at 4096 a 4,281-token prompt spills 185 tokens into a second step, so there is one partial
+prefill for one step and nothing for these two flags to arbitrate. They only become interesting
+if the sweep above settles on 2048 or 1024. `--mamba-cache-dtype` does control the
 short-conv state (`short_conv.py:576`, `lfm2.py:437`), but fp8 would save ~80 KB/step against
 ~850 MB of weight traffic (~0.02%), leaves the derived block size at 16, and the vtl
 `bcx_conv_gate_quant` / `mul_quant` kernels assume a bf16 conv state — negligible upside, real
 risk. `--kv-cache-memory-bytes` / `--num-gpu-blocks-override` don't speed anything up but pin KV
 sizing, which removes memory-profiling variance from the boot-to-boot A/B noise floor.
 
-**Diagnostic worth wiring:** `--profiler-config` takes `delay_iterations`, `warmup_iterations`,
-`max_iterations` and `ignore_frontend`, i.e. a **bounded in-run torch profile** that needs
-neither `VLLM_TORCH_PROFILER_DIR` nor the `/start_profile` endpoint the served build lacks.
-v0.26.0 adds `capture_torch_profiler` (traces the cudagraph capture itself) and
-`detailed_trace_annotation`. This is the cheapest way to finally attribute the ~4 ms
-host-bound decode step.
+**Diagnostic worth wiring — mechanism CORRECTED 2026-07-26.** `--profiler-config` takes
+`delay_iterations`, `warmup_iterations`, `max_iterations`, `active_iterations` and
+`ignore_frontend`, i.e. a **bounded in-run torch profile**. It does **not** remove the need for
+`/start_profile` — that endpoint is still the trigger. What it does is *mount* it:
+`entrypoints/serve/profile/api_router.py:36-44` only calls `app.include_router(router)` when
+`profiler_config.profiler is not None`. That is exactly why the served build 404s today —
+`VLLM_TORCH_PROFILER_DIR` is unset, so the route was never registered. So:
+
+    --profiler-config='{"profiler":"torch","torch_profiler_dir":"/profile",
+                        "ignore_frontend":true,"delay_iterations":200,"max_iterations":50}'
+    curl -XPOST :8000/start_profile   # …replay… ; curl -XPOST :8000/stop_profile
+
+v0.26.0 adds `capture_torch_profiler` (traces cudagraph capture itself) and
+`detailed_trace_annotation`. `docker-compose.profile.yaml` deliberately does **not** wire this —
+a compose overlay's `command:` replaces the base list rather than appending, so it would mean
+duplicating every serve flag; prefer the vtl profiler and reach for this only for vLLM's own
+annotations. **Scope caveat, same as `make profile`:** the consumers are
+`gpu_worker.py` and `async_llm.py` — worker and frontend. `Scheduler.schedule()` is not
+instrumented by either, so the three elisions above still ship unmeasured, and this cannot
+attribute scheduler-side host time. It *can* attribute the ~4 ms host-bound decode step inside
+`execute_model`, which is the bigger half.
 
 **Dead scheduler work, now elided (2026-07-26).** Three pieces of per-step/per-request work that
 this configuration computed and no consumer read. All are microsecond-scale — this is dead-work
@@ -114,6 +134,47 @@ logit copy from the sample path, #48143 an allocation from the SSM metadata buil
 iteration logging off the engine-core loop) plus staying current. If step 5 shows a regression,
 the rollback is the digest in `Makefile` (image-level only — `vtl/vllm_patches/v0.25.0/` was
 deleted, so a source-level rollback needs `git revert`).
+
+### Compile-knob survey, 2026-07-26 (read before touching `--compilation-config`)
+
+Two settle old questions, one is the only unset knob left:
+
+**`-O3` is byte-identical to the `-O2` default.** `OPTIMIZATION_LEVEL_03` and
+`OPTIMIZATION_LEVEL_02` are the same dict, field for field (`vllm/config/vllm.py:252-296`). The
+`-O3` in `docker-compose.yaml` buys exactly nothing and costs exactly nothing — do not attribute
+any measurement to it, and do not "upgrade" to it as a fix. (`-O3` parses to
+`--optimization-level 3`, a field entirely separate from `--compilation-config`
+(`utils/argparse_utils.py:322-326`), so the two flags do **not** fight; the explicit pass_config
+wins because level defaults only fill fields still `None`.)
+
+**`fuse_attn_quant` cannot turn itself on.** The level dicts set it to `IS_QUANTIZED`, and
+`IS_QUANTIZED = False` is hardcoded at `vllm/config/vllm.py:97-104` pending issue #25689. The
+existing "do not enable it" warning is still correct, just unreachable by accident.
+
+**`use_inductor_graph_partition` — the one compile knob nothing sets, forced `False` by every
+optimization level.** With it off, the FX graph is split at `_attention_ops`
+(`config/compilation.py:764-780`), which includes **`vllm::short_conv`** — so on LFM2 the graph
+splits at all 16 layers (10 conv + 6 attn), and every custom pass runs per-subgraph. With it on,
+partitioning moves to Inductor codegen *after* passes and fusions, so `fuse_norm_quant` /
+`fuse_act_quant` see the whole graph (`config/compilation.py:520-531`).
+
+Honest prior: **probably a null result.** Walk an LFM2 layer — `operator_norm → in_proj →
+short_conv → out_proj → ffn_norm → w13 → silu_mul → down_proj` — and both fusions we depend on
+already sit inside one subgraph; the conv-gate/out_proj fusion is a hand-written vtl kernel, not
+an Inductor pass, so it does not care either way. Run it anyway because it is one JSON key and
+`make verify` already prints the number that would move:
+
+    -cc='{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true},
+          "cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,4,8,16,32],
+          "use_inductor_graph_partition":true}'
+
+Read the **fusion-replaced-N-patterns** count first: unchanged ⇒ no cross-boundary fusion
+existed ⇒ stop, do not bother with `make ab`. Needs torch ≥ 2.9 (`compilation.py:994-1001`).
+
+**Not worth it: filling the `cudagraph_capture_sizes` gaps.** `[1,2,4,8,16,32]` pads a batch of
+5-7 up to 8. Peak concurrency on this trace is ~8 and the mean is 2, and decode is weight-traffic
+bound (852 MB/step) where batch size barely moves the GPU term. 16 and 32 are never reached at
+all; dropping them saves capture time and VRAM, not latency.
 
 
 ## Hardware
@@ -241,7 +302,7 @@ For each successful request:
 | `--max-num-seqs` | 70 | Matches 70 conversations; peak concurrency under Poisson is lower |
 | `cudagraph_capture_sizes` | `[1,2,4,8,16,32]` | Tune for actual batch size distribution |
 | `cudagraph_mode` | `FULL_AND_PIECEWISE` | PIECEWISE avoids recompilation for unused sizes |
-| Speculative decoding | OFF | ngram (free, no weights) or eagle/medusa (needs draft heads). Greedy temp=0 workload is ideal for ngram |
+| Speculative decoding | **FORBIDDEN** | Not a tuning knob. A submission carrying `--speculative-config` was flagged as cheating, so the ngram/prompt-lookup win (output-identical at temp 0, ~7.4 score points per saved ms) is off the table regardless of how good it looks. See the ban in `docker-compose.yaml`; `vtl/vllm_patches/not-applied/` holds the inert prerequisite patches. |
 
 ### Frontend (per-request overhead)
 
@@ -274,7 +335,7 @@ For each successful request:
 
 | Constraint | Value | Impact |
 |-----------|-------|--------|
-| VRAM budget | 18 GB (`--gpu-memory-utilization=0.95`) | Model ~1.2 GB FP8, KV ~2 GB FP8, CUDA graph cache ~2-3 GB, headroom ~10 GB |
+| VRAM budget | 18 GB (`--gpu-memory-utilization=0.90`) | Model ~1.2 GB FP8, KV ~2 GB FP8, CUDA graph cache ~2-3 GB, headroom ~10 GB |
 | Host RAM | 8 GB | Jemalloc `decay:-1` means RSS only grows — validate peak RSS before submitting |
 | vCPU | 3 | Tokio workers = 2-3 (trade decode vs HTTP) |
 | `/dev/shm` | Billed against 8 GB RAM cap | Keep `shm_size` low (TP=1 needs little) |
