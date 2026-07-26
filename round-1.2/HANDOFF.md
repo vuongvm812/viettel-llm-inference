@@ -15,6 +15,28 @@ The upgrade landed with only the off-box gates run. Everything below needs the H
 | 6 | peak RSS under the 8 GB cap | jemalloc runs `decay:-1` (never returns pages) and v0.26.0 bumps Transformers to 5.13.0 |
 | 7 | `python3 -m pytest` of `vtl/patches/qk_norm_rope.py` inside the image | its numeric parity check only runs where there is a GPU **and** a model dir; confirm it actually executes rather than printing "skipped" |
 
+### Leading latency candidate to sweep once the above is green
+
+**`--max-num-scheduled-tokens`** (new CLI flag in v0.26.0). `--max-num-batched-tokens=8192` does
+**not** chunk our prefills — the longest prompt is 4,281 tokens, so every turn-1 prefill runs
+whole, in one step, alongside in-flight decodes. This flag caps the scheduler's per-step budget
+*without* resizing worker buffers / compile ranges / `max_in_flight_tokens`. Sweep
+8192 (control) / 4096 / 2048 / 1024 with `make ab`; watch the ITL **tail**, not just the mean,
+since gamma=2 punishes it. Adding it drops rollback compatibility with the v0.25.0 image.
+
+**Do NOT set `VLLM_USE_BREAKABLE_CUDAGRAPH=1`.** `vllm/config/vllm.py:1201-1207` maps it to
+`CompilationMode.NONE` ("Equivalent to -cc.mode=none"), which disables the whole torch.compile
+pipeline and takes `fuse_norm_quant` + `fuse_act_quant` — i.e. the custom kernel work — with it.
+LFM2 is not in its auto-enable allowlist. Same for `fuse_attn_quant`: it cannot match our
+dynamic per-token fp8 activation quant, and enabling it downgrades `cudagraph_mode` from
+FULL_AND_PIECEWISE to FULL.
+
+**Small regression to expect:** v0.26.0 adds `KVCacheManager.estimate_cached_tokens()` on the
+step that emits each request's first token (`scheduler.py:1805`), a Python loop over every
+allocated block in every KV group. It is NOT gated by `--disable-log-stats` (`PrefillStats()` is
+built unconditionally at `request.py:197`). At our ~4.7k max context that is ~600 trivial
+iterations once per request, landing in TTFT — tens of microseconds, but one-directional.
+
 **Expectation management:** the upgrade's original justification (#46384 `--prefix-match-unit`)
 was found to be a **no-op on this model** — see the derivation in `docker-compose.yaml`. Do not
 expect a TTFT win. What v0.26.0 actually buys is incidental host-side work (#48641 drops an fp32
