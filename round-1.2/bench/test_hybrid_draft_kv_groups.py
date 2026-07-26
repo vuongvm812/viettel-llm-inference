@@ -168,6 +168,60 @@ def test_get_mamba_groups_still_rejects_a_different_mamba_family():
     raise AssertionError("mixed mamba families must not be accepted")
 
 
+def test_draft_hf_overrides_is_always_a_callable():
+    """The invariant behind the boot failure below. Not a quirk of our config."""
+    if _SKIP:
+        import pytest
+
+        pytest.skip(_SKIP)
+    from vllm.config.speculative import SpeculativeConfig
+
+    # Even when the TARGET's overrides are a plain dict (or absent), the draft's are
+    # composed into a callable -- so any code path that requires a dict is broken for
+    # every draft model, not just this one.
+    for target_overrides in (None, {}, {"some_key": 1}):
+        composed = SpeculativeConfig.compose_draft_hf_overrides(target_overrides)
+        assert callable(composed), (target_overrides, composed)
+        assert not isinstance(composed, dict)
+
+
+def test_get_quant_config_tolerates_a_callable_hf_overrides():
+    """A quantized drafter must not be a hard boot failure.
+
+    Stock v0.26.0 raised ValueError("hf_overrides must be a dict ...") whenever a
+    model's checkpoint carried no embedded quantization_config -- i.e. exactly the
+    online/RTN case that `--speculative-config '{"quantization":"vtl_w4a8"}'` needs
+    over a bf16 350M checkpoint. Combined with the test above, that made a quantized
+    draft model impossible. Asserts only that THIS failure mode is gone; any other
+    outcome (success, or a later unrelated error) is fine.
+    """
+    if _SKIP:
+        import pytest
+
+        pytest.skip(_SKIP)
+    import tempfile
+    from types import SimpleNamespace
+
+    from vllm.model_executor.model_loader.weight_utils import get_quant_config
+
+    with tempfile.TemporaryDirectory() as empty_model_dir:
+        model_config = SimpleNamespace(
+            quantization="fp8",  # always registered; get_config_filenames() is []
+            hf_config=SimpleNamespace(),  # no embedded quantization_config
+            hf_overrides=lambda cfg: cfg,  # what a draft ModelConfig always has
+            quantization_config=None,
+            model=empty_model_dir,
+            revision=None,
+        )
+        load_config = SimpleNamespace(download_dir=None)
+        try:
+            get_quant_config(model_config, load_config)  # type: ignore[arg-type]
+        except ValueError as exc:
+            assert "hf_overrides must be a dict" not in str(exc), exc
+        except Exception:
+            pass  # unrelated failure from the stub; not what this guards
+
+
 if __name__ == "__main__":
     if _SKIP:
         print(f"SKIP ({_SKIP})")
@@ -176,4 +230,6 @@ if __name__ == "__main__":
         test_grouping_needs_no_drafter_isolation()
         test_get_mamba_groups_allows_differing_state_shapes()
         test_get_mamba_groups_still_rejects_a_different_mamba_family()
+        test_draft_hf_overrides_is_always_a_callable()
+        test_get_quant_config_tolerates_a_callable_hf_overrides()
         print("hybrid draft kv group contract ok")

@@ -53,6 +53,11 @@ gen v1/worker/gpu_model_runner.py               gpu_model_runner
 # with gpu_model_runner, which registers the per-group block tables.
 gen v1/spec_decode/llm_base_proposer.py         llm_base_proposer_multigroup
 gen v1/worker/mamba_utils.py                    mamba_groups_hybrid_draft
+# Paired with the draft model too: a DRAFT ModelConfig's hf_overrides is always a callable, and
+# get_quant_config RAISED on anything but a dict -- which made a quantized drafter
+# (--speculative-config '{"quantization":"vtl_w4a8"}') a hard boot failure. Without this the
+# 350M drafter loads bf16, costs ~2x per draft token, and the arm cannot win.
+gen model_executor/model_loader/weight_utils.py draft_quant_hf_overrides
 # V2 model runner (VLLM_USE_V2_MODEL_RUNNER=1): greedy argmax fast path in the V2
 # sampler, and the dead-num_accepted-scatter elision in the hybrid model state.
 gen v1/worker/gpu/sample/sampler.py             v2_greedy_sampler

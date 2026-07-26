@@ -1,0 +1,24 @@
+diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
+index db161a5..29b4f70 100644
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -294,10 +294,15 @@ def get_quant_config(
+     # hf_overrides
+     hf_overrides = model_config.hf_overrides
+     if not isinstance(hf_overrides, dict):
+-        raise ValueError(
+-            "hf_overrides must be a dict for get_quant_config "
+-            "to get the quantization config from it."
+-        )
++        # vtl: a DRAFT model's hf_overrides is ALWAYS a callable --
++        # SpeculativeConfig.compose_draft_hf_overrides returns
++        # SpeculativeConfig.hf_config_override even when the target's overrides are a
++        # plain dict -- and a callable cannot carry either of the two keys read below.
++        # Raising here made `--speculative-config '{"quantization": ...}'` impossible for
++        # every draft model whose checkpoint has no embedded quantization_config, i.e.
++        # exactly the online/RTN case. Treat a non-dict as "no overrides" and fall through
++        # to the online / default-config paths.
++        hf_overrides = {}
+     quantization_config_file = hf_overrides.get("quantization_config_file", None)
+     if quantization_config_file is not None:
+         if hasattr(quant_cls, "from_config_file"):
