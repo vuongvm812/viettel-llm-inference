@@ -1,0 +1,50 @@
+name: Bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      workdir:
+        description: 'Round directory (e.g. round-1.2)'
+        required: true
+        default: 'round-1.2'
+        type: string
+      image_digest:
+        description: 'Image digest (sha256:...)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  bench:
+    runs-on: [self-hosted, rtx3060]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bench deps
+        run: pip install -q -r '${{ inputs.workdir }}/bench/requirements.txt'
+
+      - name: Start server
+        run: make ci-up ROUND='${{ inputs.workdir }}' IMAGE_DIGEST='${{ inputs.image_digest }}'
+
+      - name: Run bench
+        working-directory: ${{ inputs.workdir }}
+        run: make bench TARGET=http://localhost:8000
+
+      - name: Report
+        if: always()
+        working-directory: ${{ inputs.workdir }}
+        run: python3 bench/_ci_report.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            ${{ inputs.workdir }}/bench-open.json
+            ${{ inputs.workdir }}/bench-closed-*.json
+
+      - name: Stop server
+        if: always()
+        run: make ci-down ROUND='${{ inputs.workdir }}' || true

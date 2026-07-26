@@ -1,0 +1,32 @@
+name: Bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      workdir:
+        description: 'Round directory (e.g. round-1.2)'
+        required: true
+        default: 'round-1.2'
+        type: string
+      image_digest:
+        description: 'Image digest (sha256:...)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  bootstrap:
+    runs-on: [self-hosted, rtx3060]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start server
+        run: make ci-up ROUND='${{ inputs.workdir }}' IMAGE_DIGEST='${{ inputs.image_digest }}'
+
+      - name: Health OK
+        run: echo "Image booted successfully"
+
+      - name: Stop server
+        if: always()
+        run: make ci-down ROUND='${{ inputs.workdir }}' || true

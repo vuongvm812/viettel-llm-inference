@@ -1,0 +1,15 @@
+name: viettel-llm-ci
+
+services:
+  runner:
+    image: myoung34/github-runner:ubuntu-22.04
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REPO_URL: https://github.com/vuongvm812/viettel-llm-inference
+      ACCESS_TOKEN: ${GH_PAT}
+      RUNNER_SCOPE: repo
+      EPHEMERAL: 0
+      LABELS: rtx3060
+      DOCKER_HOST: unix:///var/run/docker.sock
