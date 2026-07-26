@@ -1,5 +1,5 @@
 diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
-index f8b52d0..01a3aa5 100644
+index f8b52d0..8bdf049 100644
 --- a/vllm/v1/spec_decode/llm_base_proposer.py
 +++ b/vllm/v1/spec_decode/llm_base_proposer.py
 @@ -1,6 +1,7 @@
@@ -41,7 +41,7 @@ index f8b52d0..01a3aa5 100644
          self.eagle3_use_aux_hidden_state: bool = (
              self._get_eagle3_use_aux_hidden_state_from_config()
          )
-@@ -390,23 +406,56 @@ class SpecDecodeBaseProposer:
+@@ -390,23 +406,66 @@ class SpecDecodeBaseProposer:
                  positions = positions[0]
              self.positions[:num_tokens] = positions
  
@@ -87,6 +87,16 @@ index f8b52d0..01a3aa5 100644
 +        per_layer: dict[str, torch.Tensor] = {}
 +        for attn_group in self.draft_attn_groups:
 +            gid = attn_group.kv_cache_group_id
++            if attn_group.backend.is_ssm():
++                # mamba_attn addresses state by BLOCK TABLE and never reads
++                # cm.slot_mapping, so give SSM layers the primary view rather than
++                # allocating a second buffer and copying into it every draft step.
++                # Passing the primary mapping (not a zero buffer) also keeps the
++                # value meaningful should a future backend start reading it.
++                view = self._slot_mapping_buffer[:num_tokens]
++                for layer_name in attn_group.layer_names:
++                    per_layer[layer_name] = view
++                continue
 +            buf = self._slot_mapping_buffer_for(gid)
 +            # The PRIMARY group always prefers the caller's mapping: the proposer
 +            # rewrites it (set_inputs_first_pass -> extend_all_queries_by_N), so the
@@ -108,7 +118,7 @@ index f8b52d0..01a3aa5 100644
  
      def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
          """Initialize cudagraph dispatcher keys for the drafter.
-@@ -776,7 +825,8 @@ class SpecDecodeBaseProposer:
+@@ -776,7 +835,8 @@ class SpecDecodeBaseProposer:
      ) -> torch.Tensor:
          """Update positions, slot mappings, and sequence metadata for the
          next draft step. Returns the updated positions tensor."""
@@ -118,7 +128,7 @@ index f8b52d0..01a3aa5 100644
          if self.uses_mrope:
              out_pos = self.mrope_positions[0, :batch_size]
          elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-@@ -816,6 +866,39 @@ class SpecDecodeBaseProposer:
+@@ -816,6 +876,46 @@ class SpecDecodeBaseProposer:
          if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
              common_attn_metadata.seq_lens_cpu_upper_bound += 1
  
@@ -136,6 +146,13 @@ index f8b52d0..01a3aa5 100644
 +            for attn_group in self.draft_attn_groups:
 +                gid = attn_group.kv_cache_group_id
 +                if gid == self.kv_cache_gid:
++                    continue
++                if attn_group.backend.is_ssm():
++                    # SSM backends address state by BLOCK TABLE, never by slot
++                    # mapping (mamba_attn derives state_indices_tensor from
++                    # block_table_tensor and ignores cm.slot_mapping entirely).
++                    # Recomputing it for them is a per-draft-step gather on a
++                    # 3-vCPU host that nothing reads.
 +                    continue
 +                block_table = self._per_group_block_tables.get(gid)
 +                if block_table is None:
@@ -158,7 +175,7 @@ index f8b52d0..01a3aa5 100644
          return positions
  
      def set_inputs_first_pass(
-@@ -995,9 +1078,28 @@ class SpecDecodeBaseProposer:
+@@ -995,9 +1095,36 @@ class SpecDecodeBaseProposer:
      ) -> tuple[list[object], dict[str, object]]:
          per_group_attn_metadata: list[object] = []
          per_layer_attn_metadata: dict[str, object] = {}
@@ -175,7 +192,15 @@ index f8b52d0..01a3aa5 100644
 +            if gid != self.kv_cache_gid and gid in self._per_group_block_tables:
 +                cm = copy(common_attn_metadata)
 +                cm.block_table_tensor = self._per_group_block_tables[gid][:num_reqs]
-+                if gid in self._per_group_slot_mappings:
++                # SSM groups address state purely by block table; mamba_attn never
++                # reads cm.slot_mapping. Leaving the primary group's mapping in place
++                # for them avoids a length mismatch, because the proposer EXTENDS the
++                # query (extend_all_queries_by_N) while the runner-registered mapping
++                # is still the target step's length.
++                if (
++                    not attn_group.backend.is_ssm()
++                    and gid in self._per_group_slot_mappings
++                ):
 +                    sm = self._per_group_slot_mappings[gid]
 +                    if sm.shape[0] >= num_actual_tokens:
 +                        sm = sm[:num_actual_tokens]
@@ -188,7 +213,7 @@ index f8b52d0..01a3aa5 100644
              )
              per_group_attn_metadata.append(attn_metadata)
              for layer_name in attn_group.layer_names:
-@@ -1153,6 +1255,13 @@ class SpecDecodeBaseProposer:
+@@ -1153,6 +1280,13 @@ class SpecDecodeBaseProposer:
              slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
              causal=True,
              dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
@@ -202,7 +227,7 @@ index f8b52d0..01a3aa5 100644
          )
  
          return (
-@@ -1264,6 +1373,9 @@ class SpecDecodeBaseProposer:
+@@ -1264,6 +1398,9 @@ class SpecDecodeBaseProposer:
              slot_mapping=common_attn_metadata.slot_mapping[token_indices],
              causal=True,
              dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
@@ -212,7 +237,7 @@ index f8b52d0..01a3aa5 100644
          )
  
          return spec_common_attn_metadata, token_indices
-@@ -1689,27 +1801,18 @@ class SpecDecodeBaseProposer:
+@@ -1689,27 +1826,18 @@ class SpecDecodeBaseProposer:
          return use_aux_hidden_state
  
      def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
@@ -251,7 +276,7 @@ index f8b52d0..01a3aa5 100644
  
      def initialize_attn_backend(
          self,
-@@ -1719,59 +1822,100 @@ class SpecDecodeBaseProposer:
+@@ -1719,59 +1847,100 @@ class SpecDecodeBaseProposer:
          """
          Initialize AttentionGroups for draft layers using kv_cache_config.
          Called from the model runner's initialize_metadata_builders.
