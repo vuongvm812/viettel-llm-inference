@@ -27,7 +27,7 @@ services:
     # Every OTHER flag and env var here is still deliberately version-agnostic; keep new
     # version-specific ones to a minimum, and land them only in the same commit that re-pins
     # this digest.
-    image: unseenablefuture/awesome-badger@sha256:030c8c94cf3e099891b5deeb4bda8f6d74ebb831bfb2c928467c204707c36148 # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:c1ade3ac2d1bbf150f9fdbdd1dfaa19875636606bf47881d5990e3aed5ec9e3a # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -141,7 +141,7 @@ services:
       # "ngram_gpu" for the other chain drafters -- all three are chain at the verify seam,
       # so method= is the whole A/B.
       #
-      # - --speculative-config={"method":"ngram_gpu","num_speculative_tokens":3,"prompt_lookup_min":3,"prompt_lookup_max":5}
+      - --speculative-config={"method":"ngram_gpu","num_speculative_tokens":3,"prompt_lookup_min":3,"prompt_lookup_max":5}
       #
       # GO/NO-GO BEFORE SHIPPING IT, both mandatory:
       #   (a) long-context probe token-identical spec ON vs OFF at temperature 0. This is the
@@ -229,7 +229,7 @@ services:
       # !! Set this to "0" whenever the --speculative-config line above is uncommented. ngram /
       # ngram_gpu / suffix are V1-runner-only in v0.26.0 and V2 RAISES at startup on them, so
       # the two must move together or nothing binds :8000.
-      VLLM_USE_V2_MODEL_RUNNER: "1"
+      VLLM_USE_V2_MODEL_RUNNER: "0"
       VTL_V2_GREEDY_FASTPATH: "1"        # argmax short-circuit for provably-greedy batches
       VTL_V2_GREEDY_ARGMAX_KERNEL: "0"   # reserved: fused argmax .cu not built; torch.argmax is
                                          #   already a fused reduction -- flip on only if a profile wins

@@ -105,16 +105,18 @@ def _cascade_dead(mgr) -> bool:
 
     Resolved once, then cached on the manager instance. Two sources, in order:
 
-    1. The handshake: ``sched_policy``'s ``schedule()`` wrapper holds the ``Scheduler``, whose
-       ``use_v2_model_runner`` (``scheduler.py:290``) is authoritative, and stashes it as
-       ``_vtl_v2`` before calling the stock ``schedule()`` -- so the flag is in place before
-       the first walk. Absent if ``VTL_ENABLE_SCHED_POLICY=0``.
-    2. The env, but only when explicitly set (see ``_v2_from_env``). This keeps the elision
-       alive when sched_policy is toggled off to A/B the reorder.
+    1. An explicit ``_vtl_v2`` set on the manager by something that knows better. Nothing sets
+       it today -- ``sched_policy`` used to, from the Scheduler's authoritative
+       ``use_v2_model_runner`` (``scheduler.py:290``), but that handshake was reverted along
+       with the rest of that commit's per-step scheduler work. The hook stays because it is
+       one ``getattr`` and it is how a future caller overrides the env.
+    2. The env, but only when explicitly set (see ``_v2_from_env``). This is the live source:
+       ``docker-compose.yaml`` always sets ``VLLM_USE_V2_MODEL_RUNNER`` to a literal, so the
+       elision resolves on the first call.
 
     FAILS CLOSED: unresolved -> False -> do the stock walk. A wrong True would silently break
     V1 cascade attention; a wrong False only costs the walk we wanted to skip. The unresolved
-    case is deliberately NOT cached, so a later handshake still lands.
+    case is deliberately NOT cached, so a later override still lands.
     """
     cached = getattr(mgr, "_vtl_cascade_dead", None)
     if cached is not None:

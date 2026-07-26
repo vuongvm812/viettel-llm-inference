@@ -114,14 +114,19 @@ removal, not a win, and an indistinguishable A/B is the expected result, not a f
   consumer is `gpu_model_runner.py:4207`, i.e. **V1** cascade attention. The V2 runner never
   reads it. Not already free either: prefix caching + 2 groups selects
   `HybridKVCacheCoordinator`, which does not override the method, so `FullAttentionManager` walks
-  the request's blocks counting `ref_cnt`. Elided only when V2 is *proven* live — `sched_policy`
-  hands the manager the Scheduler's own `use_v2_model_runner`, with an explicit-env fallback and
-  fail-closed-to-stock if neither resolves.
-- Our own waiting-queue reorder ran on every step with no guard. It now skips when the running
-  cap is hit (nothing can be admitted) and when the queue is one we already sorted, bounded by an
-  8-step staleness TTL. Steady-state effect here is ~0 because `waiting` is almost always shorter
-  than 2; the value is the burst case, where a backed-up queue was paying n `find_longest_cache_hit`
-  block-hash walks per step to re-derive the order it already had.
+  the request's blocks counting `ref_cnt`. Elided only when V2 is *proven* live — read from an
+  explicitly-set `VLLM_USE_V2_MODEL_RUNNER` (`docker-compose.yaml` always sets it to a literal),
+  fail-closed-to-stock if it does not resolve.
+- **REVERTED 2026-07-26.** Guards on our own waiting-queue reorder — skip when the running cap
+  is hit, plus a queue fingerprint with an 8-step re-sort TTL, plus a `sched_policy`→manager
+  handshake carrying the Scheduler's `use_v2_model_runner`. Measured **slower** and were backed
+  out; `sched_policy.py` is again the pre-guard reorder (only the `len < 2` return). They could
+  not have paid for themselves: `waiting` is almost always shorter than 2 at this concurrency,
+  so `len < 2` fired first on nearly every step and the guards only added per-step work to the
+  path they were meant to shorten. The burst case they targeted does not occur on this trace
+  (mean 2 / peak 8 concurrent generations). The elision above lost only its handshake source
+  and still resolves from the env. Do not re-add caching here without a queue deep enough to
+  sort in the first place.
 
 **`make profile` was broken and is fixed (2026-07-26).** `vtl/patches/profiler.py` imported the
 **V1** `GPUModelRunner` while the server runs `VLLM_USE_V2_MODEL_RUNNER=1`, so the worker built
@@ -176,8 +181,9 @@ a hybrid LFM2 target cannot host. So spec-decode here means the **V1** runner. T
 (Literal edits, not env interpolation — see the `--max-num-scheduled-tokens` note above for
 why this file carries no `${VAR}`.) Flipping to V1 makes `v2_greedy_sampler.patch` + `mamba_hybrid_postprocess.patch` inert and
 re-activates `vtl/patches/greedy_sampler.py` (the V1 fast path, already spec-safe). The
-`kv_cache_manager` common-prefix elision self-disables under V1 via the `sched_policy`
-handshake, which is correct — V1 cascade attention is the one consumer of that field.
+`kv_cache_manager` common-prefix elision self-disables under V1 by reading that same
+`VLLM_USE_V2_MODEL_RUNNER: "0"`, which is correct — V1 cascade attention is the one consumer
+of that field. So edit 2 covers both.
 
 **Go/no-go, both mandatory before this ships:**
 1. Long-context probe token-identical spec ON vs OFF at temperature 0. This is the exact check
