@@ -5,11 +5,11 @@
 Row 1 is DONE (`VLLM_FORK_DIGEST=@sha256:c5bea8bf…` in `Makefile`, main image re-pinned to
 `@sha256:030c8c94…` in `docker-compose.yaml`). Rows 2–7 still need the H200 and are **not**
 optional. Off-box, `make check` and `bash vtl/vllm_patches/gen.sh` both pass as of 2026-07-26
-(all five v0.26.0 patches apply clean to a pristine `v0.26.0` tree, both parked patches too).
+(all six v0.26.0 patches apply clean to a pristine `v0.26.0` tree, the parked one too).
 
 | # | Command | Catches |
 |---|---|---|
-| 1 | ~~`make vllm-fork PUSH=1`~~ **done** | patch/version drift; the `patch --dry-run` gate. Digest is pinned; `make push` refuses to ship without it. |
+| 1 | `make vllm-fork PUSH=1` — **RE-OPENED 2026-07-26** | patch/version drift; the `patch --dry-run` gate. The pinned `VLLM_FORK_DIGEST=@sha256:c5bea8bf…` predates `mamba_utils.patch` + the spec-rollback hunks in `short_conv.patch`/`lfm2.patch`, so it must be rebuilt and BOTH digests re-pinned (fork in `Makefile`, main image in `docker-compose.yaml`). Nothing else changes for the shipped config — the new hunks are inert at `num_spec=0`. |
 | 2 | `make build && make up && make verify` | plugin loaded, quant methods registered, async scheduling on, **fusion-replaced-N-patterns count** (a drop = a fusion patch silently stopped matching) |
 | 3 | `make test-kernel` | the `vtl._C` kernels and the two hijacked `_C` op schemas |
 | 4 | `bench/eval_quality.py`, capturing against the **v0.25.0 image** then the v0.26.0 one | **The important one.** Greedy temp-0 output parity. Several vtl patches reimplement vLLM internals verbatim (`qk_norm_rope` replaces `Lfm2Attention.forward`; `greedy_sampler` replaces `Sampler.forward`), and their failure mode is wrong tokens with no exception. Nothing else catches that. |
@@ -19,21 +19,25 @@ optional. Off-box, `make check` and `bash vtl/vllm_patches/gen.sh` both pass as 
 
 ### Leading latency candidate to sweep once the above is green
 
-**`--max-num-scheduled-tokens` — LIVE at 4096, still unmeasured. This is the one behavioural
+**`--max-num-scheduled-tokens` — LIVE at 2048, still unmeasured. This is the one behavioural
 change in the artifact that no measurement backs.**
 `--max-num-batched-tokens=8192` does **not** chunk our prefills: the longest prompt is 4,281
 tokens, so every turn-1 prefill runs whole, in one step, alongside in-flight decodes. This flag
 caps the scheduler's per-step budget *without* resizing worker buffers / compile ranges /
 `max_in_flight_tokens`.
 
-`docker-compose.yaml` now ships `${VTL_MAX_SCHED_TOKENS:-4096}`. 4096 is **below** the longest
-prompt, so it does change behaviour: every turn-1 prefill takes 2 scheduler steps instead of 1.
-It is a weak setting for its own stated purpose — it shaves the worst step from 4,281 to 4,096
-tokens, i.e. 4% — so the sweep should bracket it on both sides. Pure env, no file edit:
+`docker-compose.yaml` ships a literal `2048`. **Do not make it `${VTL_MAX_SCHED_TOKENS:-2048}`
+or any other interpolation** — this compose file is deployed to the judge as-is, where an
+unresolved `${VAR}` is a boot failure. Sweep by editing the literal.
 
-    VTL_MAX_SCHED_TOKENS=8192 make ab   # the "flag absent" arm == pre-v0.26.0 behaviour
-    VTL_MAX_SCHED_TOKENS=2048 make ab
-    VTL_MAX_SCHED_TOKENS=1024 make ab
+2048 is well **below** the longest prompt, so it does change behaviour: a 4,281-token turn-1
+prefill now takes 3 scheduler steps instead of 1, trading ~2 extra iterations of TTFT for a
+flatter in-flight decode ITL tail. Bracket it on both sides — `8192` is the "flag absent" arm
+(== `max_num_batched_tokens` == the pre-v0.26.0 fallback), then `4096`, then `1024`.
+
+At 2048 the prefill genuinely chunks, so `--max-num-partial-prefills` /
+`--long-prefill-token-threshold` are now live enough to arbitrate rather than being the no-ops
+they were at 4096 — sweep those only if 2048 or 1024 wins.
 
 Watch the ITL **tail**, not the mean — gamma=2 is what makes this worth doing. Add boots, not
 reps. Note this flag made the file v0.26.0-only; rollback means dropping the line too.
@@ -63,10 +67,10 @@ FULL_AND_PIECEWISE to FULL.
 **Inert here, checked so nobody re-checks:** `--prefill-schedule-interval` lives in
 `DPEngineCoreProc`, which asserts `is_moe` — data-parallel only, dead at TP=1.
 `--max-num-partial-prefills` / `--long-prefill-token-threshold` bite only once prefills actually
-chunk. `--max-num-scheduled-tokens=4096` landed, so they are now technically live — but barely:
-at 4096 a 4,281-token prompt spills 185 tokens into a second step, so there is one partial
-prefill for one step and nothing for these two flags to arbitrate. They only become interesting
-if the sweep above settles on 2048 or 1024. `--mamba-cache-dtype` does control the
+chunk. That is no longer hypothetical: `--max-num-scheduled-tokens` now ships at **2048**, so a
+4,281-token prompt spans 3 steps and these two have something to arbitrate. Sweep them only
+after the `VTL_MAX_SCHED_TOKENS` bracket picks a winner — at 4096 or 8192 they go back to being
+no-ops. `--mamba-cache-dtype` does control the
 short-conv state (`short_conv.py:576`, `lfm2.py:437`), but fp8 would save ~80 KB/step against
 ~850 MB of weight traffic (~0.02%), leaves the derived block size at 16, and the vtl
 `bcx_conv_gate_quant` / `mul_quant` kernels assume a bf16 conv state — negligible upside, real
@@ -134,6 +138,58 @@ logit copy from the sample path, #48143 an allocation from the SSM metadata buil
 iteration logging off the engine-core loop) plus staying current. If step 5 shows a regression,
 the rollback is the digest in `Makefile` (image-level only — `vtl/vllm_patches/v0.25.0/` was
 deleted, so a source-level rollback needs `git revert`).
+
+### Speculative decoding — un-banned, wired, unmeasured (2026-07-26)
+
+**The "truncation / dual-path cheating" flag was never a detector.** It was the judge's
+inference from the long-context probe scoring 0% while the short scored trace looked healthy —
+the signature of a server with two code paths. The actual defect is an upstream vLLM bug on
+this model:
+
+- LFM2 has 10 short-conv layers, each carrying a persistent `conv_state`.
+- Under chain spec-decode the target advances that state once per **draft** token.
+- Stock `ShortConv.forward_cuda` calls `causal_conv1d_update` with **no** `num_accepted_tokens`
+  / `query_start_loc` / `max_query_len` (verified against pristine `v0.26.0`, line 282), so
+  **rejected drafts are committed to the state and never rolled back**. `mamba_mixer2.py:991`
+  passes exactly those three args for exactly this reason; short-conv just never did.
+- The error is small per step and compounds with length: clean at 4k, garbage at 32k. Hence a
+  passing benchmark and a 0% long-context probe from one code path.
+
+Fixed and now in the applied set: `v0.26.0/short_conv.patch` (pass the three kernel args,
+capture `num_spec`, widen `get_state_shape`, bypass the fused `bcx_conv_gate_quant` while spec
+is active — it has no `num_accepted` path), `lfm2.patch` and `mamba_utils.patch` (thread
+`num_spec` through the shape planner; all three must move together or boot raises). Inert at
+`num_spec=0`, so the shipped non-spec artifact is unchanged. Contract test:
+`bench/test_shortconv_spec_rollback.py` (in-image, skips on the dev box).
+
+**Second blocker, and it is the one that bites first:** vLLM v0.26.0's **V2 model runner does
+not implement ngram/ngram_gpu/suffix at all** — `config/vllm.py:2154-2165` lists them as
+unsupported and `_validate_v2_model_runner` **raises at startup**, so with
+`VLLM_USE_V2_MODEL_RUNNER=1` the process dies before binding `:8000` and every request scores
+zero. Only eagle/eagle3/mtp/dflash/dspark survive V2, and all of those need a draft model that
+a hybrid LFM2 target cannot host. So spec-decode here means the **V1** runner. Two edits in
+`docker-compose.yaml`, and they must move together:
+
+1. uncomment the `--speculative-config={"method":"ngram",…}` line in the `command:` block;
+2. set `VLLM_USE_V2_MODEL_RUNNER: "0"` in `environment:`.
+
+(Literal edits, not env interpolation — see the `--max-num-scheduled-tokens` note above for
+why this file carries no `${VAR}`.) Flipping to V1 makes `v2_greedy_sampler.patch` + `mamba_hybrid_postprocess.patch` inert and
+re-activates `vtl/patches/greedy_sampler.py` (the V1 fast path, already spec-safe). The
+`kv_cache_manager` common-prefix elision self-disables under V1 via the `sched_policy`
+handshake, which is correct — V1 cascade attention is the one consumer of that field.
+
+**Go/no-go, both mandatory before this ships:**
+1. Long-context probe token-identical spec ON vs OFF at temperature 0. This is the exact check
+   the old flag was a proxy for; nothing else re-earns the trust.
+2. TPOT actually drops on the MIG 1g.18gb slice. The prior is favourable — decode is
+   weight-traffic bound (852 MB/step at batch ≤ 8), so verifying k+1 tokens is nearly free
+   while step count falls with acceptance — but the drafter runs on the co-dominant host term
+   and the fused conv-gate kernel is off under spec. Also log the acceptance rate: this trace
+   generates prose rather than copying from the prompt, which is ngram's weak case.
+
+Whichever way (2) lands, (1) is worth running once regardless: it is the only direct evidence
+that the dual-path root cause is actually gone.
 
 ### Compile-knob survey, 2026-07-26 (read before touching `--compilation-config`)
 
@@ -302,7 +358,7 @@ For each successful request:
 | `--max-num-seqs` | 70 | Matches 70 conversations; peak concurrency under Poisson is lower |
 | `cudagraph_capture_sizes` | `[1,2,4,8,16,32]` | Tune for actual batch size distribution |
 | `cudagraph_mode` | `FULL_AND_PIECEWISE` | PIECEWISE avoids recompilation for unused sizes |
-| Speculative decoding | **FORBIDDEN** | Not a tuning knob. A submission carrying `--speculative-config` was flagged as cheating, so the ngram/prompt-lookup win (output-identical at temp 0, ~7.4 score points per saved ms) is off the table regardless of how good it looks. See the ban in `docker-compose.yaml`; `vtl/vllm_patches/not-applied/` holds the inert prerequisite patches. |
+| Speculative decoding | **UN-BANNED 2026-07-26, still OFF by default** | The old "cheating" flag was the judge inferring two code paths from a 0% long-context probe, not a detector on `--speculative-config`. Root cause and fix: short-conv `conv_state` rollback, now in the applied patch set. Two env vars turn it on (`VTL_SPEC` + `VTL_V2_RUNNER=0`); see the block in `docker-compose.yaml` and the section below. |
 
 ### Frontend (per-request overhead)
 

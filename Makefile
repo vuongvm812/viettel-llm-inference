@@ -71,12 +71,15 @@ VLLM_RS_PGO ?= 1
 PGO_MODEL ?= /model
 # Host path to the local model dir mounted at /model for the PGO training run.
 PGO_HFMODEL ?= ../hf-model
-# -Ctarget-cpu for the vllm-rs binary (plain AND PGO builds). Default native: full host
-# codegen (AVX-512 on an H200 host CPU). Bakes in the BUILD box's ISA — build on the deploy
-# CPU (the H200) for the full win; an older build box (Mac under Rosetta ≈ AVX2) yields a
-# portable subset that still runs on H200. For an emulated build, override PGO_TARGET_CPU=
-# x86-64-v3 or empty (a native/AVX2 instrumented binary can crash the PGO training replay).
-PGO_TARGET_CPU ?= native
+# -Ctarget-cpu for the vllm-rs binary (plain AND PGO builds). Default `x86-64`: the portable
+# baseline ISA, so the binary is independent of whatever box built it and cannot SIGILL on the
+# judge host. Note the spelling — rustc/LLVM's CPU name is `x86-64`, NOT `x86_64`; the
+# underscore form is unrecognised and LLVM warns and silently falls back, which looks like it
+# worked. Raise it for more codegen: `x86-64-v3` (AVX2, safe on any modern server),
+# `x86-64-v4` (AVX-512), or `native` (best codegen, but bakes in the BUILD box's ISA — only
+# correct when building ON the H200, and a native/AVX2 instrumented binary can crash the PGO
+# training replay under Rosetta/OrbStack). Empty also means baseline (RUSTFLAGS unset).
+PGO_TARGET_CPU ?= x86-64-v4
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.

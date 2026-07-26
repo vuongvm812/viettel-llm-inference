@@ -31,12 +31,15 @@ ARG RUST_TOOLCHAIN=1.95   # keep in sync with vllm/rust-toolchain.toml (v0.26.0:
 # never loaded). Override with a HF repo id to fetch over the network.
 ARG PGO_MODEL=/model
 # -Ctarget-cpu for the vllm-rs binary — governs BOTH the plain and PGO builds. Default
-# `native`: best codegen (AVX-512 on an H200 host CPU). It bakes in the BUILD box's ISA,
-# so build on the deploy CPU (the H200) to get the full win; a build box with an OLDER ISA
-# (e.g. a Mac under Rosetta ≈ AVX2) just yields a portable subset that still runs on H200.
-# Set PGO_TARGET_CPU=x86-64-v3 (portable AVX2) or empty (baseline) for an emulated build —
-# a native/AVX2 instrumented binary can crash the PGO training replay under Rosetta/OrbStack.
-ARG PGO_TARGET_CPU=native
+# `x86-64`: the portable baseline ISA, so the binary does not depend on which box built it
+# and cannot SIGILL on the judge host. Spelling matters — rustc/LLVM's CPU name is `x86-64`,
+# NOT `x86_64`; the underscore form is unrecognised, LLVM warns and silently falls back to
+# baseline anyway, so a typo here looks like it worked. Raise it for more codegen:
+# `x86-64-v3` (AVX2, safe on any modern server), `x86-64-v4` (AVX-512), or `native` (best
+# codegen, but bakes in the BUILD box's ISA — only correct when building ON the H200, and a
+# native/AVX2 instrumented binary can crash the PGO training replay under Rosetta/OrbStack).
+# Empty also means baseline (the RUSTFLAGS export below collapses to nothing).
+ARG PGO_TARGET_CPU=x86-64
 # The final stage copies vllm-rs from this stage. `make vllm-fork VLLM_RS_PGO=1` sets it
 # to rust-builder-pgo so only then is the (heavier, network/model-dependent) PGO stage built.
 ARG RUST_BUILDER=rust-builder

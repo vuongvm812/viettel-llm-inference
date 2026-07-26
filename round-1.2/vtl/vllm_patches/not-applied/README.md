@@ -13,26 +13,15 @@ contain **eight** modified files, only three of which any committed `*.patch` re
 `gen.sh` now fails if a modified file is not captured, so this cannot recur silently. The
 never-shipped work is preserved below rather than deleted.
 
-## `shortconv_specdecode_rollback.patch` (3 files)
+## ~~`shortconv_specdecode_rollback.patch`~~ — LANDED 2026-07-26, no longer parked
 
-Short-conv state rollback for chain speculative decode (ngram / ngram_gpu / suffix).
-
-`short_conv.py` passes `num_accepted_tokens` / `query_start_loc` / `max_query_len` to
-`causal_conv1d_update` so the conv state rolls back to the accepted prefix instead of committing
-rejected drafts, captures `num_speculative_tokens`, widens `get_state_shape`, and bypasses the
-fused `bcx_conv_gate_quant` while spec-decode is active (that kernel has no `num_accepted` path).
-`mamba_utils.py` adds the `num_spec` parameter to `short_conv_state_shape` that the widening
-calls. `lfm2.py` threads the same `num_spec` through
-`get_mamba_state_shape_from_config`, so `Platform._align_hybrid_block_size` and
-`MambaSpec.page_size_bytes` agree — without it boot trips `assert page_size_padded >= page_size`.
-
-All three must land together. An earlier revision of this patch omitted the `mamba_utils.py`
-hunk; it applied cleanly and then raised
-`TypeError: short_conv_state_shape() got an unexpected keyword argument 'num_spec'`
-at the first `get_state_shape()`.
-
-**Status:** applies cleanly on top of `v0.26.0/*.patch` and byte-compiles (re-checked by
-`gen.sh`). **Not runtime-verified on v0.26.0** — it has never been booted on any version.
+Folded into the applied set as `v0.26.0/{short_conv,lfm2,mamba_utils}.patch`. It is the fix for
+the "truncation / dual-path" flag (short-conv `conv_state` committed rejected drafts, so the
+long-context probe returned garbage). Inert at `num_spec=0`, so shipping it does not change the
+non-spec path; `bench/test_shortconv_spec_rollback.py` is the contract test. `mamba_utils.py`
+now has its own `gen` line — all three files must move together or boot raises
+`TypeError: short_conv_state_shape() got an unexpected keyword argument 'num_spec'` /
+`assert page_size_padded >= page_size`. Still **not runtime-verified**: it has never been booted.
 
 ## `hybrid_draft_kv_groups.v0.25.0.patch` (4 files)
 
@@ -46,11 +35,13 @@ compares mamba specs on everything except `shapes` (`worker/mamba_utils.py`), an
 files drifted substantially upstream (+355/-87 lines), so a clean `patch` result here means very
 little — treat this as a design record, not a working patch. Never booted.
 
-## Prerequisite for either
+## Prerequisite for what is left here
 
-Speculative decoding, which `docker-compose.yaml` currently forbids
-(`DO NOT enable --speculative-config`). Without spec-decode both diffs are inert: `num_spec` is 0
-and the extra kernel args are `None`.
+`hybrid_draft_kv_groups` only matters for a *separate draft model*, which needs speculative
+decoding AND a draft whose layers land in one KV-cache group. `docker-compose.yaml` no longer
+forbids spec-decode (`--speculative-config=${VTL_SPEC:-None}`, plus `VTL_V2_RUNNER=0` because
+v0.26.0's V2 runner rejects ngram/suffix), but the no-model drafters — ngram / ngram_gpu /
+suffix — need none of this patch.
 
 ## Re-checking
 

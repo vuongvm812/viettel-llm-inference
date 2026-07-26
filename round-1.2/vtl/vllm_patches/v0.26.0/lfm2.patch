@@ -1,5 +1,5 @@
 diff --git a/vllm/model_executor/models/lfm2.py b/vllm/model_executor/models/lfm2.py
-index 601bd22..c40872d 100644
+index 601bd22..25a263c 100644
 --- a/vllm/model_executor/models/lfm2.py
 +++ b/vllm/model_executor/models/lfm2.py
 @@ -283,7 +283,18 @@ class Lfm2ShortConvDecoderLayer(nn.Module):
@@ -22,3 +22,19 @@ index 601bd22..c40872d 100644
          self.short_conv(
              hidden_states,
              output,
+@@ -447,6 +458,15 @@ class Lfm2ForCausalLM(
+             tp_world_size=parallel_config.tensor_parallel_size,
+             intermediate_size=hf_config.conv_dim,
+             conv_kernel=hf_config.conv_L_cache,
++            # vtl: MUST stay in lockstep with ShortConv.get_state_shape (short_conv.patch),
++            # which also passes num_spec. This classmethod is what
++            # Platform._align_hybrid_block_size sizes attn block_size / mamba_page_size_padded
++            # from; the layer's spec is what MambaSpec.page_size_bytes then asserts against.
++            # Without it, spec-decode widens the conv state (num_spec extra columns) but the
++            # padding was computed for the narrow one -> `assert page_size_padded >= page_size`
++            # at boot. Stock mamba2/qwen3_next thread num_spec through both sides for exactly
++            # this reason.
++            num_spec=vllm_config.num_speculative_tokens,
+         )
+ 
+     @classmethod

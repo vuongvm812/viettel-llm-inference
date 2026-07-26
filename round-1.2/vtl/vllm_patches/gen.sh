@@ -36,6 +36,10 @@ gen model_executor/layers/mamba/short_conv.py   short_conv
 # Paired with short_conv: the in_proj hoist only lets RMSNormQuantFusionPass fire if the
 # operator_norm output also stops having a second consumer. Regenerate them together.
 gen model_executor/models/lfm2.py               lfm2
+# Paired with short_conv + lfm2: short_conv_state_shape gains the num_spec argument that both
+# of them pass. Landing any two of the three without the third is a boot-time TypeError or
+# `assert page_size_padded >= page_size`. Regenerate all three together.
+gen model_executor/layers/mamba/mamba_utils.py  mamba_utils
 # V2 model runner (VLLM_USE_V2_MODEL_RUNNER=1): greedy argmax fast path in the V2
 # sampler, and the dead-num_accepted-scatter elision in the hybrid model state.
 gen v1/worker/gpu/sample/sampler.py             v2_greedy_sampler

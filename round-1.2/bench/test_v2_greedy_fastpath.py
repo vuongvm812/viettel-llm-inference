@@ -2,21 +2,22 @@
 
 Tests ``_vtl_greedy_eligible`` from the forked V2 sampler
 (``vllm/v1/worker/gpu/sample/sampler.py``). Runs inside the container (torch +
-vllm present); skips gracefully on a dev box without them. No pytest -- one file,
-assert-based, matching ``vtl/patches/greedy_sampler.py``'s convention.
+vllm present); skips gracefully on a dev box without them.
+
+Collected by ``make test-kernel`` (pytest, inside the image) and runnable standalone:
 
     python3 round-1.2/bench/test_v2_greedy_fastpath.py
 """
-
-import sys
 
 import numpy as np
 
 try:
     from vllm.v1.worker.gpu.sample.sampler import NO_LOGPROBS, _vtl_greedy_eligible
+
+    _SKIP = ""
 except Exception as exc:  # torch / vllm not importable on this host
-    print(f"SKIP (vllm not importable: {exc})")
-    sys.exit(0)
+    NO_LOGPROBS = -1
+    _SKIP = f"vllm not importable: {exc}"
 
 
 def _clean(n=4):
@@ -32,7 +33,14 @@ def _clean(n=4):
     )
 
 
-def main() -> None:
+def test_greedy_eligible_predicate() -> None:
+    # Named test_* so pytest actually collects it: `make test-kernel` runs
+    # `pytest /bench/test_*.py`, which silently ran NOTHING when this file only
+    # had a main() guarded by __name__ == "__main__".
+    if _SKIP:
+        import pytest
+
+        pytest.skip(_SKIP)
     # Plain greedy batch -> eligible.
     assert _vtl_greedy_eligible(**_clean()) is True
 
@@ -60,4 +68,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if _SKIP:
+        print(f"SKIP ({_SKIP})")
+    else:
+        test_greedy_eligible_predicate()
