@@ -1,414 +1,83 @@
 name: viettel-llm-optimized
 
-# Registry-only deploy: this compose + a pushed image. No build context, no local
-# mounts -- the judge host provides the model at /model and scrapes :8000.
-#
-# Phase-2 workload (LFM2.5-1.2B; regenerate stats with `python bench/trace_stats.py`):
-#   70 multi-turn conversations, <=6 turns each (420 turns), ~4,000 input tok/turn,
-#   max_tokens=200, temperature=0, random human think-pauses between turns.
-#   Far less prefill-bound than round-1's 18.7k single-turn prompts. The dominant cache
-#   win is now INTRA-conversation prefix reuse: turn N reuses turns 0..N-1. Prefix caching
-#   + decode throughput are the levers; re-tune --max-num-seqs/--max-num-batched-tokens
-#   against the regenerated trace-round2.jsonl.
-
 services:
   model:
-    # vLLM v0.26.0 image (verified: this digest is built FROM vllm-fork@sha256:c5bea8bf, whose
-    # 37 layers it reuses as an exact prefix, and that fork is stock v0.26.0 + the five
-    # vtl/vllm_patches/v0.26.0/*.patch byte-for-byte).
-    #
-    # !! THIS FILE NOW REQUIRES v0.26.0+. `--max-num-scheduled-tokens` below is a v0.26.0-only
-    # CLI flag (the field existed in v0.25.0's SchedulerConfig but EngineArgs never exposed it).
-    # Rolling back to the v0.25.0 image pinned in Makefile therefore means deleting that line
-    # too -- otherwise argparse rejects the unknown flag with SystemExit(2) before the socket
-    # binds, nothing answers on :8000, and every request scores zero. Rollback = restore the
-    # Makefile digest AND drop that one flag.
-    #
-    # Every OTHER flag and env var here is still deliberately version-agnostic; keep new
-    # version-specific ones to a minimum, and land them only in the same commit that re-pins
-    # this digest.
-    image: unseenablefuture/awesome-badger@sha256:c1ade3ac2d1bbf150f9fdbdd1dfaa19875636606bf47881d5990e3aed5ec9e3a # submission: re-pin by @sha256:<new digest>
-    platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
+    image: unseenablefuture/awesome-badger@sha256:c1ade3ac2d1bbf150f9fdbdd1dfaa19875636606bf47881d5990e3aed5ec9e3a
+    platform: linux/amd64
     entrypoint:
-      - python3 #Don't change this to vllm-server
-      - -m  #Don't change this to vllm-server
-      - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
     command:
       - -O3
-      - --model=/model #Don't change this to vllm-server
-      - --served-model-name=LFM2.5-1.2B-Instruct #Don't change this to vllm-server
-      - --host=0.0.0.0 #Don't change this to vllm-server
-      - --port=8000 #Don't change this to vllm-server
+      - --model=/model
+      - --served-model-name=LFM2.5-1.2B-Instruct
+      - --host=0.0.0.0
+      - --port=8000
 
-      # Must match the model's native context (config.json max_position_embeddings=128000).
-      # Any tighter cap truncates the judge's long-context probe -> flagged as
-      # "truncation / dual-path" cheating.
       - --max-model-len=32768
       - --gpu-memory-utilization=0.90
       - --tensor-parallel-size=1
 
-      # Intra-conversation prefix reuse is the biggest win now (turn N reuses turns 0..N-1).
-      # LFM2 is a hybrid (short-conv state + attn KV): mamba_cache_mode MUST be `align` --
-      # Lfm2ForCausalLM raises NotImplementedError on `all`, so the server won't boot otherwise.
       - --enable-prefix-caching
       - --mamba_cache_mode=align
-      # --prefix-match-unit (v0.26.0 #46384) DELIBERATELY NOT SET: on this model it is a no-op.
-      # It sets hash_block_size, which defaults to the GCD of the cache groups' block sizes.
-      # LFM2's conv state is 2048*(3-1)*2B = 8192B/layer; fp8 KV is 2*8*64*1B = 1024B/token, so
-      # Platform._align_hybrid_block_size gives attn_block_size = 16*cdiv(8192, 16*1024) = 16 and
-      # leaves block_size at 16; `align` then sets mamba_block_size = block_size = 16. Groups are
-      # [16,16] -> GCD 16, so --prefix-match-unit=16 IS the default. Worse, the partial-hit paths
-      # gate on mamba block_size > hash_block_size (kv_cache_coordinator.py, scheduler.py,
-      # _cache_partial_tail_block), so 16 keeps all three closed. Going finer is the only way to
-      # arm them and it is a measured loss: bench/trace_stats.py says block_size 1 avoids
-      # 1,106,010 prefill tokens vs 16's 1,102,736 -- 3,274 tokens, 0.24% of a 1.34M-token
-      # prefill -- against doubled per-request hashing plus an extra mandatory chunk-split stop
-      # per request on a Python-bound scheduler. #46384 pays off when the mamba page dwarfs the
-      # attention page (its docstring example: unit 32 vs a 1024-token block); LFM2's conv state
-      # is too small for that to ever happen.
-      #
-      # vLLM v0.26.0 (#48012) also adds per-KV-cache-group backend selection:
-      #   --attention-config '{"backend_per_kind": {"full_attention": "FLASH_ATTN"}}'
-      # DELIBERATELY NOT SET. On the H200 the auto-selector already picks FLASH_ATTN for the
-      # 6 GQA layers, so it is a no-op there; on the sm_86 dev box fp8 KV is exactly why the
-      # selector falls back to FlashInfer, so pinning FLASH_ATTN risks a hard startup failure
-      # (an invalid backend for a kind raises at startup) on the only box we iterate on.
-      # Use it as a DIAGNOSTIC when you need dev to take the judge's code path, not as a default.
       - --enable-chunked-prefill
-      - --max-num-seqs=70 # peak concurrency ~6 in the trace; a small cap shrinks the cudagraph
-                          # capture set + VRAM and leaves OOM headroom. Sweep with bench/replay.py.
-      # CORRECTED 2026-07-26: this does NOT chunk our prefills. The longest prompt in the trace
-      # is 4,281 tokens (bench/trace_stats.py) against a budget of 8,192, so every turn-1 prefill
-      # is scheduled WHOLE, in one step, alongside whatever is decoding -- exactly the in-flight
-      # ITL spike the old comment here claimed was solved. The budget only binds when several
-      # prefills coincide in one step. Lowering it is not the fix: max_num_batched_tokens also
-      # sizes worker input buffers, the compile ranges, and max_in_flight_tokens.
-      #
-      # The fix is --max-num-scheduled-tokens (NEW CLI flag in v0.26.0, vllm/engine/arg_utils.py;
-      # scheduler.py:111-113 falls back to max_num_batched_tokens when unset, and it is the sole
-      # per-step token budget at scheduler.py:445). It caps the scheduler WITHOUT resizing
-      # buffers, so e.g. 2048 splits a 4.3k prefill into 3 shorter steps and flattens the decode
-      # ITL tail that gamma=2 punishes, paying ~2 extra scheduler iterations of TTFT (worth 1/40th
-      # per ms). It is set below -- and is v0.26.0-only, which is what makes this whole file
-      # v0.26.0-only (see the rollback note at the top).
+      - --max-num-seqs=70
       - --max-num-batched-tokens=8192
-      # UNMEASURED. Sweep by editing this literal -- 8192 is the "flag absent" arm
-      # (== max_num_batched_tokens == the pre-v0.26.0 fallback at scheduler.py:111-113),
-      # then 4096, then 1024. No env interpolation here: the submitted artifact is deployed
-      # as-is and an unresolved ${VAR} is a boot failure.
       - --max-num-scheduled-tokens=2048
-      # W4A8: int4 weights (group-128, symmetric, RTN at load) + fp8-e4m3 per-token activations,
-      # via vLLM's SM90 CUTLASS w4a8 kernel. Cuts decode weight traffic 1306 -> 852 MB/step
-      # (-35%, ~0.76 ms at the ~600 GB/s of an H200 MIG 1g.18gb slice). Note the int4 group
-      # scales cost 64.8 MB, not 8: cutlass_pack_scale_fp8 stores 8 copies of each scale.
-      # See vtl/patches/quant_w4a8.py; falls back to vtl_fp8 per-layer on any rejected shape.
-      #
-      # UNPROVEN ON THIS BOX. TPOT ~= max(host, gpu); the host term (~3.4 ms) is unaffected by
-      # MIG and the modelled GPU term stays under it both before and after, so the expected
-      # TPOT delta is ~0 and TTFT likely gets slightly WORSE (prefill re-dequantizes weight
-      # tiles that fp8 never does). A/B this against vtl_fp8 on the slice before submitting --
-      # and run an accuracy eval: RTN int4 on 1.2B is not free. Revert = vtl_fp8.
-      #
-      # A/B by editing this literal to vtl_fp8. NO `${VAR}` interpolation anywhere in this file:
-      # it is deployed to the judge as-is, where an unresolved variable is a boot failure.
       - --quantization=vtl_w4a8
       - --kv-cache-dtype=fp8_e4m3
 
-      # ---- Speculative decoding: a hybrid LFM2.5-350M draft model ------------------------
-      # ROOT CAUSE OF THE OLD BAN, corrected 2026-07-26. The "truncation / dual-path cheating"
-      # flag was NOT a detector keying on --speculative-config. It was the judge's INFERENCE
-      # from the long-context probe returning garbage while the scored trace looked fine --
-      # i.e. "this server has two code paths." The real defect: LFM2's 10 short-conv layers
-      # carry a persistent conv_state, and stock ShortConv.forward_cuda calls
-      # causal_conv1d_update WITHOUT num_accepted_tokens, so the target advanced the state
-      # once per DRAFT token and committed the REJECTED ones. Corruption compounds with
-      # length -> fine at 4k, garbage at 32k.
-      #
-      # That fix is upstream PR #44296, and this repo shipped only 2 of its 3 files until
-      # 2026-07-26: the runner never named ShortConvAttentionMetadataBuilder in the gate that
-      # injects num_accepted_tokens, so the builder saw None, forward_cuda took the NON-spec
-      # path, and mamba_attn's decode_threshold collapsed to 1 (every spec row misclassified
-      # as a prefill). The whole rollback was dead code while this flag was live. Now fixed
-      # across vtl/vllm_patches/v0.26.0/{short_conv,lfm2,mamba_utils,gpu_model_runner}.patch;
-      # bench/test_shortconv_spec_rollback.py pins all four. Inert at num_spec=0.
-      # Not a cheat: at temperature 0 spec-decode is output-identical to greedy by construction.
-      #
-      # THE DRAFTER. LiquidAI/LFM2.5-350M is the most compatible possible draft for this
-      # target -- same Lfm2ForCausalLM, same 16 layers, same 10-conv/6-attn layer_types, same
-      # 65536 vocab, BYTE-IDENTICAL tokenizer.json, and (decisively) the same 8 KV heads x 64
-      # head_dim, so draft and target attention layers share one KV cache group with no
-      # patching at all. Only the conv width differs (1024 vs 2048), which is what needed
-      # vLLM issue #49112 fixed: llm_base_proposer_multigroup.patch lifts v0.26.0's own
-      # multi-group drafter into the base proposer, and mamba_groups_hybrid_draft.patch stops
-      # get_mamba_groups asserting one identical MambaSpec across groups. Contract test:
-      # bench/test_hybrid_draft_kv_groups.py. The weights are baked into the image's HF cache
-      # (Dockerfile ARG DRAFT_MODEL) and resolved offline -- the judge host has no network.
-      #
-      # "quantization":"vtl_w4a8" IS LOAD-BEARING, NOT A TWEAK. A draft model does NOT inherit
-      # --quantization (config/speculative.py only propagates it on the mtp/dspark branches),
-      # so without this key the drafter loads bf16 at ~0.71 GB of weight traffic per draft
-      # token -- against a target decode step of ~0.85 GB in w4a8. The drafter would cost
-      # nearly as much per forward as the 1.2B it drafts for, and break-even would need ~3.3
-      # of 4 tokens accepted every step. At w4a8 it is ~0.34 GB, i.e. break-even near 55%
-      # acceptance. It needs no patch: vllm.config.utils.replace re-runs VllmConfig.__post_init__,
-      # which builds quant_config from the DRAFT model_config, and vtl_w4a8 quantizes RTN at
-      # load so the bf16 checkpoint is exactly what it wants.
-      #
-      # !! THIS LINE AND VLLM_USE_V2_MODEL_RUNNER MOVE TOGETHER. v0.26.0 declares every method
-      # outside eagle/eagle3/mtp/dflash/dspark UNSUPPORTED on the V2 model runner --
-      # config/vllm.py:2153-2165 -> _validate_v2_model_runner RAISES at startup, so with
-      # VLLM_USE_V2_MODEL_RUNNER=1 the process dies before binding :8000 and every request
-      # scores zero. "draft_model" is in that rejected set exactly like ngram. The speculator
-      # lives only in the V1 runner, so spec ON means V1 ON, which makes the two VTL_V2_* fork
-      # patches inert and re-activates vtl/patches/greedy_sampler.py (the V1 fast path, already
-      # spec-safe -- it falls through on the bonus token). It is already "0" further down.
-      #
-      - --speculative-config={"method":"draft_model","model":"LiquidAI/LFM2.5-350M","num_speculative_tokens":3,"quantization":"vtl_w4a8"}
-      #
-      # A/B by swapping which of these lines is commented; nothing else moves. Sweep surface,
-      # all inside the one literal above -- no new flags, no ${VAR} anywhere in this file:
-      #   "quantization": vtl_w4a8 -> vtl_fp8 (~0.48 GB/forward, accuracy-safer) -> drop the key
-      #     entirely for the bf16 baseline. RTN int4 hits a 350M harder than the 1.2B and that
-      #     lands straight on the acceptance rate; this trade IS the experiment.
-      #   "num_speculative_tokens": 3 -> 2 -> 1.
-      #   "num_speculative_tokens_per_batch_size": [[1,2,3],[3,8,1]] -- adaptive gamma over
-      #     inclusive batch ranges (config/speculative.py). The trace is mean 2 / peak 8
-      #     concurrent and drafter cost scales with batch while the win does not, so this is
-      #     the best latency knob after quantization.
-      #   "max_model_len": cap the draft under 32768 to claw back block table + KV pool.
-      # - --speculative-config={"method":"ngram_gpu","num_speculative_tokens":3,"prompt_lookup_min":3,"prompt_lookup_max":5}
-      #
-      # GO/NO-GO BEFORE SHIPPING IT, both mandatory:
-      #   (a) long-context probe token-identical spec ON vs OFF at temperature 0. This is the
-      #       exact check the judge's flag was a proxy for. Nothing else re-earns the trust.
-      #       Run it on the ngram_gpu arm FIRST: the rollback only became live in this commit,
-      #       so the previously-submitted image may itself fail this.
-      #   (b) TPOT must actually drop on the MIG 1g.18gb slice. Decode here is weight-traffic
-      #       bound (852 MB/step at batch<=8), so verifying k+1 tokens is nearly free and the
-      #       step count falls with the acceptance rate -- but the drafter is a whole extra
-      #       forward on a ~19-SM slice with 3 vCPU, and the fused bcx_conv_gate_quant kernel
-      #       is bypassed while spec is active. Measure, do not model.
-
-      # Per-step/per-request overhead is inside the judged TPOT/TTFT (measured at the HTTP client):
-      # drop the periodic stats logger and quiet uvicorn.
-      #
-      # --disable-log-stats is now load-bearing beyond the logger: it sets scheduler.log_stats,
-      # which vtl/patches/kv_cache_manager.py reads to skip estimate_cached_tokens() -- a scan of
-      # every allocated KV block that vLLM otherwise runs once per request INSIDE TTFT, because
-      # PrefillStats() is built unconditionally (request.py:197) and is NOT gated by this flag
-      # upstream. Turn stats back on and the real scan returns automatically; no knob to remember.
-      #
-      # !! DO NOT add --enable-prompt-tokens-details without also setting
-      # VTL_CHEAP_PREFILL_STATS=0. That flag is the one consumer of the cached-token count that
-      # log_stats does NOT gate (output_processor.py:640 -> prompt_tokens_details.cached_tokens),
-      # so the field would silently report 0. It is not set, which is why the elision is invisible.
       - --disable-log-stats
       - --uvicorn-log-level=warning
+
+      - --speculative-config={"method":"draft_model","model":"LiquidAI/LFM2.5-350M","num_speculative_tokens":3,"quantization":"vtl_w4a8"}
 
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
     ports:
       - "8000:8000"
     environment:
       VLLM_PLUGINS: vtl
-      VLLM_LOGGING_LEVEL: WARNING             # INFO does per-request log work on the hot path
-      # Pin the axum/tower/hyper HTTP stack to WARN independent of the app default above, so
-      # the per-request tower_http TraceLayer span stays disabled even if you raise
-      # VLLM_LOGGING_LEVEL to INFO/DEBUG to debug the app. Per-target directives only (no
-      # global default), so they override just these targets and leave app logs at the default.
+      VLLM_LOGGING_LEVEL: WARNING
+
       RUST_LOG: "tower_http=warn,tower=warn,axum=warn,hyper=warn,hyper_util=warn,h2=warn"
-      DO_NOT_TRACK: "1"                        # disable anonymous usage stats / telemetry
+      DO_NOT_TRACK: "1"
       VLLM_NO_USAGE_STATS: "1"
-      # The draft model named in --speculative-config above is baked into the image's HF cache
-      # at /opt/hf-cache (Dockerfile: ENV HF_HOME + ARG DRAFT_MODEL). Resolve it from that cache
-      # with no network round-trip -- the judge host has none, and a hub lookup here would hang
-      # the boot rather than fail it. The TARGET loads from the /model PATH, so offline mode does
-      # not affect it. Drop both lines if you build with DRAFT_MODEL= (empty).
+
       HF_HOME: /opt/hf-cache
       HF_HUB_OFFLINE: "1"
-      VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
+      VTL_DISABLE: 0
 
-      # ---- vLLM v0.26.0 knobs evaluated and REJECTED ------------------------------------
-      # VLLM_PREFIX_CACHE_RETENTION_INTERVAL (#47782, Marconi retention extended to mamba
-      # states). Do NOT set it to 0. Per MambaManager.reachable_block_mask: None = dense
-      # (cache every state block, the default); 0 = keep ONLY reachable_boundaries, i.e.
-      # num_prompt_tokens-1 plus shared-prefix junctions -- with segment_tokens None, no
-      # state produced during DECODE is cached at all. This trace is 70 conversations x 6
-      # turns where turn N+1 replays turn N's prompt AND its ~291-token reply, and
-      # find_longest_cache_hit reconciles every group down to the shortest hit, so the mamba
-      # group would cap the whole hybrid at the end of turn N's PROMPT. Est. ~102k extra
-      # prefill tokens (~+43% of the 234k currently computed), straight into the TTFT path
-      # under a gamma=2 penalty. Sparse retention buys eviction headroom, and we have none
-      # to buy: the working set is ~1.4GB fp8 against a ~14GB budget.
-      #
-      # VLLM_ENABLE_STARTUP_PLAN (#47388, persist memory-profiling across boots). Not set:
-      # boot is outside the scored window (180s start_period), and compute_plan_fingerprint
-      # hashes VllmConfig + device + torch build but NOT the process env -- so the VTL_*
-      # knobs that change resident weight bytes (VTL_LM_HEAD_QUANT, VTL_W4A8_IGNORE,
-      # VTL_DISABLE) all share one fingerprint. The apply gate samples free memory BEFORE
-      # weights load, so it cannot catch the mismatch. That makes it actively harmful to the
-      # A/B methodology it was supposed to help: arm B would silently reuse arm A's KV
-      # capacity. If you want it for the dev loop, set it per-shell, not in the submission.
-
-      # ---- TPOT: host-side per-step cost ----------------------------------------------
-      # STALE -- every number below was measured on a FULL H200. The judge runs an MIG
-      # 1g.18gb slice (1/7 SMs, 1/8 memory slices), which scales the GPU term ~8x and leaves
-      # the 3-core host term alone. Re-measure the split before trusting any of it.
-      #
-      # Measured split of the 4ms TPOT: ~0.5ms GPU, ~3.4ms HOST. Async scheduling is really
-      # pipelined (max_concurrent_batches=2), so TPOT ~= max(host, gpu) -- the host IS the
-      # TPOT. SGLang publishes 2.2ms for this exact model on H200 at concurrency 1, so ~1.8ms
-      # (~13 score points) is on the table. Every knob below is one env var to revert.
-      #
-      # ---- Model Runner V2 ------------------------------------------------------------
-      # V2 is vLLM's per-step-CPU-overhead rewrite (GPU-resident batch prep + sampling),
-      # attractive on this host-bound slice. Stock V2 was REJECTED on 2026-07-21 (TPOT
-      # 5.0 -> 5.6ms, TTFT 62 -> 80ms) -- but that was STOCK V2: its Sampler runs a full
-      # 65k-vocab FP32 logit copy + bias/penalty/badwords/temp/min_p kernels + gumbel every
-      # step even at temp 0, because the vtl greedy fast path only patched the *V1* Sampler
-      # class. The flags below add a V2-native greedy fast path (fork edit in
-      # vllm/v1/worker/gpu/sample/sampler.py) plus a dead-launch elision in the hybrid
-      # postprocess. RE-MEASURE {V1,V2}x{stock,+patches} on the slice before trusting either
-      # way; revert to V1 = VLLM_USE_V2_MODEL_RUNNER "0" (which also makes the VTL_V2_* flags
-      # inert). Each VTL_V2_* fails closed to the stock V2 path, so default-on cannot crash.
-      # !! Keep this "0" for as long as --speculative-config above is live. draft_model / ngram /
-      # ngram_gpu / suffix are all V1-runner-only in v0.26.0 (config/vllm.py:2153-2165 allows
-      # only eagle/eagle3/mtp/dflash/dspark on V2) and V2 RAISES at startup on them, so the two
-      # must move together or nothing binds :8000.
       VLLM_USE_V2_MODEL_RUNNER: "0"
-      VTL_V2_GREEDY_FASTPATH: "1"        # argmax short-circuit for provably-greedy batches
-      VTL_V2_GREEDY_ARGMAX_KERNEL: "0"   # reserved: fused argmax .cu not built; torch.argmax is
-                                         #   already a fused reduction -- flip on only if a profile wins
-      VTL_V2_FUSED_POSTPROCESS: "1"      # skip the dead num_accepted scatter when no spec-decode
-      VTL_V2_FORCE_CUTLASS_FP8: "1"      # force fp8 layers off Marlin (its stable-ABI aten::empty
-                                         #   crashes under V2's dynamic-shape graph) onto CUTLASS.
-                                         #   Only matters under V2; "0" reverts. See quant_fp8.py.
-      # VTL_V2_FUSED_CONV_ALIGN reserved for the on-box fused conv+align kernel (Part B Target 1);
-      # inert until that .cu is built and parity-checked -- stock precopy runs meanwhile.
+      VTL_V2_GREEDY_FASTPATH: "1"
+      VTL_V2_GREEDY_ARGMAX_KERNEL: "0"
+      VTL_V2_FUSED_POSTPROCESS: "1"
+      VTL_V2_FORCE_CUTLASS_FP8: "1"
 
-      # vLLM only pins torch's CPU thread count in set_multiprocessing_worker_envs(), which the
-      # MULTIPROC executor calls. At --tensor-parallel-size=1 we get UniProcExecutor, which
-      # never does. A cgroup CPU quota does not change hardware_concurrency(), so torch would
-      # otherwise size its pools to the HOST's core count (64+) inside our 3-core budget and
-      # libgomp would busy-spin after every parallel region. PASSIVE stops the spin-wait.
       OMP_NUM_THREADS: "3"
       MKL_NUM_THREADS: "3"
       OMP_WAIT_POLICY: "ACTIVE"
 
-      # CPython hands the GIL to a waiting thread only after sys.getswitchinterval() -- 5ms by
-      # default, longer than a whole decode step. The engine-core main loop is tight pure
-      # Python that never blocks while it has work, while the output thread needs the GIL to
-      # forward each step's tokens. vtl/plugin.py already defaults this to 0.0002s; set
-      # VTL_GIL_SWITCH_INTERVAL: "0" here to restore the interpreter default (the A/B control).
-
       VLLM_USE_RUST_FRONTEND: "1"
       VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "60"
-      # Rust frontend (vllm-rs) tokio worker-thread count. Unset in code auto-sizes to the
-      # CFS quota (≈3 on the judge's 3-core budget). Pinned here so it's tunable: lower to 2
-      # to reserve a core for the engine's decode/ZMQ loop (TPOT is the scored path) if you
-      # see contention; sweep 2↔3. MUST be a positive int — empty or 0 panics vllm-rs at boot.
       TOKIO_WORKER_THREADS: "3"
-      # TOKIO_WORKER_THREADS sizes ONLY the HTTP runtime. vllm-rs starts two more that ignore
-      # it: the ZMQ runtime is hard-coded to 4 threads regardless of CPU quota
-      # (engine-core-client/src/runtime.rs) to run 3 IO-bound tasks, and the request runtime
-      # uses available_parallelism(). That is ~10 tokio workers plus 3 Python threads on 3
-      # cores. Pinning both to 1 removes ~6 runnable threads; at 1 zmq worker the recv->
-      # dispatch handoff also collapses onto the tokio LIFO slot instead of waking a second
-      # thread per token. Sweep 1<->2 if TTFT regresses (one zmq thread means a large msgpack
-      # decode blocks request submission).
       VLLM_RS_ZMQ_WORKER_THREADS: "3"
       VLLM_RS_REQUEST_WORKER_THREADS: "3"
-      # Drop the per-request axum TraceLayer span (latency A/B). Unset = layer ON (default);
-      # 1 removes it, which is what we ship. Set to 0 to restore it and measure the delta.
-      # Trade-off: loses rejected-request log visibility (logs are already WARN-pinned anyway).
       VLLM_RS_DISABLE_HTTP_TRACE: "1"
 
-      # ---- Quantization --------------------------------------------------------------
-      # Only the OVERRIDES live here. Every VTL_ENABLE_<patch> not listed below already
-      # defaults ON in code (`register_patch(..., default=True)` in vtl/patches/*.py --
-      # that file list IS the switch list). Setting them to 1 here was pure duplication and
-      # drifted from the code. Same for VTL_FP8_CHANNELWISE (defaults on,
-      # quant_fp8.channelwise_enabled), VTL_SILU_MUL_FUSION (defaults "1") and
-      # VTL_GIL_SWITCH_INTERVAL (plugin.py default).
-      #
-      # !! DO NOT set VTL_ENABLE_W4A8=0 or VTL_ENABLE_FP8=0 to A/B them. Those two patches
-      # REGISTER the quantization methods, and --quantization=vtl_w4a8 is a serve flag: with
-      # the patch off, vLLM aborts at startup with "Invalid quantization method" and the
-      # container never binds :8000. To A/B quantization, change the --quantization flag
-      # itself (vtl_w4a8 <-> vtl_fp8 <-> omit for bf16). Every OTHER VTL_ENABLE_* is a safe
-      # `: 0` kill-switch.
-      #
-      # W4A8 layers that opt out fall back to fp8, not bf16, so both ignore lists apply.
-      # Accuracy ladder if the eval regresses: "conv" (drops the recurrent short-conv path, the
-      # most error-sensitive layer, for only 168 of 1036 MB), then "conv,attn" (MLP-only int4,
-      # still 84% of the win). For the head use VTL_LM_HEAD_QUANT below, not this list.
-      #
-      # lm_head is NO LONGER in the w4a8 list: it is now quantized by vtl/patches/lm_head_quant.py
-      # (268 MB/step, 31.5% of the post-w4a8 decode weight budget -- the largest tensor that was
-      # still bf16). Naming it here would force bf16 and silently undo that.
       VTL_W4A8_IGNORE: ""
-      # INERT for lm_head, kept only as documentation of intent. Both ignore lists are consulted
-      # ONLY for LinearBase layers, and lm_head is a ParallelLMHead (a VocabParallelEmbedding):
-      # VtlFp8Config.get_quant_method early-returns at quant_fp8.py:182 before reading this list,
-      # and under vtl_w4a8 the ParallelLMHead branch never delegates to the fp8 fallback at all.
-      # The head is bf16 under vtl_fp8 because stock Fp8Config has no lm_head path, not because
-      # of this entry. To keep the head out of int4 use VTL_LM_HEAD_QUANT; to force it bf16 under
-      # w4a8 use VTL_W4A8_IGNORE. Nothing else in LFM2 matches the substring.
-      VTL_FP8_IGNORE: "lm_head"               # fp8 is the per-layer fallback for W4A8
-
-      # The lm_head ladder: int4 (default) | fp8 | off. Not a boolean; anything unrecognised
-      # means "off", because every other value changes model OUTPUT and a typo must not ship an
-      # unmeasured accuracy change. tie_embedding=true is fine -- quantizing rebinds lm_head.weight
-      # and leaves embed_tokens' bf16 table alone, so the embedding lookup is untouched.
-      #
-      #   int4  -192 MB/step (~0.13 ms @600 GB/s)   highest accuracy risk in the model: RTN int4
-      #                                             on the output head, no calibration
-      #   fp8   -134 MB/step (~0.22 ms)             the middle rung; use it if int4 regresses
-      #   off    268 MB/step                        bf16, the pre-W4A8 behaviour
-      #
-      # UNMEASURED like the rest of W4A8. Run bench/eval_quality.py across all three before
-      # trusting int4. VTL_W4A8_IGNORE="lm_head" overrides this knob and forces bf16.
+      VTL_FP8_IGNORE: "lm_head"
       VTL_LM_HEAD_QUANT: "int4"
 
-      # CUTLASS tile/cluster schedule for the W4A8 GEMM. EMPTY = the kernel's own heuristic,
-      # which is what we ship. Here because that heuristic (w4a8_mm_entry.cu:341-372) keys only
-      # on M/N/K and is blind to SM count -- tuned on a full 132-SM Hopper, while the judge's
-      # MIG 1g.18gb slice has ~19 -- so its tile choice is an open question on this box.
-      #
-      # Name = "<TileM>x<TileN>_<ClusterMxNxK>". The kernel passes the WEIGHT as CUTLASS operand
-      # A, so TileM tiles output channels and TileN tiles TOKENS: a decode-shaped schedule has a
-      # small second number. TileK is fixed at 128.
-      #
-      # The ten legal values -- anything else is ignored with a warning (vtl validates so a typo
-      # can't STD_TORCH_CHECK the server mid-benchmark):
-      #   256x128_1x1x1  256x64_1x1x1  256x32_1x1x1  256x16_1x1x1  128x256_2x1x1
-      #   128x256_1x1x1  128x128_1x1x1 128x64_1x1x1  128x32_1x1x1  128x16_1x1x1
-      #
-      # The heuristic already picks 128x16/128x32 at decode (M<=32) and 128x256_1x1x1 for an
-      # 8192-token prefill -- beat those three first. Applies to every W4A8 GEMM including the
-      # conv out_projs (stamped per-layer, so a sweep can't half-apply). Submissions ship empty.
-      #
-      # Interpolated so `make sweep-schedule` can drive it from the host env with no file edit.
-      # Unset resolves to empty, i.e. the kernel heuristic -- what submissions ship.
       VTL_W4A8_SCHEDULE: ""
 
-      # Both default OFF in code -- these two ARE load-bearing overrides.
-      VTL_ENABLE_MUL_QUANT: 1                # fused conv-gate mul+fp8-quant; also gives out_proj a
-                                             # shared fp8 staging buffer, so decode|prefill|mixed
-                                             # all skip the bf16 vstack (not just pure decode)
-      VTL_ENABLE_BCX_CONV_GATE: 1            # whole short-conv DECODE block in one kernel: B*x ->
-                                             # conv1d + state rotation -> C* -> fp8 quant. Inert
-                                             # unless MUL_QUANT=1 (it fills that staging buffer).
+      VTL_ENABLE_MUL_QUANT: 1
+      VTL_ENABLE_BCX_CONV_GATE: 1
 
-      VTL_KERNEL_SYNC: 0                       # DEBUG only: 1 = cudaStreamSynchronize per kernel (slow)
+      VTL_KERNEL_SYNC: 0
 
-      VTL_DISABLE_WARMUP: 0                     # 1 = pure /health check, skip system-prefix priming
-    shm_size: "2g" # tmpfs counts against the 8GB cgroup; 2g helped push it into OOMKill. TP=1 needs little.
-    # The healthcheck doubles as a one-shot KV-prefix warm-up: the first passing run replays the
-    # first few round-2 trace requests (shared system prefix + real multi-turn threads) so the prefix
-    # is cached and decode kernels are warm before the container reports healthy (and before the judge
-    # fires its first wave). Readiness still gates ONLY on /health -- priming is best-effort and can
-    # never leave the container un-healthy. timeout raised to 30s to cover the priming POSTs (each
-    # bounded to 20s; sentinel-before-prime means a slow tick just retries). See vtl/warmup_healthcheck.py.
+      VTL_DISABLE_WARMUP: 0
+    shm_size: "2g"
     healthcheck:
       test: ["CMD", "python3", "/opt/vtl/warmup_healthcheck.py"]
       interval: 10s
