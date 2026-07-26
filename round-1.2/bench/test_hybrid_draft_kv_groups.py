@@ -222,6 +222,35 @@ def test_get_quant_config_tolerates_a_callable_hf_overrides():
             pass  # unrelated failure from the stub; not what this guards
 
 
+def test_prepare_inputs_forwards_is_prefilling():
+    """Both drafter input paths must carry is_prefilling through to the draft build.
+
+    They construct a FRESH CommonAttentionMetadata rather than .replace()-ing, so a
+    field that is only read by mamba backends is easy to drop -- and dropping it is
+    invisible until a draft model has SSM layers, because every upstream drafter is
+    pure attention. The symptom is
+    `mamba_attn._compute_common_metadata: assert is_prefilling is not None`
+    on the first draft step, after a clean boot and a served request.
+    """
+    if _SKIP:
+        import pytest
+
+        pytest.skip(_SKIP)
+    import inspect
+
+    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+
+    for fn in (
+        SpecDecodeBaseProposer.prepare_inputs_padded,
+        SpecDecodeBaseProposer.prepare_inputs,
+    ):
+        src = inspect.getsource(fn)
+        assert "is_prefilling=" in src, (
+            f"{fn.__qualname__} drops is_prefilling; a hybrid draft model will assert "
+            "in BaseMambaAttentionMetadataBuilder on the first draft step"
+        )
+
+
 if __name__ == "__main__":
     if _SKIP:
         print(f"SKIP ({_SKIP})")
@@ -232,4 +261,5 @@ if __name__ == "__main__":
         test_get_mamba_groups_still_rejects_a_different_mamba_family()
         test_draft_hf_overrides_is_always_a_callable()
         test_get_quant_config_tolerates_a_callable_hf_overrides()
+        test_prepare_inputs_forwards_is_prefilling()
         print("hybrid draft kv group contract ok")
