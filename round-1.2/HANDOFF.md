@@ -17,12 +17,29 @@ The upgrade landed with only the off-box gates run. Everything below needs the H
 
 ### Leading latency candidate to sweep once the above is green
 
-**`--max-num-scheduled-tokens`** (new CLI flag in v0.26.0). `--max-num-batched-tokens=8192` does
-**not** chunk our prefills — the longest prompt is 4,281 tokens, so every turn-1 prefill runs
-whole, in one step, alongside in-flight decodes. This flag caps the scheduler's per-step budget
-*without* resizing worker buffers / compile ranges / `max_in_flight_tokens`. Sweep
-8192 (control) / 4096 / 2048 / 1024 with `make ab`; watch the ITL **tail**, not just the mean,
-since gamma=2 punishes it. Adding it drops rollback compatibility with the v0.25.0 image.
+**`--max-num-scheduled-tokens` — WIRED, defaulted to a no-op, needs sweeping.**
+`--max-num-batched-tokens=8192` does **not** chunk our prefills: the longest prompt is 4,281
+tokens, so every turn-1 prefill runs whole, in one step, alongside in-flight decodes. This flag
+caps the scheduler's per-step budget *without* resizing worker buffers / compile ranges /
+`max_in_flight_tokens`.
+
+It is now in `docker-compose.yaml` as `${VTL_MAX_SCHED_TOKENS:-8192}`. The default 8192 equals
+`max_num_batched_tokens`, which is exactly what the scheduler used when the flag was unset
+(`scheduler.py:111-113`) — so **the submitted artifact's behaviour is unchanged until someone
+sweeps it**. Sweep is pure env, no file edit:
+
+    VTL_MAX_SCHED_TOKENS=4096 make ab
+    VTL_MAX_SCHED_TOKENS=2048 make ab
+    VTL_MAX_SCHED_TOKENS=1024 make ab
+
+Watch the ITL **tail**, not the mean — gamma=2 is what makes this worth doing. Add boots, not
+reps. Note this flag made the file v0.26.0-only; rollback means dropping the line too.
+
+**`--kv-cache-memory-bytes` — deliberately NOT set, needs a number off the box.** It doesn't
+speed anything up; it pins KV sizing so memory profiling stops contributing to the boot-to-boot
+A/B noise floor. Guessing the value either wastes VRAM or OOMs at allocation, so read it from a
+real boot first (vLLM logs the resolved KV cache size at startup), then pin that value for the
+duration of a sweep so every arm gets identical capacity.
 
 **Do NOT set `--stream-interval` > 1.** Its docstring is aimed straight at us ("a larger value
 (e.g. 10) reduces host overhead ... by batching multiple tokens before sending"), and the host

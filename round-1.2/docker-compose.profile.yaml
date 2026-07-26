@@ -1,6 +1,18 @@
-# Phase-0 profiling overlay -- do NOT submit. This build's vLLM has the torch-profiler
-# endpoints/env stripped (no VLLM_TORCH_PROFILER_DIR, no /start_profile), so instead of
-# vLLM's profiler we arm vtl/patches/profiler.py, which wraps GPUModelRunner.execute_model
+# Phase-0 profiling overlay -- do NOT submit.
+#
+# CORRECTED 2026-07-26: this build's vLLM did NOT have the profiler "stripped". Upstream moved
+# it behind config: VLLM_TORCH_PROFILER_DIR no longer exists as an env var (0 hits in envs.py at
+# both v0.25.0 and v0.26.0), and entrypoints/serve/profile/api_router.py:attach_router only
+# mounts /start_profile + /stop_profile when `profiler_config.profiler is not None` -- which is
+# why they 404. vLLM's own profiler is therefore available via a serve flag, e.g.
+#   --profiler-config='{"profiler":"torch","torch_profiler_dir":"/profile","warmup_iterations":5,"max_iterations":20,"ignore_frontend":true}'
+# (v0.26.0 also adds capture_torch_profiler, which traces the cudagraph capture itself.)
+# We do NOT wire that here: `command:` in a compose overlay REPLACES the base list rather than
+# appending, so using it would mean duplicating every serve flag and inviting drift. The vtl
+# profiler below needs no serve flag and already works -- prefer it, and reach for
+# --profiler-config only if you need vLLM's own annotations.
+#
+# So instead of vLLM's profiler we arm vtl/patches/profiler.py, which wraps GPUModelRunner.execute_model
 # in the worker and dumps a chrome trace to the mounted dir. `make profile` drives it:
 # boot -> wait healthy -> touch ./bench-profile/.arm -> replay load -> the worker captures
 # VTL_PROFILE_STEPS steps, writes bench-profile/vtl-trace-<pid>.json, and disarms.

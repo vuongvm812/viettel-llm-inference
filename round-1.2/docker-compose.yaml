@@ -17,12 +17,16 @@ services:
     # 37 layers it reuses as an exact prefix, and that fork is stock v0.26.0 + the five
     # vtl/vllm_patches/v0.26.0/*.patch byte-for-byte).
     #
-    # Every flag and env var below is nonetheless deliberately version-AGNOSTIC -- nothing here
-    # is v0.26.0-only -- so this file also boots against the v0.25.0 rollback image pinned in
-    # Makefile. Keep it that way: a version-specific serve flag must land in the SAME commit
-    # that re-pins this digest, or a rollback silently becomes a SystemExit (argparse rejects
-    # unknown flags) before the socket binds, which scores zero. Nothing is lost by this --
-    # every v0.26.0-only knob evaluated so far is a no-op or a regression here (see below).
+    # !! THIS FILE NOW REQUIRES v0.26.0+. `--max-num-scheduled-tokens` below is a v0.26.0-only
+    # CLI flag (the field existed in v0.25.0's SchedulerConfig but EngineArgs never exposed it).
+    # Rolling back to the v0.25.0 image pinned in Makefile therefore means deleting that line
+    # too -- otherwise argparse rejects the unknown flag with SystemExit(2) before the socket
+    # binds, nothing answers on :8000, and every request scores zero. Rollback = restore the
+    # Makefile digest AND drop that one flag.
+    #
+    # Every OTHER flag and env var here is still deliberately version-agnostic; keep new
+    # version-specific ones to a minimum, and land them only in the same commit that re-pins
+    # this digest.
     image: unseenablefuture/awesome-badger@sha256:c0f2f1dcc3e68b579ac7ab676740681275fd1d1ea8c2bc9060dda7b616064e52 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
@@ -89,6 +93,17 @@ services:
       # It is v0.26.0-only, so adding it drops rollback compatibility with the pinned v0.25.0
       # image; land it only once it has actually won a sweep.
       - --max-num-batched-tokens=8192
+      # Per-step scheduler budget, decoupled from the buffer/compile sizing above.
+      # DEFAULT 8192 == max_num_batched_tokens == exactly what the scheduler already used when
+      # this was unset (scheduler.py:111-113), so the submitted artifact is byte-for-byte
+      # unchanged in behaviour until someone sweeps it. Interpolated so the A/B is pure env and
+      # needs no file edit:  VTL_MAX_SCHED_TOKENS=2048 make ab
+      # Lower values split the 4.3k turn-1 prefill across several shorter steps, flattening the
+      # in-flight decode ITL tail that gamma=2 punishes, for ~2 extra scheduler iterations of
+      # TTFT (worth 1/40th per ms). Sweep 8192/4096/2048/1024, watch the ITL TAIL not the mean.
+      # Setting this below the longest prompt is also what first makes --max-num-partial-prefills
+      # and --long-prefill-token-threshold meaningful; they are inert while nothing chunks.
+      - --max-num-scheduled-tokens=${VTL_MAX_SCHED_TOKENS:-8192}
       # W4A8: int4 weights (group-128, symmetric, RTN at load) + fp8-e4m3 per-token activations,
       # via vLLM's SM90 CUTLASS w4a8 kernel. Cuts decode weight traffic 1306 -> 852 MB/step
       # (-35%, ~0.76 ms at the ~600 GB/s of an H200 MIG 1g.18gb slice). Note the int4 group
