@@ -359,6 +359,14 @@ arm:
 ##   make ab AB_FLAG=--max-num-scheduled-tokens AB_ARMS="2048 8192"
 ##   make ab AB_FLAG=--quantization AB_ARMS="vtl_w4a8 vtl_fp8" AB_ROUNDS="1 2 3"
 ##
+## AB_OVERLAY_DIR sweeps arms that AB_FLAG cannot express. The arm value is pasted into both a
+## shell word and an output FILENAME, so a flag whose value carries spaces, braces or quotes
+## (--compilation-config, --ir-op-priority) either splits AB_ARMS or produces unreadable result
+## files. With AB_OVERLAY_DIR set, an arm is just a LABEL and its overlay is
+## $(AB_OVERLAY_DIR)/<label>.yaml, which you build up front with arm_compose.py (one call per
+## arm, --allow-unchanged for the control):
+##   make ab AB_ARMS="base vllmc" AB_OVERLAY_DIR=/tmp/ab-norm AB_ROUNDS="1 2 3"
+##
 ## Results: $(ROUND)/bench-ab-<arm>-r<round>-<rep>.json. Rank by ERS -- compare.py converts the
 ## boot-to-boot floor into ERS at the measured operating point and refuses to call a
 ## within-noise spread a winner. Add boots (AB_ROUNDS), not reps.
@@ -370,18 +378,22 @@ AB_LIMIT ?= 150
 ## Requests replayed once, discarded, before the measured reps: torch.compile/cudagraph/autotune
 ## work that lands in the first boot's TTFT would otherwise be charged to whichever arm booted.
 AB_WARM ?= 20
+AB_OVERLAY_DIR ?=
 ab:
-	@test -n "$(AB_FLAG)" -a -n "$(AB_ARMS)" || { echo "usage: make ab AB_FLAG=--flag AB_ARMS='v1 v2'"; exit 1; }
+	@test -n "$(AB_ARMS)" -a -n "$(AB_FLAG)$(AB_OVERLAY_DIR)" || { echo "usage: make ab AB_FLAG=--flag AB_ARMS='v1 v2'  [or AB_OVERLAY_DIR=<dir> with AB_ARMS='label1 label2']"; exit 1; }
 	$(IN) for r in $(AB_ROUNDS); do for a in $(AB_ARMS); do \
-	  echo "=== boot round $$r arm $(AB_FLAG)=$$a"; \
-	  python3 bench/arm_compose.py --allow-unchanged --out /tmp/vtl-ab.yaml $(ARM_COMPOSE_FILES) "$(AB_FLAG)=$$a" || exit 1; \
-	  $(DC) -f /tmp/vtl-ab.yaml up -d --force-recreate --wait || exit 1; \
+	  echo "=== boot round $$r arm $(AB_FLAG)$(if $(AB_FLAG),=)$$a"; \
+	  if [ -n "$(AB_OVERLAY_DIR)" ]; then ov="$(AB_OVERLAY_DIR)/$$a.yaml"; \
+	    test -f "$$ov" || { echo "no overlay $$ov -- build it with bench/arm_compose.py"; exit 1; }; \
+	  else ov=/tmp/vtl-ab.yaml; \
+	    python3 bench/arm_compose.py --allow-unchanged --out $$ov $(ARM_COMPOSE_FILES) "$(AB_FLAG)=$$a" || exit 1; fi; \
+	  $(DC) -f $$ov up -d --force-recreate --wait || exit 1; \
 	  ( $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) --limit $(AB_WARM) --out /dev/null || exit 1; \
 	    i=0; while [ $$i -lt $(AB_REPS) ]; do i=$$((i+1)); \
 	      $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	        --limit $(AB_LIMIT) --out bench-ab-$$a-r$$r-$$i.json || exit 1; \
 	    done ); rc=$$?; \
-	  $(DC) -f /tmp/vtl-ab.yaml down; [ $$rc -eq 0 ] || exit $$rc; \
+	  $(DC) -f $$ov down; [ $$rc -eq 0 ] || exit $$rc; \
 	done; done
 	@echo "verdict: cd $(ROUND) && python3 bench/ab_summary.py bench-ab-*.json"
 	@echo "  (compare.py prints one column per BOOT and cannot group arms — use ab_summary)"

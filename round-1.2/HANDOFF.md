@@ -283,6 +283,12 @@ wins because level defaults only fill fields still `None`.)
 `IS_QUANTIZED = False` is hardcoded at `vllm/config/vllm.py:97-104` pending issue #25689. The
 existing "do not enable it" warning is still correct, just unreachable by accident.
 
+**`use_inductor_graph_partition` — CLOSED 2026-07-27, measured WORSE on the dev box; leave it
+unset.** 3 boots/arm: ERS 0.4352 ±0.0032 off vs 0.4281 ±0.0038 on, TTFT p50 77 → 79 ms, TPOT
+unmoved, `torch.compile` 14.97 s → 27.19 s. See LEDGER.md row 2 — and read the gate caveat below
+before re-opening it on the H200, where the fusion count is actually legible. The survey text
+that follows is the pre-measurement reasoning, kept because it is still the right map.
+
 **`use_inductor_graph_partition` — the one compile knob nothing sets, forced `False` by every
 optimization level.** With it off, the FX graph is split at `_attention_ops`
 (`config/compilation.py:764-780`), which includes **`vllm::short_conv`** — so on LFM2 the graph
@@ -302,6 +308,25 @@ an Inductor pass, so it does not care either way. Run it anyway because it is on
 
 Read the **fusion-replaced-N-patterns** count first: unchanged ⇒ no cross-boundary fusion
 existed ⇒ stop, do not bother with `make ab`. Needs torch ≥ 2.9 (`compilation.py:994-1001`).
+
+> **That gate is DEGENERATE on the dev box — run it on the H200 only (measured 2026-07-27).**
+> `sm_86` fails the exact-SM-9.0 CUTLASS gate, so all 64 linears fall back
+> (`w4a8 quantized 0 layers … shape=64`), no `torch.ops._C.*_fp8_quant` node ever enters the
+> graph, and `RMSNormQuantFusionPass` logs `Replaced 0 patterns` **with the knob off as well as
+> on**. 0 vs 0 is not "no cross-boundary fusion existed", it is "there was nothing to fuse here".
+> Note the count also needs `VLLM_LOGGING_LEVEL=DEBUG` — `docker-compose.verify.yaml` only
+> raises it to INFO, so `make prove` prints `WARN fusion match count unknown`, not a number.
+> What the dev box *did* confirm is that the knob does what the docs say: the pass runs 5× (once
+> per split subgraph) with it off and **1×** over the whole graph with it on, at the cost of
+> `torch.compile took 27.19 s` vs `14.97 s`. Boot is healthy either way on torch 2.11.
+>
+> Do **not** reach for `--ir-op-priority` to "fix" the 0. v0.26.0 lowers `rms_norm` /
+> `fused_add_rms_norm` as `native` whenever inductor is on
+> (`platforms/cuda.py:get_default_ir_op_priority`), and setting
+> `--ir-op-priority={"rms_norm":["vllm_c"],"fused_add_rms_norm":["vllm_c"]}` does flip the
+> selected impl (`Selected implementations: fused_add_rms_norm=vllm_c*2`) — but the count stays
+> 0, because `rms_quant_fusion.py:41,183` matches the **`vllm.ir` node**, and the fusion pass
+> runs *before* the lowering pass. The impl choice cannot affect whether the pattern fires.
 
 **Not worth it: filling the `cudagraph_capture_sizes` gaps.** `[1,2,4,8,16,32]` pads a batch of
 5-7 up to 8. Peak concurrency on this trace is ~8 and the mean is 2, and decode is weight-traffic
