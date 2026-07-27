@@ -65,7 +65,7 @@ VLLM_FORK_TAG ?= v0.26.0
 # UNPINNED until `make vllm-fork PUSH=1` runs on the H200. Empty = resolve by mutable tag, which
 # means two "identical" A/B boots can silently be different images -- the one failure the
 # boot-to-boot noise methodology cannot detect. `make push` refuses to ship while it is empty.
-VLLM_FORK_DIGEST ?= @sha256:5f498360f32dc08bda775a947555cef623367b75e883485ef4f5f225ba0842d4
+VLLM_FORK_DIGEST ?= @sha256:54ea32f92863e4f269e15fecf4a2173d2b661c7bf1a3cd7ade698b56daf3d165
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # patched vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)$(VLLM_FORK_DIGEST)
