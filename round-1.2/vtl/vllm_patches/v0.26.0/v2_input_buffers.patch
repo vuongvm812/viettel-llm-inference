@@ -1,0 +1,24 @@
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 64c1096..1dd966a 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -32,6 +32,19 @@ class InputBuffers:
+             max_num_reqs, dtype=torch.int32, device=device
+         )
+ 
++        # vtl: two per-step CONSTANTS that GPUModelRunner.prepare_inputs used to rebuild
++        # on the device every step on the no-draft (decode) path -- a device alloc plus a
++        # kernel launch each, on a host-bound step. Unlike every other buffer here these
++        # are never written after construction: callers only slice them. That is what
++        # makes them safe to share across async scheduling's two in-flight batches, where
++        # a mutable shared buffer would be a correctness bug. Keep them read-only.
++        self.cu_num_logits_arange = torch.arange(
++            max_num_reqs + 1, dtype=torch.int32, device=device
++        )
++        self.zeros_max_num_reqs = torch.zeros(
++            max_num_reqs, dtype=torch.int32, device=device
++        )
++
+ 
+ @dataclass
+ class InputBatch:

@@ -44,6 +44,10 @@ gen model_executor/layers/mamba/mamba_utils.py  mamba_utils
 # sampler, and the dead-num_accepted-scatter elision in the hybrid model state.
 gen v1/worker/gpu/sample/sampler.py             v2_greedy_sampler
 gen v1/worker/gpu/model_states/mamba_hybrid.py  mamba_hybrid_postprocess
+# Paired: prepare_inputs slices two constant buffers that InputBuffers.__init__ allocates.
+# Landing either one alone is an AttributeError on the first decode step. Regenerate together.
+gen v1/worker/gpu/input_batch.py                v2_input_buffers
+gen v1/worker/gpu/model_runner.py               v2_prepare_inputs
 
 # THE guard. A hardcoded gen() list silently drops any edit to a file not named above -- that is
 # how three files' worth of spec-decode work sat unshipped in the checkout while notes claimed it
