@@ -57,7 +57,7 @@ VLLM_FORK_TAG ?= v0.26.0
 # UNPINNED until `make vllm-fork PUSH=1` runs on the H200. Empty = resolve by mutable tag, which
 # means two "identical" A/B boots can silently be different images -- the one failure the
 # boot-to-boot noise methodology cannot detect. `make push` refuses to ship while it is empty.
-VLLM_FORK_DIGEST ?= @sha256:5968cedbc5e5ce0106ea293997ffd8cbe72825052aa3d617b43c5381736c5ea2
+VLLM_FORK_DIGEST ?= 
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # patched vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)$(VLLM_FORK_DIGEST)
@@ -79,7 +79,7 @@ PGO_HFMODEL ?= ../hf-model
 # `x86-64-v4` (AVX-512), or `native` (best codegen, but bakes in the BUILD box's ISA — only
 # correct when building ON the H200, and a native/AVX2 instrumented binary can crash the PGO
 # training replay under Rosetta/OrbStack). Empty also means baseline (RUSTFLAGS unset).
-PGO_TARGET_CPU ?= x86-64-v4
+PGO_TARGET_CPU ?= x86-64
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
