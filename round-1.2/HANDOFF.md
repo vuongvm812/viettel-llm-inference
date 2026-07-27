@@ -4,13 +4,37 @@
 
 Row 1 is DONE (`VLLM_FORK_DIGEST=@sha256:c5bea8bf…` in `Makefile`, main image re-pinned to
 `@sha256:030c8c94…` in `docker-compose.yaml`). Rows 2–7 still need the H200 and are **not**
-optional. Off-box, `make check` and `bash vtl/vllm_patches/gen.sh` both pass as of 2026-07-26
-(all six v0.26.0 patches apply clean to a pristine `v0.26.0` tree, the parked one too).
+optional. Off-box, `make check` and `bash vtl/vllm_patches/gen.sh` both pass as of 2026-07-27
+(all eight v0.26.0 patches apply clean to a pristine `v0.26.0` tree, the parked one too).
+
+> **READ THIS BEFORE RUNNING ROW 2 — `make verify` could not pass, and now there is `make prove`.**
+> Every vtl module logs to `vllm.vtl`, a child of the `vllm` logger, and `vllm/logger.py:59,66` pin
+> both that logger and its handler to `$VLLM_LOGGING_LEVEL`. `docker-compose.yaml` ships `WARNING`,
+> so every INFO record is dropped — starting with `vtl/plugin.py:69` (`"vtl: applied N/M patches"`),
+> which is the **first** thing `verify` greps. It exited 1 there, before a single W4A8 assertion.
+>
+> The asymmetry is the dangerous part: every W4A8 **failure** signal is WARNING (`quantized 0
+> layers`, `CUDA ops absent`, `lm_head … FAILED`) and every **success** signal is INFO (the layer
+> *count*, `lm_head quantized to int4`, the fusion pattern count). On the shipped config you can
+> prove int4 failed but never that it succeeded — and a silent all-fp8 fallback is ~1,172 MB/step
+> instead of ~660 MB, i.e. **~0.85 ms of TPOT**, invisible in every other signal. Three gates flip
+> *all 65 layers* at once, never a subset: `cutlass.py:36` is an **exact** SM-9.0 match (not `>=`),
+> the pinned image must actually carry the sm90a kernels, and per-layer quantize must not raise.
+>
+> Use **`make prove`** (boots with `docker-compose.verify.yaml`, which sets INFO, runs the greps,
+> tears down). Do **not** raise the level in `docker-compose.yaml` or `docker-compose.localtest.yaml`
+> — INFO logging costs host time on a host-bound decode loop, so an arm booted at INFO is not
+> comparable to one booted at WARNING. Prove the config, then measure at WARNING.
+>
+> **Pass condition: `vtl: w4a8 quantized 65 layers (fallbacks: shape=0 error=0 load=0, total=0)`.**
+> 65 = 64 `LinearBase` + `lm_head`. Anything less is silent fp8. Audited 2026-07-27: no LFM2 shape
+> violates any CUTLASS W4A8 constraint (K ∈ {2048, 8192}, N ∈ {2048, 3072, 6144, 16384, 65536}, all
+> exact multiples of 128), so a shortfall means a runtime gate tripped, not a bad shape.
 
 | # | Command | Catches |
 |---|---|---|
 | 1 | `make vllm-fork PUSH=1` — **RE-OPENED 2026-07-26** | patch/version drift; the `patch --dry-run` gate. The pinned `VLLM_FORK_DIGEST=@sha256:c5bea8bf…` predates `mamba_utils.patch` + the spec-rollback hunks in `short_conv.patch`/`lfm2.patch`, so it must be rebuilt and BOTH digests re-pinned (fork in `Makefile`, main image in `docker-compose.yaml`). Nothing else changes for the shipped config — the new hunks are inert at `num_spec=0`. |
-| 2 | `make build && make up && make verify` | plugin loaded, quant methods registered, async scheduling on, **fusion-replaced-N-patterns count** (a drop = a fusion patch silently stopped matching) |
+| 2 | `make build && make prove` (**not** `make up && make verify` — see the box above) | plugin loaded, quant methods registered, async scheduling on, **65-layer int4 coverage**, `lm_head quantized to int4`, **fusion-replaced-N-patterns count** (a drop = a fusion patch silently stopped matching) |
 | 3 | `make test-kernel` | the `vtl._C` kernels and the two hijacked `_C` op schemas |
 | 4 | `bench/eval_quality.py`, capturing against the **v0.25.0 image** then the v0.26.0 one | **The important one.** Greedy temp-0 output parity. Several vtl patches reimplement vLLM internals verbatim (`qk_norm_rope` replaces `Lfm2Attention.forward`; `greedy_sampler` replaces `Sampler.forward`), and their failure mode is wrong tokens with no exception. Nothing else catches that. |
 | 5 | `make bench` / `make ab` vs the v0.25.0 image | whether the upgrade is latency-neutral. Add **boots, not reps** — the noise floor is boot-to-boot (~0.5 ms TPOT). |
@@ -144,58 +168,80 @@ iteration logging off the engine-core loop) plus staying current. If step 5 show
 the rollback is the digest in `Makefile` (image-level only — `vtl/vllm_patches/v0.25.0/` was
 deleted, so a source-level rollback needs `git revert`).
 
-### Speculative decoding — un-banned, wired, unmeasured (2026-07-26)
+### Speculative decoding — CLOSED, measured dead on this workload (2026-07-27)
 
-**The "truncation / dual-path cheating" flag was never a detector.** It was the judge's
-inference from the long-context probe scoring 0% while the short scored trace looked healthy —
-the signature of a server with two code paths. The actual defect is an upstream vLLM bug on
-this model:
+**Do not re-open this without new evidence about the trace.** The earlier version of this section
+called spec-decode "un-banned, wired, unmeasured" and treated it as the leading TPOT lever. It was
+investigated properly on 2026-07-27 and every leg of that case failed. It is not merely unfinished:
+the workload is the wrong shape for it, the two viable drafters each carry a disqualifying cost, and
+the "fix" this section used to advertise was never actually in any image.
 
-- LFM2 has 10 short-conv layers, each carrying a persistent `conv_state`.
-- Under chain spec-decode the target advances that state once per **draft** token.
-- Stock `ShortConv.forward_cuda` calls `causal_conv1d_update` with **no** `num_accepted_tokens`
-  / `query_start_loc` / `max_query_len` (verified against pristine `v0.26.0`, line 282), so
-  **rejected drafts are committed to the state and never rolled back**. `mamba_mixer2.py:991`
-  passes exactly those three args for exactly this reason; short-conv just never did.
-- The error is small per step and compounds with length: clean at 4k, garbage at 32k. Hence a
-  passing benchmark and a 0% long-context probe from one code path.
+**1. Acceptance is ~1.28 tokens/forward-pass, i.e. no speedup.** The trace is *synthetic*:
+`bench/build_trace_round2.py` pads every message to an exact token count by cycling a bank of 26
+fixed English notes (`KB_NOTES`, `sized_text()`), so ~79% of a turn-6 prompt is verbatim repetition
+and one request's context holds ~87 whole-note copies drawn from those 26. That makes the obvious
+statistic *look* excellent and it is the wrong one: n-gram self-match over the **prompt** is 50-55%,
+but vLLM's ngram proposer scores on what the model **writes**. Measured n-gram coverage of the prose
+part of a reply against its prior context is **0.0-1.7%** (n=3..5). A direct simulation of vLLM's
+proposer semantics yields **1.28 accepted tokens/step on prose** vs 3.87 on the note padding — and
+only the prose figure is real, because the model generates the answer rather than replaying notes.
+The system prompt actively suppresses the one behaviour that would help: *"cite the relevant part of
+the material in your own words rather than quoting it at length"* (`build_trace_round2.py:204-205`).
 
-Fixed and now in the applied set: `v0.26.0/short_conv.patch` (pass the three kernel args,
-capture `num_spec`, widen `get_state_shape`, bypass the fused `bcx_conv_gate_quant` while spec
-is active — it has no `num_accepted` path), `lfm2.patch` and `mamba_utils.patch` (thread
-`num_spec` through the shape planner; all three must move together or boot raises). Inert at
-`num_spec=0`, so the shipped non-spec artifact is unchanged. Contract test:
-`bench/test_shortconv_spec_rollback.py` (in-image, skips on the dev box).
+**2. Both no-model drafters are disqualified, for different reasons.**
+- `ngram` sets `async_scheduling = False` (`vllm/config/vllm.py:1101-1112`). It gives up host/device
+  overlap on a decode loop that is host-bound — the exact resource we are short of. Its match is
+  also a single-threaded host scan of the *entire* context (`ngram_proposer.py:249-281`; the
+  `parallel=True` is a lie, `:48` computes `min(1, cpu_count // 2)`), so its cost **grows with
+  context length**.
+- `ngram_gpu` keeps async scheduling but allocates `token_ids_gpu_tensor` of
+  `max_num_seqs × max_model_len × 4B` in `__init__`, before KV profiling
+  (`gpu_model_runner.py:617-622`). At our `--max-num-seqs=70` / `--max-model-len=32768` that is
+  **9.17 GB** resident on an 18 GB slice. Usable only with `--max-num-seqs` cut to ~8-16.
 
-**Second blocker, and it is the one that bites first:** vLLM v0.26.0's **V2 model runner does
-not implement ngram/ngram_gpu/suffix at all** — `config/vllm.py:2154-2165` lists them as
-unsupported and `_validate_v2_model_runner` **raises at startup**, so with
-`VLLM_USE_V2_MODEL_RUNNER=1` the process dies before binding `:8000` and every request scores
-zero. Only eagle/eagle3/mtp/dflash/dspark survive V2, and all of those need a draft model that
-a hybrid LFM2 target cannot host. So spec-decode here means the **V1** runner. Two edits in
-`docker-compose.yaml`, and they must move together:
+**3. There is no V2-runner path at all.** `vllm/config/vllm.py:2185-2196` lists `ngram` and
+`ngram_gpu` as unsupported, and **`suffix` falls into the same rejection** via the `elif` (an earlier
+version of this section missed that). `_validate_v2_model_runner` (`:2247-2256`) *raises* rather than
+falling back, and because `docker-compose.yaml` sets `VLLM_USE_V2_MODEL_RUNNER` explicitly,
+`:552-553` short-circuits the graceful path — the process dies before binding `:8000`. The only
+V2-allowed methods (eagle / eagle3 / mtp / dflash / dspark) each need a trained head or a checkpoint
+LFM2 does not have, and training one is out of scope (see "What NOT to Touch").
 
-1. uncomment the `--speculative-config={"method":"ngram",…}` line in the `command:` block;
-2. set `VLLM_USE_V2_MODEL_RUNNER: "0"` in `environment:`.
+**4. Going to V1 to get a drafter costs roughly 3-5x the per-step host numpy/Python and ~3x the H2D
+launch count** — V1 appends sampled tokens with a per-request Python loop and gathers input IDs with
+a host `index_select`, where V2 does both in one Triton kernel. On 3 vCPU that is the wrong trade to
+make for a 1.28x drafter. Also: the vtl greedy fast path goes **dead on every spec step** —
+`rejection_sampler.py:136-147` calls the sampler with `predict_bonus_token=True` and
+`max_num_logprobs=-1`, and `_should_fastpath` (`vtl/patches/greedy_sampler.py:32-42`) rejects both.
 
-(Literal edits, not env interpolation — see the `--max-num-scheduled-tokens` note above for
-why this file carries no `${VAR}`.) Flipping to V1 makes `v2_greedy_sampler.patch` + `mamba_hybrid_postprocess.patch` inert and
-re-activates `vtl/patches/greedy_sampler.py` (the V1 fast path, already spec-safe). The
-`kv_cache_manager` common-prefix elision self-disables under V1 by reading that same
-`VLLM_USE_V2_MODEL_RUNNER: "0"`, which is correct — V1 cascade attention is the one consumer
-of that field. So edit 2 covers both.
+**5. The `conv_state` rollback fix was INERT in every image ever built.** This is the important
+correction. The root cause described previously is real — stock `ShortConv.forward_cuda` commits
+rejected drafts to the persistent `conv_state`, which is why the long-context probe scored 0% while
+the short trace looked healthy. But the shipped `short_conv.patch` gates on
+`attn_metadata.num_accepted_tokens is not None`, and stock `gpu_model_runner.py:2470-2478` populates
+that field only for `(Mamba2, GDN, BailingLinear)` metadata builders —
+`ShortConvAttentionMetadataBuilder` is **not** in the tuple. The file that adds it (upstream PR
+#44296's third file) sat in the gitignored `vllm/` checkout and was never turned into a `.patch`, so
+`Dockerfile.vllm-fork` never applied it. With `num_accepted_tokens=None`,
+`mamba_attn.py:414-415` sets `decode_threshold=1`, every `1+k` row is classified as a prefill,
+`has_decode` is False for all 10 conv layers, and the rollback never runs. **This section previously
+claimed three files must move together; it is four, and the fourth fails silently rather than
+raising.** Anyone re-opening spec decode must land it first.
 
-**Go/no-go, both mandatory before this ships:**
-1. Long-context probe token-identical spec ON vs OFF at temperature 0. This is the exact check
-   the old flag was a proxy for; nothing else re-earns the trust.
-2. TPOT actually drops on the MIG 1g.18gb slice. The prior is favourable — decode is
-   weight-traffic bound (852 MB/step at batch ≤ 8), so verifying k+1 tokens is nearly free
-   while step count falls with acceptance — but the drafter runs on the co-dominant host term
-   and the fused conv-gate kernel is off under spec. Also log the acceptance rate: this trace
-   generates prose rather than copying from the prompt, which is ngram's weak case.
+The whole investigation, including the ~1238 lines of draft-model work that was never shipped, is
+preserved in `vtl/vllm_patches/archive/` with the reasoning. `bench/test_shortconv_spec_rollback.py`
+stays as the contract test if this is ever revived.
 
-Whichever way (2) lands, (1) is worth running once regardless: it is the only direct evidence
-that the dual-path root cause is actually gone.
+**If you do re-open it, the cheapest possible gate first:** boot the *current* config unchanged, run
+`bench/eval_quality.py --out ref.json` to capture 420 real generations, and re-run the proposer
+simulation against those instead of the synthetic replies in the trace. No config change, no runner
+switch, no patch work. If real output clears ~2 tokens/step, the case changes; below that, nothing
+downstream can pay for itself.
+
+**Also note `--speculative-config` is no longer present in `docker-compose.yaml`** — commit `e141e9c`
+stripped 322 lines of comments from that file and took the commented-out block with it. It was a
+comment cleanup, not a decision, but the practical effect is that turning spec on is now a fresh
+edit rather than an uncomment.
 
 ### Compile-knob survey, 2026-07-26 (read before touching `--compilation-config`)
 
@@ -235,7 +281,7 @@ existed ⇒ stop, do not bother with `make ab`. Needs torch ≥ 2.9 (`compilatio
 
 **Not worth it: filling the `cudagraph_capture_sizes` gaps.** `[1,2,4,8,16,32]` pads a batch of
 5-7 up to 8. Peak concurrency on this trace is ~8 and the mean is 2, and decode is weight-traffic
-bound (852 MB/step) where batch size barely moves the GPU term. 16 and 32 are never reached at
+bound (~660 MB/step) where batch size barely moves the GPU term. 16 and 32 are never reached at
 all; dropping them saves capture time and VRAM, not latency.
 
 
@@ -257,7 +303,7 @@ all; dropping them saves capture time and VRAM, not latency.
 | Property | Value |
 |----------|-------|
 | Hidden size | 2048 |
-| Intermediate | 12288 |
+| Intermediate | **8192** (not the 12288 in `config.json` — `block_auto_adjust_ff_dim: true` recomputes it: `int(2*12288/3)=8192`, rounded up to a 256 multiple. Confirmed against the checkpoint header: `w1.weight [8192, 2048]`.) |
 | Layers | 16 (10 short-conv + 6 GQA full-attention) |
 | KV heads | 8, head_dim=64 |
 | Short-conv dim | 2048, cache_len=3 |
@@ -364,7 +410,7 @@ For each successful request:
 | `--max-num-seqs` | 70 | Matches 70 conversations; peak concurrency under Poisson is lower |
 | `cudagraph_capture_sizes` | `[1,2,4,8,16,32]` | Tune for actual batch size distribution |
 | `cudagraph_mode` | `FULL_AND_PIECEWISE` | PIECEWISE avoids recompilation for unused sizes |
-| Speculative decoding | **UN-BANNED 2026-07-26, still OFF by default** | The old "cheating" flag was the judge inferring two code paths from a 0% long-context probe, not a detector on `--speculative-config`. Root cause and fix: short-conv `conv_state` rollback, now in the applied patch set. Two env vars turn it on (`VTL_SPEC` + `VTL_V2_RUNNER=0`); see the block in `docker-compose.yaml` and the section below. |
+| Speculative decoding | **CLOSED 2026-07-27 — measured dead, do not re-open blind** | ~1.28 accepted tok/step on prose (the trace's 50-55% prompt-side n-gram match is padding, not signal). `ngram` disables async scheduling; `ngram_gpu` wants 9.17 GB at `--max-num-seqs=70`; V2 rejects ngram/ngram_gpu/suffix and V1 costs 3-5x the per-step host work. The `conv_state` rollback fix was **inert in every image** (4th file never patched). Full verdict in the section above; archived work in `vtl/vllm_patches/archive/`. |
 
 ### Frontend (per-request overhead)
 

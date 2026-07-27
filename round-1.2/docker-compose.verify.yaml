@@ -1,0 +1,25 @@
+# VERIFICATION overlay -- do NOT submit this, and do NOT boot an A/B arm with it.
+#
+# Why it exists: every vtl module logs to `vllm.vtl`, a child of the `vllm` logger, and
+# vllm/logger.py:59,66 pin BOTH that logger and its handler to $VLLM_LOGGING_LEVEL. The
+# submission config ships WARNING, so every INFO record is dropped -- including
+# vtl/plugin.py:69 ("vtl: applied N/M patches"), which is the FIRST thing `make verify`
+# greps for. Result: verify exits 1 before reaching a single W4A8 assertion.
+#
+# The asymmetry is what makes this dangerous. Every W4A8 *failure* signal is WARNING
+# ("quantized 0 layers", "CUDA ops absent", "lm_head ... FAILED") and every *success*
+# signal is INFO (the layer COUNT, "lm_head quantized to int4", the fusion pattern
+# count). On the shipped config you can therefore prove int4 failed but never that it
+# succeeded -- and a silent all-fp8 fallback is ~1,172 MB/step instead of ~660 MB, i.e.
+# ~0.85 ms of TPOT, invisible in every other signal.
+#
+# Kept OUT of docker-compose.yaml (the submission artifact) and out of
+# docker-compose.localtest.yaml (which every dev boot picks up) on purpose: INFO logging
+# costs host time on a decode loop that is host-bound, so an arm booted with this is not
+# comparable to one booted without it. Use it to PROVE the config, then measure at WARNING.
+#
+# Usage: `make prove` (see the Makefile), or by hand as the last -f in the chain.
+services:
+  model:
+    environment:
+      VLLM_LOGGING_LEVEL: INFO

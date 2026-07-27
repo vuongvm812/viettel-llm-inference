@@ -1,0 +1,1238 @@
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 4b4a97f..b67a250 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -826,6 +826,37 @@ class VllmConfig:
+         ):
+             return
+ 
++        # vtl: this downgrade may only be skipped when the schedule is DEGENERATE -- every entry
++        # picking the same K as the static num_speculative_tokens -- because then there is only
++        # one verification length and the stock capture path already covers it.
++        #
++        # A genuinely varying schedule must keep the downgrade. Registering FULL keys per
++        # distinct 1+K without also teaching the capture pass to produce them is worse than the
++        # downgrade: dispatch returns FULL for a descriptor with no captured graph and
++        # CUDAGraphWrapper raises during serving. See the note on
++        # GPUModelRunner.uniform_decode_query_lens for what finishing it requires.
++        import os as _os
++
++        schedule = speculative_config.num_speculative_tokens_per_batch_size or []
++        distinct_ks = {int(entry[2]) for entry in schedule}
++        # `bool(...)` first: an EMPTY set is a subset of everything, so without it an empty
++        # schedule would skip the downgrade -- failing open in a function whose entire job is to
++        # fail closed. Unreachable today (the validator rejects an empty list) but wrong to rely
++        # on that.
++        degenerate = bool(distinct_ks) and distinct_ks <= {
++            int(speculative_config.num_speculative_tokens)
++        }
++
++        if degenerate and _os.environ.get(
++            "VTL_DYNAMIC_SD_FULL_CG", "1"
++        ).strip().lower() in ("1", "true", "yes", "on"):
++            logger.info_once(
++                "vtl: keeping cudagraph_mode=%s -- the dynamic SD schedule resolves to a "
++                "single verification length, which the stock capture path already covers.",
++                self.compilation_config.cudagraph_mode.name,
++            )
++            return
++
+         logger.warning_once(
+             "Dynamic speculative decoding changes the target verification "
+             "length at runtime. Overriding cudagraph_mode from %s to "
+diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
+index db161a5..29b4f70 100644
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -294,10 +294,15 @@ def get_quant_config(
+     # hf_overrides
+     hf_overrides = model_config.hf_overrides
+     if not isinstance(hf_overrides, dict):
+-        raise ValueError(
+-            "hf_overrides must be a dict for get_quant_config "
+-            "to get the quantization config from it."
+-        )
++        # vtl: a DRAFT model's hf_overrides is ALWAYS a callable --
++        # SpeculativeConfig.compose_draft_hf_overrides returns
++        # SpeculativeConfig.hf_config_override even when the target's overrides are a
++        # plain dict -- and a callable cannot carry either of the two keys read below.
++        # Raising here made `--speculative-config '{"quantization": ...}'` impossible for
++        # every draft model whose checkpoint has no embedded quantization_config, i.e.
++        # exactly the online/RTN case. Treat a non-dict as "no overrides" and fall through
++        # to the online / default-config paths.
++        hf_overrides = {}
+     quantization_config_file = hf_overrides.get("quantization_config_file", None)
+     if quantization_config_file is not None:
+         if hasattr(quant_cls, "from_config_file"):
+diff --git a/vllm/v1/attention/backends/mamba_attn.py b/vllm/v1/attention/backends/mamba_attn.py
+index 6fce7d0..0216cd2 100644
+--- a/vllm/v1/attention/backends/mamba_attn.py
++++ b/vllm/v1/attention/backends/mamba_attn.py
+@@ -163,6 +163,19 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
+         if self.use_spec_decode:
+             self.supports_update_block_table = False
+ 
++        # vtl: the uniform query length this builder captures FULL cudagraphs at.
++        #
++        # The TARGET verifies 1+num_spec tokens per request, which is the stock assumption. A
++        # separate DRAFT model does not: its decode steps are one token per request
++        # (llm_base_proposer.propose sets max_query_len = 1), while its builder is constructed
++        # from the SHARED vllm_config and therefore still reports num_spec_tokens = 3. Asserting
++        # `1 + num_spec_tokens` would reject every draft capture.
++        #
++        # Overridden to 1 on the draft builders by SpecDecodeBaseProposer. Not derived from
++        # num_spec_tokens, because that value also sizes state_indices_tensor_d and the align-mode
++        # block gather -- zeroing it to move this assert would silently narrow both.
++        self.vtl_capture_query_len = 1 + self.num_spec_tokens
++
+     def build_for_cudagraph_capture(
+         self, common_attn_metadata: CommonAttentionMetadata
+     ) -> M:
+@@ -180,10 +193,14 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
+             "Make sure all cudagraph capture sizes <= max_num_seq."
+         )
+ 
+-        assert m.max_query_len == 1 + self.num_spec_tokens  # decode-only
++        assert m.max_query_len == self.vtl_capture_query_len  # decode-only
+ 
+         num_accepted_tokens = None
+-        if self.num_spec_tokens > 0:
++        # vtl: gate on the CAPTURE query length, not num_spec_tokens. A draft builder inherits
++        # num_spec_tokens > 0 from the shared config but has no rollback -- its
++        # num_accepted_tokens is None at run time, so synthesising one here would capture a graph
++        # that takes a different branch than replay.
++        if self.num_spec_tokens > 0 and self.vtl_capture_query_len > 1:
+             num_accepted_tokens = torch.diff(m.query_start_loc)
+ 
+         prev_last_scheduled_idx = None
+diff --git a/vllm/v1/cudagraph_dispatcher.py b/vllm/v1/cudagraph_dispatcher.py
+index 6a48b62..0239fd8 100644
+--- a/vllm/v1/cudagraph_dispatcher.py
++++ b/vllm/v1/cudagraph_dispatcher.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from collections.abc import Sequence
+ from collections.abc import Set as AbstractSet
+ from dataclasses import replace
+ from itertools import product
+@@ -135,14 +136,36 @@ class CudagraphDispatcher:
+         uniform_decode: bool,
+         has_lora: bool,
+         num_active_loras: int = 0,
++        query_len: int | None = None,
+     ) -> BatchDescriptor:
++        """vtl: ``query_len`` overrides the single ``self.uniform_decode_query_len``.
++
++        Dynamic speculative decoding varies the verification length per step (1+K, where K comes
++        from the batch-size schedule), so a uniform decode batch no longer has ONE query length.
++        The caller passes the length actually in play; everything else is unchanged, and the
++        default keeps the stock single-length behaviour.
++        """
+         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+-        uniform_decode_query_len = self.uniform_decode_query_len
++        uniform_decode_query_len = (
++            query_len if query_len is not None else self.uniform_decode_query_len
++        )
+         num_tokens_padded = self._bs_to_padded_graph_size[num_tokens]
+ 
+         if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
++            if num_tokens_padded % uniform_decode_query_len != 0:
++                # Not expressible as a uniform batch at this query length -- fall through to the
++                # relaxed (piecewise) descriptor rather than asserting, because with a dynamic
++                # schedule the padded size need not divide every K.
++                uniform_decode = False
++                num_reqs = min(num_tokens_padded, max_num_seqs)
++                return BatchDescriptor(
++                    num_tokens=num_tokens_padded,
++                    num_reqs=num_reqs,
++                    uniform=False,
++                    has_lora=has_lora,
++                    num_active_loras=num_active_loras,
++                )
+             num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)
+-            assert num_tokens_padded % uniform_decode_query_len == 0
+         else:
+             uniform_decode = False
+             num_reqs = min(num_tokens_padded, max_num_seqs)
+@@ -164,8 +187,19 @@ class CudagraphDispatcher:
+         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
+ 
+     def initialize_cudagraph_keys(
+-        self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
++        self,
++        cudagraph_mode: CUDAGraphMode,
++        uniform_decode_query_len: int = 1,
++        extra_uniform_decode_query_lens: Sequence[int] = (),
+     ):
++        """vtl: ``extra_uniform_decode_query_lens`` adds FULL keys at additional query lengths.
++
++        Under dynamic speculative decoding the target verifies 1+K tokens per request with K
++        chosen per step from the batch-size schedule, so one set of FULL keys at the static max
++        would only ever match the largest K and every other step would silently fall back to
++        PIECEWISE. Capturing a graph per distinct 1+K is what makes dynamic SD and full
++        cudagraphs coexist on the V1 runner (the V2 runner does this natively).
++        """
+         # This should be called only after attention backend is initialized. So we can
+         # get the correct cudagraph mode after backend support is resolved.
+         self.cudagraph_mode = cudagraph_mode
+@@ -208,27 +242,33 @@ class CudagraphDispatcher:
+             cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+             and cudagraph_mode.separate_routine()
+         ):
+-            max_num_tokens = (
+-                uniform_decode_query_len
+-                * self.vllm_config.scheduler_config.max_num_seqs
+-            )
+             assert self.compilation_config.cudagraph_capture_sizes is not None, (
+                 "Cudagraph capture sizes must be set when full mode is enabled."
+             )
+-            cudagraph_capture_sizes_for_decode = [
+-                x
+-                for x in self.compilation_config.cudagraph_capture_sizes
+-                if x <= max_num_tokens and x >= uniform_decode_query_len
+-            ]
+-            for bs, num_active_loras in product(
+-                cudagraph_capture_sizes_for_decode, lora_cases
+-            ):
+-                self.add_cudagraph_key(
+-                    CUDAGraphMode.FULL,
+-                    self._create_padded_batch_descriptor(
+-                        bs, True, num_active_loras > 0, num_active_loras
+-                    ),
++            # Deduped and sorted so the stock single-length case is byte-identical.
++            query_lens = sorted(
++                {uniform_decode_query_len, *extra_uniform_decode_query_lens}
++            )
++            for query_len in query_lens:
++                if query_len <= 0:
++                    continue
++                max_num_tokens = (
++                    query_len * self.vllm_config.scheduler_config.max_num_seqs
+                 )
++                cudagraph_capture_sizes_for_decode = [
++                    x
++                    for x in self.compilation_config.cudagraph_capture_sizes
++                    if x <= max_num_tokens and x >= query_len and x % query_len == 0
++                ]
++                for bs, num_active_loras in product(
++                    cudagraph_capture_sizes_for_decode, lora_cases
++                ):
++                    self.add_cudagraph_key(
++                        CUDAGraphMode.FULL,
++                        self._create_padded_batch_descriptor(
++                            bs, True, num_active_loras > 0, num_active_loras, query_len
++                        ),
++                    )
+ 
+         self.keys_initialized = True
+ 
+@@ -240,6 +280,9 @@ class CudagraphDispatcher:
+         num_active_loras: int = 0,
+         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
+         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
++        # vtl: the query length actually in play this step. None = the static
++        # self.uniform_decode_query_len. Only differs under dynamic speculative decoding.
++        uniform_decode_query_len: int | None = None,
+     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+         """
+         Given conditions(e.g.,batch descriptor and if using piecewise only),
+@@ -301,7 +344,11 @@ class CudagraphDispatcher:
+ 
+         normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
+         batch_desc = self._create_padded_batch_descriptor(
+-            num_tokens, normalized_uniform, has_lora, effective_num_active_loras
++            num_tokens,
++            normalized_uniform,
++            has_lora,
++            effective_num_active_loras,
++            uniform_decode_query_len,
+         )
+ 
+         if CUDAGraphMode.FULL in allowed_modes:
+diff --git a/vllm/v1/spec_decode/dflash.py b/vllm/v1/spec_decode/dflash.py
+index 5d1c062..7a19720 100644
+--- a/vllm/v1/spec_decode/dflash.py
++++ b/vllm/v1/spec_decode/dflash.py
+@@ -220,7 +220,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
+         - Multimodal inputs are not currently supported
+         """
+         num_query_tokens = min(num_tokens, self.max_query_tokens)
+-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
++        # vtl: the base method also returns the BatchDescriptor now (drafter FULL cudagraphs).
++        # DFlash stays PIECEWISE, whose keys are relaxed, so the descriptor is discarded here.
++        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp, _ = (
+             self._determine_batch_execution_and_padding(
+                 num_query_tokens, use_cudagraphs=use_cudagraphs
+             )
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+index f8b52d0..71f85d7 100644
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import dataclasses
++import os
++from copy import copy
+ from importlib.util import find_spec
+ from typing import TYPE_CHECKING, Any, cast
+ 
+@@ -21,7 +23,7 @@ if TYPE_CHECKING:
+ 
+ from vllm.distributed.eplb.eplb_state import EplbState
+ from vllm.distributed.parallel_state import get_pp_group
+-from vllm.forward_context import set_forward_context
++from vllm.forward_context import BatchDescriptor, set_forward_context
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.model_loader import get_model
+@@ -39,7 +41,11 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+-from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
++from vllm.v1.kv_cache_interface import (
++    KVCacheConfig,
++    KVCacheSpec,
++    UniformTypeKVCacheSpecs,
++)
+ from vllm.v1.sample.metadata import SamplingMetadata
+ from vllm.v1.sample.ops.topk_topp_sampler import (
+     empty_exponential_noise_like,
+@@ -151,17 +157,49 @@ class SpecDecodeBaseProposer:
+ 
+         self.draft_attn_groups: list[AttentionGroup] = []
+         self.kv_cache_gid: int = -1
++        # Multi-KV-cache-group drafting (vLLM issue #49112). A hybrid draft model
++        # -- e.g. LFM2.5-350M drafting for LFM2.5-1.2B -- has short-conv layers
++        # (MambaSpec) and attention layers (FullAttentionSpec) that legitimately
++        # live in DIFFERENT KV cache groups, each with its own block table. These
++        # stay empty for a single-group drafter (EAGLE/MTP/DFlash), where every
++        # path below degrades to the original single-group behaviour.
++        self._per_group_block_tables: dict[int, torch.Tensor] = {}
++        self._per_group_slot_mappings: dict[int, torch.Tensor] = {}
++        # Slot-mapping buffers for non-primary groups; the primary group reuses
++        # self._slot_mapping_buffer.
++        self._per_group_slot_mapping_buffers: dict[int, torch.Tensor] = {}
+         self.eagle3_use_aux_hidden_state: bool = (
+             self._get_eagle3_use_aux_hidden_state_from_config()
+         )
+ 
+         self.compilation_config = self.vllm_config.compilation_config
+ 
+-        # Cudagraph dispatcher for PIECEWISE-only dispatching in eagle.
+-        # Keys are initialized later via initialize_cudagraph_keys() called from
++        # Cudagraph dispatcher for the drafter. Keys are initialized later via
++        # initialize_cudagraph_keys() called from
+         # gpu_model_runner._check_and_update_cudagraph_mode after
+         # adjust_cudagraph_sizes_for_spec_decode is called.
+         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
++        # vtl: drafter FULL decode cudagraphs (see initialize_cudagraph_keys).
++        #
++        # DEFAULT OFF, and deliberately so -- this is the one knob in this series that is not
++        # safe to ship on faith. The dispatch/wrapper/capture-length plumbing below is complete,
++        # but `dummy_run` still enters `set_forward_context(None, ...)`: the drafter passes NO
++        # attention metadata during warmup, and no draft builder's
++        # `build_for_cudagraph_capture` is ever called. PIECEWISE tolerates that because
++        # attention runs between graph pieces; a FULL capture puts attention INSIDE the graph
++        # and would capture against absent metadata.
++        #
++        # TO FINISH: give dummy_run a capture path that builds a uniform-decode
++        # CommonAttentionMetadata (num_reqs = num_tokens, query_len 1), calls
++        # build_for_cudagraph_capture on each draft attn group, and hands the per-layer dict to
++        # set_forward_context instead of None. Then flip this default. The prize is real --
++        # ~17 replays per draft step become 1 -- but an unvalidated capture crash costs the whole
++        # run, so it stays behind an explicit VTL_DRAFT_FULL_CUDAGRAPH=1.
++        self.vtl_full_cudagraph = os.environ.get(
++            "VTL_DRAFT_FULL_CUDAGRAPH", "0"
++        ).strip().lower() in ("1", "true", "yes", "on")
++        # Set once FULL keys exist, so propose() knows a uniform-decode descriptor is dispatchable.
++        self.vtl_full_decode_ready = False
+ 
+         # persistent buffers for cuda graph
+         self.input_ids = torch.zeros(
+@@ -390,29 +428,83 @@ class SpecDecodeBaseProposer:
+                 positions = positions[0]
+             self.positions[:num_tokens] = positions
+ 
++    def set_per_group_attn_metadata(
++        self,
++        gid: int,
++        block_table: torch.Tensor,
++        slot_mapping: torch.Tensor,
++    ) -> None:
++        """Register the model runner's block table / slot mapping for one group."""
++        self._per_group_block_tables[gid] = block_table
++        self._per_group_slot_mappings[gid] = slot_mapping
++
++    def _slot_mapping_buffer_for(self, gid: int) -> torch.Tensor:
++        if gid == self.kv_cache_gid:
++            return self._slot_mapping_buffer
++        buf = self._per_group_slot_mapping_buffers.get(gid)
++        if buf is None:
++            buf = torch.zeros(self.max_positions, dtype=torch.int64, device=self.device)
++            self._per_group_slot_mapping_buffers[gid] = buf
++        return buf
++
+     def _get_slot_mapping(
+         self,
+         num_tokens: int,
+         slot_mapping: torch.Tensor | None = None,
+     ) -> dict[str, torch.Tensor]:
+-        """Return slot_mapping dict for EAGLE layers.
++        """Per-layer slot_mapping, with one buffer per KV cache group.
+ 
+-        If slot_mapping is provided, copies it into the buffer first.
++        With a single draft group this is the original behaviour: one buffer,
++        one view, handed to every draft layer.
+         """
+-        if slot_mapping is not None:
+-            num_actual = slot_mapping.shape[0]
+-            self._slot_mapping_buffer[:num_actual].copy_(slot_mapping)
+-            if num_tokens > num_actual:
+-                self._slot_mapping_buffer[num_actual:num_tokens].fill_(PADDING_SLOT_ID)
+-
+-        view = self._slot_mapping_buffer[:num_tokens]
+-        return {name: view for name in self._draft_attn_layer_names}
++        per_layer: dict[str, torch.Tensor] = {}
++        for attn_group in self.draft_attn_groups:
++            gid = attn_group.kv_cache_group_id
++            if attn_group.backend.is_ssm():
++                # mamba_attn addresses state by BLOCK TABLE and never reads
++                # cm.slot_mapping, so give SSM layers the primary view rather than
++                # allocating a second buffer and copying into it every draft step.
++                # Passing the primary mapping (not a zero buffer) also keeps the
++                # value meaningful should a future backend start reading it.
++                view = self._slot_mapping_buffer[:num_tokens]
++                for layer_name in attn_group.layer_names:
++                    per_layer[layer_name] = view
++                continue
++            buf = self._slot_mapping_buffer_for(gid)
++            # The PRIMARY group always prefers the caller's mapping: the proposer
++            # rewrites it (set_inputs_first_pass -> extend_all_queries_by_N), so the
++            # runner-registered one is stale by the time drafting starts. Only the
++            # other groups fall back to what the runner registered.
++            if gid == self.kv_cache_gid and slot_mapping is not None:
++                source = slot_mapping
++            else:
++                source = self._per_group_slot_mappings.get(gid, slot_mapping)
++            if source is not None and buf.data_ptr() != source.data_ptr():
++                n = source.shape[0]
++                buf[:n].copy_(source)
++                if num_tokens > n:
++                    buf[n:num_tokens].fill_(PADDING_SLOT_ID)
++            view = buf[:num_tokens]
++            for layer_name in attn_group.layer_names:
++                per_layer[layer_name] = view
++        return per_layer
+ 
+     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
+         """Initialize cudagraph dispatcher keys for the drafter.
+ 
+-        Only supports PIECEWISE cudagraphs (via mixed_mode).
+-        This should be called after adjust_cudagraph_sizes_for_spec_decode.
++        vtl: the drafter used to be pinned to PIECEWISE unconditionally. On a hybrid LFM2 draft
++        that is expensive out of all proportion -- PIECEWISE splits the FX graph at every
++        `_attention_ops` node, which includes `vllm::short_conv`, so a 16-layer drafter replays
++        ~17 graphs plus the Python glue between them, once per draft step, while the TARGET's
++        decode is a single FULL replay. With `num_speculative_tokens=3` that is ~51 launches
++        bolted onto every decode step on a host-bound engine.
++
++        Draft steps 2..N are exactly the uniform decode case FULL cudagraphs exist for: a padded
++        batch, one token per request, inputs already staged in persistent buffers. So we add a
++        FULL decode routine alongside the PIECEWISE mixed one. Step 1 (the variable-length
++        "extend" pass over the accepted prefix) keeps PIECEWISE.
++
++        `VTL_DRAFT_FULL_CUDAGRAPH=0` restores the stock PIECEWISE-only behaviour exactly.
+         """
+         if (
+             not self.speculative_config.enforce_eager
+@@ -420,10 +512,31 @@ class SpecDecodeBaseProposer:
+             in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
+         ):
+             eagle_cudagraph_mode = CUDAGraphMode.PIECEWISE
++            if self.vtl_full_cudagraph and cudagraph_mode.decode_mode() == (
++                CUDAGraphMode.FULL
++            ):
++                # FULL_AND_PIECEWISE: piecewise for the mixed/extend pass, full for uniform
++                # decode. separate_routine() is what makes the dispatcher emit FULL keys at all.
++                eagle_cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+         else:
+             eagle_cudagraph_mode = CUDAGraphMode.NONE
+ 
+-        self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
++        # Draft decode is ONE token per request, unlike the target's 1+num_spec.
++        self.cudagraph_dispatcher.initialize_cudagraph_keys(
++            eagle_cudagraph_mode, uniform_decode_query_len=1
++        )
++        if eagle_cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
++            # NOTE the ordering: this runs from _check_and_update_cudagraph_mode, which the
++            # runner calls INSIDE initialize_attn_backend -- i.e. BEFORE
++            # initialize_metadata_builders reaches `drafter.initialize_attn_backend`. So
++            # `self.draft_attn_groups` is still empty here and the builders do not exist yet.
++            # The per-builder capture length is therefore applied at the END of the drafter's
++            # own initialize_attn_backend, which reads this flag.
++            self.vtl_full_decode_ready = True
++            logger.info(
++                "vtl: drafter will use FULL cudagraphs for its uniform decode steps "
++                "(was PIECEWISE-only)"
++            )
+ 
+     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         """Greedy-sample draft tokens from hidden states."""
+@@ -435,8 +548,63 @@ class SpecDecodeBaseProposer:
+             logits = self.vocab_mapping.constrain_draft_logits(logits)
+             draft_token_ids = logits.argmax(dim=-1)
+             return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)
++        fused = self._vtl_fused_argmax(hidden_states)
++        if fused is not None:
++            return fused
+         return self.model.compute_logits(hidden_states).argmax(dim=-1)
+ 
++    def _vtl_fused_argmax(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        """Fused int4 GEMV + argmax over the draft head, or None to use the stock path.
++
++        Skips the `[rows, vocab]` logits tensor entirely. Only ever active on a DRAFT head that
++        vtl pruned AND packed a plain-layout int4 copy for -- see
++        round-1.2/vtl/patches/lm_head_quant.py and round-1.2/vtl/csrc/draft_argmax.cu. Returns
++        None for anything else, which is every path in stock vLLM.
++
++        Fail-closed: any miss or error falls through to `compute_logits(...).argmax(-1)`, which
++        is the same answer by construction (the packing is checked against a torch oracle in
++        bench/test_draft_argmax.py). The one thing this must not do is raise.
++        """
++        head = getattr(getattr(self, "model", None), "lm_head", None)
++        qweight = getattr(head, "vtl_argmax_qweight", None)
++        if qweight is None:
++            return None
++        try:
++            rows = hidden_states.reshape(-1, hidden_states.shape[-1])
++            tiles = head.vtl_argmax_tiles
++            n_rows = rows.shape[0]
++            # Workspace is cached on the layer and grown on demand: the draft batch is padded to
++            # a handful of cudagraph sizes, so this allocates a few times at warmup and never
++            # again -- and never inside a captured region.
++            buf = getattr(head, "_vtl_argmax_ws", None)
++            if buf is None or buf[0].shape[0] < n_rows:
++                buf = (
++                    torch.empty((n_rows, tiles), dtype=torch.float32, device=rows.device),
++                    torch.empty((n_rows, tiles), dtype=torch.int32, device=rows.device),
++                )
++                head._vtl_argmax_ws = buf
++            out = torch.empty(n_rows, dtype=torch.int64, device=rows.device)
++            torch.ops.vllm_cuda.draft_argmax(
++                out,
++                rows,
++                qweight,
++                head.vtl_argmax_group_scale,
++                buf[0][:n_rows],
++                buf[1][:n_rows],
++            )
++            return out.view(hidden_states.shape[:-1])
++        except Exception:
++            # Once, then never again -- a per-step warning on the decode path would cost more
++            # than the kernel saves.
++            if not getattr(self, "_vtl_argmax_failed", False):
++                self._vtl_argmax_failed = True
++                logger.warning(
++                    "vtl: fused draft argmax failed; falling back to logits+argmax",
++                    exc_info=True,
++                )
++            head.vtl_argmax_qweight = None
++            return None
++
+     def _sample_from_logits(
+         self,
+         logits: torch.Tensor,
+@@ -558,7 +726,8 @@ class SpecDecodeBaseProposer:
+             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+         )
+ 
+-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
++        # First pass: variable-length extend over the accepted prefix, never uniform decode.
++        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp, batch_desc = (
+             self._determine_batch_execution_and_padding(num_tokens)
+         )
+ 
+@@ -583,6 +752,7 @@ class SpecDecodeBaseProposer:
+             num_tokens=num_input_tokens,
+             num_tokens_across_dp=num_tokens_across_dp,
+             cudagraph_runtime_mode=cudagraph_runtime_mode,
++            batch_descriptor=batch_desc,
+             slot_mapping=self._get_slot_mapping(
+                 slot_mapping_size, common_attn_metadata.slot_mapping
+             ),
+@@ -656,8 +826,15 @@ class SpecDecodeBaseProposer:
+         # Generate the remaining draft tokens.
+         draft_token_ids_list = [draft_token_ids]
+ 
+-        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
+-            self._determine_batch_execution_and_padding(batch_size)
++        # Draft steps 2..N: one token per request, padded batch -- the uniform decode case, and
++        # the only part of the draft path a FULL cudagraph can capture.
++        (
++            cudagraph_runtime_mode,
++            input_batch_size,
++            batch_size_across_dp,
++            decode_batch_desc,
++        ) = self._determine_batch_execution_and_padding(
++            batch_size, uniform_decode=self.vtl_full_decode_ready
+         )
+ 
+         common_attn_metadata.num_actual_tokens = batch_size
+@@ -742,6 +919,7 @@ class SpecDecodeBaseProposer:
+                 num_tokens=input_batch_size,
+                 num_tokens_across_dp=batch_size_across_dp,
+                 cudagraph_runtime_mode=cudagraph_runtime_mode,
++                batch_descriptor=decode_batch_desc,
+                 slot_mapping=self._get_slot_mapping(input_batch_size),
+             ):
+                 ret_hidden_states = self.model(**model_kwargs)
+@@ -777,6 +955,18 @@ class SpecDecodeBaseProposer:
+         """Update positions, slot mappings, and sequence metadata for the
+         next draft step. Returns the updated positions tensor."""
+         positions_1d = positions[0] if self.uses_mrope else positions
++        # SNAPSHOT, not an alias. `positions_1d` usually IS a view of self.positions[:batch_size],
++        # which eagle_step_update_slot_mapping_and_metadata overwrites in place just below -- so
++        # reading it afterwards to build the `exceeds` mask would test the NEW positions against
++        # max_model_len instead of the old ones. Only materialised when a secondary non-SSM group
++        # will actually consume it (for LFM2 both groups `continue`, so this stays None and the
++        # clone never happens).
++        old_positions_1d = None
++        if self._per_group_block_tables and any(
++            g.kv_cache_group_id != self.kv_cache_gid and not g.backend.is_ssm()
++            for g in self.draft_attn_groups
++        ):
++            old_positions_1d = positions_1d.clone()
+         if self.uses_mrope:
+             out_pos = self.mrope_positions[0, :batch_size]
+         elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
+@@ -816,6 +1006,46 @@ class SpecDecodeBaseProposer:
+         if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
+             common_attn_metadata.seq_lens_cpu_upper_bound += 1
+ 
++        # Multi-group drafting (issue #49112): the block above produced the slot
++        # mapping for the PRIMARY group only. Recompute it for every other group
++        # from that group's own block table -- otherwise a hybrid draft's conv
++        # layers index the attention group's blocks, which is either OOB or silent
++        # cross-request state corruption. No-op for a single-group drafter.
++        self._per_group_slot_mappings[self.kv_cache_gid] = (
++            common_attn_metadata.slot_mapping
++        )
++        if self._per_group_block_tables and old_positions_1d is not None:
++            new_positions_1d = positions[0] if self.uses_mrope else positions
++            exceeds = old_positions_1d + 1 >= self.max_model_len
++            for attn_group in self.draft_attn_groups:
++                gid = attn_group.kv_cache_group_id
++                if gid == self.kv_cache_gid:
++                    continue
++                if attn_group.backend.is_ssm():
++                    # SSM backends address state by BLOCK TABLE, never by slot
++                    # mapping (mamba_attn derives state_indices_tensor from
++                    # block_table_tensor and ignores cm.slot_mapping entirely).
++                    # Recomputing it for them is a per-draft-step gather on a
++                    # 3-vCPU host that nothing reads.
++                    continue
++                block_table = self._per_group_block_tables.get(gid)
++                if block_table is None:
++                    continue
++                n_blocks = block_table.shape[1]
++                bn = new_positions_1d // block_size
++                bn.clamp_(max=n_blocks - 1)
++                bn = bn.to(torch.long)
++                block_ids = (
++                    block_table[:batch_size].gather(1, bn.unsqueeze(1)).squeeze(1)
++                )
++                sm = block_ids * block_size + (new_positions_1d % block_size)
++                sm.masked_fill_(exceeds, PADDING_SLOT_ID)
++                buf = self._slot_mapping_buffer_for(gid)
++                buf[:batch_size].copy_(sm)
++                if input_batch_size > batch_size:
++                    buf[batch_size:input_batch_size].fill_(PADDING_SLOT_ID)
++                self._per_group_slot_mappings[gid] = buf[:batch_size]
++
+         return positions
+ 
+     def set_inputs_first_pass(
+@@ -995,9 +1225,36 @@ class SpecDecodeBaseProposer:
+     ) -> tuple[list[object], dict[str, object]]:
+         per_group_attn_metadata: list[object] = []
+         per_layer_attn_metadata: dict[str, object] = {}
++        # The proposer always works in unpadded shape. Per-group block tables
++        # registered via set_per_group_attn_metadata are stored at the model
++        # runner's padded shape; slice them to match cm's num_reqs.
++        num_reqs = common_attn_metadata.num_reqs
++        num_actual_tokens = common_attn_metadata.num_actual_tokens
+         for attn_group in self.draft_attn_groups:
++            gid = attn_group.kv_cache_group_id
++            # common_attn_metadata IS the primary group's, by construction (the runner
++            # hands the drafter the cm whose kv_cache_gid matches), and the proposer has
++            # since rewritten its slot mapping -- so never override it here.
++            if gid != self.kv_cache_gid and gid in self._per_group_block_tables:
++                cm = copy(common_attn_metadata)
++                cm.block_table_tensor = self._per_group_block_tables[gid][:num_reqs]
++                # SSM groups address state purely by block table; mamba_attn never
++                # reads cm.slot_mapping. Leaving the primary group's mapping in place
++                # for them avoids a length mismatch, because the proposer EXTENDS the
++                # query (extend_all_queries_by_N) while the runner-registered mapping
++                # is still the target step's length.
++                if (
++                    not attn_group.backend.is_ssm()
++                    and gid in self._per_group_slot_mappings
++                ):
++                    sm = self._per_group_slot_mappings[gid]
++                    if sm.shape[0] >= num_actual_tokens:
++                        sm = sm[:num_actual_tokens]
++                    cm.slot_mapping = sm
++            else:
++                cm = common_attn_metadata
+             attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
+-                common_attn_metadata=common_attn_metadata, draft_index=draft_index
++                common_attn_metadata=cm, draft_index=draft_index
+             )
+             per_group_attn_metadata.append(attn_metadata)
+             for layer_name in attn_group.layer_names:
+@@ -1153,6 +1410,13 @@ class SpecDecodeBaseProposer:
+             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
+             causal=True,
+             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
++            # vtl: per-request and unchanged by the padding above (num_reqs is the
++            # same), so it forwards like seq_lens. Dropping it was invisible upstream
++            # because every existing drafter is pure attention and attention backends
++            # never read it -- but a MAMBA draft layer reaches
++            # BaseMambaAttentionMetadataBuilder._compute_common_metadata via
++            # build_for_drafting, which asserts it is not None.
++            is_prefilling=common_attn_metadata.is_prefilling,
+         )
+ 
+         return (
+@@ -1264,6 +1528,9 @@ class SpecDecodeBaseProposer:
+             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
+             causal=True,
+             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
++            # vtl: see the matching note in prepare_inputs_padded -- a mamba draft
++            # layer asserts on this being None.
++            is_prefilling=common_attn_metadata.is_prefilling,
+         )
+ 
+         return spec_common_attn_metadata, token_indices
+@@ -1632,10 +1899,17 @@ class SpecDecodeBaseProposer:
+             1 if only_one_forward_pass else self.num_speculative_tokens
+         ):
+             if fwd_idx <= 1:
+-                cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+-                    self._determine_batch_execution_and_padding(
+-                        num_tokens, use_cudagraphs=use_cudagraphs
+-                    )
++                (
++                    cudagraph_runtime_mode,
++                    num_input_tokens,
++                    num_tokens_across_dp,
++                    batch_desc,
++                ) = self._determine_batch_execution_and_padding(
++                    num_tokens,
++                    use_cudagraphs=use_cudagraphs,
++                    # fwd_idx 0 is the extend pass; 1+ are the uniform decode steps this
++                    # dummy run must capture a FULL graph for.
++                    uniform_decode=self.vtl_full_decode_ready and fwd_idx >= 1,
+                 )
+ 
+             # Make sure to use EAGLE's own buffer during cudagraph capture.
+@@ -1654,6 +1928,7 @@ class SpecDecodeBaseProposer:
+                 num_tokens=num_input_tokens,
+                 num_tokens_across_dp=num_tokens_across_dp,
+                 cudagraph_runtime_mode=cudagraph_runtime_mode,
++                batch_descriptor=batch_desc,
+                 slot_mapping=slot_mapping_dict,
+             ):
+                 if self.supports_mm_inputs:
+@@ -1689,27 +1964,18 @@ class SpecDecodeBaseProposer:
+         return use_aux_hidden_state
+ 
+     def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
++        """No-op: draft layers may span several KV cache groups.
++
++        Was an assertion that every draft layer lived in ONE group, which is an
++        EAGLE-shaped assumption that a hybrid draft model cannot satisfy (its
++        short-conv layers carry a MambaSpec and its attention layers a
++        FullAttentionSpec, so they are necessarily different groups -- vLLM issue
++        #49112). ``initialize_attn_backend`` now keys AttentionGroups on
++        ``(backend, group id)``, which makes the invariant structural rather than
++        asserted. Kept as a hook so the model runner call site and the subclass
++        overrides that already returned early do not have to change.
+         """
+-        Validate that all drafting layers belong to the same KVCacheGroup.
+-        Need this assumption to ensure all drafting layers can use the
+-        same AttentionMetadata.
+-        May extend to multiple AttentionMetadata in the future.
+-        """
+-        kv_cache_groups: dict[str, int] = {}
+-        for id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+-            for layer_name in kv_cache_group.layer_names:
+-                kv_cache_groups[layer_name] = id
+-        assert (
+-            len(
+-                set(
+-                    [
+-                        kv_cache_groups[layer_name]
+-                        for layer_name in self._draft_attn_layer_names
+-                    ]
+-                )
+-            )
+-            == 1
+-        ), "All drafting layers should belong to the same kv cache group"
++        return
+ 
+     def initialize_attn_backend(
+         self,
+@@ -1719,67 +1985,135 @@ class SpecDecodeBaseProposer:
+         """
+         Initialize AttentionGroups for draft layers using kv_cache_config.
+         Called from the model runner's initialize_metadata_builders.
++
++        Draft layers are grouped by ``(attention backend, kv cache group id)``, so
++        a drafter whose layers span several KV cache groups gets one AttentionGroup
++        -- and therefore one AttentionMetadata and one block table -- per group.
++        A single-group drafter yields exactly the previous one-group-per-backend
++        result. This replaces the old ``validate_same_kv_cache_group`` assertion,
++        which rejected hybrid draft models outright (vLLM issue #49112).
+         """
+         all_attn_layers = get_layers_from_vllm_config(
+             self.vllm_config,
+             AttentionLayerBase,  # type: ignore[type-abstract]
+         )
+ 
+-        # Find which kv_cache_group the draft layers belong to
+-        self.validate_same_kv_cache_group(kv_cache_config)
+-        kv_cache_spec = None
++        layer_to_gid: dict[str, int] = {}
++        layer_to_spec: dict[str, KVCacheSpec] = {}
+         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+-            if self._draft_attn_layer_names & set(group.layer_names):
+-                self.kv_cache_gid = gid
+-                kv_cache_spec = group.kv_cache_spec
+-                break
+-
+-        attention_groups: dict[tuple[str, str], AttentionGroup] = {}
+-        if kv_cache_spec is not None:
+-            for layer_name in self._draft_attn_layer_names:
+-                attn_backend = all_attn_layers[layer_name].get_attn_backend()
+-                backend_key = attn_backend.full_cls_name()
+-                if backend_key not in attention_groups:
+-                    layer_kv_cache_spec = kv_cache_spec
+-                    if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+-                        layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
++            group_spec = group.kv_cache_spec
++            for layer_name in group.layer_names:
++                layer_to_gid[layer_name] = gid
++                if isinstance(group_spec, UniformTypeKVCacheSpecs):
++                    if layer_name in group_spec.kv_cache_specs:
++                        layer_to_spec[layer_name] = group_spec.kv_cache_specs[
+                             layer_name
+                         ]
+-
+-                    kernel_block_size = (
+-                        kernel_block_sizes[self.kv_cache_gid]
+-                        if kernel_block_sizes is not None
+-                        and self.kv_cache_gid < len(kernel_block_sizes)
+-                        else None
+-                    )
+-                    attn_group = AttentionGroup(
+-                        backend=attn_backend,
+-                        layer_names=[layer_name],
+-                        kv_cache_spec=layer_kv_cache_spec,
+-                        kv_cache_group_id=self.kv_cache_gid,
+-                    )
+-                    attn_group.create_metadata_builders(
+-                        self.vllm_config,
+-                        self.device,
+-                        kernel_block_size=kernel_block_size,
+-                    )
+-                    attention_groups[backend_key] = attn_group
++                    else:
++                        target_layer_name = getattr(
++                            all_attn_layers.get(layer_name),
++                            "kv_sharing_target_layer_name",
++                            None,
++                        )
++                        if (
++                            target_layer_name
++                            and target_layer_name in group_spec.kv_cache_specs
++                        ):
++                            layer_to_spec[layer_name] = group_spec.kv_cache_specs[
++                                target_layer_name
++                            ]
++                        else:
++                            layer_to_spec[layer_name] = group_spec
+                 else:
+-                    attention_groups[backend_key].layer_names.append(layer_name)
++                    layer_to_spec[layer_name] = group_spec
++
++        attention_groups: dict[tuple[str, int], AttentionGroup] = {}
++        for layer_name in sorted(self._draft_attn_layer_names):
++            if layer_name not in layer_to_spec:
++                continue
++            attn_backend = all_attn_layers[layer_name].get_attn_backend()
++            spec = layer_to_spec[layer_name]
++            gid = layer_to_gid[layer_name]
++            group_key = (attn_backend.full_cls_name(), gid)
++
++            if group_key not in attention_groups:
++                kernel_block_size = (
++                    kernel_block_sizes[gid]
++                    if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
++                    else None
++                )
++                attn_group = AttentionGroup(
++                    backend=attn_backend,
++                    layer_names=[layer_name],
++                    kv_cache_spec=spec,
++                    kv_cache_group_id=gid,
++                )
++                attn_group.create_metadata_builders(
++                    self.vllm_config,
++                    self.device,
++                    kernel_block_size=kernel_block_size,
++                )
++                attention_groups[group_key] = attn_group
++            else:
++                attention_groups[group_key].layer_names.append(layer_name)
+ 
+         self.draft_attn_groups = list(attention_groups.values())
+-        self.block_size = (
+-            self.draft_attn_groups[0].get_metadata_builder().kv_cache_spec.block_size
++        if self.draft_attn_groups:
++            # The primary group must be an ATTENTION group: self.block_size feeds
++            # compute_new_slot_mapping, which is meaningless for an SSM group. Layer
++            # 0 of a hybrid draft (e.g. LFM2.5) is a short-conv layer, so taking
++            # draft_attn_groups[0] blindly would pick the SSM group.
++            primary = next(
++                (g for g in self.draft_attn_groups if not g.backend.is_ssm()),
++                self.draft_attn_groups[0],
++            )
++            self.kv_cache_gid = primary.kv_cache_group_id
++            self.block_size = primary.get_metadata_builder().kv_cache_spec.block_size
++        else:
++            self.kv_cache_gid = 0
++            self.block_size = kv_cache_config.kv_cache_groups[
++                0
++            ].kv_cache_spec.block_size
++        logger.debug(
++            "Drafting over %d kv cache group(s), block size %d",
++            len({g.kv_cache_group_id for g in self.draft_attn_groups}),
++            self.block_size,
+         )
+-        logger.debug("Using block size %d for drafting layers", self.block_size)
++
++        # vtl: the builders exist only now, so this is where the FULL-decode capture length
++        # lands. initialize_cudagraph_keys ran earlier (from the runner's
++        # _check_and_update_cudagraph_mode, before this method) and set the flag; applying it
++        # there would have iterated an empty draft_attn_groups and silently done nothing, and
++        # the drafter's FULL capture would then trip
++        # `assert m.max_query_len == 1 + num_spec_tokens` at boot.
++        if self.vtl_full_decode_ready:
++            marked = 0
++            for attn_group in self.draft_attn_groups:
++                for builder in attn_group.metadata_builders:
++                    if hasattr(builder, "vtl_capture_query_len"):
++                        builder.vtl_capture_query_len = 1
++                        marked += 1
++            logger.info(
++                "vtl: %d draft metadata builder(s) set to capture at query_len 1", marked
++            )
+ 
+     def _determine_batch_execution_and_padding(
+         self,
+         num_tokens: int,
+         use_cudagraphs: bool = True,
+-    ) -> tuple[CUDAGraphMode, int, torch.Tensor | None]:
++        uniform_decode: bool = False,
++    ) -> tuple[CUDAGraphMode, int, torch.Tensor | None, BatchDescriptor | None]:
++        """vtl: also returns the BatchDescriptor.
++
++        FULL cudagraphs are keyed on the exact descriptor -- including ``num_reqs`` and
++        ``uniform`` -- so the caller must hand the same object to ``set_forward_context`` rather
++        than let it synthesise ``BatchDescriptor(num_tokens=...)``, which would miss every FULL
++        key. PIECEWISE keys are relaxed (``num_reqs=None, uniform=False``) and match either way,
++        so the extra return value is inert on the stock path.
++        """
+         cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+             num_tokens,
++            uniform_decode=uniform_decode,
+             valid_modes=({CUDAGraphMode.NONE} if not use_cudagraphs else None),
+         )
+         num_tokens_padded = batch_desc.num_tokens
+@@ -1815,7 +2149,7 @@ class SpecDecodeBaseProposer:
+                 assert batch_desc.num_tokens == num_tokens_padded
+                 num_tokens_across_dp[dp_rank] = num_tokens_padded
+ 
+-        return cudagraph_mode, num_tokens_padded, num_tokens_across_dp
++        return cudagraph_mode, num_tokens_padded, num_tokens_across_dp, batch_desc
+ 
+ 
+ # NOTE(woosuk): Currently, the below code is not used and we always use argmax
+diff --git a/vllm/v1/spec_decode/step3p5.py b/vllm/v1/spec_decode/step3p5.py
+index 47821cc..40abf89 100644
+--- a/vllm/v1/spec_decode/step3p5.py
++++ b/vllm/v1/spec_decode/step3p5.py
+@@ -309,7 +309,10 @@ class Step3p5MTPProposer(EagleProposer):
+             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+         )
+ 
+-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
++        # vtl: the base method also returns the BatchDescriptor now (drafter FULL cudagraphs).
++        # Step3p5 stays PIECEWISE, where the descriptor is relaxed and set_forward_context's
++        # synthesised one matches, so it is discarded here.
++        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp, _ = (
+             self._determine_batch_execution_and_padding(num_tokens)
+         )
+ 
+@@ -373,7 +376,7 @@ class Step3p5MTPProposer(EagleProposer):
+ 
+         draft_token_ids_list = [draft_token_ids]
+ 
+-        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
++        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp, _ = (
+             self._determine_batch_execution_and_padding(batch_size)
+         )
+ 
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index f3f0afb..d4b771b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -143,6 +143,9 @@ from vllm.v1.attention.backends.linear_attn import (
+     BailingLinearAttentionMetadataBuilder,
+ )
+ from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
++from vllm.v1.attention.backends.short_conv_attn import (
++    ShortConvAttentionMetadataBuilder,
++)
+ from vllm.v1.attention.backends.utils import (
+     NULL_BLOCK_ID,
+     create_fast_prefill_custom_backend,
+@@ -857,6 +860,22 @@ class GPUModelRunner(
+ 
+         self.uniform_decode_query_len = 1 + self.num_spec_tokens
+ 
++        # vtl: every verification length a uniform decode step may be DISPATCHED at.
++        #
++        # This must never list a length the CAPTURE pass cannot produce, or dispatch returns
++        # FULL for a descriptor that has no graph and CUDAGraphWrapper raises mid-serving
++        # (capturing is globally disabled by then). Capture currently cannot: _warmup_and_capture
++        # drops `desc.num_reqs` and `_dummy_run` hardcodes
++        # `max_query_len = self.uniform_decode_query_len`, so every FULL capture lands on the
++        # static length no matter which descriptor asked for it.
++        #
++        # So this stays a single element. Supporting a real per-K set needs `desc.num_reqs`
++        # threaded into `_dummy_run` with `max_query_len = num_tokens // num_reqs`, AND
++        # mamba_attn's `assert m.max_query_len == self.vtl_capture_query_len` relaxed for the
++        # target. Until then dynamic SD keeps the stock PIECEWISE downgrade (see
++        # VllmConfig._maybe_override_dynamic_sd_cudagraph_mode), which is correct, just slower.
++        self.uniform_decode_query_lens = [self.uniform_decode_query_len]
++
+         # Cudagraph dispatcher for runtime cudagraph dispatching.
+         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
+ 
+@@ -2474,10 +2493,17 @@ class GPUModelRunner(
+                     Mamba2AttentionMetadataBuilder,
+                     GDNAttentionMetadataBuilder,
+                     BailingLinearAttentionMetadataBuilder,
++                    # vtl: upstream PR #44296's third file. Without ShortConv here
++                    # the builder's num_accepted_tokens stays None, so
++                    # ShortConv.forward_cuda takes the non-spec kernel path AND
++                    # mamba_attn's decode_threshold collapses to 1 -- every spec row
++                    # is misclassified as a prefill and the conv_state rollback never
++                    # happens. Moves with short_conv/lfm2/mamba_utils.patch.
++                    ShortConvAttentionMetadataBuilder,
+                 ),
+             ):
+                 assert ubid is None, (
+-                    "UBatching not supported with GDN or linear attn yet"
++                    "UBatching not supported with GDN, linear attn or short_conv yet"
+                 )
+                 extra_attn_metadata_args = dict(
+                     num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
+@@ -2551,6 +2577,13 @@ class GPUModelRunner(
+                         DFlashProposer,
+                         Gemma4Proposer,
+                         ExtractHiddenStatesProposer,
++                        # vtl (issue #49112): without this a separate draft model
++                        # fell through to the `else` and was handed group 0's
++                        # common_attn_metadata unconditionally. For a HYBRID draft
++                        # group 0 is the SSM group, so its attention layers would
++                        # have indexed the conv block table (and vice versa) --
++                        # OOB, or silent cross-request state corruption.
++                        DraftModelProposer,
+                     ),
+                 ):
+                     if self.drafter.kv_cache_gid == kv_cache_gid:
+@@ -2558,7 +2591,9 @@ class GPUModelRunner(
+                 else:
+                     spec_decode_common_attn_metadata = cm
+             # Capture per-group block tables for multi-group proposers.
+-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
++            if self.speculative_config and isinstance(
++                self.drafter, (Step3p5MTPProposer, DraftModelProposer)
++            ):
+                 self.drafter.set_per_group_attn_metadata(
+                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
+                 )
+@@ -3896,13 +3931,28 @@ class GPUModelRunner(
+         torch.Tensor | None,
+         CUDAGraphStat | None,
+     ]:
+-        uniform_decode = self._is_uniform_decode(
+-            max_num_scheduled_tokens=max_num_scheduled_tokens,
+-            uniform_decode_query_len=self.uniform_decode_query_len,
+-            num_tokens=num_tokens,
+-            num_reqs=num_reqs,
+-            force_uniform_decode=force_uniform_decode,
+-        )
++        # vtl: match against ANY captured verification length, not just the static max. With a
++        # dynamic K schedule the step's query length is 1+K for whatever K the scheduler picked;
++        # `step_query_len` is then the length this batch's descriptor must be built with.
++        step_query_len = self.uniform_decode_query_len
++        if force_uniform_decode is not None:
++            # Capture path: the caller already decided, and it drives the descriptor with
++            # max_num_scheduled_tokens. Honour that verbatim rather than re-deriving a length.
++            uniform_decode = force_uniform_decode
++            if force_uniform_decode:
++                step_query_len = max_num_scheduled_tokens
++        else:
++            uniform_decode = False
++            for candidate in self.uniform_decode_query_lens:
++                if self._is_uniform_decode(
++                    max_num_scheduled_tokens=max_num_scheduled_tokens,
++                    uniform_decode_query_len=candidate,
++                    num_tokens=num_tokens,
++                    num_reqs=num_reqs,
++                ):
++                    uniform_decode = True
++                    step_query_len = candidate
++                    break
+         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
+         # is present). Also, chunked-prefill is disabled, so batch are uniform.
+         has_encoder_output = (
+@@ -3927,6 +3977,9 @@ class GPUModelRunner(
+                 num_active_loras=num_active_loras,
+                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
+                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
++                # vtl: the verification length this step actually uses (1+K under a dynamic
++                # schedule). Equals self.uniform_decode_query_len in the static case.
++                uniform_decode_query_len=step_query_len,
+             )
+ 
+         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+@@ -5409,6 +5462,21 @@ class GPUModelRunner(
+             self.model = CUDAGraphWrapper(
+                 self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
+             )
++            # vtl: the drafter needs its own FULL wrapper or its uniform decode steps have no
++            # graph to replay into and stay PIECEWISE -- ~17 replays per draft step on a hybrid
++            # LFM2 draft, three times per target step. The wrapper is a no-op unless the
++            # forward context carries cudagraph_runtime_mode=FULL, which only the drafter's
++            # decode steps set (see SpecDecodeBaseProposer.initialize_cudagraph_keys), so the
++            # variable-length extend pass is unaffected.
++            drafter = getattr(self, "drafter", None)
++            if (
++                drafter is not None
++                and getattr(drafter, "vtl_full_cudagraph", False)
++                and hasattr(drafter, "model")
++            ):
++                drafter.model = CUDAGraphWrapper(
++                    drafter.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
++                )
+         elif self.parallel_config.use_ubatching:
+             if cudagraph_mode.has_full_cudagraphs():
+                 self.model = UBatchWrapper(
+@@ -6108,13 +6176,25 @@ class GPUModelRunner(
+                     | Gemma4Proposer,
+                 )
+                 assert self.speculative_config is not None
+-                # Eagle currently only supports PIECEWISE cudagraphs.
+-                # Therefore only use cudagraphs if the main model uses PIECEWISE
+-                # NOTE(lucas): this is a hack, need to clean up.
++                # The drafter historically only supported PIECEWISE cudagraphs, so it was run
++                # EAGER during the target's FULL capture pass and captured nothing there.
++                #
++                # vtl: with VTL_DRAFT_FULL_CUDAGRAPH the drafter also captures FULL graphs for
++                # its uniform decode steps, so it must participate in the FULL pass too. Its own
++                # dispatcher decides what it can actually capture at each size -- passing
++                # use_cudagraphs=True here only permits capture, it does not force it.
++                drafter_full = getattr(self.drafter, "vtl_full_cudagraph", False) and (
++                    getattr(self.drafter, "vtl_full_decode_ready", False)
++                )
++                allowed_capture_modes = (
++                    (CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL)
++                    if drafter_full
++                    else (CUDAGraphMode.PIECEWISE,)
++                )
+                 use_cudagraphs = (
+                     (
+                         is_graph_capturing
+-                        and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
++                        and cudagraph_runtime_mode in allowed_capture_modes
+                     )
+                     or (
+                         not is_graph_capturing
+@@ -7125,7 +7205,11 @@ class GPUModelRunner(
+         # Trigger cudagraph dispatching keys initialization after
+         # resolved cudagraph mode.
+         self.cudagraph_dispatcher.initialize_cudagraph_keys(
+-            cudagraph_mode, self.uniform_decode_query_len
++            cudagraph_mode,
++            self.uniform_decode_query_len,
++            # vtl: one FULL key set per verification length the dynamic K schedule can produce.
++            # Identical to the stock call when the schedule is unset.
++            extra_uniform_decode_query_lens=self.uniform_decode_query_lens,
+         )
+ 
+         # Initialize drafter's cudagraph dispatcher if using spec decode.
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index 7f611a2..237a768 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -438,7 +438,41 @@ def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSp
+             mamba_group_ids.append(i)
+             mamba_specs.append(kv_cache_spec)
+     assert len(mamba_group_ids) > 0, "no mamba layers in the model"
+-    assert all(mamba_specs[0] == spec for spec in mamba_specs)
++    # vtl (vLLM issue #49112): a HYBRID separate draft model contributes its own mamba
++    # group, and its `shapes` differ from the target's -- LFM2.5-350M drafting for the
++    # 1.2B target is conv_dim 1024 vs 2048. Full spec equality is stricter than any
++    # caller needs: everything read off the returned spec is `block_size` and
++    # `num_speculative_blocks`, which are cache_config/speculative_config globals and
++    # must still agree. Per-layer geometry (base addr, block stride, conv width, element
++    # size) comes from the LIVE state tensors in collect_mamba_copy_meta /
++    # initialize_from_forward_context, never from this spec.
++    #
++    # So compare every field EXCEPT `shapes`, plus the shapes' LENGTH -- one state tensor
++    # per layer for short_conv, two for mamba2 -- because `mamba_state_copy_funcs` is a
++    # single tuple taken from the TARGET model class and zipped against each layer's
++    # kv_cache. That length term is what makes a drafter from a different mamba family
++    # fail loudly here instead of silently mis-copying.
++    #
++    # `page_size_padded` is excluded for the same reason as `shapes`: it is DERIVED from
++    # them. `Platform.set_kv_cache_params` returns early leaving it None when a model's
++    # conv page already equals its attention page, and sets it otherwise -- and it runs
++    # once per model config, so the target and the drafter reach the SAME page size by
++    # different routes (here: target 4*2048*bf16 = 16384 = its attn page -> None; draft
++    # 4*1024*bf16 = 8192 -> padded to 16384). Which route the target takes moves with
++    # `num_speculative_tokens`, because that shifts cache_config.block_size, so leaving
++    # this field in made the assert fire at some K and pass at others for no real reason.
++    # Compare the RESOLVED `page_size_bytes` instead: same invariant, no bookkeeping.
++    spec_keys = {
++        (
++            dataclasses.replace(spec, shapes=(), page_size_padded=None),
++            len(spec.shapes),
++            spec.page_size_bytes,
++        )
++        for spec in mamba_specs
++    }
++    assert len(spec_keys) == 1, (
++        f"mamba KV cache groups differ in more than their state shapes: {mamba_specs}"
++    )
+     return mamba_group_ids, mamba_specs[0]
+ 
+ 

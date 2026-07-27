@@ -6,10 +6,19 @@ step LFM2.5 streams 1035.5 M body params + a bf16 lm_head:
 
     body    group scales   chan   lm_head   total     @600 GB/s
     bf16 2071   --          --     268      2339 MB     3.90 ms
-    fp8  1036   --          1.6    268      1306 MB     2.18 ms   <- vtl_fp8 today
-    int4  518   64.8        1.6    268       852 MB     1.42 ms
+    fp8  1036   --          1.6    268      1306 MB     2.18 ms   <- vtl_fp8 today (bf16 head)
+    int4  518   64.8        1.6    268       852 MB     1.42 ms   <- SUPERSEDED, see below
+    int4  518   64.8        1.6     75.8     660 MB     1.10 ms   <- what we ship today
 
-so ~35% less weight traffic than fp8, ~0.76 ms of GPU time per step.
+so ~49% less weight traffic than fp8, ~1.08 ms of GPU time per step.
+
+THE 852 FIGURE IS STALE AND IS NOW A DIAGNOSTIC. It assumed a bf16 lm_head, which was true before
+[[lm_head_quant]] landed; ``VTL_LM_HEAD_QUANT=int4`` takes that 268 MB down to 75.8 MB. Keep the row
+because the arithmetic makes it a free tell: 660 - 75.8 + 268 = 852. So *measuring* ~852 MB/step, or
+seeing a decode GPU term near 1.42 ms rather than 1.10 ms, is the signature of lm_head having
+silently fallen back to bf16 -- which no other signal distinguishes from success. ``make verify``
+greps ``lm_head quantized to`` for exactly this reason, and (since 2026-07-27) ``make prove`` is what
+actually lets that grep see the line -- at the shipped ``VLLM_LOGGING_LEVEL=WARNING`` it is dropped.
 
 The group-scale figure is 64.8 MB, NOT the 8.1 MB the raw count suggests: cutlass_pack_scale_fp8
 expands every scale into an ``Array<ElementScale, ScalePackSize>`` with ScalePackSize = 8

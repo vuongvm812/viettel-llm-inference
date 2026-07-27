@@ -96,7 +96,7 @@ IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap
+.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify prove vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -153,8 +153,20 @@ debug-kernel: build
 stats:
 	$(IN) python3 bench/trace_stats.py --trace $(TRACE)
 
+## Boot at INFO, run the assertions below, tear down. THIS is the target that can actually
+## prove the artifact: `make verify` alone reads the logs of whatever is already running, and
+## the shipped config logs at WARNING, where every vtl success line is dropped and the very
+## first grep ("vtl: applied") fails. See docker-compose.verify.yaml for the full reasoning.
+## Never measure latency from this boot -- INFO logging costs host time on a host-bound loop.
+prove:
+	$(IN) $(DC) -f docker-compose.verify.yaml up -d --force-recreate --wait
+	@$(MAKE) verify ROUND=$(ROUND) || { $(IN) $(DC) -f docker-compose.verify.yaml down; exit 1; }
+	$(IN) $(DC) -f docker-compose.verify.yaml down
+
 ## Post-boot assertions. We rely on vLLM's defaults rather than passing risky flags,
 ## so prove the defaults actually resolved our way. Run against a live container.
+## Reads an ALREADY-RUNNING container's logs -- prefer `make prove`, which boots one at the
+## log level these greps need.
 verify:
 	@$(IN) $(DC) logs model 2>/dev/null > /tmp/vtl-verify.log || true
 	@# vLLM always logs this line once config is resolved, enabled or not. Its absence

@@ -2,7 +2,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:c1ade3ac2d1bbf150f9fdbdd1dfaa19875636606bf47881d5990e3aed5ec9e3a
+    image: unseenablefuture/awesome-badger@sha256:9cf26d062d620b53c53de7eb9d637b3b03d1486cfda7e927cfbc9a17ef78f4b2
     platform: linux/amd64
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -72,7 +72,13 @@ services:
       VTL_W4A8_IGNORE: ""
       VTL_FP8_IGNORE: "lm_head"
       VTL_LM_HEAD_QUANT: "int4"
-      VTL_W4A8_SCHEDULE: ""
+      # NULL, not "". A literal empty string PINS the container's value and overrides whatever
+      # the host env holds -- which silently made `make sweep-schedule` a no-op: all four arms
+      # booted the kernel heuristic and produced four measurements of the same thing. Null means
+      # "pass through from the host env if set, omit otherwise", so an unset judge environment
+      # still lands on validate_schedule(None) -> the heuristic, exactly as before.
+      # This is NOT ${VAR} interpolation -- nothing here can fail to resolve at boot.
+      # VTL_W4A8_SCHEDULE: ""
 
       VTL_ENABLE_MUL_QUANT: 1
       VTL_ENABLE_BCX_CONV_GATE: 1

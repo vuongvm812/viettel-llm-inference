@@ -2,7 +2,9 @@
 
 WHY. After [[quant_w4a8]] shrinks every ``LinearBase`` to int4, the per-decode-step weight
 budget is 852 MB and ``lm_head`` is **268 MB of it (31.5%)** -- the single biggest remaining
-chunk, and it grew in relative terms precisely because W4A8 shrank everything else:
+chunk, and it grew in relative terms precisely because W4A8 shrank everything else.
+Those are the numbers this patch exists to fix; with it applied the step budget is **~660 MB**
+(1.10 ms @600 GB/s), so 852 is the *before*, never the current figure -- see [[quant_w4a8]].
 
     lm_head          bytes/step   vs bf16     @600 GB/s (the judge's MIG 1g.18gb slice)
     bf16   65536x2048   268.4 MB      --        0.447 ms
