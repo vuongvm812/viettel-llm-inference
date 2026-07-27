@@ -383,7 +383,8 @@ ab:
 	    done ); rc=$$?; \
 	  $(DC) -f /tmp/vtl-ab.yaml down; [ $$rc -eq 0 ] || exit $$rc; \
 	done; done
-	@echo "compare: cd $(ROUND) && python3 bench/compare.py bench-ab-*.json"
+	@echo "verdict: cd $(ROUND) && python3 bench/ab_summary.py bench-ab-*.json"
+	@echo "  (compare.py prints one column per BOOT and cannot group arms — use ab_summary)"
 
 ## The --max-num-scheduled-tokens bracket. This flag ships LIVE at 2048 with no measurement
 ## behind it: 2048 is below the longest prompt (4,281 tok), so a turn-1 prefill spans 3

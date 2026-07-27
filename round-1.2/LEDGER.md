@@ -10,7 +10,7 @@ host-side wins below ~1 ms — a null here means *unknown*, not negative. Schedu
 
 | # | Date | Hypothesis | Predicted | Measured | Kept? | Why |
 |---|------|-----------|-----------|----------|-------|-----|
-| 1 | 2026-07-27 | `--max-num-scheduled-tokens`: shipped 2048 chunks the 4,281-tok turn-1 prefill into 3 scheduler steps; 8192 (== `max_num_batched_tokens`, i.e. flag-absent) runs it whole | 8192 wins ~10 ms TTFT, TPOT within noise → small ERS win for 8192 | _in flight_ | _pending_ | 6-boot run launched on `andromeda` 2026-07-27 12:20 UTC (3 boots/arm, interleaved, `--limit 150`); ~30 min. Read `/tmp/ab-run.log` then `python3 bench/compare.py bench-ab-*.json` |
+| 1 | 2026-07-27 | `--max-num-scheduled-tokens`: shipped 2048 chunks the 4,281-tok turn-1 prefill into 3 scheduler steps; 8192 (== `max_num_batched_tokens`, i.e. flag-absent) runs it whole | 8192 wins ~10 ms TTFT, TPOT within noise → small ERS win for 8192 | **NULL, and backwards.** 3 boots/arm × 150 req. ERS 0.4326 ±0.0050 (2048) vs 0.4249 ±0.0118 (8192); delta 0.0077 < the 0.0118 within-arm floor. TTFT p50 77 ms vs 80 ms — 8192 is 3 ms *worse*, not 10 ms better. TPOT mean 6.00 vs 6.05 ms | **No change** (2048 already ships) | The chunk cap does not shape TTFT on this trace: p50 is set by the many short prompts, and the one 4,281-tok prompt is a single request out of 150. Removing the cap only widens the batch, and the boot-to-boot spread with it (±0.0118 vs ±0.0050 ERS; TPOT p99 ±0.37 vs ±0.06 ms) — 8192 is the *less reproducible* arm. Do not re-test this bracket (1024/4096 included) without a trace whose prefills dominate p50 |
 
 ## Harness notes (learned the hard way, 2026-07-27)
 
@@ -27,3 +27,18 @@ host-side wins below ~1 ms — a null here means *unknown*, not negative. Schedu
   "`python3 bench/…`" fails there unless it is a pure-stdlib script (`compare.py`, `metrics.py`).
 - Smoke-test a new sweep target with `AB_ROUNDS=1 AB_LIMIT=10 AB_WARM=5` (~4 min) before
   spending 30 min of boots on it.
+- **`compare.py` cannot read an `ab` run.** It prints one column per *file*, and every boot's
+  header is the same `localhost:8000`, so six columns are indistinguishable and its "spread"
+  mixes within-arm boot noise into the between-arm delta — the exact comparison the boots were
+  added to avoid. `bench/ab_summary.py` groups by arm (from the `bench-ab-<arm>-r<n>-<i>` name,
+  reps inside a boot averaged) and tests the arm delta against the **within-arm boot spread the
+  run itself observed**. Use it for `make ab`; `compare.py` is still right for two single runs.
+- **The 0.5 ms boot-to-boot TPOT floor is pessimistic for an interleaved same-image run.** Row
+  1's six boots held TPOT mean to ±0.04 ms within the 2048 arm and ±0.13 ms within 8192 — 4–13×
+  tighter than the folklore number `compare.py` hardcodes, which would have called a real win
+  null. Measure the floor per run (ab_summary does) rather than assuming it. Note the floor is
+  *arm-dependent*: the wider-batch arm was 2–6× noisier, so it is a property of the config under
+  test, not of the box.
+- A boot+warm+measure cycle at `--limit 150` is ~2.5 min, not the ~5 min first estimated: a
+  3-boot-per-arm two-arm A/B costs ~16 min. Six boots per arm is affordable when a delta lands
+  near the floor.
