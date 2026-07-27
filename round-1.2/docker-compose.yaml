@@ -2,7 +2,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:c1ade3ac2d1bbf150f9fdbdd1dfaa19875636606bf47881d5990e3aed5ec9e3a
+    image: unseenablefuture/awesome-badger@sha256:08a567bf467f506e139335f3a894c0811900708861e7e88a515599e0d03180e2
     platform: linux/amd64
     entrypoint:
       - python3
@@ -75,7 +75,7 @@ services:
       VTL_ENABLE_MUL_QUANT: 1
       VTL_ENABLE_BCX_CONV_GATE: 1
       VTL_BCX_SPEC: 1
-      VTL_DRAFT_FULL_CUDAGRAPH: 0
+      VTL_DRAFT_FULL_CUDAGRAPH: 1
       VTL_DRAFT_FUSED_ARGMAX: 1
       VTL_ENABLE_PEARL: 1
       VTL_DYNAMIC_SD_FULL_CG: 1

@@ -1,8 +1,8 @@
 diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
-index 7f611a2..a7e7504 100644
+index 7f611a2..237a768 100644
 --- a/vllm/v1/worker/mamba_utils.py
 +++ b/vllm/v1/worker/mamba_utils.py
-@@ -438,7 +438,26 @@ def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSp
+@@ -438,7 +438,41 @@ def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSp
              mamba_group_ids.append(i)
              mamba_specs.append(kv_cache_spec)
      assert len(mamba_group_ids) > 0, "no mamba layers in the model"
@@ -21,8 +21,23 @@ index 7f611a2..a7e7504 100644
 +    # single tuple taken from the TARGET model class and zipped against each layer's
 +    # kv_cache. That length term is what makes a drafter from a different mamba family
 +    # fail loudly here instead of silently mis-copying.
++    #
++    # `page_size_padded` is excluded for the same reason as `shapes`: it is DERIVED from
++    # them. `Platform.set_kv_cache_params` returns early leaving it None when a model's
++    # conv page already equals its attention page, and sets it otherwise -- and it runs
++    # once per model config, so the target and the drafter reach the SAME page size by
++    # different routes (here: target 4*2048*bf16 = 16384 = its attn page -> None; draft
++    # 4*1024*bf16 = 8192 -> padded to 16384). Which route the target takes moves with
++    # `num_speculative_tokens`, because that shifts cache_config.block_size, so leaving
++    # this field in made the assert fire at some K and pass at others for no real reason.
++    # Compare the RESOLVED `page_size_bytes` instead: same invariant, no bookkeeping.
 +    spec_keys = {
-+        (dataclasses.replace(spec, shapes=()), len(spec.shapes)) for spec in mamba_specs
++        (
++            dataclasses.replace(spec, shapes=(), page_size_padded=None),
++            len(spec.shapes),
++            spec.page_size_bytes,
++        )
++        for spec in mamba_specs
 +    }
 +    assert len(spec_keys) == 1, (
 +        f"mamba KV cache groups differ in more than their state shapes: {mamba_specs}"
