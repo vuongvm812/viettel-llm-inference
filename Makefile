@@ -96,7 +96,7 @@ IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify prove vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap
+.PHONY: check stats build up down warm push bench arm sweep-sched-tokens sweep-quant sweep-schedule profile test-kernel bench-kernel debug-kernel verify prove vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -110,6 +110,7 @@ check:
 	$(IN) python3 bench/metrics.py
 	$(IN) python3 bench/eval_quality.py --self-check
 	$(IN) python3 bench/profile_trace.py --self-check
+	$(IN) python3 bench/arm_compose.py --self-check
 	$(IN) [ -f bench/build_trace_round2.py ] && PYTHONPATH=. python3 bench/build_trace_round2.py --self-check || true
 	$(IN) python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
 
@@ -196,7 +197,7 @@ verify:
 	   sm=$$(echo "$$d" | sed -n 's/.*, \([0-9]*\) SMs.*/\1/p'); \
 	   if [ -n "$$sm" ] && [ "$$sm" -gt 60 ]; then \
 	     echo "WARN GPU is $$d -- NOT a MIG slice. W4A8 buys ~0.09 ms here and still costs TTFT"; \
-	     echo "     + accuracy: A/B VTL_QUANT=vtl_fp8 before submitting."; \
+	     echo "     + accuracy: run 'make sweep-quant' before submitting."; \
 	   else echo "OK   GPU is $$d"; fi; \
 	 fi
 	@grep -q "registered quantization method 'vtl_w4a8'" /tmp/vtl-verify.log \
@@ -317,6 +318,52 @@ bench:
 	  python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	    --closed-loop $$n --out bench-closed-$$n.json; \
 	done
+
+# --- flag arms ------------------------------------------------------------------------------
+# bench/arm_compose.py needs the same overlay chain docker sees, in its own spelling.
+ARM_COMPOSE_FILES := $(patsubst -f,--compose-file,$(COMPOSE_FILES))
+
+## Boot ONE arm: the shipped config overridden by exactly the flags you name, replay, tear down.
+## Never edits docker-compose.yaml -- that file is the submission artifact, and a literal left
+## un-reverted after a sweep ships a config nobody chose. See bench/arm_compose.py.
+##   make arm ARM=fp8   ARM_FLAGS='--quantization=vtl_fp8'
+##   make arm ARM=st1024 ARM_FLAGS='--max-num-scheduled-tokens=1024'
+##   make arm ARM=noflag ARM_FLAGS='~--max-num-scheduled-tokens'   # prove the flag is neutral
+## ARM_EVAL=1 also captures greedy outputs for an accuracy diff (eval_quality.py --compare).
+ARM ?= arm
+ARM_FLAGS ?=
+ARM_EVAL ?=
+arm:
+	@[ -n "$(ARM_FLAGS)" ] || { echo "usage: make arm ARM=<name> ARM_FLAGS='--flag=value ...'"; exit 1; }
+	$(IN) python3 bench/arm_compose.py --out /tmp/vtl-arm-$(ARM).yaml $(ARM_COMPOSE_FILES) $(ARM_FLAGS)
+	$(IN) $(DC) -f /tmp/vtl-arm-$(ARM).yaml up -d --force-recreate --wait
+	@# Tear down even if the replay fails, or the next arm boots on top of this one.
+	$(IN) ( python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --out bench-arm-$(ARM).json \
+	  && { [ -z "$(ARM_EVAL)" ] || python3 bench/eval_quality.py --target $(TARGET) --trace $(TRACE) --out ref-$(ARM).json; } \
+	  ); rc=$$?; $(DC) -f /tmp/vtl-arm-$(ARM).yaml down; exit $$rc
+
+## The --max-num-scheduled-tokens bracket. This flag ships LIVE at 2048 with no measurement
+## behind it: 2048 is below the longest prompt (4,281 tok), so a turn-1 prefill spans 3
+## scheduler steps instead of 1 -- it trades TTFT for a flatter in-flight decode ITL tail.
+## 8192 == max_num_batched_tokens == the flag-absent behaviour. Watch the TPOT tail, not the mean.
+SCHED_TOKENS ?= 8192 4096 2048 1024
+sweep-sched-tokens:
+	@for v in $(SCHED_TOKENS); do \
+	  $(MAKE) arm ROUND=$(ROUND) ARM=st$$v ARM_FLAGS="--max-num-scheduled-tokens=$$v" || exit 1; \
+	done
+	@echo "compare: cd $(ROUND) && python3 bench/compare.py bench-arm-st*.json"
+
+## W4A8 vs FP8, end to end. Two questions in one sweep, and the second is the one nobody has
+## asked: (1) does int4 actually pay on THIS box -- it is worth ~1.08 ms/step of GPU time on a
+## MIG slice but only ~0.09 ms on a full H200, where it still costs TTFT; (2) does group-128
+## symmetric RTN with no calibration and no zero-points hurt quality? quant_w4a8.py says
+## ACCURACY IS UNMEASURED. ARM_EVAL=1 captures both arms' greedy output for the diff.
+sweep-quant:
+	@for q in vtl_w4a8 vtl_fp8; do \
+	  $(MAKE) arm ROUND=$(ROUND) ARM=$$q ARM_EVAL=1 ARM_FLAGS="--quantization=$$q" || exit 1; \
+	done
+	@echo "latency:  cd $(ROUND) && python3 bench/compare.py bench-arm-vtl_w4a8.json bench-arm-vtl_fp8.json"
+	@echo "accuracy: cd $(ROUND) && python3 bench/eval_quality.py --compare ref-vtl_fp8.json ref-vtl_w4a8.json"
 
 ## Sweep the CUTLASS W4A8 tile/cluster schedule (needs the GPU). The kernel's own heuristic
 ## (w4a8_mm_entry.cu:341-372) keys ONLY on M/N/K and is blind to SM count -- it was tuned on a

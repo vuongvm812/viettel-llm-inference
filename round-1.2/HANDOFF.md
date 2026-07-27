@@ -41,6 +41,30 @@ optional. Off-box, `make check` and `bash vtl/vllm_patches/gen.sh` both pass as 
 | 6 | peak RSS under the 8 GB cap | jemalloc runs `decay:-1` (never returns pages) and v0.26.0 bumps Transformers to 5.13.0 |
 | 7 | `python3 -m pytest` of `vtl/patches/qk_norm_rope.py` inside the image | its numeric parity check only runs where there is a GPU **and** a model dir; confirm it actually executes rather than printing "skipped" |
 
+### The sweep runbook (2026-07-27) — one command per arm, none of them edit the artifact
+
+Ranked by expected value, and **all of them are meaningless until `make prove` reads 65 layers**.
+
+| | Command | Answers |
+|---|---|---|
+| 1 | `make prove` | is the shipped config actually the config we think it is |
+| 2 | `make bench` | the v0.26.0 baseline, which does not exist yet |
+| 3 | `make sweep-quant` | does int4 pay on THIS box, **and** does uncalibrated RTN hurt quality |
+| 4 | `make sweep-sched-tokens` | the one live flag with no measurement behind it |
+| 5 | `make sweep-schedule` | the CUTLASS tile heuristic, tuned for 132 SMs, run on ~16-19 |
+
+`make arm ARM=<name> ARM_FLAGS='--flag=value'` is the general form (`~--flag` removes one). It
+reads the resolved command list out of `docker compose config` and writes a throwaway overlay, so
+**no sweep ever edits `docker-compose.yaml`** — which matters because that file is the submission
+artifact and a literal left un-reverted ships a config nobody chose.
+
+**Rank arms by ERS, not by the TTFT/TPOT columns.** `bench/compare.py` prints it. From a
+5 ms TPOT / 100 ms TTFT operating point, shaving 1 ms off TPOT is worth ~34 ms off TTFT, so the
+two columns routinely disagree about which arm won and only ERS can order them. `compare.py` also
+converts the boot-to-boot noise floor (~0.5 ms TPOT) into ERS *at the measured operating point*
+and refuses to call a within-noise spread a winner — s_tpot is quadratic, so that same half
+millisecond is worth 0.020 ERS at 6.5 ms and 0.036 at 4 ms. **Add boots, not reps.**
+
 ### Leading latency candidate to sweep once the above is green
 
 **`--max-num-scheduled-tokens` — LIVE at 2048, still unmeasured. This is the one behavioural

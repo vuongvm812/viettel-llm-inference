@@ -78,7 +78,7 @@ services:
       # "pass through from the host env if set, omit otherwise", so an unset judge environment
       # still lands on validate_schedule(None) -> the heuristic, exactly as before.
       # This is NOT ${VAR} interpolation -- nothing here can fail to resolve at boot.
-      # VTL_W4A8_SCHEDULE: ""
+      VTL_W4A8_SCHEDULE: "128x16_1x1x1"
 
       VTL_ENABLE_MUL_QUANT: 1
       VTL_ENABLE_BCX_CONV_GATE: 1

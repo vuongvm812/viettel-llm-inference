@@ -34,8 +34,13 @@ term, i.e. a measured TPOT delta of ~0. And TTFT can only get worse -- at 8192 b
 kernel re-dequantizes each weight tile once per 256-token N-tile, SM work on an SM-starved slice
 that pure-fp8 cutlass_scaled_mm never pays -- and prefill on 19 SMs is COMPUTE bound, which is
 exactly where that lands. The base case for this whole patch is "no benefit, slightly worse
-TTFT". It must be A/B'd against vtl_fp8 on the MIG slice before it ships: ``VTL_QUANT=vtl_fp8
-make up`` then ``make bench``, plus ``bench/eval_quality.py`` for the accuracy half.
+TTFT". It must be A/B'd against vtl_fp8 on the MIG slice before it ships: **``make sweep-quant``**
+runs both arms and captures both halves (latency via bench/compare.py, accuracy via
+bench/eval_quality.py --compare). Corrected 2026-07-27: this used to say ``VTL_QUANT=vtl_fp8 make
+up``, and **no such variable has ever existed** -- nothing reads it. Quantization is a
+``--quantization`` CLI flag, which is why the A/B needs bench/arm_compose.py to override the
+shipped command list instead of an env var, and why running the old recipe would have silently
+benchmarked w4a8 against itself.
 
 IF THAT A/B SHOWS A REAL TTFT REGRESSION, the fix is to hold BOTH weight formats and dispatch on
 M in apply() -- fp8 for prefill, int4 for decode -- at ~1 GB extra resident, which the 18 GB
