@@ -609,7 +609,8 @@ class VtlW4A8Config(_QuantizationConfig):
                     return None
                 from vtl.patches.lm_head_quant import lm_head_method
 
-                return lm_head_method(layer)
+                # prefix selects FR-Spec vocab pruning: only `draft_model.*` is narrowed.
+                return lm_head_method(layer, prefix)
 
             if not isinstance(layer, LinearBase):
                 # Not ours (embed_tokens, attention, MoE -- the lm_head branched off above).

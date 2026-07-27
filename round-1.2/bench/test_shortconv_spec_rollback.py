@@ -79,7 +79,14 @@ def test_both_callers_pass_num_spec():
 
 
 def test_decode_branch_passes_rollback_args():
-    """The decode branch hands the kernel the rollback args and drops the fused path."""
+    """Both decode branches hand the kernel the rollback args.
+
+    The stock Triton branch takes num_accepted_tokens/query_start_loc/max_query_len. The FUSED
+    branch used to be bypassed under spec entirely; it now implements the rollback itself, so
+    the assertion here had to move rather than be deleted -- checking only that the bypass
+    exists would go green on a patch that dropped the rollback and left the kernel committing
+    rejected drafts, which is the exact defect this file was written for.
+    """
     if _SKIP:
         import pytest
 
@@ -87,9 +94,27 @@ def test_decode_branch_passes_rollback_args():
     fwd = inspect.getsource(ShortConv.forward_cuda)
     for arg in ("num_accepted_tokens", "query_start_loc", "max_query_len"):
         assert arg in fwd, f"{arg} missing from ShortConv.forward_cuda"
-    # ...and bypasses the fused conv-gate kernel while spec is active (it has no
-    # num_accepted path, so leaving it on would re-commit rejected drafts).
-    assert "spec_decode_active" in fwd, fwd
+    # The fused call site must forward the rollback args too, gated on spec being active.
+    #
+    # Split on the full CALL, not the bare name: the first occurrence of "bcx_conv_gate_quant"
+    # in forward_cuda is a comment, so splitting on the name left `tail` spanning the whole rest
+    # of the function INCLUDING the stock Triton branch -- which passes num_accepted_tokens
+    # anyway. The assertion was therefore vacuous: deleting both rollback args from the fused
+    # call still passed. Bound the slice at the closing paren so only the fused call is examined.
+    marker = "torch.ops.vllm_cuda.bcx_conv_gate_quant("
+    assert marker in fwd, "fused conv-gate call site vanished from forward_cuda"
+    tail = fwd.split(marker, 1)[1]
+    depth = 1
+    for i, ch in enumerate(tail):
+        depth += (ch == "(") - (ch == ")")
+        if depth == 0:
+            tail = tail[:i]
+            break
+    else:
+        raise AssertionError("unbalanced parens after the fused conv-gate call")
+    assert "num_accepted_tokens" in tail, tail
+    assert "query_start_loc_d" in tail, tail
+    assert "spec_decode_active" in tail, tail
 
 
 def test_runner_injects_num_accepted_for_shortconv():

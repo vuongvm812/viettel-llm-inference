@@ -1,0 +1,25 @@
+diff --git a/vllm/v1/spec_decode/step3p5.py b/vllm/v1/spec_decode/step3p5.py
+index 47821cc..40abf89 100644
+--- a/vllm/v1/spec_decode/step3p5.py
++++ b/vllm/v1/spec_decode/step3p5.py
+@@ -309,7 +309,10 @@ class Step3p5MTPProposer(EagleProposer):
+             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+         )
+ 
+-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
++        # vtl: the base method also returns the BatchDescriptor now (drafter FULL cudagraphs).
++        # Step3p5 stays PIECEWISE, where the descriptor is relaxed and set_forward_context's
++        # synthesised one matches, so it is discarded here.
++        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp, _ = (
+             self._determine_batch_execution_and_padding(num_tokens)
+         )
+ 
+@@ -373,7 +376,7 @@ class Step3p5MTPProposer(EagleProposer):
+ 
+         draft_token_ids_list = [draft_token_ids]
+ 
+-        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
++        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp, _ = (
+             self._determine_batch_execution_and_padding(batch_size)
+         )
+ 

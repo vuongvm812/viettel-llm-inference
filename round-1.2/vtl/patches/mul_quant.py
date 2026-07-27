@@ -13,9 +13,11 @@ pure-decode path and feeds ``out_proj`` the pre-quantized result via ``cutlass_s
 fails closed to the stock ``y = C*Bx`` + normal ``out_proj`` path.
 
 Second-order vs [[shortconv_quant]] (which is the actual TPOT lever): this only removes a bf16
-[T, conv_dim] round-trip + one launch per conv layer. **Default OFF** (``VTL_ENABLE_MUL_QUANT``);
-enable only after an on-box A/B shows decode TPOT improves (torch.compile/inductor may already fuse
-the multiply) and the eval confirms no accuracy regression. Requires the conv projections to be fp8
+[T, conv_dim] round-trip + one launch per conv layer. **Default ON** (``VTL_ENABLE_MUL_QUANT=0``
+to revert), in lockstep with [[bcx_conv_gate]], which is inert without the staging buffer this
+patch installs -- disagreeing defaults meant an environment setting neither silently got no fused
+conv path. Still worth an on-box A/B (torch.compile/inductor may already fuse the multiply) and an
+eval confirming no accuracy regression. Requires the conv projections to be fp8
 (shortconv_quant on) -- otherwise ``out_proj`` is bf16 and there is nothing to feed pre-quantized.
 """
 
@@ -48,7 +50,10 @@ def _register_fake() -> None:
     _fake_registered = True
 
 
-@register_patch("mul_quant", default=False)
+# Default ON, in lockstep with [[bcx_conv_gate]]: that patch is INERT without this one (it
+# writes into the fp8 staging buffer this one installs), so leaving the two defaults disagreeing
+# meant an environment that set neither silently got no fused conv path at all.
+@register_patch("mul_quant", default=True)
 def apply() -> None:
     import torch
 
@@ -71,7 +76,8 @@ def _self_check() -> None:
 
     # apply() is registered under "mul_quant" with default False (opt-in).
     names = {p.name: p.default for p in PATCH_REGISTRY}
-    assert names.get("mul_quant") is False, names
+    # ON by default, matching bcx_conv_gate (which is inert without this patch).
+    assert names.get("mul_quant") is True, names
     print("mul_quant self-check ok")
 
 

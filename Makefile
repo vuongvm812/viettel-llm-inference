@@ -333,6 +333,49 @@ sweep-schedule:
 	done
 	@echo "compare: $(ROUND)/bench-sched-*.json (heuristic is the baseline)"
 
+## Sweep num_speculative_tokens (needs the GPU). Answers "does K=3 pay?" -- the drafter costs
+## ~0.34 GB of weight traffic per pass against a ~0.85 GB target step, so three draft passes are
+## ~1.2 target-steps of GPU before any host cost, and the break-even sits near 40% per-token
+## acceptance. Each arm boots fresh, replays the trace, and prints acceptance alongside TPOT;
+## bench-spec-K*.json are the rows to compare. K=0 is the spec-OFF control.
+## Strips --disable-log-stats from the DERIVED overlay only -- the submitted compose keeps it,
+## because vtl/patches/kv_cache_manager.py:160 self-gates its prefill block-scan elision on
+## log_stats being OFF, so enabling stats puts a per-request block walk back inside TTFT. That
+## is fine for a measurement boot and not fine for the scored one.
+## If a num_speculative_tokens_per_batch_size schedule is ever added back to compose, sed it here
+## too: build_dynamic_sd_schedule_lookup applies min(static_K, schedule_K), so a schedule would
+## silently clamp every arm of this sweep.
+## The submitted docker-compose.yaml carries NO ${VAR} interpolation on purpose (an unset var
+## there is a boot failure, i.e. score 0), so the sweep cannot parameterize it through the
+## environment. Instead it DERIVES a throwaway overlay from that same file with one sed on the
+## num_speculative_tokens literal -- so the swept arms cannot drift from the submitted config,
+## which is the failure mode a hand-copied overlay would reintroduce. K=0 drops the
+## --speculative-config line entirely and is the spec-OFF control.
+SPEC_KS ?= 0 1 2 3 4
+sweep-spec:
+	@for k in $(SPEC_KS); do \
+	  echo "=== num_speculative_tokens=$$k"; \
+	  f=$(ROUND)/docker-compose.spec-sweep.yaml; \
+	  if [ "$$k" = "0" ]; then \
+	    grep -v -e '--speculative-config=' -e '--disable-log-stats' \
+	      $(ROUND)/docker-compose.yaml > $$f; \
+	  else \
+	    grep -v -e '--disable-log-stats' $(ROUND)/docker-compose.yaml \
+	      | sed 's/"num_speculative_tokens":[0-9]*/"num_speculative_tokens":'$$k'/' > $$f; \
+	  fi; \
+	  grep -q "num_speculative_tokens\":$$k" $$f || [ "$$k" = "0" ] \
+	    || { echo "sed did not take -- refusing to benchmark the wrong K"; exit 1; }; \
+	  ( cd $(ROUND) && docker compose -f docker-compose.spec-sweep.yaml \
+	      -f docker-compose-optimized.yaml up -d --force-recreate --wait \
+	    && python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	         --out bench-spec-K$$k.json \
+	    ; rc=$$?; docker compose -f docker-compose.spec-sweep.yaml \
+	      -f docker-compose-optimized.yaml down; exit $$rc ); rc=$$?; \
+	  rm -f $$f; \
+	  [ $$rc -eq 0 ] || exit $$rc; \
+	done
+	@echo "compare: $(ROUND)/bench-spec-K*.json (K=0 is the spec-OFF baseline)"
+
 ## Phase-0 profiler (needs the H200). Boots with vLLM's torch profiler enabled, drives a small
 ## closed-loop replay, and prints a ranked GPU-kernel cost table. See docs/plans/.
 profile:

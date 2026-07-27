@@ -1,5 +1,5 @@
 diff --git a/vllm/model_executor/layers/mamba/short_conv.py b/vllm/model_executor/layers/mamba/short_conv.py
-index e7e36f2..04becbb 100644
+index e7e36f2..98dbaf3 100644
 --- a/vllm/model_executor/layers/mamba/short_conv.py
 +++ b/vllm/model_executor/layers/mamba/short_conv.py
 @@ -2,6 +2,9 @@
@@ -12,15 +12,24 @@ index e7e36f2..04becbb 100644
  import torch
  
  from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
-@@ -28,6 +31,166 @@ from vllm.utils.torch_utils import direct_register_custom_op
+@@ -28,6 +31,253 @@ from vllm.utils.torch_utils import direct_register_custom_op
  from vllm.v1.attention.backend import AttentionMetadata
  from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
  from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 +from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 +
 +
-+def _vtl_flag(name: str) -> bool:
-+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
++def _vtl_flag(name: str, *, default: bool = False) -> bool:
++    """Env flag with an explicit default for an UNSET variable.
++
++    ``default=True`` matches vtl/registry.py's ``is_enabled``: absent means "use the in-code
++    default", only an explicit falsy value turns the feature off. The compose files set both
++    flags below explicitly, so the default only governs an environment that does not.
++    """
++    raw = os.environ.get(name)
++    if raw is None:
++        return default
++    return raw.strip().lower() in {"1", "true", "yes", "on"}
 +
 +
 +# vtl Phase-3: fused conv-gate `y = C*Bx` + fp8 quant + out_proj, opt-in and fail-closed.
@@ -29,13 +38,21 @@ index e7e36f2..04becbb 100644
 +# both halves now write their fp8 rows into one `[num_actual_tokens, dim]` buffer and out_proj
 +# consumes it whole -- which covers prefill-only and mixed batches too, and drops the bf16
 +# `torch.vstack`. See round-1.2/vtl/patches/mul_quant.py and round-1.2/vtl/csrc/mul_quant.cu.
-+_VTL_MUL_QUANT = _vtl_flag("VTL_ENABLE_MUL_QUANT")
++_VTL_MUL_QUANT = _vtl_flag("VTL_ENABLE_MUL_QUANT", default=True)
 +
 +# vtl: replace the decode half of that path -- `(B_d*x_d).contiguous()`, the Triton
 +# `causal_conv1d_update`, and the gate+quant -- with the single fused kernel in
 +# round-1.2/vtl/csrc/bcx_conv_gate_quant.cu. Inert unless _VTL_MUL_QUANT is also on (it writes
 +# into that staging buffer). See round-1.2/vtl/patches/bcx_conv_gate.py.
-+_VTL_BCX_CONV_GATE = _vtl_flag("VTL_ENABLE_BCX_CONV_GATE")
++_VTL_BCX_CONV_GATE = _vtl_flag("VTL_ENABLE_BCX_CONV_GATE", default=True)
++
++# The chain-spec (num_accepted rollback) half of that kernel, separable so the drafter's plain
++# decode win can be kept while the target's rollback path is turned off. Inert when spec is off.
++_VTL_BCX_CONV_GATE_SPEC = _vtl_flag("VTL_BCX_SPEC", default=True)
++
++# One-shot: the fused-decode miss is silent by design (it degrades to the stock path), so without
++# a log line there is no way to tell whether the drafter's 10 conv layers joined the target's.
++_vtl_conv_gate_miss_logged = False
 +
 +# The CUTLASS W4A8 kernel supports exactly one group size and rejects anything else in
 +# can_implement(), so this cannot drift from round-1.2/vtl/patches/quant_w4a8.py:GROUP_SIZE
@@ -102,9 +119,16 @@ index e7e36f2..04becbb 100644
 +
 +    Cached per-layer. On top of the flag and the op being registered, the shape predicate itself
 +    lives in C++ (``bcx_conv_gate_supported``) so the vector width and block-size caps are not
-+    re-hardcoded here. The kernel is specialised to conv width 3 / state_len 2 -- LFM2.5's
-+    ``conv_L_cache = 3`` with the ``conv_kernel - 1`` state allocation -- and rejects anything else,
-+    in which case the caller keeps the stock ``causal_conv1d_update``.
++    re-hardcoded here. The kernel is specialised to conv width 3 and READS the first
++    ``width - 1 = 2`` state slots; the allocation may be wider (spec decode widens it to
++    ``conv_kernel - 1 + num_spec``) and that is accepted, because ``causal_conv1d_update`` pins
++    ``state_len = width - 1`` whenever ``num_accepted_tokens`` is None. Anything else is rejected
++    and the caller keeps the stock ``causal_conv1d_update``.
++
++    The miss is LOGGED ONCE per process. Both models' short-conv layers come through here, and a
++    miss is silent by design (it degrades to the stock path), so without this line there is no way
++    to tell whether 10 layers or 20 are on the fused path -- the drafter only qualifies if its own
++    ``out_proj`` was int4-quantized, which depends on the draft model getting its own quant config.
 +    """
 +    cached = getattr(layer, "_vtl_conv_gate_ok", None)
 +    if cached is not None:
@@ -136,7 +160,70 @@ index e7e36f2..04becbb 100644
 +    except Exception:
 +        ok = False
 +    layer._vtl_conv_gate_ok = ok
++    if not ok:
++        global _vtl_conv_gate_miss_logged
++        if not _vtl_conv_gate_miss_logged:
++            _vtl_conv_gate_miss_logged = True
++            # WARNING, not info: the shipped compose runs VLLM_LOGGING_LEVEL=WARNING, and this
++            # line is the documented check that the fused decode path actually took. At info it
++            # is invisible in exactly the deployment that needs it.
++            logging.getLogger("vllm.vtl").warning(
++                "vtl: short-conv fused decode kernel NOT eligible for %s "
++                "(flag=%s dim=%s width=%s state_len=%s dtype=%s); stock path. First miss only.",
++                getattr(layer, "prefix", "<unknown>"),
++                _VTL_BCX_CONV_GATE,
++                tuple(conv_weights.shape),
++                conv_weights.shape[1],
++                tuple(conv_state.shape),
++                bcx.dtype,
++            )
 +    return ok
++
++
++def _vtl_conv_gate_spec_eligible(attn_metadata, conv_state, state_indices) -> bool:
++    """True if the fused kernel can serve this CHAIN-SPEC decode batch.
++
++    Deliberately NOT cached: unlike the shape predicate, every term here is per-step. A batch
++    that qualifies now may not next step (APC can turn on, query_start_loc_d can be absent), and
++    a cached `True` would keep the kernel running with a rollback it cannot compute.
++
++    Fail-closed, and evaluated BEFORE anything mutates conv_state -- once the ring buffer has
++    advanced, falling back to the stock path would double-apply the update.
++    """
++    if not _VTL_BCX_CONV_GATE_SPEC:
++        return False
++    try:
++        # The kernel derives each request's extent from query_start_loc itself; without it there
++        # is no way to split the flat token axis into requests.
++        if attn_metadata.query_start_loc_d is None:
++            return False
++        # APC / mamba_cache_mode="all": state_indices becomes the full block table and the Triton
++        # path picks the live block via initial_state_idx / block_idx_last_scheduled_token. This
++        # kernel only ever reads column 0, so it would silently address the wrong block.
++        if getattr(attn_metadata, "block_idx_last_scheduled_token", None) is not None:
++            return False
++        if state_indices is None or state_indices.dim() != 2:
++            return False
++        # Every remaining condition MIRRORS a TORCH_CHECK in the launcher. Those raise, and this
++        # path is fail-closed by design, so each one has to be re-asserted here or an invariant
++        # maintained three files away turns into an exception mid-decode.
++        reqs = state_indices.shape[0]
++        qsl = attn_metadata.query_start_loc_d
++        num_accepted = attn_metadata.num_accepted_tokens
++        if num_accepted is None or num_accepted.numel() != reqs:
++            return False
++        if qsl.numel() != reqs + 1:
++            return False
++        if qsl.dtype != torch.int32 or num_accepted.dtype != torch.int32:
++            return False
++        if qsl.dim() != 1 or num_accepted.dim() != 1:
++            return False
++        # Slot 1+t is written for t < query_len <= state_indices.shape[1], and the taps sit at
++        # off/off+1 with off <= state_indices.shape[1]-1. Both need one slot more than the widest
++        # query.
++        return conv_state.shape[2] >= 1 + state_indices.shape[1]
++    except Exception:
++        return False
 +
 +
 +def _vtl_out_proj_quantized(out_proj, y_fp8, y_scale, out_dtype):
@@ -179,7 +266,7 @@ index e7e36f2..04becbb 100644
  
  
  # --8<-- [start:short_conv]
-@@ -76,7 +239,11 @@ class ShortConv(MambaBase, CustomOp):
+@@ -76,7 +326,11 @@ class ShortConv(MambaBase, CustomOp):
              prefix=f"{prefix}.out_proj",
          )
  
@@ -192,7 +279,7 @@ index e7e36f2..04becbb 100644
          if prefix in compilation_config.static_forward_context:
              raise ValueError(f"Duplicate layer name: {prefix}")
          compilation_config.static_forward_context[prefix] = self
-@@ -88,7 +255,7 @@ class ShortConv(MambaBase, CustomOp):
+@@ -88,7 +342,7 @@ class ShortConv(MambaBase, CustomOp):
  
      def forward_native(
          self,
@@ -201,7 +288,7 @@ index e7e36f2..04becbb 100644
          output: torch.Tensor,
      ):
          # Reference torch causal conv1d; runs on all CPU platforms. AMX kernels
-@@ -106,7 +273,6 @@ class ShortConv(MambaBase, CustomOp):
+@@ -106,7 +360,6 @@ class ShortConv(MambaBase, CustomOp):
              attn_metadata = attn_metadata_raw[self.prefix]
              assert isinstance(attn_metadata, ShortConvAttentionMetadata)
  
@@ -209,7 +296,7 @@ index e7e36f2..04becbb 100644
          B, C, x = BCx.chunk(3, dim=-1)
  
          # (dim, kernel_size) — same reshape as forward_cuda
-@@ -118,7 +284,7 @@ class ShortConv(MambaBase, CustomOp):
+@@ -118,7 +371,7 @@ class ShortConv(MambaBase, CustomOp):
              # Profile run — output value doesn't matter
              Bx = (B * x).contiguous()
              output_tensor, _ = self.out_proj(C * Bx)
@@ -218,7 +305,7 @@ index e7e36f2..04becbb 100644
              return
  
          conv_state = (
-@@ -185,15 +351,34 @@ class ShortConv(MambaBase, CustomOp):
+@@ -185,15 +438,34 @@ class ShortConv(MambaBase, CustomOp):
          hidden_states: torch.Tensor,
          output: torch.Tensor,
      ):
@@ -255,7 +342,7 @@ index e7e36f2..04becbb 100644
          output: torch.Tensor,
      ):
          forward_context = get_forward_context()
-@@ -218,8 +403,6 @@ class ShortConv(MambaBase, CustomOp):
+@@ -218,8 +490,6 @@ class ShortConv(MambaBase, CustomOp):
              has_initial_states_p = attn_metadata.has_initial_states_p
              query_start_loc_p = attn_metadata.query_start_loc_p
  
@@ -264,7 +351,7 @@ index e7e36f2..04becbb 100644
          B, C, x = BCx.chunk(3, dim=-1)
  
          conv_weights = self.conv.weight.view(
-@@ -240,6 +423,15 @@ class ShortConv(MambaBase, CustomOp):
+@@ -240,6 +510,15 @@ class ShortConv(MambaBase, CustomOp):
          has_decode = num_decodes > 0
          num_actual_tokens = num_decodes + num_prefill_tokens
  
@@ -280,7 +367,7 @@ index e7e36f2..04becbb 100644
          # NOTE: V1 puts decode before prefill
          # Separate prefill and decode by splitting varlen input
          # Split along token dimension
-@@ -260,6 +452,60 @@ class ShortConv(MambaBase, CustomOp):
+@@ -260,6 +539,93 @@ class ShortConv(MambaBase, CustomOp):
          )
          conv_output_list = []
  
@@ -304,13 +391,32 @@ index e7e36f2..04becbb 100644
 +            and _vtl_mul_quant_eligible(self.out_proj)
 +        )
 +        # The fused decode kernel additionally replaces `(B_d*x_d).contiguous()` and the Triton
-+        # causal_conv1d_update; it writes its rows of the same staging buffer.
++        # causal_conv1d_update; it writes its rows of the same staging buffer. Under chain spec
++        # it takes num_accepted_tokens/query_start_loc and does the rollback itself, so
++        # `spec_decode_active` is no longer a veto -- see _vtl_conv_gate_spec_eligible for the
++        # preconditions that still are.
++        #
++        # ALIGNMENT is checked here, per step, and NOT inside _vtl_conv_gate_eligible: the
++        # launcher's TORCH_CHECK on it is unconditional (bcx_conv_gate_quant.cu, "needs
++        # 16B-aligned bcx/out"), and it is a property of THIS step's allocations, whereas that
++        # predicate is cached per layer. Caching a per-allocation fact is how a fail-closed gate
++        # turns into a raise. Safe today only because BCx is a fresh allocation and
++        # bcx_stride = 3*dim is a multiple of 8 for both models -- neither is guaranteed.
++        _vtl_bcx_aligned = (
++            BCx.data_ptr() % 16 == 0 and BCx.stride(0) % 8 == 0
++        )
 +        use_conv_gate = (
 +            use_fused
 +            and has_decode
-+            and not spec_decode_active
++            and _vtl_bcx_aligned
 +            and _vtl_conv_gate_eligible(
 +                self, conv_weights, conv_state, state_indices_tensor_d, BCx
++            )
++            and (
++                not spec_decode_active
++                or _vtl_conv_gate_spec_eligible(
++                    attn_metadata, conv_state, state_indices_tensor_d
++                )
 +            )
 +        )
 +        # FAIL-CLOSED SCOPE. Every precondition is validated by the two `_eligible` helpers above,
@@ -323,14 +429,28 @@ index e7e36f2..04becbb 100644
 +        if use_fused:
 +            try:
 +                dim = conv_weights.shape[0]
-+                y_fp8 = torch.empty(
++                # Under chain spec the fused kernel launches ONE BLOCK PER REQUEST and writes
++                # only each request's own [qs, qe) rows. Cudagraph-padded requests have qs == qe,
++                # so rows past query_start_loc[-1] are covered by no block at all -- with
++                # `empty` they would carry whatever was in the arena, including NaN bit patterns,
++                # into out_proj's GEMM inside a replayed graph. The non-spec path writes every
++                # row (one block per token) and does not need this. `zeros` also keeps the
++                # file-header guarantee that padded rows are DEFINED rather than garbage.
++                alloc = torch.zeros if spec_decode_active else torch.empty
++                y_fp8 = alloc(
 +                    (num_actual_tokens, dim),
 +                    dtype=torch.float8_e4m3fn,
 +                    device=BCx.device,
 +                )
-+                y_scale = torch.empty(
++                y_scale = alloc(
 +                    (num_actual_tokens, 1), dtype=torch.float32, device=BCx.device
 +                )
++                # Second half of the alignment gate (see the note at use_conv_gate): the fused
++                # kernel's TORCH_CHECK covers the OUTPUT pointer too, and that buffer does not
++                # exist until here. A fresh empty/zeros is 16B-aligned in practice; drop to the
++                # stock path rather than raise if an allocator ever says otherwise.
++                if use_conv_gate and y_fp8.data_ptr() % 16 != 0:
++                    use_conv_gate = False
 +            except Exception:
 +                self.out_proj._vtl_mul_quant_ok = False  # stop retrying; no log-spam
 +                logging.getLogger("vllm.vtl").exception(
@@ -341,7 +461,7 @@ index e7e36f2..04becbb 100644
          if has_prefill:
              Bx_p = (B_p * x_p).transpose(0, 1)
              Bx = causal_conv1d_fn(
-@@ -274,21 +520,76 @@ class ShortConv(MambaBase, CustomOp):
+@@ -274,21 +640,82 @@ class ShortConv(MambaBase, CustomOp):
                  query_start_loc=query_start_loc_p,
              ).transpose(0, 1)[:num_prefill_tokens]
  
@@ -371,6 +491,10 @@ index e7e36f2..04becbb 100644
 -                conv_state_indices=state_indices_tensor_d,
 +            if use_conv_gate:
 +                # B*x -> conv1d + state rotation -> C* -> fp8 quant, in one launch.
++                # Under chain spec the last two arguments make the kernel roll the conv_state
++                # back to the accepted prefix instead of committing rejected drafts -- the same
++                # contract causal_conv1d_update gets in the stock branch below. Both are None
++                # off the spec path, which selects the one-block-per-token instantiation.
 +                torch.ops.vllm_cuda.bcx_conv_gate_quant(
 +                    y_fp8[:num_decodes],
 +                    y_scale[:num_decodes],
@@ -381,6 +505,8 @@ index e7e36f2..04becbb 100644
 +                    state_indices_tensor_d,
 +                    NULL_BLOCK_ID,
 +                    None,
++                    attn_metadata.num_accepted_tokens if spec_decode_active else None,
++                    attn_metadata.query_start_loc_d if spec_decode_active else None,
 +                )
 +            else:
 +                Bx_d = (B_d * x_d).contiguous()
@@ -430,7 +556,7 @@ index e7e36f2..04becbb 100644
  
          # Merge prefill and decode outputs before passing to gated MLP
          hidden_states = torch.vstack(conv_output_list)
-@@ -305,10 +606,13 @@ class ShortConv(MambaBase, CustomOp):
+@@ -305,10 +732,13 @@ class ShortConv(MambaBase, CustomOp):
          )
  
      def get_state_shape(self) -> tuple[tuple[int, ...]]:
@@ -444,7 +570,7 @@ index e7e36f2..04becbb 100644
          )
  
      @property
-@@ -317,20 +621,23 @@ class ShortConv(MambaBase, CustomOp):
+@@ -317,20 +747,23 @@ class ShortConv(MambaBase, CustomOp):
  
  
  def short_conv(

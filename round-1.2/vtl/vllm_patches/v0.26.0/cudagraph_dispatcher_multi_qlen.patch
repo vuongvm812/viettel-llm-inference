@@ -1,0 +1,145 @@
+diff --git a/vllm/v1/cudagraph_dispatcher.py b/vllm/v1/cudagraph_dispatcher.py
+index 6a48b62..0239fd8 100644
+--- a/vllm/v1/cudagraph_dispatcher.py
++++ b/vllm/v1/cudagraph_dispatcher.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from collections.abc import Sequence
+ from collections.abc import Set as AbstractSet
+ from dataclasses import replace
+ from itertools import product
+@@ -135,14 +136,36 @@ class CudagraphDispatcher:
+         uniform_decode: bool,
+         has_lora: bool,
+         num_active_loras: int = 0,
++        query_len: int | None = None,
+     ) -> BatchDescriptor:
++        """vtl: ``query_len`` overrides the single ``self.uniform_decode_query_len``.
++
++        Dynamic speculative decoding varies the verification length per step (1+K, where K comes
++        from the batch-size schedule), so a uniform decode batch no longer has ONE query length.
++        The caller passes the length actually in play; everything else is unchanged, and the
++        default keeps the stock single-length behaviour.
++        """
+         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+-        uniform_decode_query_len = self.uniform_decode_query_len
++        uniform_decode_query_len = (
++            query_len if query_len is not None else self.uniform_decode_query_len
++        )
+         num_tokens_padded = self._bs_to_padded_graph_size[num_tokens]
+ 
+         if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
++            if num_tokens_padded % uniform_decode_query_len != 0:
++                # Not expressible as a uniform batch at this query length -- fall through to the
++                # relaxed (piecewise) descriptor rather than asserting, because with a dynamic
++                # schedule the padded size need not divide every K.
++                uniform_decode = False
++                num_reqs = min(num_tokens_padded, max_num_seqs)
++                return BatchDescriptor(
++                    num_tokens=num_tokens_padded,
++                    num_reqs=num_reqs,
++                    uniform=False,
++                    has_lora=has_lora,
++                    num_active_loras=num_active_loras,
++                )
+             num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)
+-            assert num_tokens_padded % uniform_decode_query_len == 0
+         else:
+             uniform_decode = False
+             num_reqs = min(num_tokens_padded, max_num_seqs)
+@@ -164,8 +187,19 @@ class CudagraphDispatcher:
+         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
+ 
+     def initialize_cudagraph_keys(
+-        self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
++        self,
++        cudagraph_mode: CUDAGraphMode,
++        uniform_decode_query_len: int = 1,
++        extra_uniform_decode_query_lens: Sequence[int] = (),
+     ):
++        """vtl: ``extra_uniform_decode_query_lens`` adds FULL keys at additional query lengths.
++
++        Under dynamic speculative decoding the target verifies 1+K tokens per request with K
++        chosen per step from the batch-size schedule, so one set of FULL keys at the static max
++        would only ever match the largest K and every other step would silently fall back to
++        PIECEWISE. Capturing a graph per distinct 1+K is what makes dynamic SD and full
++        cudagraphs coexist on the V1 runner (the V2 runner does this natively).
++        """
+         # This should be called only after attention backend is initialized. So we can
+         # get the correct cudagraph mode after backend support is resolved.
+         self.cudagraph_mode = cudagraph_mode
+@@ -208,27 +242,33 @@ class CudagraphDispatcher:
+             cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+             and cudagraph_mode.separate_routine()
+         ):
+-            max_num_tokens = (
+-                uniform_decode_query_len
+-                * self.vllm_config.scheduler_config.max_num_seqs
+-            )
+             assert self.compilation_config.cudagraph_capture_sizes is not None, (
+                 "Cudagraph capture sizes must be set when full mode is enabled."
+             )
+-            cudagraph_capture_sizes_for_decode = [
+-                x
+-                for x in self.compilation_config.cudagraph_capture_sizes
+-                if x <= max_num_tokens and x >= uniform_decode_query_len
+-            ]
+-            for bs, num_active_loras in product(
+-                cudagraph_capture_sizes_for_decode, lora_cases
+-            ):
+-                self.add_cudagraph_key(
+-                    CUDAGraphMode.FULL,
+-                    self._create_padded_batch_descriptor(
+-                        bs, True, num_active_loras > 0, num_active_loras
+-                    ),
++            # Deduped and sorted so the stock single-length case is byte-identical.
++            query_lens = sorted(
++                {uniform_decode_query_len, *extra_uniform_decode_query_lens}
++            )
++            for query_len in query_lens:
++                if query_len <= 0:
++                    continue
++                max_num_tokens = (
++                    query_len * self.vllm_config.scheduler_config.max_num_seqs
+                 )
++                cudagraph_capture_sizes_for_decode = [
++                    x
++                    for x in self.compilation_config.cudagraph_capture_sizes
++                    if x <= max_num_tokens and x >= query_len and x % query_len == 0
++                ]
++                for bs, num_active_loras in product(
++                    cudagraph_capture_sizes_for_decode, lora_cases
++                ):
++                    self.add_cudagraph_key(
++                        CUDAGraphMode.FULL,
++                        self._create_padded_batch_descriptor(
++                            bs, True, num_active_loras > 0, num_active_loras, query_len
++                        ),
++                    )
+ 
+         self.keys_initialized = True
+ 
+@@ -240,6 +280,9 @@ class CudagraphDispatcher:
+         num_active_loras: int = 0,
+         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
+         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
++        # vtl: the query length actually in play this step. None = the static
++        # self.uniform_decode_query_len. Only differs under dynamic speculative decoding.
++        uniform_decode_query_len: int | None = None,
+     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+         """
+         Given conditions(e.g.,batch descriptor and if using piecewise only),
+@@ -301,7 +344,11 @@ class CudagraphDispatcher:
+ 
+         normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
+         batch_desc = self._create_padded_batch_descriptor(
+-            num_tokens, normalized_uniform, has_lora, effective_num_active_loras
++            num_tokens,
++            normalized_uniform,
++            has_lora,
++            effective_num_active_loras,
++            uniform_decode_query_len,
+         )
+ 
+         if CUDAGraphMode.FULL in allowed_modes:

@@ -1,5 +1,5 @@
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index f3f0afb..3d57cac 100644
+index f3f0afb..d4b771b 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -143,6 +143,9 @@ from vllm.v1.attention.backends.linear_attn import (
@@ -12,7 +12,30 @@ index f3f0afb..3d57cac 100644
  from vllm.v1.attention.backends.utils import (
      NULL_BLOCK_ID,
      create_fast_prefill_custom_backend,
-@@ -2474,10 +2477,17 @@ class GPUModelRunner(
+@@ -857,6 +860,22 @@ class GPUModelRunner(
+ 
+         self.uniform_decode_query_len = 1 + self.num_spec_tokens
+ 
++        # vtl: every verification length a uniform decode step may be DISPATCHED at.
++        #
++        # This must never list a length the CAPTURE pass cannot produce, or dispatch returns
++        # FULL for a descriptor that has no graph and CUDAGraphWrapper raises mid-serving
++        # (capturing is globally disabled by then). Capture currently cannot: _warmup_and_capture
++        # drops `desc.num_reqs` and `_dummy_run` hardcodes
++        # `max_query_len = self.uniform_decode_query_len`, so every FULL capture lands on the
++        # static length no matter which descriptor asked for it.
++        #
++        # So this stays a single element. Supporting a real per-K set needs `desc.num_reqs`
++        # threaded into `_dummy_run` with `max_query_len = num_tokens // num_reqs`, AND
++        # mamba_attn's `assert m.max_query_len == self.vtl_capture_query_len` relaxed for the
++        # target. Until then dynamic SD keeps the stock PIECEWISE downgrade (see
++        # VllmConfig._maybe_override_dynamic_sd_cudagraph_mode), which is correct, just slower.
++        self.uniform_decode_query_lens = [self.uniform_decode_query_len]
++
+         # Cudagraph dispatcher for runtime cudagraph dispatching.
+         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
+ 
+@@ -2474,10 +2493,17 @@ class GPUModelRunner(
                      Mamba2AttentionMetadataBuilder,
                      GDNAttentionMetadataBuilder,
                      BailingLinearAttentionMetadataBuilder,
@@ -31,7 +54,7 @@ index f3f0afb..3d57cac 100644
                  )
                  extra_attn_metadata_args = dict(
                      num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
-@@ -2551,6 +2561,13 @@ class GPUModelRunner(
+@@ -2551,6 +2577,13 @@ class GPUModelRunner(
                          DFlashProposer,
                          Gemma4Proposer,
                          ExtractHiddenStatesProposer,
@@ -45,7 +68,7 @@ index f3f0afb..3d57cac 100644
                      ),
                  ):
                      if self.drafter.kv_cache_gid == kv_cache_gid:
-@@ -2558,7 +2575,9 @@ class GPUModelRunner(
+@@ -2558,7 +2591,9 @@ class GPUModelRunner(
                  else:
                      spec_decode_common_attn_metadata = cm
              # Capture per-group block tables for multi-group proposers.
@@ -56,3 +79,114 @@ index f3f0afb..3d57cac 100644
                  self.drafter.set_per_group_attn_metadata(
                      kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
                  )
+@@ -3896,13 +3931,28 @@ class GPUModelRunner(
+         torch.Tensor | None,
+         CUDAGraphStat | None,
+     ]:
+-        uniform_decode = self._is_uniform_decode(
+-            max_num_scheduled_tokens=max_num_scheduled_tokens,
+-            uniform_decode_query_len=self.uniform_decode_query_len,
+-            num_tokens=num_tokens,
+-            num_reqs=num_reqs,
+-            force_uniform_decode=force_uniform_decode,
+-        )
++        # vtl: match against ANY captured verification length, not just the static max. With a
++        # dynamic K schedule the step's query length is 1+K for whatever K the scheduler picked;
++        # `step_query_len` is then the length this batch's descriptor must be built with.
++        step_query_len = self.uniform_decode_query_len
++        if force_uniform_decode is not None:
++            # Capture path: the caller already decided, and it drives the descriptor with
++            # max_num_scheduled_tokens. Honour that verbatim rather than re-deriving a length.
++            uniform_decode = force_uniform_decode
++            if force_uniform_decode:
++                step_query_len = max_num_scheduled_tokens
++        else:
++            uniform_decode = False
++            for candidate in self.uniform_decode_query_lens:
++                if self._is_uniform_decode(
++                    max_num_scheduled_tokens=max_num_scheduled_tokens,
++                    uniform_decode_query_len=candidate,
++                    num_tokens=num_tokens,
++                    num_reqs=num_reqs,
++                ):
++                    uniform_decode = True
++                    step_query_len = candidate
++                    break
+         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
+         # is present). Also, chunked-prefill is disabled, so batch are uniform.
+         has_encoder_output = (
+@@ -3927,6 +3977,9 @@ class GPUModelRunner(
+                 num_active_loras=num_active_loras,
+                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
+                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
++                # vtl: the verification length this step actually uses (1+K under a dynamic
++                # schedule). Equals self.uniform_decode_query_len in the static case.
++                uniform_decode_query_len=step_query_len,
+             )
+ 
+         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+@@ -5409,6 +5462,21 @@ class GPUModelRunner(
+             self.model = CUDAGraphWrapper(
+                 self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
+             )
++            # vtl: the drafter needs its own FULL wrapper or its uniform decode steps have no
++            # graph to replay into and stay PIECEWISE -- ~17 replays per draft step on a hybrid
++            # LFM2 draft, three times per target step. The wrapper is a no-op unless the
++            # forward context carries cudagraph_runtime_mode=FULL, which only the drafter's
++            # decode steps set (see SpecDecodeBaseProposer.initialize_cudagraph_keys), so the
++            # variable-length extend pass is unaffected.
++            drafter = getattr(self, "drafter", None)
++            if (
++                drafter is not None
++                and getattr(drafter, "vtl_full_cudagraph", False)
++                and hasattr(drafter, "model")
++            ):
++                drafter.model = CUDAGraphWrapper(
++                    drafter.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
++                )
+         elif self.parallel_config.use_ubatching:
+             if cudagraph_mode.has_full_cudagraphs():
+                 self.model = UBatchWrapper(
+@@ -6108,13 +6176,25 @@ class GPUModelRunner(
+                     | Gemma4Proposer,
+                 )
+                 assert self.speculative_config is not None
+-                # Eagle currently only supports PIECEWISE cudagraphs.
+-                # Therefore only use cudagraphs if the main model uses PIECEWISE
+-                # NOTE(lucas): this is a hack, need to clean up.
++                # The drafter historically only supported PIECEWISE cudagraphs, so it was run
++                # EAGER during the target's FULL capture pass and captured nothing there.
++                #
++                # vtl: with VTL_DRAFT_FULL_CUDAGRAPH the drafter also captures FULL graphs for
++                # its uniform decode steps, so it must participate in the FULL pass too. Its own
++                # dispatcher decides what it can actually capture at each size -- passing
++                # use_cudagraphs=True here only permits capture, it does not force it.
++                drafter_full = getattr(self.drafter, "vtl_full_cudagraph", False) and (
++                    getattr(self.drafter, "vtl_full_decode_ready", False)
++                )
++                allowed_capture_modes = (
++                    (CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL)
++                    if drafter_full
++                    else (CUDAGraphMode.PIECEWISE,)
++                )
+                 use_cudagraphs = (
+                     (
+                         is_graph_capturing
+-                        and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
++                        and cudagraph_runtime_mode in allowed_capture_modes
+                     )
+                     or (
+                         not is_graph_capturing
+@@ -7125,7 +7205,11 @@ class GPUModelRunner(
+         # Trigger cudagraph dispatching keys initialization after
+         # resolved cudagraph mode.
+         self.cudagraph_dispatcher.initialize_cudagraph_keys(
+-            cudagraph_mode, self.uniform_decode_query_len
++            cudagraph_mode,
++            self.uniform_decode_query_len,
++            # vtl: one FULL key set per verification length the dynamic K schedule can produce.
++            # Identical to the stock call when the schedule is unset.
++            extra_uniform_decode_query_lens=self.uniform_decode_query_lens,
+         )
+ 
+         # Initialize drafter's cudagraph dispatcher if using spec decode.

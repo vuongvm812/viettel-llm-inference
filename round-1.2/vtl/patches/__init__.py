@@ -42,6 +42,7 @@ _MODULES: tuple[str, ...] = (
     "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)
     "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
+    "pearl",            # PEARL post-verify overlap for the draft model (opt-in, default OFF)
     "profiler",
 )
 

@@ -1,0 +1,15 @@
+diff --git a/vllm/v1/spec_decode/dflash.py b/vllm/v1/spec_decode/dflash.py
+index 5d1c062..7a19720 100644
+--- a/vllm/v1/spec_decode/dflash.py
++++ b/vllm/v1/spec_decode/dflash.py
+@@ -220,7 +220,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
+         - Multimodal inputs are not currently supported
+         """
+         num_query_tokens = min(num_tokens, self.max_query_tokens)
+-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
++        # vtl: the base method also returns the BatchDescriptor now (drafter FULL cudagraphs).
++        # DFlash stays PIECEWISE, whose keys are relaxed, so the descriptor is discarded here.
++        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp, _ = (
+             self._determine_batch_execution_and_padding(
+                 num_query_tokens, use_cudagraphs=use_cudagraphs
+             )

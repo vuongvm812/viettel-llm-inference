@@ -59,9 +59,19 @@ void bcx_conv_gate_quant(torch::Tensor& y_fp8, torch::Tensor& y_scale, torch::Te
                          torch::Tensor const& bcx, torch::Tensor const& conv_weight,
                          std::optional<torch::Tensor> const& conv_bias,
                          torch::Tensor const& state_indices, int64_t null_block_id,
-                         std::optional<torch::Tensor> const& scale_ub);
+                         std::optional<torch::Tensor> const& scale_ub,
+                         std::optional<torch::Tensor> const& num_accepted_tokens,
+                         std::optional<torch::Tensor> const& query_start_loc);
 
 bool bcx_conv_gate_supported(int64_t dim, int64_t width, int64_t state_len);
+
+void draft_argmax(torch::Tensor& out_ids, torch::Tensor const& hidden,
+                  torch::Tensor const& qweight, torch::Tensor const& group_scale,
+                  torch::Tensor& part_val, torch::Tensor& part_idx);
+
+bool draft_argmax_supported(int64_t vocab, int64_t hidden_size);
+
+int64_t draft_argmax_tiles(int64_t vocab);
 }  // namespace vtl
 
 TORCH_LIBRARY(vllm_cuda, m) {
@@ -78,14 +88,28 @@ TORCH_LIBRARY(vllm_cuda, m) {
   m.def(
       "mul_dynamic_per_token_quant(Tensor! result, Tensor! scale, "
       "Tensor a, Tensor b, Tensor? scale_ub) -> ()");
+  // num_accepted_tokens/query_start_loc are APPENDED optionals: absent means the original
+  // one-token-per-block decode, present means chain spec decode (one block per request, taps
+  // read at num_accepted-1). Appending keeps every existing positional call site valid.
   m.def(
       "bcx_conv_gate_quant(Tensor! y_fp8, Tensor! y_scale, Tensor! conv_state, "
       "Tensor bcx, Tensor conv_weight, Tensor? conv_bias, Tensor state_indices, "
-      "int null_block_id, Tensor? scale_ub) -> ()");
+      "int null_block_id, Tensor? scale_ub, Tensor? num_accepted_tokens=None, "
+      "Tensor? query_start_loc=None) -> ()");
   // Shape predicate: no tensor arguments, so it cannot be dispatched by device key -- register
   // the implementation right here as a catch-all instead of in the CUDA block below.
   m.def("bcx_conv_gate_supported(int dim, int width, int state_len) -> bool",
         TORCH_FN(vtl::bcx_conv_gate_supported));
+
+  // Fused int4 GEMV + argmax over the DRAFT model's pruned lm_head. Reads its own plain-layout
+  // int4 copy (see draft_argmax.cu) rather than the CUTLASS-reordered production weights.
+  m.def(
+      "draft_argmax(Tensor! out_ids, Tensor hidden, Tensor qweight, Tensor group_scale, "
+      "Tensor! part_val, Tensor! part_idx) -> ()");
+  // Same catch-all reasoning as bcx_conv_gate_supported: no tensor args to dispatch on.
+  m.def("draft_argmax_supported(int vocab, int hidden_size) -> bool",
+        TORCH_FN(vtl::draft_argmax_supported));
+  m.def("draft_argmax_tiles(int vocab) -> int", TORCH_FN(vtl::draft_argmax_tiles));
 }
 
 TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
@@ -96,6 +120,7 @@ TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
          TORCH_FN(vtl::silu_and_mul_dynamic_per_token_quant));
   m.impl("mul_dynamic_per_token_quant", TORCH_FN(vtl::mul_dynamic_per_token_quant));
   m.impl("bcx_conv_gate_quant", TORCH_FN(vtl::bcx_conv_gate_quant));
+  m.impl("draft_argmax", TORCH_FN(vtl::draft_argmax));
 }
 
 // Overrides of vLLM's own _C ops (schemas defined by vllm._C_stable_libtorch, imported first).

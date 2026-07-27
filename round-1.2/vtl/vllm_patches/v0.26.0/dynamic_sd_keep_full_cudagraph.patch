@@ -1,0 +1,42 @@
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 4b4a97f..b67a250 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -826,6 +826,37 @@ class VllmConfig:
+         ):
+             return
+ 
++        # vtl: this downgrade may only be skipped when the schedule is DEGENERATE -- every entry
++        # picking the same K as the static num_speculative_tokens -- because then there is only
++        # one verification length and the stock capture path already covers it.
++        #
++        # A genuinely varying schedule must keep the downgrade. Registering FULL keys per
++        # distinct 1+K without also teaching the capture pass to produce them is worse than the
++        # downgrade: dispatch returns FULL for a descriptor with no captured graph and
++        # CUDAGraphWrapper raises during serving. See the note on
++        # GPUModelRunner.uniform_decode_query_lens for what finishing it requires.
++        import os as _os
++
++        schedule = speculative_config.num_speculative_tokens_per_batch_size or []
++        distinct_ks = {int(entry[2]) for entry in schedule}
++        # `bool(...)` first: an EMPTY set is a subset of everything, so without it an empty
++        # schedule would skip the downgrade -- failing open in a function whose entire job is to
++        # fail closed. Unreachable today (the validator rejects an empty list) but wrong to rely
++        # on that.
++        degenerate = bool(distinct_ks) and distinct_ks <= {
++            int(speculative_config.num_speculative_tokens)
++        }
++
++        if degenerate and _os.environ.get(
++            "VTL_DYNAMIC_SD_FULL_CG", "1"
++        ).strip().lower() in ("1", "true", "yes", "on"):
++            logger.info_once(
++                "vtl: keeping cudagraph_mode=%s -- the dynamic SD schedule resolves to a "
++                "single verification length, which the stock capture path already covers.",
++                self.compilation_config.cudagraph_mode.name,
++            )
++            return
++
+         logger.warning_once(
+             "Dynamic speculative decoding changes the target verification "
+             "length at runtime. Overriding cudagraph_mode from %s to "

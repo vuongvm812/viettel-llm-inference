@@ -1,16 +1,26 @@
 diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
-index f8b52d0..8bdf049 100644
+index f8b52d0..71f85d7 100644
 --- a/vllm/v1/spec_decode/llm_base_proposer.py
 +++ b/vllm/v1/spec_decode/llm_base_proposer.py
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,8 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  import dataclasses
++import os
 +from copy import copy
  from importlib.util import find_spec
  from typing import TYPE_CHECKING, Any, cast
  
-@@ -39,7 +40,11 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
+@@ -21,7 +23,7 @@ if TYPE_CHECKING:
+ 
+ from vllm.distributed.eplb.eplb_state import EplbState
+ from vllm.distributed.parallel_state import get_pp_group
+-from vllm.forward_context import set_forward_context
++from vllm.forward_context import BatchDescriptor, set_forward_context
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.model_loader import get_model
+@@ -39,7 +41,11 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
  from vllm.v1.attention.backends.registry import AttentionBackendEnum
  from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
  from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
@@ -23,7 +33,7 @@ index f8b52d0..8bdf049 100644
  from vllm.v1.sample.metadata import SamplingMetadata
  from vllm.v1.sample.ops.topk_topp_sampler import (
      empty_exponential_noise_like,
-@@ -151,6 +156,17 @@ class SpecDecodeBaseProposer:
+@@ -151,17 +157,49 @@ class SpecDecodeBaseProposer:
  
          self.draft_attn_groups: list[AttentionGroup] = []
          self.kv_cache_gid: int = -1
@@ -41,7 +51,41 @@ index f8b52d0..8bdf049 100644
          self.eagle3_use_aux_hidden_state: bool = (
              self._get_eagle3_use_aux_hidden_state_from_config()
          )
-@@ -390,23 +406,66 @@ class SpecDecodeBaseProposer:
+ 
+         self.compilation_config = self.vllm_config.compilation_config
+ 
+-        # Cudagraph dispatcher for PIECEWISE-only dispatching in eagle.
+-        # Keys are initialized later via initialize_cudagraph_keys() called from
++        # Cudagraph dispatcher for the drafter. Keys are initialized later via
++        # initialize_cudagraph_keys() called from
+         # gpu_model_runner._check_and_update_cudagraph_mode after
+         # adjust_cudagraph_sizes_for_spec_decode is called.
+         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
++        # vtl: drafter FULL decode cudagraphs (see initialize_cudagraph_keys).
++        #
++        # DEFAULT OFF, and deliberately so -- this is the one knob in this series that is not
++        # safe to ship on faith. The dispatch/wrapper/capture-length plumbing below is complete,
++        # but `dummy_run` still enters `set_forward_context(None, ...)`: the drafter passes NO
++        # attention metadata during warmup, and no draft builder's
++        # `build_for_cudagraph_capture` is ever called. PIECEWISE tolerates that because
++        # attention runs between graph pieces; a FULL capture puts attention INSIDE the graph
++        # and would capture against absent metadata.
++        #
++        # TO FINISH: give dummy_run a capture path that builds a uniform-decode
++        # CommonAttentionMetadata (num_reqs = num_tokens, query_len 1), calls
++        # build_for_cudagraph_capture on each draft attn group, and hands the per-layer dict to
++        # set_forward_context instead of None. Then flip this default. The prize is real --
++        # ~17 replays per draft step become 1 -- but an unvalidated capture crash costs the whole
++        # run, so it stays behind an explicit VTL_DRAFT_FULL_CUDAGRAPH=1.
++        self.vtl_full_cudagraph = os.environ.get(
++            "VTL_DRAFT_FULL_CUDAGRAPH", "0"
++        ).strip().lower() in ("1", "true", "yes", "on")
++        # Set once FULL keys exist, so propose() knows a uniform-decode descriptor is dispatchable.
++        self.vtl_full_decode_ready = False
+ 
+         # persistent buffers for cuda graph
+         self.input_ids = torch.zeros(
+@@ -390,29 +428,83 @@ class SpecDecodeBaseProposer:
                  positions = positions[0]
              self.positions[:num_tokens] = positions
  
@@ -118,17 +162,186 @@ index f8b52d0..8bdf049 100644
  
      def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
          """Initialize cudagraph dispatcher keys for the drafter.
-@@ -776,7 +835,8 @@ class SpecDecodeBaseProposer:
-     ) -> torch.Tensor:
+ 
+-        Only supports PIECEWISE cudagraphs (via mixed_mode).
+-        This should be called after adjust_cudagraph_sizes_for_spec_decode.
++        vtl: the drafter used to be pinned to PIECEWISE unconditionally. On a hybrid LFM2 draft
++        that is expensive out of all proportion -- PIECEWISE splits the FX graph at every
++        `_attention_ops` node, which includes `vllm::short_conv`, so a 16-layer drafter replays
++        ~17 graphs plus the Python glue between them, once per draft step, while the TARGET's
++        decode is a single FULL replay. With `num_speculative_tokens=3` that is ~51 launches
++        bolted onto every decode step on a host-bound engine.
++
++        Draft steps 2..N are exactly the uniform decode case FULL cudagraphs exist for: a padded
++        batch, one token per request, inputs already staged in persistent buffers. So we add a
++        FULL decode routine alongside the PIECEWISE mixed one. Step 1 (the variable-length
++        "extend" pass over the accepted prefix) keeps PIECEWISE.
++
++        `VTL_DRAFT_FULL_CUDAGRAPH=0` restores the stock PIECEWISE-only behaviour exactly.
+         """
+         if (
+             not self.speculative_config.enforce_eager
+@@ -420,10 +512,31 @@ class SpecDecodeBaseProposer:
+             in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
+         ):
+             eagle_cudagraph_mode = CUDAGraphMode.PIECEWISE
++            if self.vtl_full_cudagraph and cudagraph_mode.decode_mode() == (
++                CUDAGraphMode.FULL
++            ):
++                # FULL_AND_PIECEWISE: piecewise for the mixed/extend pass, full for uniform
++                # decode. separate_routine() is what makes the dispatcher emit FULL keys at all.
++                eagle_cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+         else:
+             eagle_cudagraph_mode = CUDAGraphMode.NONE
+ 
+-        self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
++        # Draft decode is ONE token per request, unlike the target's 1+num_spec.
++        self.cudagraph_dispatcher.initialize_cudagraph_keys(
++            eagle_cudagraph_mode, uniform_decode_query_len=1
++        )
++        if eagle_cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
++            # NOTE the ordering: this runs from _check_and_update_cudagraph_mode, which the
++            # runner calls INSIDE initialize_attn_backend -- i.e. BEFORE
++            # initialize_metadata_builders reaches `drafter.initialize_attn_backend`. So
++            # `self.draft_attn_groups` is still empty here and the builders do not exist yet.
++            # The per-builder capture length is therefore applied at the END of the drafter's
++            # own initialize_attn_backend, which reads this flag.
++            self.vtl_full_decode_ready = True
++            logger.info(
++                "vtl: drafter will use FULL cudagraphs for its uniform decode steps "
++                "(was PIECEWISE-only)"
++            )
+ 
+     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         """Greedy-sample draft tokens from hidden states."""
+@@ -435,8 +548,63 @@ class SpecDecodeBaseProposer:
+             logits = self.vocab_mapping.constrain_draft_logits(logits)
+             draft_token_ids = logits.argmax(dim=-1)
+             return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)
++        fused = self._vtl_fused_argmax(hidden_states)
++        if fused is not None:
++            return fused
+         return self.model.compute_logits(hidden_states).argmax(dim=-1)
+ 
++    def _vtl_fused_argmax(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        """Fused int4 GEMV + argmax over the draft head, or None to use the stock path.
++
++        Skips the `[rows, vocab]` logits tensor entirely. Only ever active on a DRAFT head that
++        vtl pruned AND packed a plain-layout int4 copy for -- see
++        round-1.2/vtl/patches/lm_head_quant.py and round-1.2/vtl/csrc/draft_argmax.cu. Returns
++        None for anything else, which is every path in stock vLLM.
++
++        Fail-closed: any miss or error falls through to `compute_logits(...).argmax(-1)`, which
++        is the same answer by construction (the packing is checked against a torch oracle in
++        bench/test_draft_argmax.py). The one thing this must not do is raise.
++        """
++        head = getattr(getattr(self, "model", None), "lm_head", None)
++        qweight = getattr(head, "vtl_argmax_qweight", None)
++        if qweight is None:
++            return None
++        try:
++            rows = hidden_states.reshape(-1, hidden_states.shape[-1])
++            tiles = head.vtl_argmax_tiles
++            n_rows = rows.shape[0]
++            # Workspace is cached on the layer and grown on demand: the draft batch is padded to
++            # a handful of cudagraph sizes, so this allocates a few times at warmup and never
++            # again -- and never inside a captured region.
++            buf = getattr(head, "_vtl_argmax_ws", None)
++            if buf is None or buf[0].shape[0] < n_rows:
++                buf = (
++                    torch.empty((n_rows, tiles), dtype=torch.float32, device=rows.device),
++                    torch.empty((n_rows, tiles), dtype=torch.int32, device=rows.device),
++                )
++                head._vtl_argmax_ws = buf
++            out = torch.empty(n_rows, dtype=torch.int64, device=rows.device)
++            torch.ops.vllm_cuda.draft_argmax(
++                out,
++                rows,
++                qweight,
++                head.vtl_argmax_group_scale,
++                buf[0][:n_rows],
++                buf[1][:n_rows],
++            )
++            return out.view(hidden_states.shape[:-1])
++        except Exception:
++            # Once, then never again -- a per-step warning on the decode path would cost more
++            # than the kernel saves.
++            if not getattr(self, "_vtl_argmax_failed", False):
++                self._vtl_argmax_failed = True
++                logger.warning(
++                    "vtl: fused draft argmax failed; falling back to logits+argmax",
++                    exc_info=True,
++                )
++            head.vtl_argmax_qweight = None
++            return None
++
+     def _sample_from_logits(
+         self,
+         logits: torch.Tensor,
+@@ -558,7 +726,8 @@ class SpecDecodeBaseProposer:
+             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+         )
+ 
+-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
++        # First pass: variable-length extend over the accepted prefix, never uniform decode.
++        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp, batch_desc = (
+             self._determine_batch_execution_and_padding(num_tokens)
+         )
+ 
+@@ -583,6 +752,7 @@ class SpecDecodeBaseProposer:
+             num_tokens=num_input_tokens,
+             num_tokens_across_dp=num_tokens_across_dp,
+             cudagraph_runtime_mode=cudagraph_runtime_mode,
++            batch_descriptor=batch_desc,
+             slot_mapping=self._get_slot_mapping(
+                 slot_mapping_size, common_attn_metadata.slot_mapping
+             ),
+@@ -656,8 +826,15 @@ class SpecDecodeBaseProposer:
+         # Generate the remaining draft tokens.
+         draft_token_ids_list = [draft_token_ids]
+ 
+-        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
+-            self._determine_batch_execution_and_padding(batch_size)
++        # Draft steps 2..N: one token per request, padded batch -- the uniform decode case, and
++        # the only part of the draft path a FULL cudagraph can capture.
++        (
++            cudagraph_runtime_mode,
++            input_batch_size,
++            batch_size_across_dp,
++            decode_batch_desc,
++        ) = self._determine_batch_execution_and_padding(
++            batch_size, uniform_decode=self.vtl_full_decode_ready
+         )
+ 
+         common_attn_metadata.num_actual_tokens = batch_size
+@@ -742,6 +919,7 @@ class SpecDecodeBaseProposer:
+                 num_tokens=input_batch_size,
+                 num_tokens_across_dp=batch_size_across_dp,
+                 cudagraph_runtime_mode=cudagraph_runtime_mode,
++                batch_descriptor=decode_batch_desc,
+                 slot_mapping=self._get_slot_mapping(input_batch_size),
+             ):
+                 ret_hidden_states = self.model(**model_kwargs)
+@@ -777,6 +955,18 @@ class SpecDecodeBaseProposer:
          """Update positions, slot mappings, and sequence metadata for the
          next draft step. Returns the updated positions tensor."""
--        positions_1d = positions[0] if self.uses_mrope else positions
-+        old_positions_1d = positions[0] if self.uses_mrope else positions
-+        positions_1d = old_positions_1d
+         positions_1d = positions[0] if self.uses_mrope else positions
++        # SNAPSHOT, not an alias. `positions_1d` usually IS a view of self.positions[:batch_size],
++        # which eagle_step_update_slot_mapping_and_metadata overwrites in place just below -- so
++        # reading it afterwards to build the `exceeds` mask would test the NEW positions against
++        # max_model_len instead of the old ones. Only materialised when a secondary non-SSM group
++        # will actually consume it (for LFM2 both groups `continue`, so this stays None and the
++        # clone never happens).
++        old_positions_1d = None
++        if self._per_group_block_tables and any(
++            g.kv_cache_group_id != self.kv_cache_gid and not g.backend.is_ssm()
++            for g in self.draft_attn_groups
++        ):
++            old_positions_1d = positions_1d.clone()
          if self.uses_mrope:
              out_pos = self.mrope_positions[0, :batch_size]
          elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-@@ -816,6 +876,46 @@ class SpecDecodeBaseProposer:
+@@ -816,6 +1006,46 @@ class SpecDecodeBaseProposer:
          if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
              common_attn_metadata.seq_lens_cpu_upper_bound += 1
  
@@ -140,7 +353,7 @@ index f8b52d0..8bdf049 100644
 +        self._per_group_slot_mappings[self.kv_cache_gid] = (
 +            common_attn_metadata.slot_mapping
 +        )
-+        if self._per_group_block_tables:
++        if self._per_group_block_tables and old_positions_1d is not None:
 +            new_positions_1d = positions[0] if self.uses_mrope else positions
 +            exceeds = old_positions_1d + 1 >= self.max_model_len
 +            for attn_group in self.draft_attn_groups:
@@ -175,7 +388,7 @@ index f8b52d0..8bdf049 100644
          return positions
  
      def set_inputs_first_pass(
-@@ -995,9 +1095,36 @@ class SpecDecodeBaseProposer:
+@@ -995,9 +1225,36 @@ class SpecDecodeBaseProposer:
      ) -> tuple[list[object], dict[str, object]]:
          per_group_attn_metadata: list[object] = []
          per_layer_attn_metadata: dict[str, object] = {}
@@ -213,7 +426,7 @@ index f8b52d0..8bdf049 100644
              )
              per_group_attn_metadata.append(attn_metadata)
              for layer_name in attn_group.layer_names:
-@@ -1153,6 +1280,13 @@ class SpecDecodeBaseProposer:
+@@ -1153,6 +1410,13 @@ class SpecDecodeBaseProposer:
              slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
              causal=True,
              dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
@@ -227,7 +440,7 @@ index f8b52d0..8bdf049 100644
          )
  
          return (
-@@ -1264,6 +1398,9 @@ class SpecDecodeBaseProposer:
+@@ -1264,6 +1528,9 @@ class SpecDecodeBaseProposer:
              slot_mapping=common_attn_metadata.slot_mapping[token_indices],
              causal=True,
              dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
@@ -237,7 +450,37 @@ index f8b52d0..8bdf049 100644
          )
  
          return spec_common_attn_metadata, token_indices
-@@ -1689,27 +1826,18 @@ class SpecDecodeBaseProposer:
+@@ -1632,10 +1899,17 @@ class SpecDecodeBaseProposer:
+             1 if only_one_forward_pass else self.num_speculative_tokens
+         ):
+             if fwd_idx <= 1:
+-                cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+-                    self._determine_batch_execution_and_padding(
+-                        num_tokens, use_cudagraphs=use_cudagraphs
+-                    )
++                (
++                    cudagraph_runtime_mode,
++                    num_input_tokens,
++                    num_tokens_across_dp,
++                    batch_desc,
++                ) = self._determine_batch_execution_and_padding(
++                    num_tokens,
++                    use_cudagraphs=use_cudagraphs,
++                    # fwd_idx 0 is the extend pass; 1+ are the uniform decode steps this
++                    # dummy run must capture a FULL graph for.
++                    uniform_decode=self.vtl_full_decode_ready and fwd_idx >= 1,
+                 )
+ 
+             # Make sure to use EAGLE's own buffer during cudagraph capture.
+@@ -1654,6 +1928,7 @@ class SpecDecodeBaseProposer:
+                 num_tokens=num_input_tokens,
+                 num_tokens_across_dp=num_tokens_across_dp,
+                 cudagraph_runtime_mode=cudagraph_runtime_mode,
++                batch_descriptor=batch_desc,
+                 slot_mapping=slot_mapping_dict,
+             ):
+                 if self.supports_mm_inputs:
+@@ -1689,27 +1964,18 @@ class SpecDecodeBaseProposer:
          return use_aux_hidden_state
  
      def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
@@ -276,7 +519,7 @@ index f8b52d0..8bdf049 100644
  
      def initialize_attn_backend(
          self,
-@@ -1719,59 +1847,100 @@ class SpecDecodeBaseProposer:
+@@ -1719,67 +1985,135 @@ class SpecDecodeBaseProposer:
          """
          Initialize AttentionGroups for draft layers using kv_cache_config.
          Called from the model runner's initialize_metadata_builders.
@@ -414,6 +657,51 @@ index f8b52d0..8bdf049 100644
 +            self.block_size,
          )
 -        logger.debug("Using block size %d for drafting layers", self.block_size)
++
++        # vtl: the builders exist only now, so this is where the FULL-decode capture length
++        # lands. initialize_cudagraph_keys ran earlier (from the runner's
++        # _check_and_update_cudagraph_mode, before this method) and set the flag; applying it
++        # there would have iterated an empty draft_attn_groups and silently done nothing, and
++        # the drafter's FULL capture would then trip
++        # `assert m.max_query_len == 1 + num_spec_tokens` at boot.
++        if self.vtl_full_decode_ready:
++            marked = 0
++            for attn_group in self.draft_attn_groups:
++                for builder in attn_group.metadata_builders:
++                    if hasattr(builder, "vtl_capture_query_len"):
++                        builder.vtl_capture_query_len = 1
++                        marked += 1
++            logger.info(
++                "vtl: %d draft metadata builder(s) set to capture at query_len 1", marked
++            )
  
      def _determine_batch_execution_and_padding(
          self,
+         num_tokens: int,
+         use_cudagraphs: bool = True,
+-    ) -> tuple[CUDAGraphMode, int, torch.Tensor | None]:
++        uniform_decode: bool = False,
++    ) -> tuple[CUDAGraphMode, int, torch.Tensor | None, BatchDescriptor | None]:
++        """vtl: also returns the BatchDescriptor.
++
++        FULL cudagraphs are keyed on the exact descriptor -- including ``num_reqs`` and
++        ``uniform`` -- so the caller must hand the same object to ``set_forward_context`` rather
++        than let it synthesise ``BatchDescriptor(num_tokens=...)``, which would miss every FULL
++        key. PIECEWISE keys are relaxed (``num_reqs=None, uniform=False``) and match either way,
++        so the extra return value is inert on the stock path.
++        """
+         cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+             num_tokens,
++            uniform_decode=uniform_decode,
+             valid_modes=({CUDAGraphMode.NONE} if not use_cudagraphs else None),
+         )
+         num_tokens_padded = batch_desc.num_tokens
+@@ -1815,7 +2149,7 @@ class SpecDecodeBaseProposer:
+                 assert batch_desc.num_tokens == num_tokens_padded
+                 num_tokens_across_dp[dp_rank] = num_tokens_padded
+ 
+-        return cudagraph_mode, num_tokens_padded, num_tokens_across_dp
++        return cudagraph_mode, num_tokens_padded, num_tokens_across_dp, batch_desc
+ 
+ 
+ # NOTE(woosuk): Currently, the below code is not used and we always use argmax

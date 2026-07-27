@@ -1,0 +1,41 @@
+diff --git a/vllm/v1/attention/backends/mamba_attn.py b/vllm/v1/attention/backends/mamba_attn.py
+index 6fce7d0..0216cd2 100644
+--- a/vllm/v1/attention/backends/mamba_attn.py
++++ b/vllm/v1/attention/backends/mamba_attn.py
+@@ -163,6 +163,19 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
+         if self.use_spec_decode:
+             self.supports_update_block_table = False
+ 
++        # vtl: the uniform query length this builder captures FULL cudagraphs at.
++        #
++        # The TARGET verifies 1+num_spec tokens per request, which is the stock assumption. A
++        # separate DRAFT model does not: its decode steps are one token per request
++        # (llm_base_proposer.propose sets max_query_len = 1), while its builder is constructed
++        # from the SHARED vllm_config and therefore still reports num_spec_tokens = 3. Asserting
++        # `1 + num_spec_tokens` would reject every draft capture.
++        #
++        # Overridden to 1 on the draft builders by SpecDecodeBaseProposer. Not derived from
++        # num_spec_tokens, because that value also sizes state_indices_tensor_d and the align-mode
++        # block gather -- zeroing it to move this assert would silently narrow both.
++        self.vtl_capture_query_len = 1 + self.num_spec_tokens
++
+     def build_for_cudagraph_capture(
+         self, common_attn_metadata: CommonAttentionMetadata
+     ) -> M:
+@@ -180,10 +193,14 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
+             "Make sure all cudagraph capture sizes <= max_num_seq."
+         )
+ 
+-        assert m.max_query_len == 1 + self.num_spec_tokens  # decode-only
++        assert m.max_query_len == self.vtl_capture_query_len  # decode-only
+ 
+         num_accepted_tokens = None
+-        if self.num_spec_tokens > 0:
++        # vtl: gate on the CAPTURE query length, not num_spec_tokens. A draft builder inherits
++        # num_spec_tokens > 0 from the shared config but has no rollback -- its
++        # num_accepted_tokens is None at run time, so synthesising one here would capture a graph
++        # that takes a different branch than replay.
++        if self.num_spec_tokens > 0 and self.vtl_capture_query_len > 1:
+             num_accepted_tokens = torch.diff(m.query_start_loc)
+ 
+         prev_last_scheduled_idx = None

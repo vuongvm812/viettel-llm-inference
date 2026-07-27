@@ -53,6 +53,25 @@ gen v1/worker/gpu_model_runner.py               gpu_model_runner
 # with gpu_model_runner, which registers the per-group block tables.
 gen v1/spec_decode/llm_base_proposer.py         llm_base_proposer_multigroup
 gen v1/worker/mamba_utils.py                    mamba_groups_hybrid_draft
+# Drafter FULL cudagraphs (VTL_DRAFT_FULL_CUDAGRAPH). The mamba builder captures at a per-builder
+# uniform query length instead of the hardcoded 1+num_spec_tokens, because a separate DRAFT model
+# decodes ONE token per request while inheriting num_spec_tokens from the shared config. Moves
+# with llm_base_proposer_multigroup (which sets it) and gpu_model_runner (which wraps the draft
+# model and lets it join the FULL capture pass).
+gen v1/attention/backends/mamba_attn.py         mamba_attn
+# Dynamic K + full cudagraphs on the V1 runner (VTL_DYNAMIC_SD_FULL_CG). Upstream downgrades
+# cudagraph_mode to PIECEWISE whenever num_speculative_tokens_per_batch_size is set, because MRv1
+# pinned the uniform decode query length to the static 1+num_spec. These capture one FULL key set
+# per distinct 1+K and dispatch on the length actually in play. All three move together with
+# gpu_model_runner.
+gen v1/cudagraph_dispatcher.py                  cudagraph_dispatcher_multi_qlen
+gen config/vllm.py                              dynamic_sd_keep_full_cudagraph
+# Arity only: SpecDecodeBaseProposer._determine_batch_execution_and_padding now also returns the
+# BatchDescriptor, and these two SUBCLASSES unpack it. Neither is on our path (we run
+# method=draft_model) but leaving them unpacking a 3-tuple is a latent ValueError for anyone who
+# switches spec method. Moves with llm_base_proposer_multigroup.
+gen v1/spec_decode/step3p5.py                   step3p5_batch_desc_arity
+gen v1/spec_decode/dflash.py                    dflash_batch_desc_arity
 # Paired with the draft model too: a DRAFT ModelConfig's hf_overrides is always a callable, and
 # get_quant_config RAISED on anything but a dict -- which made a quantized drafter
 # (--speculative-config '{"quantization":"vtl_w4a8"}') a hard boot failure. Without this the

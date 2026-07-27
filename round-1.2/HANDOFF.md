@@ -1,5 +1,136 @@
 # HANDOFF — Round 1.2 Mission Brief
 
+## BLOCKER: none of the 2026-07-27 work is in the pinned image
+
+`docker-compose.yaml:6` pins `unseenablefuture/awesome-badger@sha256:c1ade3ac…`, built before any
+of it. The vLLM changes reach the image ONLY through `Dockerfile.vllm-fork`'s patch step, and
+there are now 15 patches where that image has 10. The judge runs `docker-compose.yaml` alone —
+`docker-compose-optimized.yaml` is a local overlay. Until `make vllm-fork PUSH=1` runs and BOTH
+digests are re-pinned (`VLLM_FORK_DIGEST` in `Makefile`, the image in `docker-compose.yaml`),
+everything below is a no-op on the scored run.
+
+## Drafter latency work, 2026-07-27 — LANDED, NONE OF IT BOOTED YET
+
+Six changes aimed at making the LFM2.5-350M draft arm cheap enough to be worth its 4 model
+invocations per decode step. Every one is behind a `VTL_*` env var, all default ON, all set
+explicitly in `docker-compose.yaml`. **Nothing here has been compiled or booted** — there is no
+GPU, torch, pytest or nvcc on the dev box. `bash vtl/vllm_patches/gen.sh` passes and the
+CPU-runnable self-checks pass; that is the whole of the evidence so far.
+
+**The headline finding, which nobody had noticed:** `bcx_conv_gate_quant` — the flagship fused
+short-conv decode kernel — has been **dead code since `num_speculative_tokens` went non-zero**.
+Spec decode widens the conv state to `conv_kernel - 1 + num_spec` = 5, and the kernel's shape
+predicate demanded `state_len == 2` exactly, so it silently rejected *both* models.
+`bench/test_bcx_conv_gate_quant.py:224` was asserting that rejection as if it were correct.
+
+| # | Change | Flag (default) | Where |
+|---|---|---|---|
+| 1 | `supported_for` takes `state_len >= kStateLen`. The kernel only ever reads the first `width-1` slots, and `causal_conv1d_update` pins `state_len = width-1` on the host whenever `num_accepted_tokens is None` (`causal_conv1d.py:1181-1184`), so the wider allocation was always inert on this path. Restores the fused kernel for the **drafter**. | `VTL_ENABLE_BCX_CONV_GATE=1` | `vtl/csrc/bcx_conv_gate_quant.cu` |
+| 2 | `kSpec` template: one block per REQUEST, per-request token loop, taps at `num_accepted-1`. Restores it for the **target** under spec (~20 launches/step). New optional op args `num_accepted_tokens`/`query_start_loc`. | `VTL_BCX_SPEC=1` | same `.cu`, `torch_bindings.cpp`, `short_conv.py` |
+| 3 | FR-Spec: prune the DRAFT lm_head to its first K token ids before quantize/pack. ~19% of the drafter's weights, read 3x per target step. Lossless — the target verifies every drafted token, so a token outside the window is simply never proposed. | `VTL_DRAFT_VOCAB=16384` | `vtl/patches/lm_head_quant.py` |
+| 4 | Drafter FULL cudagraphs for its uniform decode steps. It is pinned to PIECEWISE, which on a 16-layer hybrid splits at every conv AND attn op — ~17 replays per draft step against the target's 1. **INCOMPLETE, shipped OFF** — see below. | `VTL_DRAFT_FULL_CUDAGRAPH=0` | `llm_base_proposer.py`, `mamba_attn.py`, `gpu_model_runner.py` |
+| 5 | Multi-verification-length FULL cudagraph keys. **NO schedule ships** — see below. | `VTL_DYNAMIC_SD_FULL_CG=1` (inert without a schedule) | `cudagraph_dispatcher.py`, `config/vllm.py`, `gpu_model_runner.py` |
+| 6 | `make sweep-spec` answers "does K=3 pay?" by deriving a throwaway overlay from the submitted compose (one sed on the K literal), K ∈ {0..4}, K=0 = spec OFF. `--disable-log-stats` is stripped from the OVERLAY only. | — | `Makefile` |
+| 7 | Fused int4 GEMV + argmax over the pruned draft head. Skips the `[rows, vocab]` logits tensor. Reads its OWN plain int4 packing, NOT the CUTLASS-reordered production weights — see below. | `VTL_DRAFT_FUSED_ARGMAX=1` | `vtl/csrc/draft_argmax.cu`, `lm_head_quant.py`, `llm_base_proposer.py` |
+| 8 | PEARL: **installs nothing.** The rollback primitive (`_ConvSnapshot`, `_draft_conv_states`) is kept and tested; the overlap is not reachable safely from this seam — see below. | `VTL_ENABLE_PEARL=0` | `vtl/patches/pearl.py` |
+
+**The dynamic-K schedule was pulled back out, and this is the trap to know about.** A review
+caught that registering FULL cudagraph keys per verification length is only half the job: the
+CAPTURE pass cannot produce them. `_warmup_and_capture` drops `desc.num_reqs` and `_dummy_run`
+hardcodes `max_query_len = self.uniform_decode_query_len`, so every FULL capture lands on the
+static length regardless of which descriptor asked for it. A K=0 step (batch 9-70) would then
+dispatch FULL, find no captured graph, and `CUDAGraphWrapper` would raise **during serving** —
+capturing is globally disabled by that point. That is a mid-run crash in the submitted config,
+not a slow path.
+
+So: no schedule in `docker-compose.yaml`, `uniform_decode_query_lens` is pinned to a single
+entry, and `_maybe_override_dynamic_sd_cudagraph_mode` now only skips the stock PIECEWISE
+downgrade when the schedule is DEGENERATE (every entry equal to the static K). Anyone adding a
+real schedule gets the stock downgrade — correct, just slower — instead of a crash. Finishing it
+properly means threading `desc.num_reqs` into `_dummy_run` with
+`max_query_len = num_tokens // num_reqs` AND relaxing `mamba_attn`'s
+`assert m.max_query_len == self.vtl_capture_query_len` for the target.
+
+Also from that review, and worth not re-breaking: `--disable-log-stats` had to go BACK into the
+submitted compose. `vtl/patches/kv_cache_manager.py:160` self-gates its prefill block-scan
+elision on `log_stats` being off, so removing the flag puts a per-request block walk back inside
+TTFT. `make sweep-spec` strips it from its derived overlay instead, which is where the
+measurement belongs.
+
+**Change 4 is deliberately OFF and is the one piece of unfinished work here.** Everything around
+it is done — the dispatcher emits `FULL_AND_PIECEWISE` keys at `uniform_decode_query_len=1`, the
+draft model gets its own `CUDAGraphWrapper(FULL)`, the descriptor is threaded into
+`set_forward_context`, the mamba builders take a per-builder `vtl_capture_query_len`, and the
+drafter joins the runner's FULL capture pass. The missing piece is the capture metadata:
+`SpecDecodeBaseProposer.dummy_run` still enters `set_forward_context(None, ...)`, so no draft
+builder's `build_for_cudagraph_capture` is ever called. PIECEWISE tolerates that (attention runs
+between graph pieces); FULL does not, because attention is inside the graph. Turning the flag on
+as-is would capture against absent metadata.
+
+To finish: give `dummy_run` a capture path that builds a uniform-decode `CommonAttentionMetadata`
+(`num_reqs = num_tokens`, query_len 1), calls `build_for_cudagraph_capture` on each entry of
+`draft_attn_groups`, and passes the resulting per-layer dict to `set_forward_context` instead of
+`None`. Then flip the default. Two ordering traps already handled and worth not re-breaking:
+`initialize_cudagraph_keys` runs BEFORE `draft_attn_groups` exists (so the per-builder capture
+length is applied at the end of the drafter's `initialize_attn_backend` instead), and the base
+`_determine_batch_execution_and_padding` now returns a 4-tuple, which `step3p5.py` and
+`dflash.py` also unpack.
+
+**Why the fused argmax carries its own weight copy.** The production path packs through
+`ops.cutlass_encode_and_reorder_int4b`, a CUTLASS-internal interleaved layout. Decoding it by
+hand would fail SILENTLY: a wrong draft token is not wrong output — the target verifies every
+one — so a mistake surfaces only as a worse acceptance rate, weeks later, blamed on the model.
+So `draft_argmax.cu` defines its own plain row-major packing (8 signed int4 per int32, symmetric
+per-group scales), `lm_head_quant.pack_draft_argmax_weight` builds it at load from the same
+pre-pack bf16 rows, and `bench/test_draft_argmax.py` checks it against a pure-torch oracle
+including `torch.argmax`'s lowest-index tie-breaking. Costs ~8 MB at K=16384; buys total
+independence from a CUTLASS implementation detail. W4A16 not W4A8 on purpose: the activation is
+a few KB, so quantizing it saves nothing and only adds error to the number that picks the token.
+
+**Why PEARL installs nothing.** Two independent findings, both from review, both structural:
+
+1. **No safe overlap from that seam.** Running the drafter inside `torch.cuda.stream(...)` makes
+   every tensor it allocates owned by that stream; `wait_stream` orders *execution*, not
+   deallocation. Several escape — `out` into `self._draft_token_ids` (read later on a *third*
+   stream that never waits on ours), `self._draft_probs` into the next step's rejection sampler
+   (that one corrupts **acceptance**, silently), and the drafter's lazily-created persistent
+   buffers, which would stay side-stream-owned for the process lifetime. vLLM flags this exact
+   hazard in `v1/worker/gpu/spec_decode/utils.py` and `pp_utils.py`, and every side stream it
+   actually uses is a D2H copy into a *pre-allocated* buffer, never a model forward.
+2. **Nothing to roll back without speculation.** Wrapping the call to snapshot and drop state
+   nothing rewinds is pure cost (~20 launches) on the host-bound path it was meant to relieve.
+
+A third bug was found and is worth recording because it would have been invisible: the snapshot
+derived its rows from `block_table[:, 0]`, but under `mamba_cache_mode=align` that column is
+`NULL_BLOCK_ID = 0` for everything but the first block — so the rollback would have saved and
+restored the scratch null block while the live rows stayed advanced. A rollback that silently
+does nothing is worse than none, because the caller believes it happened.
+
+Real post-verify needs the drafter hoisted above `_sample` in `execute_model` and driven from a
+guessed prefix. Before building that, measure: the chain needs **K+1** tokens (the bonus token
+the drafter never saw), so reuse is `p^(K+1)` ≈ 0.24 at p=0.7, and on ~19 SMs the ~76% miss path
+is charged at nearly full price and is *slower* than baseline. Gate: build only if `p^(K+1) > 0.5`
+and the drafter exceeds ~35% of step time.
+
+**Owed before this can be trusted** (in addition to the v0.26.0 rows below):
+1. `make test-kernel` — the new spec cases in `bench/test_bcx_conv_gate_quant.py` A/B the rollback
+   against `causal_conv1d_update` on the whole `[blocks, D, 5]` ring buffer. **That is the only
+   thing standing between change 2 and silent recurrent-state corruption.**
+2. The temp-0 long-context probe, spec ON vs OFF (row 4 below). Changes 1 and 2 both touch the
+   conv-state rollback — the exact defect that produced the original 0% long-context score.
+3. `make bench` and read `accept` / `mean_accept_len`. If acceptance is below ~40% per token the
+   whole draft arm is negative and `num_speculative_tokens` should drop; `make sweep-spec`
+   (K ∈ {0,1,2,3,4}, K=0 = spec OFF) answers it in one command.
+4. Grep the boot log for `short-conv fused decode kernel NOT eligible` — it fires once, names the
+   layer, and is the only signal that change 1 did not take. Logged at WARNING deliberately: the
+   shipped compose runs `VLLM_LOGGING_LEVEL=WARNING`, where an info line would be invisible in
+   exactly the deployment that needs it.
+5. **Re-pin BOTH digests.** None of this reaches the judge otherwise: the vLLM changes only enter
+   the image through `Dockerfile.vllm-fork`'s patch step, and `docker-compose.yaml:6` still pins
+   the pre-change `@sha256:c1ade3ac…`. `make vllm-fork PUSH=1`, then re-pin `VLLM_FORK_DIGEST` in
+   `Makefile` and the image digest in `docker-compose.yaml`. The judge runs
+   `docker-compose.yaml` alone — `docker-compose-optimized.yaml` is a local overlay only.
+
 ## OPEN: on-box verification owed for the vLLM v0.26.0 upgrade (2026-07-26)
 
 Row 1 is DONE (`VLLM_FORK_DIGEST=@sha256:c5bea8bf…` in `Makefile`, main image re-pinned to
@@ -143,6 +274,33 @@ logit copy from the sample path, #48143 an allocation from the SSM metadata buil
 iteration logging off the engine-core loop) plus staying current. If step 5 shows a regression,
 the rollback is the digest in `Makefile` (image-level only — `vtl/vllm_patches/v0.25.0/` was
 deleted, so a source-level rollback needs `git revert`).
+
+### Drafter work: the two items that were nearly dropped (2026-07-27)
+
+Both the fused GEMV+argmax and PEARL were initially skipped on expected-value grounds and then
+built anyway. The EV reasoning is still correct and worth keeping, because it is what should
+decide whether to KEEP them once there are numbers:
+
+**Fused argmax** is the smaller prize by an order of magnitude. After FR-Spec pruning the logits
+tensor is `8 x 16384` fp32 (~0.5 MB), so the fusion is worth order 15 us/step against pruning's
+~150 us. It is built and behind `VTL_DRAFT_FUSED_ARGMAX`; if a profile does not show
+`compute_logits`/`argmax` on the critical path, turning it off costs nothing. What made it worth
+building rather than skipping is that the risky part — decoding CUTLASS's reordered layout — is
+avoidable entirely by carrying an independent 8 MB copy.
+
+**PEARL** is the weakest item on the list and is shipped OFF for that reason, not because it is
+unfinished plumbing. The arithmetic: a non-tree chain must speculate **K+1** tokens (the bonus
+token the drafter never saw), so reuse is `p^(K+1)` — about 0.24 at p=0.7. On a ~19 SM MIG slice
+there is no idle GPU to overlap into, so the ~76% miss path is charged at nearly full price and
+is *slower* than baseline. The snapshot rollback currently in `pearl.py` costs ~20 launches to
+save the ~30 being overlapped; the zero-copy fix is `bcx_conv_gate_quant`'s kSpec sliding window
+retargeted at the drafter, which also needs the draft model built at `num_spec + 1` state width —
+new coupling in the `short_conv`/`lfm2`/`mamba_utils` three-file lockstep that
+`bench/test_shortconv_spec_rollback.py` exists to protect.
+
+Decision procedure, ~20 lines and worth running before touching either again: histogram
+`num_accepted` off the rejection sampler and time `drafter.propose` against the target forward
+with CUDA events. That yields `p` and the drafter's share of step time, which is all that matters.
 
 ### Speculative decoding — LIVE in the submitted compose, unmeasured (2026-07-26)
 
