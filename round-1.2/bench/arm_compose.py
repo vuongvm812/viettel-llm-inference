@@ -104,6 +104,15 @@ def main():
         "overrides", nargs="*",
         help="--flag=value / --flag to set, ~--flag to remove",
     )
+    # The no-op guard below is a typo catcher, and it is exactly wrong for `make ab`: the
+    # CONTROL arm of an A/B restates the value the shipped config already has, so it changes
+    # nothing BY CONSTRUCTION. Without this the control can never be booted through the same
+    # overlay path as the treatment -- and booting them differently is how you measure the
+    # overlay instead of the flag.
+    p.add_argument(
+        "--allow-unchanged", action="store_true",
+        help="do not fail when the overrides are a no-op (A/B control arm)",
+    )
     args, unknown = p.parse_known_args()
     # argparse swallows anything starting with '-' as an option, so the flags we are asked to
     # SET land in `unknown`. Both buckets are overrides; order between them is preserved well
@@ -115,7 +124,7 @@ def main():
     files = args.compose_file or ["docker-compose.yaml"]
     base = resolve_command(files)
     command = apply_overrides(base, overrides)
-    if command == base:
+    if command == base and not args.allow_unchanged:
         sys.exit(f"overrides {overrides} changed nothing -- check the flag spelling")
 
     note = "arm = shipped config + " + " ".join(overrides)

@@ -91,12 +91,19 @@ TRACE := data/input/trace-round2.jsonl
 COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 DC := docker compose $(COMPOSE_FILES)
 
+# Interpreter for the bench CLIENTS (replay.py needs aiohttp). REPLAY_IN_IMAGE=1 runs them
+# inside the image we just built instead of the host python3 -- the GPU box has neither aiohttp
+# nor pip, and installing one there would make the client a per-box variable in a measurement
+# whose whole point is that only the served config differs between arms. --network host so
+# $(TARGET) still resolves; --user keeps the result JSONs owned by you and not root.
+REPLAY := $(if $(filter 1,$(REPLAY_IN_IMAGE)),docker run --rm --network host --user $$(id -u):$$(id -g) -v "$$PWD":/w -w /w --entrypoint python3 $(IMAGE):$(TAG),python3)
+
 # CI bench lifecycle (remote runner). No build step — image is the pinned digest from ci-build.
 IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: check stats build up down warm push bench arm sweep-sched-tokens sweep-quant sweep-schedule profile test-kernel bench-kernel debug-kernel verify prove vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap
+.PHONY: check stats build up down warm push bench arm ab sweep-sched-tokens sweep-quant sweep-schedule profile test-kernel bench-kernel debug-kernel verify prove vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -341,6 +348,42 @@ arm:
 	$(IN) ( python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --out bench-arm-$(ARM).json \
 	  && { [ -z "$(ARM_EVAL)" ] || python3 bench/eval_quality.py --target $(TARGET) --trace $(TRACE) --out ref-$(ARM).json; } \
 	  ); rc=$$?; $(DC) -f /tmp/vtl-arm-$(ARM).yaml down; exit $$rc
+
+## Multi-BOOT A/B over one serve flag. `make arm` boots each arm ONCE, and the noise floor here
+## is boot-to-boot (~0.5 ms TPOT) while rep-to-rep is ~0.05 ms -- so a one-boot-per-arm sweep
+## cannot resolve anything it finds. This re-boots every arm AB_ROUNDS times and INTERLEAVES the
+## arms, so a slow drift in the box (thermals, page cache) hits both arms rather than whichever
+## one ran second. Everything else is `make arm`: arm_compose.py writes a throwaway overlay, so
+## docker-compose.yaml -- the submission artifact -- is never touched.
+##
+##   make ab AB_FLAG=--max-num-scheduled-tokens AB_ARMS="2048 8192"
+##   make ab AB_FLAG=--quantization AB_ARMS="vtl_w4a8 vtl_fp8" AB_ROUNDS="1 2 3"
+##
+## Results: $(ROUND)/bench-ab-<arm>-r<round>-<rep>.json. Rank by ERS -- compare.py converts the
+## boot-to-boot floor into ERS at the measured operating point and refuses to call a
+## within-noise spread a winner. Add boots (AB_ROUNDS), not reps.
+AB_FLAG ?=
+AB_ARMS ?=
+AB_ROUNDS ?= 1 2
+AB_REPS ?= 1
+AB_LIMIT ?= 150
+## Requests replayed once, discarded, before the measured reps: torch.compile/cudagraph/autotune
+## work that lands in the first boot's TTFT would otherwise be charged to whichever arm booted.
+AB_WARM ?= 20
+ab:
+	@test -n "$(AB_FLAG)" -a -n "$(AB_ARMS)" || { echo "usage: make ab AB_FLAG=--flag AB_ARMS='v1 v2'"; exit 1; }
+	$(IN) for r in $(AB_ROUNDS); do for a in $(AB_ARMS); do \
+	  echo "=== boot round $$r arm $(AB_FLAG)=$$a"; \
+	  python3 bench/arm_compose.py --allow-unchanged --out /tmp/vtl-ab.yaml $(ARM_COMPOSE_FILES) "$(AB_FLAG)=$$a" || exit 1; \
+	  $(DC) -f /tmp/vtl-ab.yaml up -d --force-recreate --wait || exit 1; \
+	  ( $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) --limit $(AB_WARM) --out /dev/null || exit 1; \
+	    i=0; while [ $$i -lt $(AB_REPS) ]; do i=$$((i+1)); \
+	      $(REPLAY) bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	        --limit $(AB_LIMIT) --out bench-ab-$$a-r$$r-$$i.json || exit 1; \
+	    done ); rc=$$?; \
+	  $(DC) -f /tmp/vtl-ab.yaml down; [ $$rc -eq 0 ] || exit $$rc; \
+	done; done
+	@echo "compare: cd $(ROUND) && python3 bench/compare.py bench-ab-*.json"
 
 ## The --max-num-scheduled-tokens bracket. This flag ships LIVE at 2048 with no measurement
 ## behind it: 2048 is below the longest prompt (4,281 tok), so a turn-1 prefill spans 3
