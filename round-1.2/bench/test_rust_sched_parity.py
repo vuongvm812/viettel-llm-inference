@@ -14,9 +14,17 @@ Three tiers, each degrading to a clear skip rather than a false pass:
      Rust `KvManager` through the same synthetic multi-turn workload and asserts
      identical block IDs per group, computed-token counts, free-block counts and usage.
 
-  3. ORACLE PARITY (needs only the crate). An independent brute-force model of what the
-     longest cached prefix must be, recomputed from the request history — catches
-     prefix-cache logic errors off-box where vLLM cannot be imported.
+  3. ORACLE PARITY (needs only the crate). Independent brute-force models, all runnable
+     off-box where vLLM cannot be imported: (a) what the longest cached prefix must be,
+     recomputed from the request history; (b) `FreeQueueOracle`, a direct transcription
+     of vLLM's free queue, compared block ID by block ID under a pool small enough to
+     recycle ~40x; (c) a replay of the RECORDED trace (`data/input/trace-round2.jsonl`)
+     rather than only the synthetic fixture.
+
+  4. WRAPPER PARITY (needs `vllm` importable). Tiers 2-3 drive `vtl_sched.KvManager`
+     directly; this one drives the actual `VtlShadowKVCacheManager` /
+     `VtlRustKVCacheManager` subclasses, which is the only place RustMirror, the
+     BaseException guards, RustBlocks and `_refuse_unported` run.
 
 Also `--bench`: ops/step microbench of the Rust manager (no Python side needed).
 
@@ -378,6 +386,240 @@ def test_pool_pressure_forces_eviction_without_corruption():
     assert kv.num_free_blocks == 255
 
 
+# ---------------------------------------------------------------------------
+# tier 3b -- eviction-order oracle under pool pressure (no vLLM needed)
+# ---------------------------------------------------------------------------
+
+
+def full_attention_config(num_blocks, block_size=16, max_model_len=8192):
+    """One full-attention group. Eviction order lives in the shared BlockPool, so the
+    simplest layout that reaches it is the right one to model in python."""
+    cfg = rust_config(num_blocks, block_size, max_model_len)
+    cfg["groups"] = cfg["groups"][:1]
+    return cfg
+
+
+class FreeQueueOracle:
+    """`FreeKVCacheBlockQueue` + the cached-hash map, straight from the source.
+
+    `popleft` hands out the least-recently-freed block and drops whatever it had cached
+    (block_pool.py:574); `free_blocks` appends hashed blocks in EVICTION order, i.e. the
+    caller's list already reversed (`:614`); `touch` pulls a freed-but-cached block back
+    out of the queue (`:597`). Block 0 is the null block and never circulates.
+
+    Only the all-blocks-hashed case is modelled: the driver below always allocates a whole
+    number of blocks, so `free_blocks`' unhashed-first split never triggers.
+    """
+
+    def __init__(self, num_blocks):
+        from collections import deque
+
+        self.free = deque(range(1, num_blocks))
+        self.by_hash = {}
+        self.by_block = {}
+
+    def touch(self, blocks):
+        for b in blocks:
+            self.free.remove(b)
+
+    def alloc(self, n):
+        out = []
+        for _ in range(n):
+            b = self.free.popleft()
+            h = self.by_block.pop(b, None)
+            if h is not None:
+                del self.by_hash[h]
+            out.append(b)
+        return out
+
+    def cache(self, blocks, hashes, start):
+        for i in range(start, len(hashes)):
+            self.by_hash[hashes[i]] = blocks[i]
+            self.by_block[blocks[i]] = hashes[i]
+
+    def release(self, blocks):
+        self.free.extend(reversed(blocks))
+
+
+@requires_crate
+def test_eviction_order_matches_the_python_oracle_under_pressure():
+    """Small pool, long workload: every handed-out block ID must match the oracle.
+
+    The pool recycles ~40x over the run, so a single wrong eviction victim diverges the
+    ID stream immediately and never recovers.
+    """
+    block_size, num_blocks = 16, 512
+    none_hash = vtl_sched.none_hash_from_seed("0")
+    kv = vtl_sched.KvManager(full_attention_config(num_blocks, block_size))
+    oracle = FreeQueueOracle(num_blocks)
+    convs, order = synth_conversations(num_convs=40, turns=4, seed=17)
+
+    recycled = 0
+    for c, t in order:
+        tokens = convs[c][t]
+        rid = f"c{c}-t{t}"
+        slot = kv.intern(rid)
+        hashes = vtl_sched.block_hashes(none_hash, block_size, tokens)
+        kv.push_hashes(slot, b"".join(hashes), len(tokens))
+        kv.new_step_starts()
+
+        max_blocks = (len(tokens) - 1) // block_size
+        n_hit = 0
+        while n_hit < max_blocks and hashes[n_hit] in oracle.by_hash:
+            n_hit += 1
+        hit_blocks = [oracle.by_hash[h] for h in hashes[:n_hit]]
+
+        got_hit = kv.get_computed_blocks(slot, len(tokens), 0, False)
+        assert got_hit == n_hit * block_size, f"{rid}: hit tokens"
+        n = kv.pending_hit_into_buffer(0)
+        assert kv.buffer(0)[:n].tolist() == hit_blocks, f"{rid}: hit block ids"
+
+        target = aligned_target(len(tokens), block_size)
+        if target <= got_hit:
+            kv.forget(rid)
+            continue
+        oracle.touch(hit_blocks)
+        new = oracle.alloc(target // block_size - n_hit)
+        recycled += sum(1 for b in new if b in oracle.by_block)
+        blocks = hit_blocks + new
+
+        assert kv.allocate_slots(
+            slot, target - got_hit, got_hit, True, 0, 0, len(tokens), 0, False
+        ), rid
+        n = kv.new_blocks_into_buffer(0)
+        assert kv.buffer(0)[:n].tolist() == new, f"{rid}: new block ids"
+        n = kv.blocks_into_buffer(slot, 0)
+        assert kv.buffer(0)[:n].tolist() == blocks, f"{rid}: full block table"
+
+        oracle.cache(blocks, hashes[: target // block_size], n_hit)
+        kv.free(slot)
+        kv.forget(rid)
+        oracle.release(blocks)
+
+    assert kv.num_free_blocks == num_blocks - 1
+    assert len(oracle.free) == num_blocks - 1
+
+
+# ---------------------------------------------------------------------------
+# tier 3c -- replay of the recorded trace (no vLLM needed)
+# ---------------------------------------------------------------------------
+
+TRACE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data",
+    "input",
+    "trace-round2.jsonl",
+)
+
+
+def trace_conversations(path=TRACE):
+    """The recorded round-2 trace as ``(conversations, arrival_order)``.
+
+    The trace stores chat MESSAGES, not token ids, and no tokenizer is available off-box,
+    so each whitespace-delimited word maps to a stable id. That keeps the only property
+    the prefix cache reacts to — which requests share which leading token runs, and how
+    long they are — while the tier stays runnable without torch or the model. 420
+    requests, 70 conversations x 6 turns, 1482-3104 words each.
+    """
+    import json
+    import re
+
+    vocab = {}
+    convs, index, order = [], {}, []
+    with open(path) as fh:
+        for line in fh:
+            messages = json.loads(line)["body"]["messages"]
+            tokens = [
+                vocab.setdefault(w, len(vocab) + 1000)
+                for m in messages
+                for w in re.findall(r"\S+", m["content"])
+            ]
+            key = messages[0]["content"], messages[1]["content"]
+            c = index.get(key)
+            if c is None:
+                c = index[key] = len(convs)
+                convs.append([])
+            order.append((c, len(convs[c])))
+            convs[c].append(tokens)
+    return convs, order
+
+
+@requires_crate
+def test_recorded_trace_replays_with_high_reuse():
+    """Drive the real trace through the Rust manager, not just the synthetic fixture."""
+    if not os.path.exists(TRACE):
+        pytest.skip(f"{TRACE} not present")
+    block_size = 16
+    none_hash = vtl_sched.none_hash_from_seed("0")
+    convs, order = trace_conversations()
+    assert len(order) == 420 and len(convs) == 70, (len(order), len(convs))
+
+    kv = vtl_sched.KvManager(rust_config(num_blocks=1 << 14, max_model_len=8192))
+    obs = drive_rust(kv, none_hash, block_size, convs, order)
+    assert len(obs) == len(order)
+    assert all(ok is not False for _, _, ok, _, _ in obs), "a trace request failed to fit"
+    reuse = sum(h for _, h, _, _, _ in obs) / sum(len(convs[c][t]) for c, t in order)
+    # The trace measures 82.8% block-hash reuse with the real tokenizer; word-level ids
+    # give the same shape. Anything near zero means the replay lost the prefix structure.
+    assert reuse > 0.6, f"trace replay is not reusing prefixes (reuse={reuse:.2f})"
+    assert kv.num_free_blocks == (1 << 14) - 1, "everything freed"
+
+
+@requires_crate
+def test_schedule_returns_per_step_deltas_for_running_requests():
+    """The `running_new_blocks` / `running_new_lens` contract `rust_sched.py` slices.
+
+    scheduler.py:588 stores only the step's new blocks for a running request. If this
+    ever handed back the whole table, the V2 runner's `append_block_ids(overwrite=False)`
+    would duplicate the block table on every decode step.
+    """
+    block_size = 16
+    none_hash = vtl_sched.none_hash_from_seed("0")
+    kv = vtl_sched.KvManager(rust_config(num_blocks=512, max_model_len=4096))
+    core = vtl_sched.Scheduler()
+    core.set_params(
+        {
+            "max_num_scheduled_tokens": 8192,
+            "max_num_running_reqs": 64,
+            "max_model_len": 4096,
+            "num_sampled_tokens_per_step": 1,
+            "long_prefill_token_threshold": 0,
+            "enable_chunked_prefill": True,
+            "need_mamba_block_aligned_split": True,
+            "cache_block_size": block_size,
+            "num_lookahead_tokens": 0,
+            "sjf_reorder": False,
+        }
+    )
+    tokens = [7000 + i for i in range(80)]
+    slot = kv.intern("r0")
+    kv.push_hashes(slot, b"".join(vtl_sched.block_hashes(none_hash, block_size, tokens)), 80)
+
+    def req(num_tokens, computed, status):
+        return (slot, num_tokens, num_tokens, computed, 0, 64, 128, status, 0, False, False)
+
+    admitted = core.schedule(kv, [], [req(64, 0, 0)])
+    assert len(admitted["scheduled_admitted"]) == 1
+    before = [kv.blocks_into_buffer(slot, g) for g in range(kv.num_groups)]
+
+    d = core.schedule(kv, [req(65, 64, 1)], [])
+    assert len(d["scheduled_running"]) == 1
+
+    flat, lens = d["running_new_blocks"], d["running_new_lens"]
+    assert len(lens) == kv.num_groups
+    off = 0
+    for g in range(kv.num_groups):
+        n = lens[g]
+        span = flat[off : off + n]
+        off += n
+        after = kv.buffer(g)[: kv.blocks_into_buffer(slot, g)].tolist()
+        assert n == len(after) - before[g], f"group {g}: span length == table growth"
+        if n:
+            assert span == after[before[g] :], f"group {g}: span == the new tail"
+    assert off == len(flat)
+    assert sum(before) > len(flat), "a delta, not the whole table"
+
+
 @requires_crate
 def test_workload_actually_exercises_the_prefix_cache():
     """Guard against a vacuously-passing suite: the fixture must produce real reuse."""
@@ -399,11 +641,27 @@ def _try_import_vllm():
     if VLLM_SRC and os.path.isdir(VLLM_SRC) and VLLM_SRC not in sys.path:
         sys.path.append(VLLM_SRC)
     try:
-        import vllm  # noqa: F401
+        # Import a real submodule, not just the package. Running pytest from the repo root
+        # puts the source-only `vllm/` checkout on sys.path as a NAMESPACE package, so a
+        # bare `import vllm` succeeds and every later import blows up mid-test instead of
+        # skipping.
+        from vllm.v1.core.kv_cache_manager import KVCacheManager  # noqa: F401
+        import vllm
 
         return vllm
     except Exception:
         return None
+
+
+def _computed_blocks(py, request):
+    """``KVCacheManager.get_computed_blocks`` -> ``(blocks, num_computed_tokens)``.
+
+    v0.25.0 returns a 2-tuple (kv_cache_manager.py:206); read it by position so a tree
+    that grows a third element still drives this harness instead of raising ValueError.
+    """
+    out = py.get_computed_blocks(request)
+    assert len(out) >= 2, f"unexpected get_computed_blocks arity: {len(out)}"
+    return out[0], out[1]
 
 
 def _build_python_manager(num_blocks, block_size, max_model_len):
@@ -479,7 +737,7 @@ def test_manager_parity_against_vllm():
         py.new_step_starts()
         rs.new_step_starts()
 
-        py_blocks, py_hit = py.get_computed_blocks(request)
+        py_blocks, py_hit = _computed_blocks(py, request)
         rs_hit = rs.get_computed_blocks(slot, len(tokens), 0, False)
         assert py_hit == rs_hit, f"{rid}: computed tokens {py_hit} vs {rs_hit}"
         py_ids = py_blocks.get_block_ids()
@@ -518,6 +776,114 @@ def test_manager_parity_against_vllm():
     assert py_stats.hits == rs_stats["hits"]
     assert py_stats.requests == rs_stats["requests"]
     assert ku.NONE_HASH  # keep the import meaningful
+
+
+# ---------------------------------------------------------------------------
+# tier 4 -- the rust_sched.py wrapper classes themselves
+# ---------------------------------------------------------------------------
+
+
+def _install_wrappers():
+    """`_install_shadow` / `_install_authority` over the stock v0.25.0 KVCacheManager."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    from vtl.patches.rust_sched import _install_authority, _install_shadow
+
+    modes = {"radix": False, "strict": True}
+    return (
+        _install_shadow(KVCacheManager, modes),
+        _install_authority(KVCacheManager, modes),
+    )
+
+
+def _wrapper_manager(cls, num_blocks, block_size, max_model_len):
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    full = FullAttentionSpec(block_size=block_size, num_kv_heads=8, head_size=64, dtype="auto")
+    mamba = MambaSpec(
+        shapes=((4, 2048),),
+        dtypes=("auto",),
+        block_size=block_size,
+        page_size_padded=None,
+        mamba_type="mamba2",
+        num_speculative_blocks=0,
+    )
+    cfg = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["a"], full), KVCacheGroupSpec(["b"], mamba)],
+    )
+    return cls(
+        kv_cache_config=cfg,
+        max_model_len=max_model_len,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+        enable_caching=True,
+        log_stats=True,
+    )
+
+
+@requires_crate
+def test_shadow_and_authority_wrappers_agree_with_python():
+    """Tier 2 drives `vtl_sched.KvManager` directly; this drives the real subclasses.
+
+    Everything between the engine and the crate — RustMirror slot interning, the
+    BaseException guards, RustBlocks, `_refuse_unported` — only runs here.
+    """
+    if _try_import_vllm() is None:
+        pytest.skip("vllm not importable here; this tier runs in-container")
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.request import Request
+
+    shadow_cls, authority_cls = _install_wrappers()
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(16, sha256)
+
+    block_size, num_blocks, max_model_len = 16, 4096, 32768
+    shadow = _wrapper_manager(shadow_cls, num_blocks, block_size, max_model_len)
+    authority = _wrapper_manager(authority_cls, num_blocks, block_size, max_model_len)
+    assert shadow._rust is not None, "shadow mirror refused to start"
+
+    convs, order = synth_conversations(num_convs=15, turns=4, seed=77)
+    live = []
+    for c, t in order:
+        tokens = convs[c][t]
+        rid = f"c{c}-t{t}"
+        reqs = [
+            Request(
+                request_id=rid,
+                prompt_token_ids=tokens,
+                sampling_params=None,
+                pooling_params=None,
+                eos_token_id=None,
+                block_hasher=hasher,
+            )
+            for _ in range(2)
+        ]
+        for mgr, request in zip((shadow, authority), reqs):
+            mgr.new_step_starts()
+            blocks, hit = _computed_blocks(mgr, request)
+            mgr.allocate_slots(request, len(tokens) - hit, hit, blocks)
+        assert shadow.get_block_ids(rid) == authority.get_block_ids(rid), rid
+        live.append(reqs)
+        if len(live) > 6:
+            for mgr, request in zip((shadow, authority), live.pop(0)):
+                mgr.free(request)
+
+    assert shadow.rust_shadow_mismatches == 0
+    assert shadow._rust is not None, "a guard fired and disabled the mirror"
+    assert authority.usage == pytest.approx(shadow.usage)
+
+    # Deferred freeing would drain the stale python pool -- authority must refuse.
+    with pytest.raises(RuntimeError):
+        authority.pop_blocks_for_free(live[0][1])
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +930,7 @@ def bench(iters=3):
                 block_hasher=hasher,
             )
             py.new_step_starts()
-            blocks, hit = py.get_computed_blocks(request)
+            blocks, hit = _computed_blocks(py, request)
             if py.allocate_slots(request, len(tokens) - hit, hit, blocks) is not None:
                 py.free(request)
         dt = time.perf_counter() - t0

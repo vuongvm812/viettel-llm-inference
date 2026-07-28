@@ -57,7 +57,7 @@ import glob
 import logging
 import os
 
-from vtl.registry import mark_patched, register_patch
+from vtl.registry import already_patched, mark_patched, register_patch
 
 log = logging.getLogger("vllm.vtl.l2")
 
@@ -151,9 +151,13 @@ def _load_cudart():
         return _cudart
     _cudart_tried = True
 
-    names = ["libcudart.so.13", "libcudart.so.12", "libcudart.so"]
-    # torch ships its own copy (torch/lib, or the nvidia-cuda-runtime-cu12 wheel) and may
-    # have dlopen'd it RTLD_LOCAL, in which case the bare soname above can still miss.
+    # torch's OWN copy first (torch/lib, or the nvidia-cuda-runtime-cu12 wheel). It is the
+    # runtime this process is already running on, and it is what the bare sonames below can get
+    # wrong: `libcudart.so.13` is tried first by version order but torch here bundles 12.x, so
+    # the generic name can hand us a second, unrelated runtime whose device state is not the one
+    # the model was loaded into. torch may also have dlopen'd its copy RTLD_LOCAL, which is why
+    # the soname fallbacks stay -- they just go last.
+    names: list[str] = []
     try:
         import torch
 
@@ -162,6 +166,7 @@ def _load_cudart():
             names.extend(sorted(glob.glob(os.path.join(root, pattern))))
     except Exception:
         pass
+    names += ["libcudart.so.13", "libcudart.so.12", "libcudart.so"]
 
     for name in names:
         try:
@@ -267,7 +272,12 @@ def _install_window(model, device: int = 0) -> None:
 
     target = largest_packed_weight(model)
     if target is None:
-        log.warning("vtl: no weight_packed buffers found; L2 window not attached")
+        # Roll the set-aside back, same reason as the cudaStreamSetAttribute failure below:
+        # L2 reserved for persisting lines we then never mark is L2 taken away from everything
+        # else. Leaving it set here would make "no int4 layers" strictly worse than not running.
+        lib.cudaDeviceSetLimit(ctypes.c_int(LIMIT_PERSISTING_L2_CACHE_SIZE), ctypes.c_size_t(0))
+        log.warning("vtl: no weight_packed buffers found; L2 window not attached, "
+                    "set-aside rolled back to 0")
         return
     name, base_ptr, nbytes = target
 
@@ -310,23 +320,19 @@ def _install_window(model, device: int = 0) -> None:
     )
 
 
-_installed = False
-
-
 @register_patch("l2_persist", default=True)
 def apply() -> None:
     """Hook ``BaseModelLoader.load_model`` to probe (always) and pin (opt-in) after load.
 
-    Note we do NOT use ``already_patched(BaseModelLoader, "load_model")`` as a guard the
-    way ``quant_w4a8`` does: that check is per-attribute, not per-patch, so it would see
-    w4a8's wrapper (installed earlier in the apply order) and silently skip us. Our own
-    module flag is the right granularity; the two wrappers stack fine.
+    ``patch="l2_persist"``, not the bare ``already_patched(BaseModelLoader, "load_model")``:
+    ``quant_w4a8`` wraps this same attribute, and the unnamed check is per-attribute, so it
+    would see w4a8's wrapper and silently skip us (or vice versa, depending on the order of
+    ``_MODULES``). The named check asks about US. The two wrappers stack fine.
     """
-    global _installed
-    if _installed:
-        return
-
     from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+
+    if already_patched(BaseModelLoader, "load_model", patch="l2_persist"):
+        return
 
     original = BaseModelLoader.load_model
 
@@ -347,8 +353,7 @@ def apply() -> None:
             log.exception("vtl: L2 persist hook failed; serving unaffected")
         return model
 
-    BaseModelLoader.load_model = mark_patched(load_model, original)
-    _installed = True
+    BaseModelLoader.load_model = mark_patched(load_model, original, patch="l2_persist")
 
 
 def _self_check() -> None:

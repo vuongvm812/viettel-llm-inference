@@ -26,7 +26,16 @@ from __future__ import annotations
 import os
 
 import pytest
-import torch
+
+# importorskip, not a plain import: `make test-kernel` globs bench/test_*.py, but pytest also
+# gets pointed at bench/ from the host, where there is no torch and no vtl -- a module-level
+# `import torch` makes that a COLLECTION error, i.e. the whole directory fails instead of this
+# one file skipping.
+torch = pytest.importorskip("torch", reason="w4a8 v2 parity needs torch + an sm_90 GPU")
+
+# Same names quant_w4a8 will accept, imported rather than restated: a name that exists in only
+# one of the two lists is an arm that is either swept and rejected or accepted and never swept.
+VALID_SCHEDULES_V2 = pytest.importorskip("vtl.patches.quant_w4a8").VALID_SCHEDULES_V2
 
 FP8 = torch.float8_e4m3fn
 
@@ -35,7 +44,9 @@ FP8 = torch.float8_e4m3fn
 #   16384x2048  mlp w13           2048x8192   mlp w2   (the deep-wave Stream-K case)
 #   6144x2048   conv in_proj      65536x2048  lm_head
 SHAPES = [(3072, 2048), (2048, 2048), (16384, 2048), (2048, 8192), (6144, 2048), (65536, 2048)]
-MS = [1, 4, 8, 16, 33, 512]
+# 32 and 33 straddle the threshold branch (`M > m_threshold`), which is the one place an
+# off-by-one silently routes all of decode to the stock kernel.
+MS = [1, 4, 8, 16, 32, 33, 512]
 MTHRESH = 32
 
 
@@ -59,17 +70,10 @@ def _skip_reason() -> str | None:
 SKIP = _skip_reason()
 pytestmark = pytest.mark.skipif(SKIP is not None, reason=SKIP or "")
 
-# Every name quant_w4a8 will accept. An arm compiled out (#if VTL_W4A8_ENABLE_PP=0, or a
-# builder static_assert that forced it out) is discovered at runtime by _available(), not
-# hardcoded here -- the point is that dropping an arm must not turn into a failing test.
-ALL_SCHEDULES = [
-    "128x16_1x1x1_sk",
-    "128x32_1x1x1_sk",
-    "128x16_2x1x1",
-    "128x8_1x1x1",
-    "64x16_1x1x1_pp",
-    "64x32_1x1x1_pp",
-]
+# An arm compiled out (#if VTL_W4A8_ENABLE_PP=0, or a builder static_assert that forced it out)
+# is discovered at runtime by available(), not listed here -- dropping an arm must not turn into
+# a failing test. sorted() so the parametrize ids are stable across runs.
+ALL_SCHEDULES = sorted(VALID_SCHEDULES_V2)
 
 _packed_cache: dict[tuple[int, int], tuple] = {}
 
@@ -119,18 +123,38 @@ def v2_mm(xq, scales, packed, schedule, m_threshold=MTHRESH):
 _available_cache: dict[str, bool] = {}
 
 
+#: What the C++ dispatcher says when a name is unknown OR its `#if` compiled the arm out. This
+#: is the ONE failure that means "skip"; everything else -- a wrong-arch cubin faulting at the
+#: sync, a CUTLASS can_implement rejection, a bad argument -- is a real failure and must not be
+#: laundered into a green skip. Mapping every exception to "not compiled in" is how a box where
+#: every single arm faults reports all-green.
+_NOT_BUILT = "not-compiled-in schedule"
+
+
 def available(schedule: str) -> bool:
-    """Launch the arm once at a tiny shape. An arm that was compiled out raises from the C++
-    dispatcher ("unknown or not-compiled-in schedule"); a wrong-arch cubin faults at the sync."""
+    """Launch the arm once at a tiny shape. False only if the dispatcher says it isn't built."""
     if schedule not in _available_cache:
         try:
             xq, scales = activation(16, 128)
             v2_mm(xq, scales, packed_weight(128, 128), schedule, m_threshold=16)
             torch.cuda.synchronize()
             _available_cache[schedule] = True
-        except Exception:
+        except RuntimeError as exc:
+            if _NOT_BUILT not in str(exc):
+                raise
             _available_cache[schedule] = False
     return _available_cache[schedule]
+
+
+def test_extension_has_at_least_one_arm():
+    """We only get here on sm_90 with vtl._C_w4a8 imported and w4a8_mm_v2 registered. If EVERY
+    arm then reports "not built", the .so is a shell: the parity tests below would all skip and
+    the whole extension would read as passing."""
+    built = [s for s in ALL_SCHEDULES if available(s)]
+    assert built, (
+        f"vtl._C_w4a8 is loaded on sm_90 but none of {ALL_SCHEDULES} launched -- "
+        "every arm was compiled out"
+    )
 
 
 @pytest.mark.parametrize("schedule", ALL_SCHEDULES)

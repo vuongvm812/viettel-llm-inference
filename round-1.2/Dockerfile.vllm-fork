@@ -88,20 +88,28 @@ RUN git clone --depth 1 --branch "${VLLM_SRC_REF}" --filter=blob:none --sparse \
 
 # Our frontend optimizations (sonic_rs parse extractor + tuned release profile) live as a
 # tracked patch — the fetched source is pristine v0.25.0, so this is what makes the build
-# produce the optimized binary instead of stock. Grep-guarded (idempotent) like the
-# api_server_rust_frontend patch, so a pre-modified source is a no-op too.
+# produce the optimized binary instead of stock.
+#
+# Idempotency is PER PATCH, not per stage: a reverse dry-run that applies cleanly means that
+# patch is already in the checkout, so it is skipped and the others still apply. (The old
+# single grep-guard on sonic_rs skipped ALL patches whenever the frontend one was present, so
+# a checkout carrying the older patches silently shipped without the newer ones.) The final
+# asserts pin one marker per independent patch group.
 COPY vtl/vllm_patches/rust-frontend/ /tmp/rust_patches/
-RUN F=/src/rust/src/server/src/routes/openai/utils/validated_json.rs; \
-    if grep -q sonic_rs "$F"; then \
-      echo "rust-frontend optimizations already present in the checkout; skipping patch"; \
-    else \
-      for p in /tmp/rust_patches/*.patch; do \
-        [ -e "$p" ] || { echo "no rust patches found"; exit 1; }; \
-        echo "== apply $p"; patch -p1 -d /src/rust --dry-run < "$p" && patch -p1 -d /src/rust < "$p" || exit 1; \
-      done; \
-    fi \
- && rm -rf /tmp/rust_patches \
- && grep -q sonic_rs "$F"   # fail loudly if neither the checkout nor the patch supplied it
+RUN set -eu; \
+    for p in /tmp/rust_patches/*.patch; do \
+      [ -e "$p" ] || { echo "no rust patches found"; exit 1; }; \
+      if patch -p1 -d /src/rust -R --dry-run --force < "$p" >/dev/null 2>&1; then \
+        echo "== skip  $p (already in the checkout)"; \
+      else \
+        echo "== apply $p"; \
+        patch -p1 -d /src/rust --dry-run < "$p" && patch -p1 -d /src/rust < "$p"; \
+      fi; \
+    done; \
+    rm -rf /tmp/rust_patches; \
+    grep -q sonic_rs /src/rust/src/server/src/routes/openai/utils/validated_json.rs; \
+    test -f /src/rust/src/engine-core-client/src/shm_ipc.rs; \
+    echo "rust-frontend patches present (sonic_rs + shm_ipc)"
 
 # PGO training assets (only used by the rust-builder-pgo stage below).
 COPY vtl/pgo_train.sh /src/pgo_train.sh
@@ -111,9 +119,15 @@ COPY data/input/trace-round2.jsonl /src/trace-round2.jsonl
 WORKDIR /src/rust
 # -Ctarget-cpu applies to the plain build too (not just PGO), so a non-PGO image gets the
 # tuned codegen and PGO can be A/B'd in isolation. See the PGO_TARGET_CPU ARG note re: build host.
+#
+# The `cargo test` is the compile-time gate for shm_ipc.patch (mirroring the vtl-sched-builder
+# precedent): its unit tests hold the golden record vectors shared with the Python packer plus
+# the framing-rejection cases, and nothing else ever runs them. Scoped to the one crate and
+# --lib so it reuses the release artifacts just built and skips the integration/doc suites.
 RUN set -eux; \
     export RUSTFLAGS="${PGO_TARGET_CPU:+-Ctarget-cpu=$PGO_TARGET_CPU}"; \
     cargo build --release --bin vllm-rs --features native-tls-vendored; \
+    cargo test --release -p vllm-engine-core-client --lib; \
     mkdir -p /out; \
     cp target/release/vllm-rs /out/vllm-rs; \
     /out/vllm-rs --help >/dev/null

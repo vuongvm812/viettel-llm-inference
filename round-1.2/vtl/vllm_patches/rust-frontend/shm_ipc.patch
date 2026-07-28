@@ -139,17 +139,17 @@ index f4ae0e1..3cadbd7 100644
  mod transport;
 diff --git a/src/engine-core-client/src/shm_ipc.rs b/src/engine-core-client/src/shm_ipc.rs
 new file mode 100644
-index 0000000..b6ee98a
+index 0000000..fa8d66d
 --- /dev/null
 +++ b/src/engine-core-client/src/shm_ipc.rs
-@@ -0,0 +1,677 @@
+@@ -0,0 +1,719 @@
 +//! iceoryx2 zero-copy shared-memory data plane for the frontend <-> EngineCore hop.
 +//!
 +//! Opt-in via `VTL_SHM_IPC=1`; with the flag unset **nothing in this module runs** and the
 +//! client keeps the stock ZMQ transport. The Python counterpart lives in
 +//! `round-1.2/vtl/patches/shm_ipc.py` and must agree with the constants below
-+//! ([`SUBSCRIBER_MAX_BUFFER_SIZE`], [`HISTORY_SIZE`], the service names and the record
-+//! framing) or `open_or_create` refuses to open the peer's service.
++//! ([`SUBSCRIBER_MAX_BUFFER_SIZE`], [`HISTORY_SIZE`], [`ENABLE_SAFE_OVERFLOW`], the service
++//! names and the record framing) or `open_or_create` refuses to open the peer's service.
 +//!
 +//! Design notes:
 +//! * ZMQ stays fully wired. The input (frontend -> engine) ROUTER half is retained inside
@@ -197,6 +197,19 @@ index 0000000..b6ee98a
 +const MAX_SUBSCRIBERS: usize = 1;
 +const SUBSCRIBER_MAX_BUFFER_SIZE: usize = 512;
 +const HISTORY_SIZE: usize = 0;
++/// iceoryx2 defaults to safe overflow: publishing into a FULL subscriber buffer silently
++/// overwrites the oldest unread sample — for a request stream that is a request that vanishes
++/// with no log and no error. Turning it off makes the condition observable: the setting is
++/// part of the service config (`open_or_create` refuses a peer that disagrees, so the Python
++/// side sets the same value) and with [`BackpressureStrategy::DiscardData`] a full buffer
++/// makes `send()` report 0 receivers — the same signal as "nobody subscribed", which already
++/// routes to the ZMQ fallback. The iceoryx2 default `RetryUntilDelivered` would instead spin
++/// the caller until the reader drains.
++///
++/// Backlog math for the 512-sample buffer: the scored trace peaks at 8 concurrent generations
++/// and the engine emits one output batch per decode step, so 512 samples is ~2 s of stream at
++/// a 4 ms TPOT. A peer that far behind is wedged, not busy.
++const ENABLE_SAFE_OVERFLOW: bool = false;
 +/// Worst-case ADD payload (msgpack `EngineCoreRequest`) comfortably fits; the publisher's
 +/// segment grows by powers of two if a request ever exceeds it.
 +const REQUEST_MAX_PAYLOAD: usize = 1 << 20;
@@ -246,6 +259,7 @@ index 0000000..b6ee98a
 +        .max_subscribers(MAX_SUBSCRIBERS)
 +        .subscriber_max_buffer_size(SUBSCRIBER_MAX_BUFFER_SIZE)
 +        .history_size(HISTORY_SIZE)
++        .enable_safe_overflow(ENABLE_SAFE_OVERFLOW)
 +        .open_or_create()
 +        .map_err(shm_error)?;
 +    let event: EventFactory<ShmService> = node
@@ -283,6 +297,9 @@ index 0000000..b6ee98a
 +            .publisher_builder()
 +            .initial_max_slice_len(REQUEST_MAX_PAYLOAD)
 +            .allocation_strategy(AllocationStrategy::PowerOfTwo)
++            // With safe overflow off, this is what a full engine buffer does: report
++            // (`send()` -> 0 receivers) instead of spinning this request's task.
++            .backpressure_strategy(BackpressureStrategy::DiscardData)
 +            .create()
 +            .map_err(shm_error)?;
 +        let notifier: Notifier<ShmService> =
@@ -372,6 +389,9 @@ index 0000000..b6ee98a
 +                false
 +            }
 +            Err(error) => {
++                // The latch is permanent on purpose: a per-message retry would interleave the
++                // two transports, and an already-published-but-unread record could then be
++                // overtaken by a later ZMQ one (an ABORT reaching the engine before its ADD).
 +                live.store(false, Ordering::Relaxed);
 +                warn!(error = %error.as_report(), "vtl shm_ipc: publish failed, falling back to ZMQ");
 +                false
@@ -430,7 +450,12 @@ index 0000000..b6ee98a
 +            match run_output_loop(&name, &tx) {
 +                Ok(()) => debug!("vtl shm_ipc: output loop exited"),
 +                Err(error) => {
++                    // Abnormal exit: the engine may already have published records nobody
++                    // will ever read. Push the error into the SAME channel the outputs use
++                    // (like the TAG_DEAD path does) so the client surfaces the loss instead
++                    // of absorbing it as a silent stall.
 +                    warn!(error = %error.as_report(), "vtl shm_ipc: output loop failed");
++                    let _ = tx.blocking_send(Err(error));
 +                }
 +            }
 +        })
@@ -604,7 +629,13 @@ index 0000000..b6ee98a
 +
 +    // One allocation per vec, same as the msgpack path; the payload itself is never copied
 +    // out of shared memory beyond the request ids and token ids we must own.
-+    let mut outputs = Vec::with_capacity(num_outputs);
++    //
++    // `num_outputs` comes off the wire, so the capacity is clamped by what the remaining
++    // bytes could POSSIBLY describe (every output costs at least its fixed head). Reserving
++    // the raw u32 would let a corrupt header ask for 4 billion elements, and a failed
++    // `Vec::with_capacity` aborts the process instead of returning the decode error below.
++    let capacity = num_outputs.min((body.len() - reader.at) / RAW_OUTPUT_HEAD_LEN);
++    let mut outputs = Vec::with_capacity(capacity);
 +    for _ in 0..num_outputs {
 +        if reader.bytes.len() - reader.at < RAW_OUTPUT_HEAD_LEN {
 +            return Err(raw_error("truncated raw output record"));
@@ -794,6 +825,12 @@ index 0000000..b6ee98a
 +
 +        // Empty body.
 +        assert!(decode_raw_outputs(&[]).is_err());
++
++        // A hostile output count must come back as a decode error, NOT as a `with_capacity`
++        // of 4 billion elements (`handle_alloc_error` aborts the whole frontend).
++        let mut huge = decode_hex(GOLDEN_PLAIN_DECODE);
++        huge[15..19].copy_from_slice(&u32::MAX.to_le_bytes());
++        assert!(decode_raw_outputs(&huge).is_err());
 +    }
 +
 +    #[test]
@@ -807,6 +844,11 @@ index 0000000..b6ee98a
 +        assert!(output_service("ipc:///tmp/in-a").starts_with("vtl/out/"));
 +        // Both channels share one seed so the two names stay paired.
 +        assert_eq!(seed("ipc:///tmp/in-a").len(), 12);
++        // Golden cross-language literal, asserted verbatim by the Python `_self_check`
++        // (`GOLDEN_SEED_ADDRESS` / `GOLDEN_SEED`). The seed is implemented once per language,
++        // so without a shared vector a divergence would just give the two processes different
++        // service names -- i.e. a silent ZMQ-only boot, never an error.
++        assert_eq!(seed("ipc:///tmp/vllm-in-0"), "23c5030baa20");
 +    }
 +
 +    #[test]

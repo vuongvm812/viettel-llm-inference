@@ -57,6 +57,14 @@ pub struct Params {
 pub struct Decisions {
     /// `(slot, num_new_tokens)` for requests already in `running`.
     pub scheduled_running: Vec<(u32, usize)>,
+    /// Blocks `allocate_slots` handed out THIS STEP for each `scheduled_running` entry,
+    /// flattened group-major: entry `i` group `g` has `running_new_lens[i * G + g]` ids,
+    /// consecutive in `running_new_blocks`. v0.25.0 stores exactly this delta for running
+    /// requests (scheduler.py:588) and the FULL table only for waiting admissions
+    /// (`:983`); the V2 runner appends `new_block_ids` without overwriting, so handing
+    /// back the whole table every step duplicates the block table.
+    pub running_new_blocks: Vec<u32>,
+    pub running_new_lens: Vec<u32>,
     /// `(slot, num_new_tokens, num_computed_tokens)` admitted from `waiting`; `status`
     /// at admission time decides new vs resumed on the Python side.
     pub scheduled_admitted: Vec<(u32, usize, usize)>,
@@ -71,6 +79,8 @@ pub struct Decisions {
 impl Decisions {
     fn clear(&mut self) {
         self.scheduled_running.clear();
+        self.running_new_blocks.clear();
+        self.running_new_lens.clear();
         self.scheduled_admitted.clear();
         self.preempted.clear();
         self.waiting_order.clear();
@@ -208,6 +218,13 @@ impl ScheduleCore {
                 num_new_tokens = params.long_prefill_token_threshold;
             }
             num_new_tokens = num_new_tokens.min(token_budget);
+            // BUG-COMPAT NOTE: python computes `max_model_len - num_computed_tokens -
+            // num_sampled_tokens_per_step` in signed arithmetic, so an over-length request
+            // propagates a NEGATIVE num_new_tokens past the `== 0` check into
+            // allocate_slots (which then raises). saturating_sub clamps to 0, which the
+            // `== 0` check turns into a skip. Deliberate: the python path is an engine
+            // crash, ours is a no-op, and the served config caps num_tokens at
+            // max_model_len upstream so neither branch can be reached.
             num_new_tokens = num_new_tokens.min(
                 params
                     .max_model_len
@@ -263,6 +280,11 @@ impl ScheduleCore {
             self.decisions
                 .scheduled_running
                 .push((request.slot, num_new_tokens));
+            for g in 0..kv.new_blocks.len() {
+                let nb = &kv.new_blocks[g];
+                self.decisions.running_new_lens.push(nb.len() as u32);
+                self.decisions.running_new_blocks.extend_from_slice(nb);
+            }
             token_budget -= num_new_tokens;
             req_index += 1;
         }
@@ -293,7 +315,15 @@ impl ScheduleCore {
                 } else {
                     request.num_computed_tokens
                 };
-                let uncached_common = kv.coord.num_uncached_common_prefix_tokens;
+                // scheduler.py:684 zeroes this per iteration and only refills it (`:730`)
+                // right after a fresh `get_computed_blocks`. Reading the coordinator
+                // unconditionally would feed the PREVIOUS request's Marconi hint into
+                // `mamba_block_aligned_split` whenever num_computed_tokens != 0.
+                let uncached_common = if request.num_computed_tokens == 0 {
+                    kv.coord.num_uncached_common_prefix_tokens
+                } else {
+                    0
+                };
 
                 let mut num_new_tokens = request.num_tokens - num_computed_tokens;
                 if params.long_prefill_token_threshold > 0
@@ -524,6 +554,88 @@ mod tests {
             core.decisions.scheduled_admitted[0].0, short,
             "the 64-token prompt must jump the 512-token one"
         );
+    }
+
+    #[test]
+    fn running_new_blocks_are_the_step_delta_not_the_whole_table() {
+        // scheduler.py:588 stores only what THIS step's allocate_slots returned for a
+        // running request. Re-handing the full table makes the V2 runner's
+        // append_block_ids(overwrite=False) duplicate every row, every step.
+        let p = params();
+        let mut kv = Manager::new(cfg(512)).unwrap();
+        let a = seed(&mut kv, "a", 64, 1);
+        let mut core = ScheduleCore::new();
+        core.schedule(&mut kv, &[], &[req(a, 64)], &p).unwrap();
+        let before: Vec<usize> = (0..2).map(|g| kv.group_blocks(a, g).len()).collect();
+
+        let mut r = req(a, 64);
+        r.num_computed_tokens = 64;
+        r.num_tokens = 65;
+        r.num_tokens_with_spec = 65;
+        r.status = crate::manager::STATUS_RUNNING;
+        r.is_prefill_chunk = false;
+        core.schedule(&mut kv, &[r], &[], &p).unwrap();
+        assert_eq!(core.decisions.scheduled_running.len(), 1);
+        assert_eq!(core.decisions.scheduled_running[0].1, 1);
+
+        // Independent replay: the same manager state driven straight through
+        // allocate_slots must produce exactly the recorded spans.
+        let mut kv2 = Manager::new(cfg(512)).unwrap();
+        let a2 = seed(&mut kv2, "a", 64, 1);
+        let mut core2 = ScheduleCore::new();
+        core2.schedule(&mut kv2, &[], &[req(a2, 64)], &p).unwrap();
+        kv2.new_step_starts();
+        assert!(kv2
+            .allocate_slots(a2, 1, 0, false, 0, 64, 65, crate::manager::STATUS_RUNNING, true)
+            .unwrap());
+
+        let d = &core.decisions;
+        assert_eq!(d.running_new_lens.len(), 2, "one length per group per request");
+        let mut off = 0usize;
+        for g in 0..2 {
+            let n = d.running_new_lens[g] as usize;
+            let span = &d.running_new_blocks[off..off + n];
+            off += n;
+            assert_eq!(n, kv.group_blocks(a, g).len() - before[g], "group {g} growth");
+            assert_eq!(span, &kv2.new_blocks[g][..], "group {g} == allocate_slots delta");
+        }
+        assert_eq!(off, d.running_new_blocks.len());
+        assert!(
+            d.running_new_blocks.len() < before[0] + before[1],
+            "the delta must be smaller than the table it extends"
+        );
+    }
+
+    #[test]
+    fn marconi_hint_does_not_leak_into_a_resumed_request() {
+        // scheduler.py:684 zeroes num_uncached_common_prefix_tokens per iteration and
+        // only refills it after a fresh get_computed_blocks (`:730`). A resumed request
+        // (num_computed_tokens > 0) skips that call, so reading the coordinator would
+        // splice the PREVIOUS request's hint into its mamba-aligned split.
+        let mut p = params();
+        p.max_num_scheduled_tokens = 8192;
+        let mut kv = Manager::new(cfg(512)).unwrap();
+        let mut core = ScheduleCore::new();
+
+        let base = seed(&mut kv, "base", 64, 1);
+        core.schedule(&mut kv, &[], &[req(base, 64)], &p).unwrap();
+        assert_eq!(core.decisions.scheduled_admitted.len(), 1);
+
+        // `dup` re-sends the identical 64 tokens: the full-attention chain matches 3
+        // blocks but the only cached mamba state sits at token 64, so the hit collapses
+        // to 0 and leaves a 48-token uncached common prefix behind.
+        let dup = seed(&mut kv, "dup", 64, 1);
+        let mut resumed = req(seed(&mut kv, "resumed", 200, 9), 200);
+        resumed.num_computed_tokens = 32;
+        resumed.status = STATUS_PREEMPTED;
+
+        core.schedule(&mut kv, &[], &[req(dup, 64), resumed], &p)
+            .unwrap();
+        assert_eq!(kv.coord.num_uncached_common_prefix_tokens, 48, "hint is live");
+        assert_eq!(core.decisions.scheduled_admitted.len(), 2);
+        // 200 - 200 % 16 = 192 is the last cacheable position, so the chunk is 192 - 32.
+        // With the stale hint it would have been floored to 48.
+        assert_eq!(core.decisions.scheduled_admitted[1].1, 160);
     }
 
     #[test]

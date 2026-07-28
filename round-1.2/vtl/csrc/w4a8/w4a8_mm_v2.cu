@@ -102,6 +102,7 @@ using QuantType = cutlass::int4b_t;     // B element type (packed int4)
 
 static int constexpr TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
 static int constexpr ScalePackSize = 8;  // pack 8 scale elements together
+static int constexpr PackFactor = 8;     // 8 int4s per int32 word of B (w4a8_mm_entry.cu:41)
 
 // A matrix configuration
 using ElementA = MmaType;                   // Element type for A matrix operand
@@ -234,7 +235,8 @@ struct W4A8GemmKernelV2 {
                        int64_t group_size,
                        at::Tensor const& channel_scales,
                        at::Tensor const& token_scales) {
-    // TODO: param validation
+    // VTL: upstream's `// TODO: param validation` is answered in check_args(), called once at
+    // the op entry (w4a8_mm_v2) so it also covers the M > threshold forward to the stock kernel.
     int m = A.size(0);
     int k = A.size(1);
     int n = B.size(1);
@@ -375,6 +377,92 @@ using Kernel_64x32_1x1x1_pp =
                      cutlass::epilogue::TmaWarpSpecialized>;
 #endif
 
+// VTL: the param validation upstream left as a TODO. Every argument below is immediately cast
+// to a raw device pointer and handed to a kernel that derives its extents from OTHER arguments,
+// so a wrong dtype or a short buffer is an out-of-bounds DEVICE read: the context is poisoned
+// and every later request in the same benchmark fails too, far from the call that broke it.
+// These are host-side integer compares against a GEMM that is microseconds at its cheapest, and
+// they live at the op entry (not in the template) so they cover the stock-forwarding branch too
+// and are compiled once rather than per arm.
+//
+// The contract is the stock kernel's own (w4a8_mm_entry.cu:172-174 for the extents, :380-411
+// for what the two packing ops emit):
+//   A               [m, k]                       fp8 e4m3, row-major contiguous
+//   B               [k/8, n]                     int32, 8 int4s per word, encoded + reordered
+//   group_scales    [n * ceil(k/gs) * 8] flat    fp8 e4m3 -- pack_scale_fp8 expands each 8x
+//   channel_scales  [n] (or a scalar)            fp32     -- epilogue ColOrScalarLoad
+//   token_scales    [m] (or a scalar)            fp32     -- epilogue RowOrScalarLoad
+//
+// B's STRIDES are deliberately not checked: the kernel ignores them and reads through its own
+// tile_to_shape(LayoutAtomQuant, (n,k,1)) layout, so the only thing that bounds the access is
+// the element count, which is what we check. Requiring contiguity here would reject the
+// column-major buffer the production path actually passes.
+void check_args(at::Tensor const& A, at::Tensor const& B,
+                at::Tensor const& group_scales, int64_t group_size,
+                at::Tensor const& channel_scales,
+                at::Tensor const& token_scales) {
+  TORCH_CHECK(A.is_cuda() && B.is_cuda() && group_scales.is_cuda() &&
+                  channel_scales.is_cuda() && token_scales.is_cuda(),
+              "vtl w4a8 v2: every argument must be a CUDA tensor");
+  TORCH_CHECK(B.device() == A.device() &&
+                  group_scales.device() == A.device() &&
+                  channel_scales.device() == A.device() &&
+                  token_scales.device() == A.device(),
+              "vtl w4a8 v2: all arguments must be on one device, got A on ",
+              A.device(), " and B on ", B.device());
+
+  TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
+              "vtl w4a8 v2: A and B must be 2-D, got A.dim()=", A.dim(),
+              " B.dim()=", B.dim());
+  TORCH_CHECK(A.scalar_type() == at::kFloat8_e4m3fn,
+              "vtl w4a8 v2: A must be float8_e4m3fn, got ", A.scalar_type());
+  // stride_A is a PACKED stride built from (m, k, 1); a view with any other layout would be
+  // read as if it were dense.
+  TORCH_CHECK(A.is_contiguous(),
+              "vtl w4a8 v2: A must be contiguous (the mainloop assumes a packed row-major "
+              "stride); call .contiguous() first");
+  TORCH_CHECK(B.scalar_type() == at::kInt,
+              "vtl w4a8 v2: B must be int32 (packed int4), got ", B.scalar_type());
+
+  int64_t const m = A.size(0);
+  int64_t const k = A.size(1);
+  int64_t const n = B.size(1);
+  TORCH_CHECK(B.size(0) * PackFactor == k,
+              "vtl w4a8 v2: B must be [k/", PackFactor, ", n] for A's k=", k,
+              ", got B=[", B.size(0), ", ", n, "]");
+  TORCH_CHECK(B.numel() * PackFactor == k * n,
+              "vtl w4a8 v2: B holds ", B.numel() * PackFactor,
+              " int4s, the GEMM reads k*n=", k * n);
+  TORCH_CHECK(group_size > 0 && k % group_size == 0,
+              "vtl w4a8 v2: k=", k, " is not a multiple of group_size=", group_size);
+
+  TORCH_CHECK(group_scales.scalar_type() == at::kFloat8_e4m3fn,
+              "vtl w4a8 v2: group_scales must be float8_e4m3fn (the output of "
+              "cutlass_pack_scale_fp8), got ", group_scales.scalar_type());
+  TORCH_CHECK(group_scales.is_contiguous(),
+              "vtl w4a8 v2: group_scales must be contiguous");
+  int64_t const want_scales = n * (k / group_size) * ScalePackSize;
+  TORCH_CHECK(group_scales.numel() == want_scales,
+              "vtl w4a8 v2: group_scales has ", group_scales.numel(),
+              " elements, expected n*(k/group_size)*", ScalePackSize, " = ",
+              want_scales, " -- was it run through cutlass_pack_scale_fp8?");
+
+  TORCH_CHECK(channel_scales.scalar_type() == at::kFloat &&
+                  token_scales.scalar_type() == at::kFloat,
+              "vtl w4a8 v2: channel_scales and token_scales must be float32, got ",
+              channel_scales.scalar_type(), " and ", token_scales.scalar_type());
+  TORCH_CHECK(channel_scales.is_contiguous() && token_scales.is_contiguous(),
+              "vtl w4a8 v2: channel_scales and token_scales must be contiguous");
+  // numel, not shape: production passes channel_scales as [n, 1] and the epilogue's
+  // ColOrScalarLoad/RowOrScalarLoad also accept a single broadcast scalar.
+  TORCH_CHECK(channel_scales.numel() == n || channel_scales.numel() == 1,
+              "vtl w4a8 v2: channel_scales must hold n=", n, " values (or 1), got ",
+              channel_scales.numel());
+  TORCH_CHECK(token_scales.numel() == m || token_scales.numel() == 1,
+              "vtl w4a8 v2: token_scales must hold m=", m, " values (or 1), got ",
+              token_scales.numel());
+}
+
 at::Tensor mm_dispatch_v2(at::Tensor const& A, at::Tensor const& B,
                           at::Tensor const& group_scales, int64_t group_size,
                           at::Tensor const& channel_scales,
@@ -446,6 +534,7 @@ at::Tensor w4a8_mm_v2(at::Tensor const& a, at::Tensor const& b_q,
                       at::Tensor const& channel_scales,
                       at::Tensor const& token_scales,
                       std::string const& schedule, int64_t m_threshold) {
+  check_args(a, b_q, group_scales, group_size, channel_scales, token_scales);
   if (a.size(0) > m_threshold) {
     return stock_mm(a, b_q, group_scales, group_size, channel_scales,
                     token_scales);

@@ -90,10 +90,12 @@ check:
 	$(IN) python3 bench/sweep_report.py --selfcheck
 	$(IN) python3 bench/eval_quality.py --self-check
 	$(IN) python3 bench/profile_trace.py --self-check
-	$(IN) [ -f bench/build_trace_round2.py ] && PYTHONPATH=. python3 bench/build_trace_round2.py --self-check || true
+	@# if-form, not `[ -f x ] && cmd || true`: that swallows the script's OWN failure as well as
+	@# its absence, i.e. a broken self-check reports green. Absent = fine, present = must pass.
+	$(IN) if [ -f bench/build_trace_round2.py ]; then PYTHONPATH=. python3 bench/build_trace_round2.py --self-check; fi
 	@# Formula half runs anywhere; the live-allocator half needs CUDA and skips off-box
 	@# (it runs for real under `make test-kernel`, which pytest-globs bench/test_*.py).
-	$(IN) [ -f bench/test_kv_alignment.py ] && python3 bench/test_kv_alignment.py || true
+	$(IN) if [ -f bench/test_kv_alignment.py ]; then python3 bench/test_kv_alignment.py; fi
 	$(IN) python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
 
 # No compose, no server, no model: the kernel tests just need the image and a GPU.
@@ -317,7 +319,9 @@ V2_SCHEDULES ?= 128x16_1x1x1_sk 128x32_1x1x1_sk 128x16_2x1x1 128x8_1x1x1 \
                 64x16_1x1x1_pp 64x32_1x1x1_pp
 SCHEDULES ?= heuristic $(STOCK_SCHEDULES) $(if $(V2),$(V2_SCHEDULES))
 BOOTS ?= 3
-SWEEP_OVERLAY := /tmp/vtl-sched.yaml
+# Named for the knob it sweeps, NOT /tmp/vtl-sched.yaml -- that reads like the vtl-sched Rust
+# crate (WS4), which has nothing to do with W4A8 tiles.
+SWEEP_OVERLAY := /tmp/vtl-w4a8-sweep.yaml
 # One line, duplicated in the micro target rather than abstracted: stock name -> $$s, heuristic
 # -> neither, anything else -> $$v2.
 SWEEP_CLASSIFY = s=""; v2=""; case " $(STOCK_SCHEDULES) " in *" $$name "*) s="$$name";; \

@@ -28,3 +28,6 @@ python = ["dep:pyo3", "dep:numpy"]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+# An integer wrap in the block accounting must be a catchable panic, not silently
+# corrupted state that the engine keeps serving from. Costs ~nothing at this scale.
+overflow-checks = true

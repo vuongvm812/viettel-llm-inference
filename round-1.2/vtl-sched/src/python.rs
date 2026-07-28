@@ -13,7 +13,7 @@
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyTuple};
 
 use crate::config::{Config, GroupConfig};
 use crate::hash;
@@ -317,13 +317,13 @@ impl KvManager {
         self.inner.free(slot)
     }
 
-    fn pop_blocks_for_free(&mut self, slot: u32) -> Vec<u32> {
+    fn pop_blocks_for_free<'py>(&mut self, py: Python<'py>, slot: u32) -> Bound<'py, PyList> {
         let mut out = std::mem::take(&mut self.flat);
         out.clear();
         self.inner.pop_blocks_for_free(slot, &mut out);
-        let res = out.clone();
+        let list = PyList::new_bound(py, out.iter().map(|&b| b as i64));
         self.flat = out;
-        res
+        list
     }
 
     fn remove_skipped_blocks(&mut self, slot: u32, total_computed_tokens: usize) {
@@ -374,13 +374,13 @@ impl KvManager {
         Ok(Some(d))
     }
 
-    fn take_new_block_ids(&mut self) -> Vec<u32> {
+    fn take_new_block_ids<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyList> {
         let mut out = std::mem::take(&mut self.flat);
         out.clear();
         self.inner.take_new_block_ids(&mut out);
-        let res = out.clone();
+        let list = PyList::new_bound(py, out.iter().map(|&b| b as i64));
         self.flat = out;
-        res
+        list
     }
 
     fn num_common_prefix_blocks(&mut self, slot: u32) -> Vec<usize> {
@@ -395,6 +395,9 @@ impl KvManager {
 #[pyclass(module = "vtl_sched")]
 pub struct Scheduler {
     core: ScheduleCore,
+    /// Engine constants, handed over once by `set_params` instead of rebuilt from a dict
+    /// on every step. None until `set_params` runs.
+    params: Option<Params>,
 }
 
 /// A running/waiting request as a flat tuple. Order must match `rust_sched.py::pack_req`.
@@ -422,20 +425,14 @@ impl Scheduler {
     fn new() -> Self {
         Scheduler {
             core: ScheduleCore::new(),
+            params: None,
         }
     }
 
-    /// Run one scheduling step. Returns the decisions; `SchedulerOutput` assembly and
-    /// all request/queue mutation stay in Python.
-    fn schedule<'py>(
-        &mut self,
-        py: Python<'py>,
-        kv: &mut KvManager,
-        running: Vec<ReqTuple>,
-        waiting: Vec<ReqTuple>,
-        params: &Bound<'py, PyDict>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let p = Params {
+    /// Install the engine constants. Called once at first schedule; every field is fixed
+    /// for the lifetime of the engine, so re-parsing a dict per step is pure overhead.
+    fn set_params(&mut self, params: &Bound<'_, PyDict>) -> PyResult<()> {
+        self.params = Some(Params {
             max_num_scheduled_tokens: get_usize(params, "max_num_scheduled_tokens")?,
             max_num_running_reqs: get_usize(params, "max_num_running_reqs")?,
             max_model_len: get_usize(params, "max_model_len")?,
@@ -451,7 +448,22 @@ impl Scheduler {
                 .map(|v| v.extract::<f64>())
                 .transpose()?
                 .unwrap_or(0.90),
-        };
+        });
+        Ok(())
+    }
+
+    /// Run one scheduling step. Returns the decisions; `SchedulerOutput` assembly and
+    /// all request/queue mutation stay in Python.
+    fn schedule<'py>(
+        &mut self,
+        py: Python<'py>,
+        kv: &mut KvManager,
+        running: Vec<ReqTuple>,
+        waiting: Vec<ReqTuple>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let p = self
+            .params
+            .ok_or_else(|| PyRuntimeError::new_err("Scheduler.set_params was never called"))?;
         let running: Vec<SchedReq> = running.iter().map(unpack).collect();
         let waiting: Vec<SchedReq> = waiting.iter().map(unpack).collect();
         self.core
@@ -460,6 +472,14 @@ impl Scheduler {
         let d = &self.core.decisions;
         let out = PyDict::new_bound(py);
         out.set_item("scheduled_running", d.scheduled_running.clone())?;
+        out.set_item(
+            "running_new_blocks",
+            PyList::new_bound(py, d.running_new_blocks.iter().map(|&b| b as i64)),
+        )?;
+        out.set_item(
+            "running_new_lens",
+            PyList::new_bound(py, d.running_new_lens.iter().map(|&n| n as i64)),
+        )?;
         out.set_item("scheduled_admitted", d.scheduled_admitted.clone())?;
         out.set_item("preempted", d.preempted.clone())?;
         out.set_item("waiting_order", d.waiting_order.clone())?;
@@ -478,6 +498,14 @@ fn py_to_key(obj: &Bound<'_, PyAny>) -> PyResult<Key> {
     }
     if let Ok(s) = obj.extract::<String>() {
         return Ok(Key::Str(s));
+    }
+    // CPython pickles True/False as NEWTRUE/NEWFALSE, not as an int, so extracting a
+    // bool into Key::Int would hash to different bytes than vLLM. vLLM's extra_keys are
+    // only ever str / int / bytes / tuple / None, so refuse instead of guessing.
+    if obj.is_instance_of::<PyBool>() {
+        return Err(PyValueError::new_err(
+            "bool extra keys are not supported (CPython pickles them as NEWTRUE/NEWFALSE)",
+        ));
     }
     if let Ok(i) = obj.extract::<i64>() {
         return Ok(Key::Int(i));

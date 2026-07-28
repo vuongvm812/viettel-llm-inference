@@ -8,7 +8,11 @@ Gates (all default OFF, all independent except where noted)::
 
     VTL_ENABLE_RUST_SCHED=1        install this patch at all (registry gate)
     VTL_RUST_SCHED_SHADOW=1        run Rust ALONGSIDE Python every call and compare
-    VTL_RUST_SCHED_SHADOW_STRICT=1 make a shadow mismatch RAISE (tests only, never serving)
+    VTL_RUST_SCHED_SHADOW_STRICT=1 make a shadow mismatch raise (TESTS ONLY). In serving
+                                   the outer guard catches the AssertionError and simply
+                                   disables the mirror, so strict buys nothing there --
+                                   it exists so a pytest driving the manager directly
+                                   fails on the first divergence instead of counting.
     VTL_RUST_SCHED=1               make Rust AUTHORITATIVE for the KVCacheManager surface
     VTL_RUST_SCHED_FULL=1          also run the Rust schedule() loop (implies VTL_RUST_SCHED)
     VTL_RUST_SCHED_RADIX=1         use the radix index instead of the flat hash map
@@ -57,6 +61,37 @@ _ST_WAITING, _ST_RUNNING, _ST_PREEMPTED = 0, 1, 2
 def env_on(name: str) -> bool:
     """Env gate parsing. Pure python, exercised by the self-check without the crate."""
     return os.environ.get(name, "").strip().lower() in _TRUTHY
+
+
+def reraise_fatal(exc: BaseException) -> None:
+    """Re-raise the two exceptions a guard must never swallow.
+
+    Every guard below catches ``BaseException``, not ``Exception``: a panic inside the
+    crate surfaces as ``pyo3_runtime.PanicException``, which derives from BaseException,
+    so ``except Exception`` would let a Rust ``assert!`` take down EngineCore. Ctrl-C and
+    ``SystemExit`` are the two that must still get through.
+    """
+    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        raise exc
+
+
+def kv_transfer_configured():
+    """``True``/``False`` if vLLM's ambient config can be read, ``None`` if it cannot.
+
+    A KV connector is fatal for authority mode (see ``VtlRustKVCacheManager.__init__``),
+    but v0.25.0 constructs the Scheduler outside any ``set_current_vllm_config`` context,
+    so this answers ``None`` more often than not. It is the cheap outer layer; the hard
+    one is ``pop_blocks_for_free`` refusing outright.
+    """
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        cfg = get_current_vllm_config_or_none()
+    except Exception:
+        return None
+    if cfg is None:
+        return None
+    return getattr(cfg, "kv_transfer_config", None) is not None
 
 
 def modes() -> dict:
@@ -217,13 +252,25 @@ _STATUS_MAP: dict = {}
 
 def status_code(request) -> int:
     """Map ``RequestStatus`` to the small ints the Rust core uses. On the per-step path,
-    so the enum lookup is resolved once and then it is a dict hit."""
+    so the enum lookup is resolved once and then it is a dict hit.
+
+    Unknown statuses REFUSE. v0.25.0 has three more waiting-ish states
+    (``WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR``, ``WAITING_FOR_REMOTE_KVS``,
+    ``WAITING_FOR_STREAMING_REQ``); defaulting them to RUNNING made the Rust loop admit
+    requests the Python scheduler parks in ``skipped_waiting``.
+    """
     if not _STATUS_MAP:
         from vllm.v1.request import RequestStatus
 
         _STATUS_MAP[RequestStatus.WAITING] = _ST_WAITING
+        _STATUS_MAP[RequestStatus.RUNNING] = _ST_RUNNING
         _STATUS_MAP[RequestStatus.PREEMPTED] = _ST_PREEMPTED
-    return _STATUS_MAP.get(request.status, _ST_RUNNING)
+    try:
+        return _STATUS_MAP[request.status]
+    except KeyError:
+        raise NotImplementedError(
+            f"rust_sched: unported RequestStatus {request.status!s}"
+        ) from None
 
 
 # --------------------------------------------------------------------------
@@ -272,15 +319,19 @@ def _install_shadow(base, mirror_modes):
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            cfg, reason = build_config(self, mirror_modes["radix"])
             self._rust = None
             self._shadow = ShadowState(mirror_modes["strict"])
+            if kv_transfer_configured():
+                log.warning("rust_sched: shadow disabled -- a KV connector is configured")
+                return
+            cfg, reason = build_config(self, mirror_modes["radix"])
             if reason is not None:
                 log.warning("rust_sched: shadow disabled -- %s", reason)
                 return
             try:
                 self._rust = vtl_sched.KvManager(cfg)
-            except Exception as exc:
+            except BaseException as exc:
+                reraise_fatal(exc)
                 log.warning("rust_sched: shadow disabled -- crate rejected config: %r", exc)
                 return
             self._mirror = RustMirror(self._rust)
@@ -322,9 +373,8 @@ def _install_shadow(base, mirror_modes):
                             rs,
                             request.request_id,
                         )
-                except Exception:
-                    log.exception("rust_sched: shadow get_computed_blocks failed")
-                    self._rust = None
+                except BaseException as exc:
+                    self._disable("get_computed_blocks", exc)
             return blocks, num
 
         def allocate_slots(self, request, num_new_tokens, *args, **kwargs):
@@ -332,9 +382,8 @@ def _install_shadow(base, mirror_modes):
             if self._rust is not None:
                 try:
                     self._mirror_allocate(request, num_new_tokens, result, args, kwargs)
-                except Exception:
-                    log.exception("rust_sched: shadow allocate_slots failed")
-                    self._rust = None
+                except BaseException as exc:
+                    self._disable("allocate_slots", exc)
             return result
 
         def _mirror_allocate(self, request, num_new_tokens, result, args, kwargs):
@@ -389,9 +438,8 @@ def _install_shadow(base, mirror_modes):
                 try:
                     slot = self._mirror.slot(request)
                     self._rust.cache_blocks(slot, int(num_computed_tokens))
-                except Exception:
-                    log.exception("rust_sched: shadow cache_blocks failed")
-                    self._rust = None
+                except BaseException as exc:
+                    self._disable("cache_blocks", exc)
 
         def free(self, request):
             super().free(request)
@@ -406,9 +454,8 @@ def _install_shadow(base, mirror_modes):
                         request.request_id,
                     )
                     self._mirror.drop(request.request_id)
-                except Exception:
-                    log.exception("rust_sched: shadow free failed")
-                    self._rust = None
+                except BaseException as exc:
+                    self._disable("free", exc)
 
         def get_num_common_prefix_blocks(self, running_request_id):
             out = super().get_num_common_prefix_blocks(running_request_id)
@@ -422,10 +469,39 @@ def _install_shadow(base, mirror_modes):
                             list(self._rust.num_common_prefix_blocks(slot)),
                             running_request_id,
                         )
-                except Exception:
-                    log.exception("rust_sched: shadow common-prefix failed")
-                    self._rust = None
+                except BaseException as exc:
+                    self._disable("common-prefix", exc)
             return out
+
+        def reset_prefix_cache(self):
+            out = super().reset_prefix_cache()
+            if self._rust is not None:
+                try:
+                    self._shadow.check(
+                        "reset_prefix_cache", out, self._rust.reset_prefix_cache()
+                    )
+                except BaseException as exc:
+                    self._disable("reset_prefix_cache", exc)
+            return out
+
+        def evict_blocks(self, block_ids):
+            super().evict_blocks(block_ids)
+            if self._rust is not None:
+                try:
+                    self._rust.evict_blocks([int(b) for b in block_ids])
+                    self._shadow.check(
+                        "evict_blocks.free_blocks",
+                        self.block_pool.get_num_free_blocks(),
+                        self._rust.num_free_blocks,
+                    )
+                except BaseException as exc:
+                    self._disable("evict_blocks", exc)
+
+        def _disable(self, where: str, exc: BaseException) -> None:
+            """Drop the mirror. Never lets a crate panic reach EngineCore."""
+            reraise_fatal(exc)
+            log.exception("rust_sched: shadow %s failed; mirror disabled", where)
+            self._rust = None
 
         @property
         def rust_shadow_mismatches(self) -> int:
@@ -474,6 +550,39 @@ class RustBlocks:
     get_unhashed_block_ids_all_groups = get_unhashed_block_ids
 
 
+# Public ``KVCacheManager`` members (v0.25.0 kv_cache_manager.py) that authority mode
+# deliberately INHERITS rather than overrides. Empty today: everything the base exposes is
+# either reimplemented against Rust or refused. It exists so that a vLLM bump adding a
+# method makes `_refuse_unported` stub it, instead of silently answering from the stale
+# python coordinator.
+_AUTHORITY_INHERITS: frozenset = frozenset()
+
+
+def _refuse_unported(cls, base) -> None:
+    """Stub every public base method the subclass did not port, with a raiser.
+
+    Same doctrine as ``RustBlocks``: in authority mode the python coordinator, block pool
+    and per-request block lists are frozen at construction, so an inherited method does
+    not fail -- it returns a confident, stale answer.
+    """
+    def make_raiser(name):
+        def raiser(self, *args, **kwargs):
+            raise NotImplementedError(
+                f"KVCacheManager.{name} is not ported to VTL_RUST_SCHED; refusing "
+                "rather than answering from stale python state"
+            )
+
+        raiser.__name__ = name
+        return raiser
+
+    for name in dir(base):
+        if name.startswith("_") or name in _AUTHORITY_INHERITS or name in vars(cls):
+            continue
+        if not callable(getattr(base, name, None)):
+            continue
+        setattr(cls, name, make_raiser(name))
+
+
 def _install_authority(base, mirror_modes):
     """Rust becomes the source of truth for the KVCacheManager surface."""
     import vtl_sched
@@ -483,6 +592,16 @@ def _install_authority(base, mirror_modes):
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            if kv_transfer_configured():
+                # Split brain: with a KV connector, scheduler.py binds the (now stale)
+                # python block_pool into the connector (`:280`) and, when
+                # `defer_block_free` is on, drains `pop_blocks_for_free`'s result through
+                # `block_pool.free_blocks` (`:2157`) -- which would leak every deferred
+                # block out of the Rust pool for good.
+                raise RuntimeError(
+                    "VTL_RUST_SCHED=1 is not compatible with a KV connector "
+                    "(kv_transfer_config is set)"
+                )
             cfg, reason = build_config(self, mirror_modes["radix"])
             if reason is not None:
                 raise RuntimeError(f"VTL_RUST_SCHED=1 but config unsupported: {reason}")
@@ -538,7 +657,8 @@ def _install_authority(base, mirror_modes):
                     slot = self._mirror.slot(request)
                     hit = self._rust.peek_cache_hit(slot, int(request.num_tokens))
                     remaining = max(num_prompt - hit, 0)
-            except Exception:
+            except BaseException as exc:
+                reraise_fatal(exc)
                 return (1 << 60), (1 << 60)
             bs = self.coordinator.scheduler_block_size or 16
             return remaining, -(-remaining // bs)
@@ -633,8 +753,15 @@ def _install_authority(base, mirror_modes):
                 self._rust.remove_skipped_blocks(slot, int(total_computed_tokens))
 
         def pop_blocks_for_free(self, request):
-            slot = self._mirror.slot(request)
-            return list(self._rust.pop_blocks_for_free(slot))
+            # Defence in depth behind the kv_transfer_config refusal in __init__: the only
+            # caller is `_free_request_blocks` under `defer_block_free`, which hands the
+            # result to the STALE python `block_pool.free_blocks` (scheduler.py:2157).
+            # Returning ints there is an AttributeError; returning anything is a permanent
+            # leak from the Rust pool.
+            raise RuntimeError(
+                "VTL_RUST_SCHED=1 does not support deferred block freeing "
+                "(pop_blocks_for_free drains the stale python block pool)"
+            )
 
         def evict_blocks(self, block_ids):
             self._rust.evict_blocks([int(b) for b in block_ids])
@@ -673,8 +800,9 @@ def _install_authority(base, mirror_modes):
             return RustBlocks(tuple(blocks))
 
         def take_new_block_ids(self):
-            return list(self._rust.take_new_block_ids())
+            return self._rust.take_new_block_ids()
 
+    _refuse_unported(VtlRustKVCacheManager, base)
     return VtlRustKVCacheManager
 
 
@@ -709,12 +837,22 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool):
     from vllm.v1.engine import EngineCoreEventType
     from vllm.v1.request import RequestStatus
 
-    original = scheduler_cls.schedule
-    # sched_policy already wrapped schedule(); reach through to the real one -- the SJF
-    # reorder it adds is reproduced inside the Rust loop.
-    superseded = getattr(original, "__vtl_wrapped__", None)
-    if superseded is not None:
-        original = superseded
+    # Whatever is bound right now -- typically sched_policy's SJF wrapper. Every fallback
+    # path must call THIS, not the unwrapped original: dropping the wrapper would silently
+    # turn the reorder off on unsupported steps. The Rust path never calls python at all
+    # (`sched.rs::reorder_waiting` reproduces the same key), so no unwrapping is needed.
+    wrapped = scheduler_cls.schedule
+
+    def bail_reason(self):
+        """Per-step conditions the Rust loop does not model (scheduler.py:637-664)."""
+        if getattr(self, "skipped_waiting", None):
+            return "blocked requests are parked in skipped_waiting"
+        if getattr(self, "num_waiting_for_streaming_input", 0):
+            return "paused streaming sessions hold model-runner slots"
+        pause = getattr(self, "_pause_state", None)
+        if pause is not None and getattr(pause, "name", str(pause)) != "UNPAUSED":
+            return f"scheduler is paused ({pause})"
+        return None
 
     def schedule(self, *args, **kwargs):
         kv = self.kv_cache_manager
@@ -728,39 +866,63 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool):
                         reason or "KV manager is not Rust-backed",
                     )
                     self._vtl_rust_warned = True
-                return original(self, *args, **kwargs)
+                return wrapped(self, *args, **kwargs)
             core = self._vtl_rust_core = vtl_sched.Scheduler()
+            # Engine constants: handed over once, not re-parsed from a dict per step.
+            core.set_params(
+                {
+                    "max_num_scheduled_tokens": int(self.max_num_scheduled_tokens),
+                    "max_num_running_reqs": int(self.max_num_running_reqs),
+                    "max_model_len": int(self.max_model_len),
+                    "num_sampled_tokens_per_step": int(self.num_sampled_tokens_per_step),
+                    "long_prefill_token_threshold": int(
+                        self.scheduler_config.long_prefill_token_threshold or 0
+                    ),
+                    "enable_chunked_prefill": bool(
+                        self.scheduler_config.enable_chunked_prefill
+                    ),
+                    "need_mamba_block_aligned_split": bool(
+                        self.need_mamba_block_aligned_split
+                    ),
+                    "cache_block_size": int(self.cache_config.block_size),
+                    "num_lookahead_tokens": int(self.num_lookahead_tokens),
+                    "sjf_reorder": bool(sjf_enabled),
+                }
+            )
             log.info("rust_sched: FULL schedule() loop active (sjf=%s)", sjf_enabled)
 
-        self.current_step += 1
+        # Bail BEFORE `current_step += 1`: the fallback does its own increment.
+        bail = bail_reason(self)
         mirror = kv._mirror
         by_slot = {}
         running = []
-        for request in self.running:
-            slot = mirror.slot(request)
-            by_slot[slot] = request
-            running.append(pack_req(slot, request))
         waiting = []
-        for request in self.waiting:
-            slot = mirror.slot(request)
-            by_slot[slot] = request
-            waiting.append(pack_req(slot, request))
+        if bail is None:
+            try:
+                for request in self.running:
+                    slot = mirror.slot(request)
+                    by_slot[slot] = request
+                    running.append(pack_req(slot, request))
+                for request in self.waiting:
+                    if request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                        bail = f"waiting request in status {request.status!s}"
+                        break
+                    slot = mirror.slot(request)
+                    by_slot[slot] = request
+                    waiting.append(pack_req(slot, request))
+            except NotImplementedError as exc:  # unported RequestStatus on a running req
+                bail = str(exc)
+        if bail is not None:
+            seen = getattr(self, "_vtl_rust_bails", None)
+            if seen is None:
+                seen = self._vtl_rust_bails = set()
+            if bail not in seen:
+                seen.add(bail)
+                log.warning("rust_sched: this step falls back to vLLM -- %s", bail)
+            return wrapped(self, *args, **kwargs)
 
-        params = {
-            "max_num_scheduled_tokens": int(self.max_num_scheduled_tokens),
-            "max_num_running_reqs": int(self.max_num_running_reqs),
-            "max_model_len": int(self.max_model_len),
-            "num_sampled_tokens_per_step": int(self.num_sampled_tokens_per_step),
-            "long_prefill_token_threshold": int(
-                self.scheduler_config.long_prefill_token_threshold or 0
-            ),
-            "enable_chunked_prefill": bool(self.scheduler_config.enable_chunked_prefill),
-            "need_mamba_block_aligned_split": bool(self.need_mamba_block_aligned_split),
-            "cache_block_size": int(self.cache_config.block_size),
-            "num_lookahead_tokens": int(self.num_lookahead_tokens),
-            "sjf_reorder": bool(sjf_enabled),
-        }
-        decisions = core.schedule(kv._rust, running, waiting, params)
+        self.current_step += 1
+        decisions = core.schedule(kv._rust, running, waiting)
 
         # --- apply the decisions (scheduler.py:1045-1133 in Python) ----------
         timestamp = time.monotonic()
@@ -770,11 +932,24 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool):
         scheduled_new_reqs = []
         scheduled_resumed_reqs = []
 
-        for slot, num_new in decisions["scheduled_running"]:
+        # scheduler.py:588 keeps only the step's DELTA for a running request (`:983`
+        # keeps the full table, but only for a waiting admission). The V2 runner appends
+        # new_block_ids without overwriting, so re-sending the whole table every step
+        # duplicates rows until the block table overflows.
+        flat = decisions["running_new_blocks"]
+        lens = decisions["running_new_lens"]
+        num_groups = kv._rust.num_groups
+        off = 0
+        for i, (slot, num_new) in enumerate(decisions["scheduled_running"]):
             request = by_slot[slot]
             scheduled_running_reqs.append(request)
             num_scheduled_tokens[request.request_id] = num_new
-            req_to_new_blocks[request.request_id] = kv.get_blocks(request.request_id)
+            groups = []
+            for g in range(num_groups):
+                n = lens[i * num_groups + g]
+                groups.append(flat[off : off + n])
+                off += n
+            req_to_new_blocks[request.request_id] = RustBlocks(tuple(groups))
 
         # Rebuild the waiting queue from the Rust core's view. This is NOT cosmetic: the
         # SJF reorder happens inside the core, so popping the Python deque's front would
@@ -865,7 +1040,7 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool):
         self._update_after_schedule(scheduler_output)
         return scheduler_output
 
-    scheduler_cls.schedule = mark_patched(schedule, original)
+    scheduler_cls.schedule = mark_patched(schedule, wrapped)
 
 
 # --------------------------------------------------------------------------
@@ -882,7 +1057,8 @@ def apply() -> None:
 
     try:
         import vtl_sched  # noqa: F401
-    except Exception as exc:
+    except BaseException as exc:
+        reraise_fatal(exc)
         log.warning("rust_sched: vtl_sched extension not importable (%r); staying on vLLM", exc)
         return
 
@@ -992,6 +1168,45 @@ def _self_check() -> None:
     else:  # pragma: no cover
         raise AssertionError("connector path must refuse loudly")
     log.setLevel(logging.NOTSET)
+
+    # reraise_fatal: a crate panic (BaseException, not Exception) is swallowed by the
+    # guards; interpreter signals still get through.
+    class FakePanic(BaseException):
+        pass
+
+    reraise_fatal(FakePanic())
+    for fatal in (KeyboardInterrupt(), SystemExit()):
+        try:
+            reraise_fatal(fatal)
+        except BaseException as exc:  # noqa: BLE001 - that is the point
+            assert exc is fatal
+        else:  # pragma: no cover
+            raise AssertionError("interpreter signals must propagate")
+
+    # _refuse_unported: authority mode must refuse anything it did not port, rather than
+    # inherit a confident answer computed from the frozen python coordinator.
+    class FakeBase:
+        def ported(self):
+            return "python"
+
+        def unported(self):
+            return "stale python answer"
+
+    class FakeAuthority(FakeBase):
+        def ported(self):
+            return "rust"
+
+    _refuse_unported(FakeAuthority, FakeBase)
+    assert FakeAuthority().ported() == "rust"
+    try:
+        FakeAuthority().unported()
+    except NotImplementedError as exc:
+        assert "unported" in str(exc) and "refusing" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("unported base methods must refuse")
+
+    # No vLLM here, so the ambient-config probe must answer "unknown", not crash.
+    assert kv_transfer_configured() is None
 
     # build_config degrades to a reason string instead of raising when vLLM is absent.
     cfg, reason = build_config(object(), False)

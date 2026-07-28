@@ -37,6 +37,20 @@ BASELINE = "heuristic"  # the sentinel arm = kernel heuristic = what submissions
 METRICS = (("TPOT p50", "itl_ms", 3), ("TTFT p50", "ttft_ms", 1))
 
 
+def makefile_schedules(makefile):
+    """``{'STOCK_SCHEDULES': [...], 'V2_SCHEDULES': [...]}`` from the root Makefile.
+
+    Backslash continuations are joined first -- both lists are wrapped across two lines, and a
+    regex that stops at the newline would silently see half the arms.
+    """
+    text = makefile.read_text().replace("\\\n", " ")
+    found = {}
+    for name in ("STOCK_SCHEDULES", "V2_SCHEDULES"):
+        m = re.search(rf"^{name}\s*[:?]?=\s*(.*)$", text, re.M)
+        found[name] = m.group(1).split() if m else []
+    return found
+
+
 def parse_name(path):
     """('128x16_1x1x1', '2') from 'bench-sched-128x16_1x1x1-b2.json'. None if not a sweep file."""
     m = NAME_RE.search(Path(path).name)
@@ -143,8 +157,41 @@ def main():
     render(rows, floors)
 
 
+def _check_schedule_names():
+    """The arm names live in two places -- the Makefile boots them, quant_w4a8 validates them.
+
+    A name in only one list costs a whole boot and does not look like a bug: quant_w4a8 warns
+    and falls back to the kernel heuristic, so the arm just quietly reports the baseline's
+    numbers. Cheap to check here, since --selfcheck already runs off-box in `make check`.
+    """
+    here = Path(__file__).resolve()
+    makefile = here.parents[2] / "Makefile"
+    if not makefile.exists():
+        print(f"  (schedule cross-check skipped: no {makefile})")
+        return
+    sys.path.insert(0, str(here.parents[1]))  # the round dir, so `vtl` imports off-box
+    try:
+        from vtl.patches.quant_w4a8 import VALID_SCHEDULES, VALID_SCHEDULES_V2
+    except ImportError as exc:  # a bare bench/ checkout: report, don't fail
+        print(f"  (schedule cross-check skipped: {exc})")
+        return
+
+    names = makefile_schedules(makefile)
+    for key, valid in (("STOCK_SCHEDULES", VALID_SCHEDULES),
+                       ("V2_SCHEDULES", VALID_SCHEDULES_V2)):
+        swept = names[key]
+        assert swept, f"Makefile {key} is empty or unparsed -- the sweep would boot no arms"
+        unknown = sorted(set(swept) - set(valid))
+        assert not unknown, (
+            f"Makefile {key} names {unknown}, which quant_w4a8 rejects: those boots would run "
+            "the kernel heuristic and read as duplicate baselines"
+        )
+
+
 def _selfcheck():
     import tempfile
+
+    _check_schedule_names()
 
     assert parse_name("bench-sched-128x16_1x1x1-b2.json") == ("128x16_1x1x1", "2")
     assert parse_name("x/y/bench-sched-heuristic-b1.json") == ("heuristic", "1")

@@ -66,6 +66,19 @@ SUBSCRIBER_MAX_BUFFER_SIZE = 512
 HISTORY_SIZE = 0
 REQUEST_MAX_PAYLOAD = 1 << 20
 OUTPUT_MAX_PAYLOAD = 1 << 18
+# iceoryx2 defaults to safe overflow: a publish into a FULL subscriber buffer silently
+# overwrites the oldest unread sample. For a request/output stream that is silent data loss
+# (a hung request, no log), so both sides turn it off -- the setting is part of the service
+# config and `open_or_create` refuses to pair a service whose peer disagrees. With overflow
+# off the publisher's backpressure strategy decides what a full buffer does; DiscardData
+# makes `send()` report 0 receivers, which is the same signal as "nobody subscribed" and
+# therefore already routes to the ZMQ fallback below. (RetryUntilDelivered, the iceoryx2
+# default, would instead BLOCK the engine's output thread on a stalled frontend.)
+ENABLE_SAFE_OVERFLOW = False
+# Backlog math for the 512-sample buffer: the scored trace peaks at 8 concurrent generations
+# and the engine emits ONE output batch per decode step, so the buffer holds ~512 decode
+# steps ~= 2 s of stream at a 4 ms TPOT. A frontend that falls that far behind is not
+# "momentarily busy", it is wedged -- reporting the failure and demoting to ZMQ is right.
 
 # --- record framing; MUST stay identical to the Rust side ---------------------------------
 TAG_MSGPACK = b"M"
@@ -136,6 +149,57 @@ def output_service(input_address: str) -> str:
 # ------------------------------------------------------------------------------------------
 
 
+# msgspec struct fields as of the ported v0.25.0 (``vllm/v1/engine/__init__.py``). The raw
+# layout is a *reject list* (``raw_packable``), so a field ADDED by a vLLM bump would be
+# silently dropped rather than falling back to msgpack. ``apply()`` diffs these against the
+# live structs and forces raw off on any drift -- fail closed. Set by ``apply()``.
+_RAW_ENABLED = True
+KNOWN_OUTPUT_FIELDS = frozenset(
+    {
+        "request_id",
+        "new_token_ids",
+        "new_logprobs",
+        "new_prompt_logprobs_tensors",
+        "pooling_output",
+        "finish_reason",
+        "stop_reason",
+        "events",
+        "kv_transfer_params",
+        "trace_headers",
+        "prefill_stats",
+        "routed_experts",
+        "num_nans_in_logits",
+    }
+)
+KNOWN_OUTPUTS_FIELDS = frozenset(
+    {
+        "engine_index",
+        "outputs",
+        "scheduler_stats",
+        "timestamp",
+        "utility_output",
+        "finished_requests",
+        "wave_complete",
+        "start_wave",
+    }
+)
+
+
+def raw_schema_ok(output_cls, outputs_cls) -> bool:
+    """True iff both msgspec structs still carry exactly the fields the raw layout knows."""
+    ok = True
+    for cls, known in ((output_cls, KNOWN_OUTPUT_FIELDS), (outputs_cls, KNOWN_OUTPUTS_FIELDS)):
+        drift = frozenset(cls.__struct_fields__) ^ known
+        if drift:
+            log.warning(
+                "vtl shm_ipc: %s fields drifted from the ported layout (%s), forcing raw off",
+                cls.__name__,
+                sorted(drift),
+            )
+            ok = False
+    return ok
+
+
 def raw_packable(outputs) -> bool:
     """True iff every field of ``outputs`` survives the fixed layout."""
     if (
@@ -163,23 +227,32 @@ def raw_packable(outputs) -> bool:
     return True
 
 
+def raw_plan(outputs):
+    """``(byte length, encoded request ids, encoded finished ids)``.
+
+    Every request id is utf-8 encoded exactly ONCE here and handed to ``raw_pack_into``;
+    sizing and packing used to encode each id separately.
+    """
+    ids = [out.request_id.encode() for out in outputs.outputs]
+    finished = [
+        req_id.encode() for req_id in sorted(outputs.finished_requests or ())
+    ]
+    total = 1 + _RAW_HEADER.size
+    for out, req_id in zip(outputs.outputs, ids):
+        total += _RAW_OUTPUT_HEAD.size + len(req_id) + 4 * len(out.new_token_ids)
+    for req_id in finished:
+        total += 4 + len(req_id)
+    return total, ids, finished
+
+
 def raw_size(outputs) -> int:
     """Exact byte length of the record ``raw_pack_into`` would write."""
-    total = 1 + _RAW_HEADER.size
-    for out in outputs.outputs:
-        total += (
-            _RAW_OUTPUT_HEAD.size
-            + len(out.request_id.encode())
-            + 4 * len(out.new_token_ids)
-        )
-    for req_id in outputs.finished_requests or ():
-        total += 4 + len(req_id.encode())
-    return total
+    return raw_plan(outputs)[0]
 
 
-def raw_pack_into(buffer, outputs) -> int:
+def raw_pack_into(buffer, outputs, plan=None) -> int:
     """Pack ``outputs`` into ``buffer`` (any writable buffer). Returns bytes written."""
-    finished = sorted(outputs.finished_requests) if outputs.finished_requests else []
+    _, ids, finished = plan if plan is not None else raw_plan(outputs)
     buffer[0:1] = TAG_RAW
     _RAW_HEADER.pack_into(
         buffer,
@@ -192,8 +265,7 @@ def raw_pack_into(buffer, outputs) -> int:
         len(finished),
     )
     at = 1 + _RAW_HEADER.size
-    for out in outputs.outputs:
-        req_id = out.request_id.encode()
+    for out, req_id in zip(outputs.outputs, ids):
         flags = 0
         finish = 0
         if out.finish_reason is not None:
@@ -221,17 +293,36 @@ def raw_pack_into(buffer, outputs) -> int:
             _U32.pack_into(buffer, at, token)
             at += 4
     for req_id in finished:
-        encoded = req_id.encode()
-        _U32.pack_into(buffer, at, len(encoded))
+        _U32.pack_into(buffer, at, len(req_id))
         at += 4
-        buffer[at : at + len(encoded)] = encoded
-        at += len(encoded)
+        buffer[at : at + len(req_id)] = req_id
+        at += len(req_id)
     return at
 
 
 # ------------------------------------------------------------------------------------------
 # iceoryx2 plumbing
 # ------------------------------------------------------------------------------------------
+
+
+# One ctypes array type for every shm view. ``ctypes.c_ubyte * n`` mints -- and permanently
+# caches -- a distinct type per distinct ``n``, so building one per record size leaks types
+# for the process' lifetime. Nothing is read or written past the slice taken in ``_shm_view``,
+# so a nominal length larger than the loan is harmless (``from_address`` touches no memory).
+_VIEW_MAX = 1 << 24
+_ShmBytes = ctypes.c_ubyte * _VIEW_MAX
+
+
+def _shm_view(address: int, size: int) -> memoryview:
+    """Writable ``memoryview`` of exactly ``size`` bytes at ``address``."""
+    assert 0 < size <= _VIEW_MAX, size
+    return memoryview(_ShmBytes.from_address(address)).cast("B")[:size]
+
+
+def _address(buffer) -> int:
+    """Address of a writable buffer. ``ctypes.memmove`` takes ints or ``bytes`` but not a
+    ``bytearray``/``memoryview``, and ``c_char`` is a fixed type (no cache growth)."""
+    return ctypes.addressof(ctypes.c_char.from_buffer(buffer))
 
 
 def _open_channel(node, name: str):
@@ -245,6 +336,7 @@ def _open_channel(node, name: str):
         .max_subscribers(MAX_SUBSCRIBERS)
         .subscriber_max_buffer_size(SUBSCRIBER_MAX_BUFFER_SIZE)
         .history_size(HISTORY_SIZE)
+        .enable_safe_overflow(ENABLE_SAFE_OVERFLOW)
         .open_or_create()
     )
     event = (
@@ -272,25 +364,31 @@ class _OutputPublisher:
             data.publisher_builder()
             .initial_max_slice_len(OUTPUT_MAX_PAYLOAD)
             .allocation_strategy(ix.AllocationStrategy.PowerOfTwo)
+            # With safe overflow off, this is what a full subscriber buffer does: report
+            # (send() -> 0 receivers) instead of blocking the engine's output thread.
+            .backpressure_strategy(ix.BackpressureStrategy.DiscardData)
             .create()
         )
         self._notifier = event.notifier_builder().create()
         log.info("vtl shm_ipc: output channel ready (%s)", name)
 
-    def publish(self, tag: bytes, payload: bytes) -> bool:
-        """Publish ``tag + payload``. False means nobody is subscribed -> use ZMQ."""
-        sample = self._publisher.loan_slice_uninit(len(payload) + 1)
+    def publish(self, tag: bytes, payload) -> bool:
+        """Publish ``tag + payload``. False means undelivered (no subscriber, or a full
+        buffer) -> use ZMQ. ``payload`` is any buffer, so the caller can reuse one."""
+        size = len(payload)
+        sample = self._publisher.loan_slice_uninit(size + 1)
         ctypes.memmove(sample.payload_ptr, tag, 1)
-        if payload:
-            ctypes.memmove(sample.payload_ptr + 1, payload, len(payload))
+        if size:
+            src = payload if isinstance(payload, bytes) else _address(payload)
+            ctypes.memmove(sample.payload_ptr + 1, src, size)
         return self._send(sample)
 
     def publish_raw(self, outputs) -> bool:
         """Pack ``outputs`` straight into the loaned shm buffer -- no msgpack, no bytes copy."""
-        size = raw_size(outputs)
+        plan = raw_plan(outputs)
+        size = plan[0]
         sample = self._publisher.loan_slice_uninit(size)
-        view = (ctypes.c_ubyte * size).from_address(sample.payload_ptr)
-        written = raw_pack_into(memoryview(view).cast("B"), outputs)
+        written = raw_pack_into(_shm_view(sample.payload_ptr, size), outputs, plan)
         assert written == size, (written, size)
         return self._send(sample)
 
@@ -338,25 +436,38 @@ def _run_input_thread(engine, input_address: str, engine_index: int, ready: thre
             listener.blocking_wait_one()
             while (sample := subscriber.receive()) is not None:
                 payload = sample.payload()
+                # ONE copy out of shm. The msgpack decoder is share_mem=True, so a decoded
+                # ndarray/tensor would BORROW whatever buffer it is handed -- handing it a
+                # view of the shm sample (which is recycled at the end of this iteration)
+                # would be a use-after-free. `record` is Python-owned, and the memoryview
+                # slice keeps it alive for any such borrow while avoiding the second
+                # whole-payload copy that `record[1:]` used to make.
                 record = ctypes.string_at(payload.as_ptr(), payload.len())
-                # upstream: core.py:1558-1587, with the frame split replaced by our framing.
-                request_type = EngineCoreRequestType(record[:1])
-                data_frames = [record[1:]]
-                if request_type == EngineCoreRequestType.ADD:
-                    req = add_request_decoder.decode(data_frames)
-                    try:
-                        request = engine.preprocess_add_request(req)
-                    except Exception:
-                        engine._handle_request_preproc_error(req)
-                        continue
-                else:
-                    request = generic_decoder.decode(data_frames)
-                    if request_type == EngineCoreRequestType.ABORT:
-                        # Aborts go to *both* queues, exactly as upstream: eager processing
-                        # plus input-queue ordering so no request leaks. Idempotent in the
-                        # scheduler.
-                        engine.aborts_queue.put_nowait(request)
-                engine.input_queue.put_nowait((request_type, request))
+                try:
+                    # upstream: core.py:1558-1587, frame split replaced by our framing.
+                    request_type = EngineCoreRequestType(record[:1])
+                    data_frames = [memoryview(record)[1:]]
+                    if request_type == EngineCoreRequestType.ADD:
+                        req = add_request_decoder.decode(data_frames)
+                        try:
+                            request = engine.preprocess_add_request(req)
+                        except Exception:
+                            engine._handle_request_preproc_error(req)
+                            continue
+                    else:
+                        request = generic_decoder.decode(data_frames)
+                        if request_type == EngineCoreRequestType.ABORT:
+                            # Aborts go to *both* queues, exactly as upstream: eager
+                            # processing plus input-queue ordering so no request leaks.
+                            # Idempotent in the scheduler.
+                            engine.aborts_queue.put_nowait(request)
+                    engine.input_queue.put_nowait((request_type, request))
+                except Exception:
+                    # One bad record must not take the channel down with it -- upstream's
+                    # process_input_sockets survives a malformed frame the same way, and
+                    # killing the thread here would strand every record already confirmed
+                    # delivered. Channel-level failures still break out below.
+                    log.exception("vtl shm_ipc: dropping malformed request record")
     except Exception:
         log.exception("vtl shm_ipc: request thread died, frontend will fall back to ZMQ")
 
@@ -380,10 +491,12 @@ def _process_output_sockets(self, output_paths, coord_output_path, engine_index)
     pending = deque()
 
     shm = None
+    shm_delivered = False  # shm has carried at least one batch
+    shm_buffer = bytearray()  # reused across publishes, like upstream's reuse_buffers
     use_raw = False
     try:
         shm = _OutputPublisher(self.addresses.inputs[0])
-        use_raw = _env_flag("VTL_SHM_IPC_RAW")
+        use_raw = _env_flag("VTL_SHM_IPC_RAW") and _RAW_ENABLED
     except Exception:
         log.exception("vtl shm_ipc: output channel setup failed, staying on ZMQ")
 
@@ -429,26 +542,37 @@ def _process_output_sockets(self, output_paths, coord_output_path, engine_index)
                 reuse_buffers.append(pending.pop()[2])
 
             if shm is not None and client_index == 0 and len(sockets) == 1:
+                sent = False
                 try:
                     if use_raw and raw_packable(outputs):
-                        if shm.publish_raw(outputs):
-                            continue
+                        sent = shm.publish_raw(outputs)
                     else:
-                        buffers = encoder.encode(outputs)
-                        # ponytail: multi-frame batches keep using the socket. That is the
-                        # zmq tensor zero-copy path (out-of-band logprob/pooling tensors);
-                        # the served config -- greedy, no logprobs, text-only decode -- never
-                        # produces one, so the mix-of-transports window below is unreachable.
-                        # CEILING: turn logprobs on together with VTL_SHM_IPC=1 and a single
-                        # batch could arrive out of order relative to its neighbours (two
-                        # transports feeding one mpsc). UPGRADE PATH: publish the frames as
-                        # one shm record with a [u32 count][u32 len...] table and hand the
-                        # slices to Rust's decode_engine_core_outputs, which already takes a
-                        # frame list. Not written because nothing here can reach it.
-                        if len(buffers) == 1 and shm.publish(TAG_MSGPACK, buffers[0]):
-                            continue
+                        # encode_into reuses one buffer, exactly like the ZMQ path below;
+                        # encoder.encode() allocated a fresh one per decode step.
+                        buffers = encoder.encode_into(outputs, shm_buffer)
+                        # ponytail: multi-frame batches cannot go over shm. That is the zmq
+                        # tensor zero-copy path (out-of-band logprob/pooling tensors); the
+                        # served config -- greedy, no logprobs, text-only decode -- never
+                        # produces one. UPGRADE PATH: publish the frames as one shm record
+                        # with a [u32 count][u32 len...] table and hand the slices to Rust's
+                        # decode_engine_core_outputs, which already takes a frame list.
+                        sent = len(buffers) == 1 and shm.publish(TAG_MSGPACK, buffers[0])
+                    if sent:
+                        shm_delivered = True
+                        continue
                 except Exception:
-                    log.exception("vtl shm_ipc: publish failed, falling back to ZMQ")
+                    log.exception("vtl shm_ipc: publish failed, ZMQ from here on")
+                    shm = None
+                if shm is not None and shm_delivered:
+                    # Latch, mirroring the Rust input side's `live: AtomicBool`: once shm has
+                    # carried a batch, the first undelivered one demotes the transport FOR
+                    # GOOD. Retrying per message would interleave ZMQ and shm, and a record
+                    # published-but-unread (e.g. the Rust output thread died) would be lost
+                    # behind later ZMQ traffic -- reordering plus silent loss.
+                    log.warning(
+                        "vtl shm_ipc: output publish undelivered after a live stream, "
+                        "falling back to ZMQ for good"
+                    )
                     shm = None
 
             buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
@@ -469,7 +593,11 @@ def apply() -> None:
 
     import iceoryx2  # noqa: F401  -- fail the patch (not the server) if the wheel is absent
 
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
     from vllm.v1.engine.core import EngineCoreProc
+
+    global _RAW_ENABLED
+    _RAW_ENABLED = raw_schema_ok(EngineCoreOutput, EngineCoreOutputs)
 
     if already_patched(EngineCoreProc, "process_input_sockets"):
         return
@@ -497,7 +625,7 @@ def apply() -> None:
     )
     log.info(
         "vtl: shm_ipc installed (iceoryx2 data plane, raw=%s)",
-        _env_flag("VTL_SHM_IPC_RAW"),
+        _env_flag("VTL_SHM_IPC_RAW") and _RAW_ENABLED,
     )
 
 
@@ -558,6 +686,11 @@ GOLDEN_PLAIN_DECODE = (
     "06000000" "01000000" "00000000" "00" "00" "0000" "00000000"
     "7265712d3161" "05000000"
 )
+# The service-name seed is implemented twice (here and in Rust `seed()`); this one literal is
+# asserted by both, so a divergence in the hash or the truncation fails a test instead of
+# quietly giving the two processes different service names (= a silent ZMQ-only boot).
+GOLDEN_SEED_ADDRESS = "ipc:///tmp/vllm-in-0"
+GOLDEN_SEED = "23c5030baa20"
 GOLDEN_FINISHED = (
     "52"
     "01" "0000" "00000000" "0000000000000000" "02000000" "02000000"
@@ -623,8 +756,30 @@ def _self_check() -> None:
     assert len(_pack(unicode_case)) == raw_size(unicode_case)
     assert "req-é".encode() in _pack(unicode_case)
 
+    # --- schema drift gate ----------------------------------------------------------------
+    class _StructOut:
+        __struct_fields__ = tuple(KNOWN_OUTPUT_FIELDS)
+
+    class _StructOuts:
+        __struct_fields__ = tuple(KNOWN_OUTPUTS_FIELDS)
+
+    assert raw_schema_ok(_StructOut, _StructOuts)
+
+    # A field ADDED upstream is exactly the case the reject-list packer cannot see.
+    class _DriftedOut:
+        __struct_fields__ = (*KNOWN_OUTPUT_FIELDS, "brand_new_field")
+
+    class _DriftedOuts:
+        __struct_fields__ = tuple(KNOWN_OUTPUTS_FIELDS - {"start_wave"})
+
+    log.disabled = True  # both cases warn by design; keep the self-check output clean
+    assert not raw_schema_ok(_DriftedOut, _StructOuts)
+    assert not raw_schema_ok(_StructOut, _DriftedOuts)
+    log.disabled = False
+
     # --- service naming -------------------------------------------------------------------
-    addr = "ipc:///tmp/vllm-in-0"
+    addr = GOLDEN_SEED_ADDRESS
+    assert _seed(addr) == GOLDEN_SEED, _seed(addr)  # shared with the Rust test
     assert request_service(addr, 0) == request_service(addr, 0)
     assert request_service(addr, 0) != request_service(addr, 1)
     assert request_service(addr, 0) != request_service("ipc:///tmp/other", 0)
@@ -659,6 +814,7 @@ def _self_check() -> None:
         data.publisher_builder()
         .initial_max_slice_len(OUTPUT_MAX_PAYLOAD)
         .allocation_strategy(ix.AllocationStrategy.PowerOfTwo)
+        .backpressure_strategy(ix.BackpressureStrategy.DiscardData)
         .create()
     )
     subscriber = data.subscriber_builder().create()
@@ -676,7 +832,14 @@ def _self_check() -> None:
     assert got is not None
     view = got.payload()
     assert ctypes.string_at(view.as_ptr(), view.len()) == record
-    print("shm_ipc self-check ok (live shm round-trip verified)")
+
+    # A full buffer must be REPORTED (0 receivers -> ZMQ fallback), never silently overwrite
+    # the oldest unread sample. This is the whole point of ENABLE_SAFE_OVERFLOW = False.
+    del got
+    for _ in range(SUBSCRIBER_MAX_BUFFER_SIZE):
+        publisher.loan_slice_uninit(1).assume_init().send()
+    assert publisher.loan_slice_uninit(1).assume_init().send() == 0, "buffer overflowed"
+    print("shm_ipc self-check ok (live shm round-trip + no-overflow policy verified)")
 
 
 def _integration() -> None:
@@ -731,7 +894,27 @@ def _integration() -> None:
     assert seen[0] == TAG_MSGPACK + b"\x90"
     assert seen[1] == _pack(outputs), (seen[1].hex(), _pack(outputs).hex())
     assert seen[2] == TAG_DEAD
+    thread.join(timeout=5)  # the bench below reads the subscriber itself
     print(f"shm_ipc integration ok ({len(seen)} records round-tripped through shm)")
+
+    # --- isolated transport microbench ----------------------------------------------------
+    # Raw-pack + publish + wakeup + receive for one typical decode-step batch, with the reader
+    # in this same thread so the number is the transport cost, not a scheduling artefact.
+    # (Decoding the record back is the Rust side's job -- see the shm_ipc.rs unit tests.)
+    import time
+
+    reps = 10_000
+    start = time.perf_counter()
+    for _ in range(reps):
+        assert publisher.publish_raw(outputs)
+        listener.try_wait_all()  # drain the wakeup, as the real reader does
+        sample = subscriber.receive()
+        assert sample is not None
+        view = sample.payload()
+        assert view.len() == raw_size(outputs)
+        del sample
+    micros = (time.perf_counter() - start) * 1e6 / reps
+    print(f"shm_ipc microbench: {micros:.2f} us/record (pack+publish+receive, n={reps})")
 
 
 if __name__ == "__main__":

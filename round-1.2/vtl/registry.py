@@ -42,13 +42,31 @@ def is_enabled(patch: Patch) -> bool:
     return raw.strip().lower() in _TRUTHY
 
 
-def already_patched(obj: object, attr: str) -> bool:
-    """True if ``obj.attr`` is one of our wrappers, so re-applying is a no-op."""
-    return hasattr(getattr(obj, attr, None), "__vtl_wrapped__")
+def already_patched(obj: object, attr: str, patch: str | None = None) -> bool:
+    """True if ``obj.attr`` is already wrapped -- by anyone (``patch=None``) or by ``patch``.
+
+    STACKING HAZARD, and the reason ``patch`` exists. Two patches may legitimately wrap the SAME
+    attribute (``quant_w4a8`` and ``l2_persist`` both wrap ``BaseModelLoader.load_model``). The
+    bare per-attribute check cannot tell "I already ran" from "somebody else ran", so whichever
+    patch applies second sees the first one's wrapper and skips itself -- silently, and the
+    outcome flips with the order of ``_MODULES``. Pass ``patch="<name>"`` at BOTH the check and
+    the mark whenever an attribute has more than one wrapper; the names ride along the chain, so
+    the answer does not depend on who wrapped last.
+    """
+    current = getattr(obj, attr, None)
+    if patch is None:
+        return hasattr(current, "__vtl_wrapped__")
+    return patch in getattr(current, "__vtl_patches__", ())
 
 
-def mark_patched(wrapper: Callable, original: Callable) -> Callable:
+def mark_patched(wrapper: Callable, original: Callable, patch: str | None = None) -> Callable:
     wrapper.__vtl_wrapped__ = original
+    # Inherit whatever the thing we wrapped was already marked with: the chain's outermost
+    # object is the only one already_patched() ever sees.
+    names = set(getattr(original, "__vtl_patches__", ()))
+    if patch:
+        names.add(patch)
+    wrapper.__vtl_patches__ = frozenset(names)
     return wrapper
 
 
@@ -107,6 +125,20 @@ def _self_check() -> None:
         assert not already_patched(Target, "method")
         Target.method = mark_patched(lambda self: None, Target.method)
         assert already_patched(Target, "method")
+
+        # Two patches on ONE attribute -- the case that made the bare check unsound. Whoever
+        # applies second must still see "not me yet", and both names must survive the stack.
+        class Shared:
+            def load(self) -> None: ...
+
+        assert not already_patched(Shared, "load", patch="w4a8")
+        Shared.load = mark_patched(lambda self: None, Shared.load, patch="w4a8")
+        assert already_patched(Shared, "load", patch="w4a8")
+        assert not already_patched(Shared, "load", patch="l2_persist")
+        Shared.load = mark_patched(lambda self: None, Shared.load, patch="l2_persist")
+        assert already_patched(Shared, "load", patch="l2_persist")
+        assert already_patched(Shared, "load", patch="w4a8")   # not lost under the second wrap
+        assert already_patched(Shared, "load")                 # unnamed check still works
 
         print("registry self-check ok")
     finally:

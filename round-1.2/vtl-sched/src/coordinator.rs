@@ -281,14 +281,14 @@ impl Coordinator {
         req: u32,
         new_computed_blocks: &[Vec<u32>],
         num_local_computed_tokens: usize,
-    ) {
+    ) -> Result<(), String> {
         if self
             .managers
             .iter()
             .any(|m| m.num_cached_block.contains_key(&req))
         {
             debug_assert!(new_computed_blocks.iter().all(|b| b.is_empty()));
-            return;
+            return Ok(());
         }
         for i in 0..self.managers.len() {
             self.managers[i].add_local_computed_blocks(
@@ -296,8 +296,9 @@ impl Coordinator {
                 req,
                 &new_computed_blocks[i],
                 num_local_computed_tokens,
-            );
+            )?;
         }
+        Ok(())
     }
 
     /// `allocate_new_blocks` (`:233`). Per-group new blocks land in `out`.

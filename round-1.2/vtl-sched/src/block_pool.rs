@@ -602,15 +602,19 @@ impl BlockPool {
     }
 
     /// `BlockPool.touch` (block_pool.py:597).
-    pub fn touch(&mut self, blocks: &[u32]) {
+    pub fn touch(&mut self, blocks: &[u32]) -> Result<(), String> {
         for &id in blocks {
             let b = self.arena.get(id);
             if b.ref_cnt == 0 && !b.is_null {
-                // Freed-but-cached block: pull it out of the eviction queue.
-                let _ = self.arena.remove(id);
+                // Freed-but-cached block: pull it out of the eviction queue. A failure
+                // here means the free list and the ref counts disagree -- unwinding is
+                // the only safe answer, since the next allocation would hand this block
+                // to a second request.
+                self.arena.remove(id)?;
             }
             self.arena.get_mut(id).ref_cnt += 1;
         }
+        Ok(())
     }
 
     /// `BlockPool.free_blocks` (block_pool.py:614). `ordered` is in *eviction* order,
@@ -622,6 +626,7 @@ impl BlockPool {
         without_hash.clear();
         for &id in ordered {
             let b = self.arena.get_mut(id);
+            debug_assert!(b.ref_cnt > 0, "double free of block {id}");
             b.ref_cnt -= 1;
             if b.ref_cnt == 0 && !b.is_null {
                 if b.hash.is_none() {

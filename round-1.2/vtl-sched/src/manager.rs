@@ -343,9 +343,11 @@ impl Manager {
 
         if has_hit {
             let pending = std::mem::take(&mut self.pending_hit);
-            self.coord
+            let res = self
+                .coord
                 .allocate_new_computed_blocks(req, &pending, num_local_computed_tokens);
             self.pending_hit = pending;
+            res?;
         }
 
         let mut out = std::mem::take(&mut self.new_blocks);

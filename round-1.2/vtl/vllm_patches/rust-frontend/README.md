@@ -28,9 +28,11 @@ frontend binary. They carry our frontend optimizations so a clean checkout (wher
   `VLLM_RS_DISABLE_HTTP_TRACE` (default off = layer stays on). Set the env to `1` to drop
   the layer entirely — a latency A/B knob. The optimized compose defaults it to `1`.
 
-Applied idempotently: the stage skips **all** patches if the checkout already carries the
-frontend optimization (grep-guard on `sonic_rs`), so building from a locally-modified
-checkout that already has both is a no-op.
+Applied idempotently **per patch**: the stage skips a patch iff its *reverse* dry-run applies
+(i.e. it is already in the checkout) and applies the rest, so a locally-modified checkout that
+carries some of them still gets the others. The stage then asserts one marker per independent
+group (`sonic_rs` in `validated_json.rs`, `src/engine-core-client/src/shm_ipc.rs` exists) and
+fails the build if either is missing.
 
 ## `shm_ipc.patch`
 - `Cargo.toml` / `src/engine-core-client/Cargo.toml` — add the `iceoryx2` (pinned **0.9.3**)
@@ -53,6 +55,17 @@ degrade path, and its output loop remains the `ENGINE_CORE_DEAD` detector.
 
 The pinned crate version must equal the `iceoryx2` PyPI wheel version installed in
 `round-1.2/Dockerfile` — the two halves share a shm data-segment layout.
+
+Both sides set `enable_safe_overflow(false)` (a *service* property: `open_or_create` rejects a
+peer that disagrees) plus `BackpressureStrategy::DiscardData` on their publisher, so a full
+subscriber buffer makes `send()` report 0 receivers and the existing ZMQ fallback fires,
+instead of iceoryx2's default of silently overwriting the oldest unread sample.
+
+The unit tests in `shm_ipc.rs` are run by `Dockerfile.vllm-fork`
+(`cargo test --release -p vllm-engine-core-client --lib`, right after the release build), so a
+drift in the record layout or the service-name seed fails the **image build**. The golden
+record vectors and the seed literal are shared verbatim with
+`round-1.2/vtl/patches/shm_ipc.py::_self_check`, which `make check` runs.
 
 ## Regenerating
 Paths are workspace-relative (`patch -p1 -d <rust-workspace>`). To regenerate after

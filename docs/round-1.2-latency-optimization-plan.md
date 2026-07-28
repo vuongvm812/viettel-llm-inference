@@ -56,7 +56,7 @@ Effort ~3 dev-days. Risks: pingpong epilogue rejects swap+transpose (drop arm); 
 
 ## WS3 — iceoryx2 zero-copy IPC: frontend ↔ EngineCore (agent 3)
 
-disruptor-rs cannot span processes; **iceoryx2** (user-selected) is zero-copy lock-free shm IPC, Rust-native core with released Python bindings on PyPI (v0.8.0), pub/sub + request/response + event patterns, no central daemon. Both processes share one container.
+disruptor-rs cannot span processes; **iceoryx2** (user-selected) is zero-copy lock-free shm IPC, Rust-native core with released Python bindings on PyPI (pinned **0.9.3** in `round-1.2/Dockerfile`, which must equal the `iceoryx2` crate version in the Rust patch — the two halves share a shm data-segment layout), pub/sub + request/response + event patterns, no central daemon. Both processes share one container.
 
 **Phase A (this WS): transport swap, serialization unchanged** — msgpack bytes written into loaned shm buffers (encode-once, zero-copy transport). Keep ZMQ alive for handshake/registration (`EngineCoreReadyResponse`), `ENGINE_CORE_DEAD` sentinel, and as fallback. Env-gated `VTL_SHM_IPC=1`, default off.
 
@@ -86,6 +86,7 @@ Effort ~3 person-weeks R0–R5, implemented end-to-end by the sub-agent in one p
 ## WS5 — L2 persistence probe + KV alignment asserts (agent 5, small)
 
 - 5-line CUDA probe (small helper in `vtl/csrc/` or ctypes-on-libcudart in `warmup_healthcheck` / a `make` target): `cudaDeviceGetAttribute(cudaDevAttrMaxPersistingL2CacheSize)` + `cudaDeviceGetLimit(cudaLimitPersistingL2CacheSize)` logged at boot. Expected 0 on the slice (docs: L2 set-aside disabled under MIG). **If nonzero** (docs wrong or judge not actually MIG): implement `cudaStreamSetAttribute` + `cudaAccessPolicyWindow` over the hot per-layer weight buffers (w2 8MB + w13 16MB int4 — pinnable scale vs. the slice's L2 partition) on the decode stream via a vtl `_C` helper, env-gated, A/B as usual. Also add `CUDA_DEVICE_DEFAULT_PERSISTING_L2_CACHE_PERCENTAGE_LIMIT` to compose comments as the MPS-style fallback knob (harmless if ignored).
+- **Default-on exception to "everything env-gated default-off":** the probe half registers with `default=True` (`VTL_ENABLE_L2_PERSIST`). It is two read-only CUDA attribute queries inside the existing `load_model` wrapper — it changes no device state and answers the question this WS exists to ask, so gating it off would mean the answer never arrives. The half that *writes* device state (the set-aside limit + the access-policy window) stays opt-in behind `VTL_L2_PERSIST=1`, default off.
 - One-time assert (test, not runtime): KV `page_size_bytes % 128 == 0` and flat-tensor base 256B-aligned for every KV group — documents that point 2c is satisfied; catches regressions if block_size/dtype changes.
 
 Effort ~0.5 dev-day.

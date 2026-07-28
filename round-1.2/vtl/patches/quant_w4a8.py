@@ -186,6 +186,20 @@ VALID_SCHEDULES_V2 = frozenset({
     "64x16_1x1x1_pp", "64x32_1x1x1_pp",
 })
 
+# The only "n<out>k<in>" keys that can ever match a layer on THIS model (same list as
+# bench/test_w4a8_v2.py's SHAPES). A key outside it is almost always a transposed or misread
+# shape, and it fails the worst way possible: the boot succeeds, the arm is never selected, and
+# the sweep row reads as a duplicate baseline. WARN, never drop -- a TP split or another model
+# changes these numbers, and a hard rejection would then be the bug.
+LFM2_SHAPE_KEYS = frozenset({
+    "n3072k2048",    # attn qkv
+    "n2048k2048",    # attn out_proj / conv out_proj
+    "n16384k2048",   # mlp w13
+    "n2048k8192",    # mlp w2      (the deep-wave Stream-K case)
+    "n6144k2048",    # conv in_proj
+    "n65536k2048",   # lm_head
+})
+
 # Above this many tokens the v2 op forwards to the stock kernel with the stock heuristic, IN
 # C++ -- the branch cannot live in apply(), which is traced with fullgraph=True (see below).
 # 32 is where the stock heuristic itself stops choosing decode tiles (w4a8_mm_entry.cu:341-344),
@@ -316,6 +330,17 @@ def parse_schedule_v2(raw: str | None) -> dict[str, str] | None:
                 SCHEDULE_V2_ENV, item,
             )
             continue
+        if key in mapping:
+            log.warning(
+                "vtl: %s names key %r twice (%r then %r); the last one wins",
+                SCHEDULE_V2_ENV, key, mapping[key], value,
+            )
+        if key != "*" and key not in LFM2_SHAPE_KEYS:
+            log.warning(
+                "vtl: %s key %r matches no linear in this model, so it will never fire "
+                "(known shapes: %s)",
+                SCHEDULE_V2_ENV, key, ", ".join(sorted(LFM2_SHAPE_KEYS)),
+            )
         mapping[key] = value
     return mapping or None
 
@@ -958,7 +983,9 @@ def _install_load_summary() -> None:
     """
     from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 
-    if already_patched(BaseModelLoader, "load_model"):
+    # patch="w4a8", not the bare per-attribute check: l2_persist wraps this same attribute, and
+    # an unnamed check would make whichever of us applies second skip itself (see registry).
+    if already_patched(BaseModelLoader, "load_model", patch="w4a8"):
         return
     original = BaseModelLoader.load_model
 
@@ -971,7 +998,7 @@ def _install_load_summary() -> None:
             log.exception("vtl: w4a8 fallback summary failed")
         return model
 
-    BaseModelLoader.load_model = mark_patched(load_model, original)
+    BaseModelLoader.load_model = mark_patched(load_model, original, patch="w4a8")
 
 
 @register_patch("w4a8", default=True)
@@ -1076,6 +1103,25 @@ def _self_check() -> None:
     partial = parse_schedule_v2("n3072k2048=bogus;*=128x8_1x1x1")
     assert partial == {"*": "128x8_1x1x1"}, partial
     assert parse_schedule_v2("n3072k2048;*=128x8_1x1x1") == {"*": "128x8_1x1x1"}
+
+    # A duplicate key and a shape that cannot exist are both still ACCEPTED (last-win / kept),
+    # but they must say so: silently, each one is a boot that reads as a duplicate baseline.
+    seen = []
+    handler = logging.Handler()
+    handler.emit = seen.append
+    log.addHandler(handler)
+    try:
+        dup = parse_schedule_v2("n2048k8192=128x8_1x1x1;n2048k8192=128x16_2x1x1")
+        assert dup == {"n2048k8192": "128x16_2x1x1"}, dup      # last wins, as before
+        ghost = parse_schedule_v2("n2048k3072=128x8_1x1x1")
+        assert ghost == {"n2048k3072": "128x8_1x1x1"}, ghost   # kept, not dropped
+        assert parse_schedule_v2("n3072k2048=128x8_1x1x1;*=128x16_2x1x1")  # no warning case
+    finally:
+        log.removeHandler(handler)
+    warned = " | ".join(r.getMessage() for r in seen)
+    assert "twice" in warned, warned
+    assert "never fire" in warned, warned
+    assert warned.count("never fire") == 1, warned   # a real shape must not trip it
 
     # Threshold parsing: default on unset/blank/garbage/negative, honoured otherwise.
     assert parse_mthresh(None) == DEFAULT_V2_MTHRESH

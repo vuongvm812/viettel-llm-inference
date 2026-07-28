@@ -264,7 +264,7 @@ impl TypeManager {
         req: u32,
         new_computed_blocks: &[u32],
         num_local_computed_tokens: usize,
-    ) {
+    ) -> Result<(), String> {
         debug_assert!(self.blocks(req).is_empty());
         let num_skipped_tokens = self.num_skipped_tokens(num_local_computed_tokens as i64);
         let num_skipped_blocks = floordiv(num_skipped_tokens, self.block_size as i64).max(0) as usize;
@@ -278,7 +278,7 @@ impl TypeManager {
             new_computed_blocks
         };
         if self.enable_caching {
-            pool.touch(kept);
+            pool.touch(kept)?;
         } else {
             debug_assert!(kept.is_empty());
         }
@@ -292,6 +292,7 @@ impl TypeManager {
             blocks.len()
         };
         self.num_cached_block.insert(req, n);
+        Ok(())
     }
 
     /// `allocate_new_blocks` (`:279`, mamba override `:1253`). Returns the new blocks,
