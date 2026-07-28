@@ -608,6 +608,9 @@ def _install_authority(base, mirror_modes):
             self._rust = vtl_sched.KvManager(cfg)
             self._mirror = RustMirror(self._rust)
             self._empty = RustBlocks(tuple([] for _ in range(self._rust.num_groups)))
+            # Plain attribute, not a property: the base __init__ assigns it (a getter-only
+            # property makes super().__init__ raise). Overwrite the python value with ours.
+            self.empty_kv_cache_blocks = self._empty
             log.info(
                 "rust_sched: AUTHORITY mode active (%d groups, %d blocks)",
                 self._rust.num_groups,
@@ -641,10 +644,6 @@ def _install_authority(base, mirror_modes):
         @property
         def free_blocks(self):
             return self._rust.num_free_blocks
-
-        @property
-        def empty_kv_cache_blocks(self):
-            return self._empty
 
         def plan_request(self, request):
             """The vtl scheduling signal, re-pointed at Rust (the Python coordinator is
