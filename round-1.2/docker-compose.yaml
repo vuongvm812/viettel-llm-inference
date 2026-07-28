@@ -223,43 +223,55 @@ services:
       # Unset resolves to empty, i.e. the kernel heuristic -- what submissions ship.
       VTL_W4A8_SCHEDULE: ""
 
-      # ---- opt/round12-5ws knobs. ALL DEFAULT OFF (matching code defaults); pinned here as
-      # literals so every switch is visible in one place and an A/B arm is a one-line flip.
-      # Flip nothing without a 3-boot A/B clearing the noise floor (bench/ab_summary.py).
+      # ---- opt/round12-5ws knobs. ALL ENABLED (2026-07-28, by decision) on the strongest
+      # un-benchmarked hypothesis per feature. NONE of these has cleared a 3-boot A/B on the
+      # slice yet, and a regression here cannot be attributed to one flag -- if TPOT/TTFT
+      # moves the wrong way, bisect by flipping these back to 0 / "" one at a time
+      # (bench/ab_summary.py). Every value is a literal; each line is a one-line revert.
+      # NOTE: inert until the image carries the round12-5ws code -- rebuild (make vllm-fork
+      # PUSH=1 -> re-pin -> make build) and re-pin the digest above, or these envs hit an
+      # image that has never heard of them.
 
       # v2 CUTLASS W4A8 schedules (vtl._C_w4a8: Stream-K / cluster / small-tile arms).
       # EMPTY = feature off, stock kernel everywhere. Either one bare name or a per-shape map
       # "n<out>k<in>=<name>;...;*=<name>". Legal names: 128x16_1x1x1_sk 128x32_1x1x1_sk
       # 128x16_2x1x1 128x8_1x1x1 64x16_1x1x1_pp 64x32_1x1x1_pp. Only fires at M <= MTHRESH;
       # prefill always keeps the stock heuristic. Driven by `make sweep-schedule V2=1`.
-      VTL_W4A8_SCHEDULE_V2: ""
+      # ENABLED with the primary hypothesis: Stream-K on every decode GEMM (the stock choice
+      # at these shapes is 128x16_1x1x1 with no k-split; w2 runs 16 CTAs x 64 k-iters on
+      # 16 SMs). Swap the map for the sweep winner once `make sweep-schedule V2=1` has run.
+      VTL_W4A8_SCHEDULE_V2: "*=128x16_1x1x1_sk"
       VTL_W4A8_V2_MTHRESH: "32"              # decode/prefill boundary for the v2 arms; 0 = control
                                              # arm (always forward to the stock kernel)
 
       # iceoryx2 shm data plane frontend<->EngineCore (ZMQ stays for handshake/death/fallback).
       # BOTH the registry gate and the master switch must be 1 to activate; RAW additionally
       # switches the per-step output record to the fixed zero-copy layout.
-      VTL_ENABLE_SHM_IPC: 0
-      VTL_SHM_IPC: 0
-      VTL_SHM_IPC_RAW: 0
+      VTL_ENABLE_SHM_IPC: 1
+      VTL_SHM_IPC: 1
+      VTL_SHM_IPC_RAW: 1
 
-      # vtl_sched Rust scheduler core. Gate + exactly one mode flag. SHADOW = Python stays
-      # authoritative, Rust runs alongside and logs mismatches (the trust-building soak);
-      # RUST = Rust owns the KVCacheManager surface; FULL additionally runs schedule() in Rust.
-      # STRICT (tests only -- in serving the guard catches and disables) and RADIX (alternate
-      # prefix index, parity-asserted) are sub-knobs of SHADOW/RUST respectively.
-      VTL_ENABLE_RUST_SCHED: 0
-      VTL_RUST_SCHED_SHADOW: 0
-      VTL_RUST_SCHED: 0
-      VTL_RUST_SCHED_FULL: 0
-      VTL_RUST_SCHED_SHADOW_STRICT: 0
-      VTL_RUST_SCHED_RADIX: 0
+      # vtl_sched Rust scheduler core. Precedence in code (rust_sched.py apply()):
+      # authority = RUST or FULL, and authority WINS -- with the flags below, the SHADOW and
+      # STRICT lines are inert (shadow only installs when authority is off; strict only
+      # matters inside shadow). They are left at 1 so that flipping RUST+FULL to 0 falls
+      # straight back to the shadow soak instead of all-Python. FULL = schedule() runs in
+      # Rust too (SJF folded in); RADIX = radix prefix index instead of flat (parity-asserted,
+      # either is valid -- this is an implementation selector, not an additive feature).
+      # Revert ladder: FULL->0 (keep Rust manager, Python schedule()) -> RUST->0 (shadow soak)
+      # -> ENABLE->0 (all-Python, provably stock-vtl).
+      VTL_ENABLE_RUST_SCHED: 1
+      VTL_RUST_SCHED_SHADOW: 1
+      VTL_RUST_SCHED: 1
+      VTL_RUST_SCHED_FULL: 1
+      VTL_RUST_SCHED_SHADOW_STRICT: 1
+      VTL_RUST_SCHED_RADIX: 1
 
       # L2 persisting-cache window over the largest packed weight (w13). The boot probe runs
       # regardless (read-only, logs cudaDevAttrMaxPersistingL2CacheSize -- expected 0: the CUDA
       # docs say the L2 set-aside is disabled under MIG, which is exactly what the probe checks).
       # The window itself is opt-in and a no-op while the probe reads 0.
-      VTL_L2_PERSIST: 0
+      VTL_L2_PERSIST: 1
       VTL_L2_PERSIST_BYTES: "25165824"       # 24 MiB set-aside request, clamped to the device max
       VTL_L2_HIT_RATIO: "0.6"                # fraction of window lines marked persisting
 
