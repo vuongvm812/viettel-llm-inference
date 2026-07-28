@@ -181,6 +181,13 @@ def _load_cudart():
 
 
 def _err(lib, rc: int) -> str:
+    # A failed cudart call sets the sticky per-thread last-error; torch's next kernel
+    # launch would inherit it and raise (boot-killing). Every failure path formats its
+    # message here, so clear it here.
+    try:
+        lib.cudaGetLastError()
+    except Exception:
+        pass
     try:
         return lib.cudaGetErrorString(ctypes.c_int(rc)).decode()
     except Exception:
@@ -276,6 +283,7 @@ def _install_window(model, device: int = 0) -> None:
         # L2 reserved for persisting lines we then never mark is L2 taken away from everything
         # else. Leaving it set here would make "no int4 layers" strictly worse than not running.
         lib.cudaDeviceSetLimit(ctypes.c_int(LIMIT_PERSISTING_L2_CACHE_SIZE), ctypes.c_size_t(0))
+        lib.cudaGetLastError()  # rc unchecked; don't let a failed rollback poison torch
         log.warning("vtl: no weight_packed buffers found; L2 window not attached, "
                     "set-aside rolled back to 0")
         return
