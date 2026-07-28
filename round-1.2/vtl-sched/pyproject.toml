@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "vtl-sched"
+version = "0.1.0"
+description = "Rust KV-cache block metadata / prefix cache / scheduler core for the vtl vLLM plugin"
+requires-python = ">=3.9"
+classifiers = ["Programming Language :: Rust"]
+
+[tool.maturin]
+module-name = "vtl_sched"
+features = ["python", "pyo3/extension-module"]
+strip = true

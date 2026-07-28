@@ -1,0 +1,30 @@
+[package]
+name = "vtl-sched"
+version = "0.1.0"
+edition = "2021"
+description = "Logic-preserving Rust port of vLLM v0.25.0 KV-cache block metadata, prefix caching and scheduler core"
+license = "Apache-2.0"
+
+[lib]
+name = "vtl_sched"
+# cdylib for the Python extension, rlib so `cargo test` can link the unit tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# PyO3/numpy are OPTIONAL: the ported logic must be testable with `cargo test` in an image
+# that has no libpython to link against — the Dockerfile builder stage does exactly that
+# before it lets the wheel out. maturin turns the `python` feature on via pyproject.toml.
+pyo3 = { version = "0.22", features = ["macros"], optional = true }
+numpy = { version = "0.22", optional = true }
+smallvec = { version = "1", features = ["union"] }
+sha2 = "0.10"
+rustc-hash = "2"
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:numpy"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

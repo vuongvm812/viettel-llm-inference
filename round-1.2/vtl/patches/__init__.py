@@ -39,6 +39,11 @@ _MODULES: tuple[str, ...] = (
     "bcx_conv_gate",    # whole short-conv DECODE block in one kernel (needs mul_quant's staging buf)
     "kv_cache_manager",
     "sched_policy",
+    # WS4: must come AFTER kv_cache_manager (it subclasses whatever is bound at apply
+    # time, so the plan_request/free_blocks signals survive) and AFTER sched_policy
+    # (VTL_RUST_SCHED_FULL supersedes its schedule() wrapper, folding the same SJF key
+    # into the Rust loop). Off unless VTL_ENABLE_RUST_SCHED=1 *and* a mode flag is set.
+    "rust_sched",
     "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)
     "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
