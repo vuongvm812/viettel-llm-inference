@@ -92,11 +92,36 @@ ARG CUDA_ARCHS="8.0;8.6;8.9;9.0+PTX"
 # which OOM-kills a small dev box. Cap it. Big CI hosts override: make build MAX_JOBS=28.
 ARG MAX_JOBS=4
 
+# CUTLASS headers for the SECOND extension, vtl._C_w4a8 (extra W4A8 Stream-K / cluster /
+# small-tile schedules). v4.4.2 is what vLLM v0.25.0 itself pins via FetchContent, so the
+# vendored kernel compiles against the same headers the stock one did. Header-only, and shipped
+# in NEITHER the wheel nor this image -- hence the fetch. Welded onto the pip install below
+# rather than given its own step so the ~800 MB of headers is created and deleted inside ONE
+# layer and never reaches the shipped image.
+ARG CUTLASS_VERSION=4.4.2
+ARG CUTLASS_URL=https://github.com/NVIDIA/cutlass/archive/refs/tags/v${CUTLASS_VERSION}.tar.gz
+
 # Scoped to the RUN, not ENV: it is a build input and has no business in the served image.
 # --no-build-isolation so setup.py sees the image's torch.
-RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
+#
+# THE CUTLASS FETCH MAY NOT FAIL THE BUILD, for exactly the reason spelled out in the jemalloc
+# block above: on the hackathon box outbound HTTP has been blocked before, and a build that
+# fails scores ZERO. No headers => setup.py leaves vtl._C_w4a8 out (CUTLASS_DIR unset) =>
+# VTL_W4A8_SCHEDULE_V2 finds no ops and the server runs the stock W4A8 path, which is what it
+# does today. Grep the build log for "cutlass:" to see which happened. python3 rather than
+# curl/wget: it is the one download tool this image is guaranteed to have.
+RUN python3 -c "import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1], '/tmp/cutlass.tar.gz')" "${CUTLASS_URL}" \
+      && mkdir -p /opt/cutlass \
+      && tar -xzf /tmp/cutlass.tar.gz -C /opt/cutlass --strip-components=1 \
+           "cutlass-${CUTLASS_VERSION}/include" "cutlass-${CUTLASS_VERSION}/tools/util/include" \
+      && echo "cutlass: v${CUTLASS_VERSION} headers OK" \
+      || echo "cutlass: fetch failed -- vtl._C_w4a8 will NOT be built (stock W4A8 only)"; \
+    rm -f /tmp/cutlass.tar.gz; \
+    [ -d /opt/cutlass/include/cutlass ] || rm -rf /opt/cutlass; \
+    TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
+    CUTLASS_DIR="$([ -d /opt/cutlass/include/cutlass ] && echo /opt/cutlass || true)" \
     pip install --no-cache-dir --no-build-isolation --no-deps /src \
-    && rm -rf /src
+    && rm -rf /src /opt/cutlass
 
 # Fail the build, not the judge's run.
 RUN python3 -c "import importlib.metadata as m; \
@@ -116,6 +141,22 @@ print('vtl._C built:', s.origin)" \
  && echo "vtl._C device code:" \
  && cuobjdump --list-elf "$SO" | sed 's/^/  /' \
  && { cuobjdump --list-ptx "$SO" | sed 's/^/  /' || echo "  (no PTX: no JIT fallback)"; }
+
+# Same check for the optional second extension, with one asymmetry: ABSENT is fine (the CUTLASS
+# fetch is best-effort and the feature is default-off), PRESENT BUT WRONG-ARCH is fatal. This
+# .so is built sm_90a-only with no PTX on purpose, so a missing sm_90a cubin means every launch
+# would die with cudaErrorNoKernelImageForDevice -- and the only sm_90a box in the loop is the
+# judge's. Import is not attempted here: it needs a driver, same as vtl._C above; the real
+# import + a probe mm happen at model load (vtl/patches/quant_w4a8.py).
+RUN SO=$(python3 -c "import importlib.util as u; s = u.find_spec('vtl._C_w4a8'); print(s.origin if s else '')") \
+ && if [ -z "$SO" ]; then \
+      echo "vtl._C_w4a8: not built (no CUTLASS headers) -- VTL_W4A8_SCHEDULE_V2 will be inert"; \
+    else \
+      echo "vtl._C_w4a8 built: $SO" \
+      && cuobjdump --list-elf "$SO" | sed 's/^/  /' \
+      && cuobjdump --list-elf "$SO" | grep -q sm_90a \
+      || { echo "vtl._C_w4a8 has NO sm_90a cubin -- it would fail at the first launch"; exit 1; }; \
+    fi
 
 ENV VLLM_PLUGINS=vtl \
     VLLM_USE_AOT_COMPILE=1 \

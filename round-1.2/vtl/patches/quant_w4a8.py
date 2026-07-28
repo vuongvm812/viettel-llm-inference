@@ -148,6 +148,50 @@ VALID_SCHEDULES = frozenset({
     "128x256_2x1x1", "128x256_1x1x1", "128x128_1x1x1", "128x64_1x1x1",
     "128x32_1x1x1", "128x16_1x1x1",
 })
+
+# ---------------------------------------------------------------------------------------
+# v2 schedules -- the arms the stock kernel does not have (vtl/csrc/w4a8/w4a8_mm_v2.cu)
+# ---------------------------------------------------------------------------------------
+# WHY A SECOND KNOB rather than more names in VTL_W4A8_SCHEDULE: these live in a different .so
+# (``vtl._C_w4a8``, sm_90a-only, no PTX) behind a different op, and the op takes an M threshold.
+# Keeping them apart means the stock sweep stays exactly what it was and a v2 typo can never
+# silently select a stock tile.
+#
+# VALUES:
+#   128x16_1x1x1_sk  128x32_1x1x1_sk   Stream-K, cooperative. The primary hypothesis: w2 is one
+#                                      deep wave (16 CTAs x 64 k-iters on 16 SMs) and qkv is a
+#                                      ragged 1.5 waves.
+#   128x16_2x1x1                       cluster multicast (of the ACTIVATION, after swap+transpose
+#                                      -- small at decode; swept, not believed).
+#   128x8_1x1x1                        narrower token tile than any stock arm.
+#   64x16_1x1x1_pp   64x32_1x1x1_pp    pingpong, the only way to reach TileM=64. SPECULATIVE: the
+#                                      mixed-dtype builder may reject it, in which case the arm
+#                                      is compiled out and naming it here just logs and falls
+#                                      back to the stock kernel.
+#
+# SYNTAX. Either one name for every eligible layer:
+#     VTL_W4A8_SCHEDULE_V2=128x16_1x1x1_sk
+# or a per-SHAPE map, since LFM2's three GEMM shapes want different tiles and a boot is
+# expensive enough that sweeping them one at a time is not affordable:
+#     VTL_W4A8_SCHEDULE_V2="n3072k2048=128x16_1x1x1_sk;n2048k8192=128x32_1x1x1_sk;*=128x16_2x1x1"
+# Keys are "n<out_features>k<in_features>" of the LINEAR (not the swapped GEMM), plus "*" as the
+# default. A shape with no key and no "*" keeps the stock path -- that is the mechanism for
+# "Stream-K on w2 only", which is the likeliest winning shape of this whole feature.
+SCHEDULE_V2_ENV = "VTL_W4A8_SCHEDULE_V2"
+
+VALID_SCHEDULES_V2 = frozenset({
+    "128x16_1x1x1_sk", "128x32_1x1x1_sk",
+    "128x16_2x1x1",
+    "128x8_1x1x1",
+    "64x16_1x1x1_pp", "64x32_1x1x1_pp",
+})
+
+# Above this many tokens the v2 op forwards to the stock kernel with the stock heuristic, IN
+# C++ -- the branch cannot live in apply(), which is traced with fullgraph=True (see below).
+# 32 is where the stock heuristic itself stops choosing decode tiles (w4a8_mm_entry.cu:341-344),
+# so it is the natural seam: prefill keeps the kernel it has today, byte for byte.
+V2_MTHRESH_ENV = "VTL_W4A8_V2_MTHRESH"
+DEFAULT_V2_MTHRESH = 32
 # The CUTLASS W4A8 kernel supports exactly one group size (see `can_implement` in
 # vllm/model_executor/kernels/linear/mixed_precision/cutlass.py:55). Not a tunable.
 GROUP_SIZE = 128
@@ -231,6 +275,179 @@ def schedule() -> str | None:
     ``_vtl_w4a8_done``. cache=1 read, so a sweep cannot half-apply.
     """
     return validate_schedule(os.environ.get(SCHEDULE_ENV))
+
+
+def parse_schedule_v2(raw: str | None) -> dict[str, str] | None:
+    """Normalize ``VTL_W4A8_SCHEDULE_V2`` into ``{shape_key: schedule}``; ``None`` = feature off.
+
+    Same fail-soft rule as validate_schedule and for the same reason: an unknown name reaches
+    the C++ dispatcher, which TORCH_CHECKs at the first forward -- i.e. a typo takes the server
+    down after it has reported healthy. Bad entries are dropped with a warning; an entry can
+    also be unknown because its arm failed to compile (the pingpong arms are expected to), and
+    "that shape keeps the stock kernel" is the right answer in both cases.
+    """
+    if not raw or not raw.strip():
+        return None
+    text = raw.strip()
+
+    # A bare name, i.e. the same schedule for every eligible layer.
+    if "=" not in text and ";" not in text:
+        if text not in VALID_SCHEDULES_V2:
+            log.warning(
+                "vtl: %s=%r is not one of %s; v2 schedules stay off",
+                SCHEDULE_V2_ENV, text, ", ".join(sorted(VALID_SCHEDULES_V2)),
+            )
+            return None
+        return {"*": text}
+
+    mapping: dict[str, str] = {}
+    for item in text.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        key, sep, value = item.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not key:
+            log.warning("vtl: %s entry %r is not 'key=schedule'; ignored", SCHEDULE_V2_ENV, item)
+            continue
+        if value not in VALID_SCHEDULES_V2:
+            log.warning(
+                "vtl: %s entry %r names an unknown schedule; that shape keeps the stock kernel",
+                SCHEDULE_V2_ENV, item,
+            )
+            continue
+        mapping[key] = value
+    return mapping or None
+
+
+def resolve_schedule_v2(mapping: dict[str, str] | None, out_features: int,
+                        in_features: int) -> str | None:
+    """Exact shape key first, then the ``*`` default, then "stock kernel"."""
+    if not mapping:
+        return None
+    return mapping.get(f"n{out_features}k{in_features}") or mapping.get("*")
+
+
+def parse_mthresh(raw: str | None) -> int:
+    """``VTL_W4A8_V2_MTHRESH``. A bad value falls back to the default rather than raising --
+    this is read at model load, where an exception costs the whole server."""
+    if not raw or not raw.strip():
+        return DEFAULT_V2_MTHRESH
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        log.warning("vtl: %s=%r is not an integer; using %d",
+                    V2_MTHRESH_ENV, raw, DEFAULT_V2_MTHRESH)
+        return DEFAULT_V2_MTHRESH
+    if value < 0:
+        log.warning("vtl: %s=%r is negative; using %d",
+                    V2_MTHRESH_ENV, raw, DEFAULT_V2_MTHRESH)
+        return DEFAULT_V2_MTHRESH
+    return value
+
+
+@functools.cache
+def schedule_v2() -> dict[str, str] | None:
+    """THE single read of ``VTL_W4A8_SCHEDULE_V2``. Same single-source rule as schedule()."""
+    return parse_schedule_v2(os.environ.get(SCHEDULE_V2_ENV))
+
+
+@functools.cache
+def v2_mthresh() -> int:
+    return parse_mthresh(os.environ.get(V2_MTHRESH_ENV))
+
+
+# None = not probed yet. Set by _ensure_v2_ready(), which runs at the FIRST quantized layer.
+_v2_ready: bool | None = None
+_v2_fake_registered = False
+
+
+def _register_v2_fake() -> None:
+    """FakeTensor rule for the new op, mirroring vLLM's own ``cutlass_w4a8_mm`` fake: out is
+    ``[tokens, out_channels]`` bf16. Without it torch.compile cannot trace through the op.
+    Idempotent -- registering a fake twice raises."""
+    global _v2_fake_registered
+    if _v2_fake_registered:
+        return
+    import torch
+
+    @torch.library.register_fake("vllm_cuda::w4a8_mm_v2")
+    def _fake(  # noqa: ANN001
+        a, b_q, group_scales, group_size, channel_scales, token_scales,
+        schedule, m_threshold,
+    ):
+        return a.new_empty((a.shape[0], channel_scales.shape[0]), dtype=torch.bfloat16)
+
+    _v2_fake_registered = True
+
+
+def _probe_v2(name: str) -> None:
+    """Launch one 16x128x128 GEMM through the named arm, synchronously.
+
+    Same discipline as ``warmup_healthcheck``: an sm_90a-only .so with no PTX imports fine on
+    any box and only dies at the first launch, so the first launch happens HERE -- during model
+    load, where the fallback is "serve the stock kernel" -- rather than in the middle of the
+    judge's benchmark, where it is a 500. Also catches the arm having been compiled out.
+    """
+    import torch
+
+    weight = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
+    packed, group_scales, chan_scales = _quantize_and_pack(weight)
+    xq = torch.randn(16, 128, device="cuda").to(torch.float8_e4m3fn)
+    token_scales = torch.ones(16, 1, dtype=torch.float32, device="cuda")
+    # m_threshold=16, not v2_mthresh(): the probe must exercise the v2 arm even if the operator
+    # is configured to hand everything to the stock kernel.
+    out = torch.ops.vllm_cuda.w4a8_mm_v2(
+        xq, packed, group_scales, GROUP_SIZE, chan_scales, token_scales, name, 16
+    )
+    torch.cuda.synchronize()  # launch failures are async; without this the probe always passes
+    assert out.shape == (16, 128) and out.dtype == torch.bfloat16, (out.shape, out.dtype)
+
+
+def _ensure_v2_ready() -> bool:
+    """Import and probe ``vtl._C_w4a8`` once. Never raises; False means "use the stock kernel".
+
+    Deliberately NOT called from the patch's apply(): that runs in every process vLLM loads the
+    plugin into, including the pre-spawn frontend, and touching torch.cuda there initializes
+    CUDA before the fork/spawn that creates the workers. The first
+    ``process_weights_after_loading`` is inside the worker, has CUDA up already, and is still
+    boot time.
+    """
+    global _v2_ready
+    if _v2_ready is not None:
+        return _v2_ready
+    _v2_ready = False
+
+    names = schedule_v2()
+    if not names:
+        return False
+
+    import torch
+
+    try:
+        capability = torch.cuda.get_device_capability()
+        if capability != (9, 0):
+            log.warning(
+                "vtl: %s is set but this GPU is sm_%d%d, not sm_90; v2 schedules stay off",
+                SCHEDULE_V2_ENV, *capability,
+            )
+            return False
+        # vtl._C first, unconditionally: it owns TORCH_LIBRARY(vllm_cuda) and _C_w4a8 only adds
+        # a fragment to that namespace.
+        import vtl._C  # noqa: F401
+        import vtl._C_w4a8  # noqa: F401
+
+        _register_v2_fake()
+        for name in sorted(set(names.values())):
+            _probe_v2(name)
+    except Exception as exc:
+        log.warning("vtl: w4a8 v2 schedules unusable (%s); serving the stock W4A8 kernel", exc)
+        return False
+
+    _v2_ready = True
+    log.info("vtl: w4a8 v2 schedules armed (%s, forwarding M>%d to the stock kernel)",
+             names, v2_mthresh())
+    return True
 
 
 def is_ignored(prefix: str, patterns: list[str]) -> bool:
@@ -402,6 +619,8 @@ def _linear_method_cls():
             # schedule() is cached, so this is one dict lookup per layer at construction and
             # an attribute load per forward -- never an environ read on the hot path.
             self.schedule = schedule()
+            # Read once here for the same reason. Dynamo bakes it into the graph as a constant.
+            self.v2_mthresh = v2_mthresh()
 
         def create_weights(
             self,
@@ -437,6 +656,7 @@ def _linear_method_cls():
             if getattr(layer, "_vtl_w4a8_done", False):
                 return
             try:
+                in_features = layer.weight.data.shape[1]  # read before the bf16 weight is freed
                 packed, group_scales, chan_scales = _quantize_and_pack(layer.weight.data)
 
                 # Everything below is INSIDE the try on purpose. If installation half-completed
@@ -474,6 +694,16 @@ def _linear_method_cls():
                 # Stamped on the layer so the short-conv patch reads it from here rather than
                 # doing its own os.environ.get -- see schedule().
                 layer._vtl_w4a8_schedule = schedule()
+                # Resolved ONCE, per layer, at load: apply() then reads a constant string, so
+                # the v2 branch is specialized away at trace time instead of being a
+                # data-dependent Python branch inside a fullgraph region. None = stock kernel.
+                # NOTE this is deliberately NOT read by the short-conv out_proj path, which
+                # calls ops.cutlass_w4a8_mm by hand -- v2 covers the linear layers only.
+                layer._vtl_w4a8_v2 = (
+                    resolve_schedule_v2(schedule_v2(), chan_scales.shape[0], in_features)
+                    if _ensure_v2_ready()
+                    else None
+                )
                 layer._vtl_w4a8_done = True
 
                 global _w4a8_layer_count
@@ -503,15 +733,31 @@ def _linear_method_cls():
             # _vtl_out_proj_fp8 in vllm_patches/v0.25.0/short_conv.patch). For every other
             # layer the quant below is what RMSNormQuantFusionPass hoists into the norm.
             xq, x_scales = self.quant_fp8(x_2d)
-            out = ops.cutlass_w4a8_mm(
-                a=xq,
-                b_q=layer.weight_packed,
-                b_group_scales=layer.weight_group_scale,
-                b_group_size=GROUP_SIZE,
-                a_token_scales=x_scales,
-                b_channel_scales=layer.weight_chan_scale,
-                maybe_schedule=self.schedule,
-            )
+            # A CONSTANT per layer (stamped at load), so this branch is resolved at trace time.
+            v2 = getattr(layer, "_vtl_w4a8_v2", None)
+            if v2 is None:
+                out = ops.cutlass_w4a8_mm(
+                    a=xq,
+                    b_q=layer.weight_packed,
+                    b_group_scales=layer.weight_group_scale,
+                    b_group_size=GROUP_SIZE,
+                    a_token_scales=x_scales,
+                    b_channel_scales=layer.weight_chan_scale,
+                    maybe_schedule=self.schedule,
+                )
+            else:
+                # The M threshold is applied INSIDE the op: prefill forwards to the same stock
+                # kernel this would otherwise call, with no Python-visible branch on batch size.
+                out = torch.ops.vllm_cuda.w4a8_mm_v2(
+                    xq,
+                    layer.weight_packed,
+                    layer.weight_group_scale,
+                    GROUP_SIZE,
+                    layer.weight_chan_scale,
+                    x_scales,
+                    v2,
+                    self.v2_mthresh,
+                )
             if bias is not None:
                 out.add_(bias)
             return out.reshape(out_shape)
@@ -760,10 +1006,13 @@ def apply() -> None:
 
     log.info(
         "vtl: registered quantization method 'vtl_w4a8' "
-        "(group=%d, ops=%s, schedule=%s, lm_head=%s, ignored=%s)",
+        "(group=%d, ops=%s, schedule=%s, v2=%s, lm_head=%s, ignored=%s)",
         GROUP_SIZE,
         "ok" if available else "MISSING",
         schedule() or "kernel heuristic",
+        # Configured, not yet armed: the .so import + probe run at the first quantized layer
+        # (see _ensure_v2_ready), and log their own line when they succeed.
+        schedule_v2() or "off",
         lm_head_mode(),
         parse_ignored_layers(os.environ.get(IGNORE_ENV)) or "none",
     )
@@ -785,6 +1034,57 @@ def _self_check() -> None:
     assert validate_schedule("64x16_1x1x1") is None     # not an instantiated tile
     assert validate_schedule("128X16_1X1X1") is None    # case matters to the C++ compare
     assert len(VALID_SCHEDULES) == 10, VALID_SCHEDULES
+
+    # ---- v2 schedules -------------------------------------------------------------------
+    # The two name sets must stay DISJOINT: they select different .so's behind different ops,
+    # and a name in both would make "which knob is live" unanswerable from the logs.
+    assert not (VALID_SCHEDULES & VALID_SCHEDULES_V2), VALID_SCHEDULES & VALID_SCHEDULES_V2
+    assert len(VALID_SCHEDULES_V2) == 6, VALID_SCHEDULES_V2
+
+    # Unset/blank/garbage = feature off, never a half-configured server.
+    assert parse_schedule_v2(None) is None
+    assert parse_schedule_v2("  ") is None
+    assert parse_schedule_v2("128x16_1x1x1") is None     # a STOCK name is not a v2 name
+    assert parse_schedule_v2("nonsense") is None
+    assert parse_schedule_v2("*=nonsense") is None       # every entry dropped -> off
+
+    # A bare name applies everywhere.
+    assert parse_schedule_v2("128x16_1x1x1_sk") == {"*": "128x16_1x1x1_sk"}
+    assert parse_schedule_v2(" 128x32_1x1x1_sk ") == {"*": "128x32_1x1x1_sk"}
+
+    # Per-shape map, including the "some shapes only" case that is the point of the syntax.
+    mapping = parse_schedule_v2(
+        "n3072k2048=128x16_1x1x1_sk;n2048k8192=128x32_1x1x1_sk;*=128x16_2x1x1"
+    )
+    assert mapping == {
+        "n3072k2048": "128x16_1x1x1_sk",
+        "n2048k8192": "128x32_1x1x1_sk",
+        "*": "128x16_2x1x1",
+    }, mapping
+    assert resolve_schedule_v2(mapping, 3072, 2048) == "128x16_1x1x1_sk"   # exact key
+    assert resolve_schedule_v2(mapping, 2048, 8192) == "128x32_1x1x1_sk"
+    assert resolve_schedule_v2(mapping, 16384, 2048) == "128x16_2x1x1"     # falls to "*"
+    assert resolve_schedule_v2(None, 3072, 2048) is None
+
+    # No "*": the unlisted shapes must keep the STOCK kernel. This is what makes
+    # "Stream-K on w2 only" expressible, so it is worth an explicit assert.
+    w2_only = parse_schedule_v2("n2048k8192=128x32_1x1x1_sk")
+    assert w2_only == {"n2048k8192": "128x32_1x1x1_sk"}, w2_only
+    assert resolve_schedule_v2(w2_only, 3072, 2048) is None
+
+    # A bad entry is dropped, the rest survive -- one typo must not disarm the whole sweep.
+    partial = parse_schedule_v2("n3072k2048=bogus;*=128x8_1x1x1")
+    assert partial == {"*": "128x8_1x1x1"}, partial
+    assert parse_schedule_v2("n3072k2048;*=128x8_1x1x1") == {"*": "128x8_1x1x1"}
+
+    # Threshold parsing: default on unset/blank/garbage/negative, honoured otherwise.
+    assert parse_mthresh(None) == DEFAULT_V2_MTHRESH
+    assert parse_mthresh("") == DEFAULT_V2_MTHRESH
+    assert parse_mthresh("abc") == DEFAULT_V2_MTHRESH
+    assert parse_mthresh("-1") == DEFAULT_V2_MTHRESH
+    assert parse_mthresh(" 8 ") == 8
+    assert parse_mthresh("0") == 0   # 0 = always forward to stock, i.e. the control arm
+    assert DEFAULT_V2_MTHRESH == 32
 
     # Substring, not exact-prefix -- the whole reason we don't use vLLM's is_layer_skipped.
     assert is_ignored("model.layers.0.lm_head", ["lm_head"]) is True
