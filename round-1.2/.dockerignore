@@ -15,3 +15,6 @@
 !data/input/trace-round2.jsonl
 !bench
 !bench/*
+# WS4 Rust scheduler crate (built in its own stage; only the wheel reaches the image).
+!vtl-sched
+!vtl-sched/**

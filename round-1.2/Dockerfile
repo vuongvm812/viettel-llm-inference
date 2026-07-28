@@ -19,6 +19,37 @@
 # fine until the width>1 tree verify is enabled on-box (see vtl/vllm_patches/INTEGRATION.md).
 ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.0
 
+# ---------------------------------------------------------------------------
+# WS4: build the `vtl_sched` Rust extension (KV-cache block metadata + prefix cache +
+# scheduler core) in a throwaway stage. Only the ~1 MB wheel is copied forward, so the
+# served image never carries rustup, cargo, ~/.cargo/registry or the 300 MB target/ dir.
+#
+# The toolchain install mirrors Dockerfile.vllm-fork's rust-builder (same rustup one-liner,
+# same reason for -o Dir::Etc::sourceparts=-: the CUDA/deadsnakes repos in sources.list.d
+# are intermittently mid-sync and would fail the build for packages that live in the base
+# Ubuntu repos).
+#
+# This stage MAY NOT be skipped silently: if the crate stops compiling we want the build
+# to fail here, not the engine to fall back to Python at the judge's run. The runtime
+# feature is env-gated and default-off regardless (see vtl/patches/rust_sched.py).
+# ---------------------------------------------------------------------------
+FROM --platform=linux/amd64 ${VLLM_IMAGE} AS vtl-sched-builder
+ARG VTL_SCHED_RUST_TOOLCHAIN=1.83
+ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:${PATH}
+RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
+    && apt-get install -y --no-install-recommends build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain "${VTL_SCHED_RUST_TOOLCHAIN}" --profile minimal
+RUN pip install --no-cache-dir "maturin>=1.5,<2.0"
+COPY vtl-sched /src/vtl-sched
+# `cargo test` here is the compile-time correctness gate: free-queue LRU order, refcounts,
+# eviction order, the pickle golden vectors and the hybrid mamba clamp rules all run
+# before the wheel is allowed out of this stage.
+RUN cd /src/vtl-sched && cargo test --release --quiet
+RUN cd /src/vtl-sched && maturin build --release --out /wheels \
+    && ls -la /wheels
+
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 
 # jemalloc for host-side malloc: less fragmentation/contention and tighter RSS than
@@ -116,6 +147,14 @@ print('vtl._C built:', s.origin)" \
  && echo "vtl._C device code:" \
  && cuobjdump --list-elf "$SO" | sed 's/^/  /' \
  && { cuobjdump --list-ptx "$SO" | sed 's/^/  /' || echo "  (no PTX: no JIT fallback)"; }
+
+# WS4: the Rust scheduler core. Wheel only -- no toolchain lands in the served image.
+# Importing it has no effect until one of VTL_RUST_SCHED_SHADOW / VTL_RUST_SCHED /
+# VTL_RUST_SCHED_FULL is set AND VTL_ENABLE_RUST_SCHED=1 (see vtl/patches/rust_sched.py).
+COPY --from=vtl-sched-builder /wheels /tmp/wheels
+RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl \
+    && rm -rf /tmp/wheels \
+    && python3 -c "import vtl_sched; print('vtl_sched ok:', vtl_sched.__version__)"
 
 ENV VLLM_PLUGINS=vtl \
     VLLM_USE_AOT_COMPILE=1 \
