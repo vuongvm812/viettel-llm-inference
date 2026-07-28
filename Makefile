@@ -90,6 +90,9 @@ check:
 	$(IN) python3 bench/eval_quality.py --self-check
 	$(IN) python3 bench/profile_trace.py --self-check
 	$(IN) [ -f bench/build_trace_round2.py ] && PYTHONPATH=. python3 bench/build_trace_round2.py --self-check || true
+	@# Formula half runs anywhere; the live-allocator half needs CUDA and skips off-box
+	@# (it runs for real under `make test-kernel`, which pytest-globs bench/test_*.py).
+	$(IN) [ -f bench/test_kv_alignment.py ] && python3 bench/test_kv_alignment.py || true
 	$(IN) python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
 
 # No compose, no server, no model: the kernel tests just need the image and a GPU.
