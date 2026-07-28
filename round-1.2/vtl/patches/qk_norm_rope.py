@@ -109,4 +109,9 @@ def _self_check() -> None:
 
 
 if __name__ == "__main__":
-    _self_check()
+    # `make check` runs every patch's self-check on a laptop with no torch/vllm/GPU, so an
+    # in-container-only check must skip, not fail -- same contract as the other patches here.
+    try:
+        _self_check()
+    except ImportError as exc:
+        print(f"qk_norm_rope self-check SKIPPED (needs the container: {exc})")

@@ -43,6 +43,11 @@ _MODULES: tuple[str, ...] = (
     "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
     "profiler",
+    "l2_persist",       # boot probe of the MIG L2 set-aside (+ opt-in persisting window).
+                        # LAST on purpose: it stacks a second wrapper on
+                        # BaseModelLoader.load_model, and quant_w4a8's summary hook must be
+                        # the inner one so the w4a8 tallies are already final when we read
+                        # weight_packed.
 )
 
 for _name in _MODULES:
