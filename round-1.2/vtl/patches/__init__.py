@@ -42,6 +42,7 @@ _MODULES: tuple[str, ...] = (
     "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)
     "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
+    "shm_ipc",          # iceoryx2 shm data plane for the frontend<->EngineCore hop (VTL_SHM_IPC=1)
     "profiler",
     "l2_persist",       # boot probe of the MIG L2 set-aside (+ opt-in persisting window).
                         # LAST on purpose: it stacks a second wrapper on

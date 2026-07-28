@@ -32,6 +32,28 @@ Applied idempotently: the stage skips **all** patches if the checkout already ca
 frontend optimization (grep-guard on `sonic_rs`), so building from a locally-modified
 checkout that already has both is a no-op.
 
+## `shm_ipc.patch`
+- `Cargo.toml` / `src/engine-core-client/Cargo.toml` — add the `iceoryx2` (pinned **0.9.3**)
+  and `sha2` dependencies. `Cargo.lock` is deliberately **not** patched: the in-image
+  `cargo build --release` is not `--locked`, so it resolves the new dep itself and the patch
+  stays free of a 1000-line lockfile hunk that every other patch would conflict with.
+- `src/engine-core-client/src/shm_ipc.rs` (new) — the whole opt-in iceoryx2 data plane:
+  service naming, the `InputSink` enum, the output reader thread and the Phase-B fixed-layout
+  record decoder, plus unit tests over golden vectors shared with the Python packer.
+- `src/engine-core-client/src/{lib.rs,client.rs,client/imp.rs}` — the three-line seam:
+  `mod shm_ipc`, build the sink + spawn the shm output reader in `from_connected`, and try the
+  shm publish before the ZMQ `transport::send_message` in `send_to_engine`.
+
+Gated on **`VTL_SHM_IPC=1`** (read by the Rust frontend *and* by `vtl/patches/shm_ipc.py` in
+the EngineCore process). Unset — the default — nothing in the module runs and the transport is
+byte-for-byte stock. `VTL_SHM_IPC_RAW=1` (Python-side only; requires `VTL_SHM_IPC=1`) switches
+the output records from msgpack to the fixed layout, with automatic per-message fallback.
+ZMQ is never torn down: it carries the handshake/registration, stays as the request-path
+degrade path, and its output loop remains the `ENGINE_CORE_DEAD` detector.
+
+The pinned crate version must equal the `iceoryx2` PyPI wheel version installed in
+`round-1.2/Dockerfile` — the two halves share a shm data-segment layout.
+
 ## Regenerating
 Paths are workspace-relative (`patch -p1 -d <rust-workspace>`). To regenerate after
 editing the checkout, diff the modified files against pristine v0.25.0 sources, e.g.
