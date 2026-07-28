@@ -1081,6 +1081,33 @@ def apply() -> None:
         sched_mod.KVCacheManager = _install_shadow(base, m)
         log.info("rust_sched: installed SHADOW manager (VTL_RUST_SCHED_SHADOW=1)")
 
+    if m["authority"]:
+        # Newer vLLM defaults scheduler_reserve_full_isl=True; its stock schedule()
+        # then calls allocate_slots(full_sequence_must_fit=True), which the authority
+        # manager refuses (the admission-fit gate needs the python coordinator the Rust
+        # pool replaced). The Rust port models the pre-feature admission (first-chunk
+        # check), so force the flag off on the live scheduler: identical semantics to
+        # what the port was verified against, and schedule_supported() then lets the
+        # full Rust loop engage.
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        if not getattr(Scheduler.__init__, "__vtl_rust_isl__", False):
+            orig_init = Scheduler.__init__
+
+            def init(self, *args, **kwargs):
+                orig_init(self, *args, **kwargs)
+                if getattr(self, "scheduler_reserve_full_isl", False) and hasattr(
+                    self.kv_cache_manager, "_rust"
+                ):
+                    self.scheduler_reserve_full_isl = False
+                    log.warning(
+                        "rust_sched: forcing scheduler_reserve_full_isl=False "
+                        "(admission-fit gate is not modeled by the Rust port)"
+                    )
+
+            init.__vtl_rust_isl__ = True
+            Scheduler.__init__ = init
+
     if m["full"]:
         from vllm.v1.core.sched.scheduler import Scheduler
 
