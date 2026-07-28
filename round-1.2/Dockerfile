@@ -73,6 +73,22 @@ RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vll
  && rm /tmp/rustfe.patch \
  && python3 -c "import vllm.entrypoints.openai.api_server; print('rust-frontend routing patch OK')"
 
+# iceoryx2 Python bindings for the opt-in zero-copy shm data plane between the Rust frontend
+# and EngineCore (vtl/patches/shm_ipc.py, VTL_SHM_IPC=1; default off). The version MUST equal
+# the `iceoryx2` crate version pinned in vtl/vllm_patches/rust-frontend/shm_ipc.patch: the two
+# halves share a shm data-segment layout and upstream makes no cross-minor compatibility
+# promise. Wheel is cp38-abi3 manylinux_2_34 -- fine on this base (Ubuntu 22.04, glibc 2.35).
+#
+# NOT allowed to fail the build, same reasoning as the jemalloc step above: this is a
+# default-off A/B knob and a PyPI hiccup must not cost the whole image (a failed build scores
+# ZERO). If the wheel is absent the patch module raises on import and the registry skips it,
+# leaving stock ZMQ. Grep the build log for "iceoryx2:" to see which happened.
+RUN if pip install --no-cache-dir iceoryx2==0.9.3; then \
+      python3 -c "import iceoryx2; print('iceoryx2: OK')"; \
+    else \
+      echo "iceoryx2: MISSING -- VTL_SHM_IPC will stay on ZMQ (still correct, just not zero-copy)"; \
+    fi
+
 COPY pyproject.toml setup.py README.md /src/
 COPY vtl /src/vtl
 
