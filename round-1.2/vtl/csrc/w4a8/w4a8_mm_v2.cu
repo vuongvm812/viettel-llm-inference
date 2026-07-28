@@ -36,7 +36,9 @@
 
 #include <torch/all.h>
 #include <torch/library.h>
-#include <ATen/cuda/CUDAContext.h>
+// ATen/cuda/CUDAContext.h pulls cusparse.h, absent from the runtime image;
+// only the stream getter is needed.
+#include <c10/cuda/CUDAStream.h>
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -251,7 +253,7 @@ struct W4A8GemmKernelV2 {
     // VTL: at::cuda guard/stream/empty in place of the stable-ABI trio, and ElementD is
     // hardcoded bf16 (the epilogue emits bf16 and this op has no out_type argument).
     const c10::cuda::CUDAGuard device_guard(A.device());
-    auto stream = at::cuda::getCurrentCUDAStream(A.device().index());
+    auto stream = c10::cuda::getCurrentCUDAStream(A.device().index());
     at::Tensor D = at::empty({m, n}, A.options().dtype(at::kBFloat16));
     // prepare arg pointers
     auto A_ptr = static_cast<MmaType const*>(A.const_data_ptr());
