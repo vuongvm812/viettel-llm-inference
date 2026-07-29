@@ -47,6 +47,10 @@ _MODULES: tuple[str, ...] = (
     "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)
     "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
+    "decode_fastpath",  # V2 runner: skip the dead metadata build on repeat pure-decode steps,
+                        # + pooled pinned staging instead of pin_memory-per-step
+    "conv_align_fused",  # registers vllm_cuda::conv_align_fused; the call site is in the fork
+    "shortconv_mega",    # registers vllm_cuda::shortconv_decode_mega + its persistent scratch
     "shm_ipc",          # iceoryx2 shm data plane for the frontend<->EngineCore hop (VTL_SHM_IPC=1)
     "profiler",
     "l2_persist",       # boot probe of the MIG L2 set-aside (+ opt-in persisting window).

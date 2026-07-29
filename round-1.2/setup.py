@@ -27,6 +27,8 @@ def _cuda_ext():
             "vtl/csrc/silu_mul_quant.cu",
             "vtl/csrc/mul_quant.cu",
             "vtl/csrc/bcx_conv_gate_quant.cu",
+            "vtl/csrc/conv_align_fused.cu",
+            "vtl/csrc/shortconv_decode_mega.cu",
             "vtl/csrc/torch_bindings.cpp",
         ],
         extra_compile_args={
@@ -40,15 +42,25 @@ def _cuda_ext():
             # code=lto_<arch>"), and a working device-LTO build would need a separate nvcc
             # device-link step BuildExtension does not do -- for ~0 gain on these memory-bound
             # kernels (each already fully inlined within its own TU via fp8_common.cuh).
+            # -Xptxas -v so the build log carries the megakernel's register/smem footprint:
+            # its device-wide barrier is only SAFE while every block is co-resident, and a
+            # spill that halves occupancy shows up here before it shows up as a hang.
             "nvcc": [
                 "-O3",
                 "-std=c++17",
                 "-lineinfo",
+                "-Xptxas",
+                "-v",
                 "-U__CUDA_NO_HALF_OPERATORS__",
                 "-U__CUDA_NO_HALF_CONVERSIONS__",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "-U__CUDA_NO_HALF2_OPERATORS__",
-            ],
+            ]
+            # -DVTL_MEGA_COOP=1 compiles the cooperative-groups barrier variant alongside
+            # the hand-rolled one. Off by default: it is an A/B artifact, not the shipped
+            # path, and on some toolchains cg::grid_group::sync() pulls in -rdc=true, which
+            # torch's BuildExtension cannot device-link (see the -dlto note above).
+            + os.environ.get("VTL_NVCC_EXTRA", "").split(),
         },
     )
     return ext, {"build_ext": BuildExtension}

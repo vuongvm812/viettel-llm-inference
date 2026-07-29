@@ -811,6 +811,17 @@ def _linear_method_cls():
                     "weight_chan_scale",
                     torch.nn.Parameter(chan_scales, requires_grad=False),
                 )
+                # LAST CHANCE to see the bf16 weight: the decode megakernel cannot read
+                # `weight_packed`/`weight_group_scale` at all (they are CUTLASS's internal
+                # mixed-input tile orders), so if it is armed it re-derives its own plain
+                # int4 view here, from this same tensor, before the line below drops it.
+                # Best-effort by construction -- a failure just leaves the mega path disarmed.
+                try:
+                    from vtl.patches.shortconv_mega import attach_mega_weights
+
+                    attach_mega_weights(layer)
+                except Exception:
+                    log.debug("vtl: mega weight view not attached for %r", layer, exc_info=True)
                 # Release the bf16 original (4x the packed size). Emptied rather than `del`ed so
                 # the attribute still exists: plenty of vLLM and vtl code does a bare
                 # `layer.weight` lookup.

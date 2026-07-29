@@ -78,6 +78,10 @@ pub struct Manager {
 
     stats: PrefixCacheStats,
 
+    /// R6a: slot -> stop params + the per-step batched stop decision. Lives here because
+    /// slot interning does, so `forget` drops both halves of a request in one place.
+    pub stops: crate::update::StopTable,
+
     /// Reusable per-group buffers (allocated once at construction).
     pub pending_hit: Vec<Vec<u32>>,
     pub new_blocks: Vec<Vec<u32>>,
@@ -146,6 +150,7 @@ impl Manager {
             free_slots: Vec::new(),
             reqs: FxHashMap::default(),
             stats: PrefixCacheStats::default(),
+            stops: Default::default(),
             pending_hit: (0..n).map(|_| Vec::with_capacity(64)).collect(),
             new_blocks: (0..n).map(|_| Vec::with_capacity(64)).collect(),
             empty_groups: (0..n).map(|_| Vec::new()).collect(),
@@ -188,6 +193,7 @@ impl Manager {
                 st.num_prompt_tokens = 0;
             }
             self.hit_len.remove(&id);
+            self.stops.forget(id);
             self.free_slots.push(id);
         }
     }

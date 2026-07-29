@@ -16,6 +16,7 @@ pub mod manager;
 pub mod radix;
 pub mod sched;
 pub mod single_type;
+pub mod update;
 
 #[cfg(feature = "python")]
 mod python;

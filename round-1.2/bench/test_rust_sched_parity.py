@@ -937,6 +937,103 @@ def bench(iters=3):
         print(f"python manager: {dt * 1e3:8.2f} ms total  {dt / len(order) * 1e6:7.2f} us/request")
 
 
+# ---------------------------------------------------------------------------
+# tier 4 -- R6a update core: the batched stop decision vs vLLM's check_stop
+# ---------------------------------------------------------------------------
+#
+# The oracle is `check_stop` (v1/core/sched/utils.py:94) transcribed with the counters
+# inlined, driven over a full stop matrix. A false "not stopped" leaks a request past its
+# max_tokens; a false "stopped" truncates an answer. Both are silent, so this tier is
+# exhaustive over the branch cross-product rather than sampled.
+
+NOT_STOPPED, FIN_STOPPED, FIN_LENGTH = 0, 1, 2
+
+
+def ref_check_stop(params, tokens, num_output, num_tokens, max_model_len):
+    """utils.py:94 `check_stop` inside scheduler.py:1904's append loop, verbatim."""
+    min_tokens, max_tokens, eos, stop_ids = params
+    for i, tok in enumerate(tokens, 1):
+        num_output += 1
+        num_tokens += 1
+        if num_output < min_tokens:
+            continue
+        if tok == eos:
+            return i, FIN_STOPPED, -1
+        if tok in stop_ids:
+            return i, FIN_STOPPED, tok
+        if num_tokens >= max_model_len or num_output >= max_tokens:
+            return i, FIN_LENGTH, -1
+    return len(tokens), NOT_STOPPED, -1
+
+
+@requires_crate
+def test_update_step_matches_check_stop():
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+    max_model_len = 64
+
+    # (min_tokens, max_tokens, eos, stop_token_ids) x (num_output, num_tokens) x tokens.
+    param_sets = [
+        (0, 4, 2, []),
+        (0, 4, 2, [13, 99]),
+        (3, 4, 2, [2]),          # eos also listed as a stop id: eos must win
+        (0, 1, None, [7]),       # no eos configured
+        (2, 100, 5, []),         # min_tokens gate, far from the length cap
+    ]
+    token_sets = [[7], [2], [99], [13], [5, 6, 2, 7], [7, 7, 7, 7, 7], []]
+    counters = [(0, 10), (3, 10), (7, 10), (0, max_model_len - 1), (0, max_model_len)]
+
+    cases = []
+    for pi, p in enumerate(param_sets):
+        slot = kv.intern(f"r{pi}")
+        kv.set_stop_params(slot, p[0], p[1], p[2], p[3])
+        assert kv.has_stop_params(slot)
+        for toks in token_sets:
+            for n_out, n_tok in counters:
+                cases.append((slot, p, toks, n_out, n_tok))
+
+    slots, cu, flat, n_out, n_tok = [], [0], [], [], []
+    for slot, _p, toks, o, t in cases:
+        slots.append(slot)
+        flat.extend(toks)
+        cu.append(len(flat))
+        n_out.append(o)
+        n_tok.append(t)
+
+    got = kv.update_step(slots, cu, flat, n_out, n_tok, max_model_len)
+    assert len(got) == len(cases)
+    for (slot, p, toks, o, t), rust in zip(cases, got):
+        want = ref_check_stop(p, toks, o, t, max_model_len)
+        assert tuple(rust) == want, (p, toks, o, t, rust, want)
+
+
+@requires_crate
+def test_update_step_refuses_unregistered_and_malformed_batches():
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+    known = kv.intern("known")
+    kv.set_stop_params(known, 0, 8, 2, [])
+    unknown = kv.intern("unknown")
+    assert not kv.has_stop_params(unknown)
+
+    got = kv.update_step([known, unknown], [0, 1, 2], [7, 7], [0, 0], [1, 1], 64)
+    assert got[0][1] == NOT_STOPPED
+    assert got[1][1] == 255, "an unregistered slot must be refused, not answered"
+
+    # Arity errors are exceptions, not silent wrong answers.
+    for bad in (
+        ([known], [0], [7], [0], [1]),            # cu_lens too short
+        ([known], [1, 2], [7], [0], [1]),         # cu_lens does not start at 0
+        ([known], [0, 5], [7], [0], [1]),         # cu_lens overruns token_ids
+        ([known], [0, 1], [7], [0, 0], [1]),      # counter arity mismatch
+    ):
+        with pytest.raises(Exception):
+            kv.update_step(*bad, 64)
+
+    # forget() drops the stop params with the id, so a recycled slot cannot inherit them.
+    kv.forget("known")
+    reused = kv.intern("fresh")
+    assert not kv.has_stop_params(reused)
+
+
 if __name__ == "__main__":
     if "--bench" in sys.argv:
         bench()

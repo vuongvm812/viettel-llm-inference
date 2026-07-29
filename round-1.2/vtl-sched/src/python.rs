@@ -21,6 +21,7 @@ use crate::hash::{Digest32, Key, HASH_LEN};
 use crate::manager::Manager;
 use crate::sched::{Params, SchedReq, ScheduleCore};
 use crate::single_type::{cdiv, Kind};
+use crate::update::StopParams;
 
 
 fn err(e: String) -> PyErr {
@@ -192,6 +193,66 @@ impl KvManager {
 
     fn num_hashes(&self, slot: u32) -> usize {
         self.inner.num_hashes(slot)
+    }
+
+    // ---- R6a: batched stop decision (update_from_output) -------------------
+
+    /// Intern a slot's immutable stop condition. Pushed once, when `rust_sched.py` first
+    /// sees the request; `forget()` drops it along with the id.
+    #[pyo3(signature = (slot, min_tokens, max_tokens, eos_token_id, stop_token_ids))]
+    fn set_stop_params(
+        &mut self,
+        slot: u32,
+        min_tokens: usize,
+        max_tokens: usize,
+        eos_token_id: Option<i64>,
+        stop_token_ids: Vec<i64>,
+    ) {
+        self.inner.stops.set(
+            slot,
+            StopParams {
+                min_tokens,
+                max_tokens,
+                eos_token_id,
+                stop_token_ids: stop_token_ids.into_iter().collect(),
+            },
+        );
+    }
+
+    fn has_stop_params(&self, slot: u32) -> bool {
+        self.inner.stops.has(slot)
+    }
+
+    /// One step's stop decisions. Flat in, flat out: request `i` owns
+    /// `token_ids[cu_lens[i]..cu_lens[i + 1]]`, and gets back
+    /// `(num_accepted, status, stop_reason)`. `status == 255` means the slot has no
+    /// interned params and Python must run `check_stop` itself for that request.
+    #[allow(clippy::too_many_arguments)]
+    fn update_step(
+        &mut self,
+        slots: Vec<u32>,
+        cu_lens: Vec<u32>,
+        token_ids: Vec<i64>,
+        num_output_tokens: Vec<u32>,
+        num_tokens: Vec<u32>,
+        max_model_len: usize,
+    ) -> PyResult<Vec<(u32, u8, i64)>> {
+        let out = self
+            .inner
+            .stops
+            .update_step(
+                &slots,
+                &cu_lens,
+                &token_ids,
+                &num_output_tokens,
+                &num_tokens,
+                max_model_len,
+            )
+            .map_err(err)?;
+        Ok(out
+            .iter()
+            .map(|v| (v.num_accepted, v.status, v.stop_reason))
+            .collect())
     }
 
     // ---- KVCacheManager surface -------------------------------------------

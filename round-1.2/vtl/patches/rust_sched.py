@@ -17,6 +17,10 @@ Gates (all default OFF, all independent except where noted)::
     VTL_RUST_SCHED_FULL=1          also run the Rust schedule() loop (implies VTL_RUST_SCHED)
     VTL_RUST_SCHED_RADIX=1         use the radix index instead of the flat hash map
                                    (same answers; see vtl-sched/src/radix.rs)
+    VTL_RUST_SCHED_UFO=1           R6a: batch the per-step stop decision of
+                                   update_from_output into ONE Rust call (needs _FULL)
+    VTL_RUST_SCHED_UFO_SHADOW=1    keep Python's check_stop authoritative and only log
+                                   where the Rust verdict disagrees
 
 Why shadow first: this replaces the most correctness-critical component in the engine,
 and LFM2's hybrid layout (6 full-attention + 10 short-conv/mamba groups,
@@ -103,6 +107,10 @@ def modes() -> dict:
         "authority": env_on("VTL_RUST_SCHED") or full,
         "full": full,
         "radix": env_on("VTL_RUST_SCHED_RADIX"),
+        # R6a rides on the full loop: it needs the Rust manager's slot interning, and
+        # nothing else in the engine would be Rust-backed without it.
+        "ufo": full and env_on("VTL_RUST_SCHED_UFO"),
+        "ufo_shadow": env_on("VTL_RUST_SCHED_UFO_SHADOW"),
     }
 
 
@@ -227,6 +235,15 @@ class RustMirror:
     def __init__(self, rust):
         self.rust = rust
         self._slots: dict[str, int] = {}
+        # slot -> hashes already pushed. `slot()` runs once per request PER STEP, so
+        # asking Rust for `num_hashes` there was one FFI crossing per request per step to
+        # re-learn a number only this class ever changes. Now it is one crossing per
+        # request LIFETIME (on first sight, because a recycled slot's hashes were cleared
+        # by `Manager::forget` and assuming that would couple us to its internals).
+        self._pushed: dict[int, int] = {}
+        # slots whose stop params are interned (UFO); discarded on drop so a recycled
+        # slot re-registers. Owned here because drop() is the one recycling point.
+        self._stops: set[int] = set()
 
     def slot(self, request) -> int:
         rid = request.request_id
@@ -234,16 +251,21 @@ class RustMirror:
         if slot is None:
             slot = self.rust.intern(rid)
             self._slots[rid] = slot
-        have = self.rust.num_hashes(slot)
+            self._pushed[slot] = self.rust.num_hashes(slot)
         hashes = request.block_hashes
+        have = self._pushed[slot]
         if len(hashes) > have:
             self.rust.push_hashes(
                 slot, b"".join(hashes[have:]), int(request.num_prompt_tokens)
             )
+            self._pushed[slot] = len(hashes)
         return slot
 
     def drop(self, request_id: str) -> None:
-        if self._slots.pop(request_id, None) is not None:
+        slot = self._slots.pop(request_id, None)
+        if slot is not None:
+            self._pushed.pop(slot, None)
+            self._stops.discard(slot)
             self.rust.forget(request_id)
 
 
@@ -827,6 +849,176 @@ def pack_req(slot: int, request) -> tuple:
     )
 
 
+def _install_update_from_output(scheduler_cls, shadow: bool):
+    """R6a -- one Rust call per step for the whole batch's stop decision.
+
+    THE SEAM, and why it is this one. ``update_from_output`` is 350 lines of
+    ``EngineCoreOutput`` assembly, connector bookkeeping and queue surgery, all of it over
+    Python objects that cannot cross the boundary. The only part that is arithmetic is
+    ``check_stop`` (utils.py:94), reached through the single narrow method
+    ``_update_request_with_output`` -- which is also the method ``AsyncScheduler``
+    overrides, so patching the base class covers both schedulers via its ``super()`` call.
+
+    So: the outer wrapper reads the whole step's sampled tokens BEFORE the loop and asks
+    Rust once; the inner wrapper then applies the precomputed verdict instead of calling
+    ``check_stop``. Per-request crossings would cost more than the six integer comparisons
+    they replace -- that is the entire reason for the batch shape.
+
+    FAIL-CLOSED AT EVERY JOINT. A request with no interned stop params, a
+    ``repetition_detection`` / structured-output / pooling request, a spec-decode step, or
+    a ``new_token_ids`` list whose length does not match what the batch was computed from,
+    all fall through to stock ``check_stop`` for that request alone.
+    """
+    from vllm.v1.request import RequestStatus
+
+    wrapped_ufo = scheduler_cls.update_from_output
+    wrapped_urwo = scheduler_cls._update_request_with_output
+
+    # Mirrors update.rs's status codes; 255 = "Rust has no params for this slot".
+    _STATUS_FROM_CODE = {
+        1: RequestStatus.FINISHED_STOPPED,
+        2: RequestStatus.FINISHED_LENGTH_CAPPED,
+    }
+
+    def register(rust, request, slot) -> bool:
+        """Intern the immutable half of this request's stop condition. False = refuse."""
+        sp = request.sampling_params
+        if sp is None or request.pooling_params is not None:
+            return False
+        # check_stop's two unported branches. `repetition_detection` is an O(n) scan over
+        # the whole output with its own tuning knobs; a structured-output request can be
+        # terminated by the grammar, which lives entirely in Python.
+        if getattr(sp, "repetition_detection", None) is not None:
+            return False
+        if getattr(request, "structured_output_request", None) is not None:
+            return False
+        # A resumable streaming session can be stopped, resumed via
+        # _update_request_as_session with REPLACED sampling_params, and keep its
+        # request_id -- so the interned "immutable half" would go stale on the same
+        # slot. Not judge traffic; refuse rather than model re-registration.
+        if getattr(request, "resumable", False):
+            return False
+        max_tokens = getattr(request, "max_tokens", None)
+        if not isinstance(max_tokens, int) or max_tokens <= 0:
+            return False
+        eos = getattr(sp, "eos_token_id", None)
+        rust.set_stop_params(
+            slot,
+            int(getattr(sp, "min_tokens", 0) or 0),
+            max_tokens,
+            None if eos is None else int(eos),
+            [int(t) for t in (sp.stop_token_ids or ())],
+        )
+        return True
+
+    def decide(self, kv, scheduler_output, model_runner_output):
+        """Build the flat batch and take the single crossing. None = nothing portable."""
+        rust, mirror = kv._rust, kv._mirror
+        sampled = model_runner_output.sampled_token_ids
+        slots: list[int] = []
+        cu: list[int] = [0]
+        toks: list[int] = []
+        n_out: list[int] = []
+        n_tok: list[int] = []
+        expect: list[tuple[str, int]] = []
+        for req_id, index in model_runner_output.req_id_to_index.items():
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            gen = sampled[index]
+            if not gen or getattr(request, "async_tokens_to_discard", 0):
+                continue
+            slot = mirror.slot(request)
+            # Python-side registry, same rationale as RustMirror._pushed: asking Rust
+            # `has_stop_params` here was one FFI crossing per request per step to re-learn
+            # a fact only this module changes. register() overwrites, so a lost entry
+            # (slot recycled -> discarded in mirror.drop) just re-registers.
+            if slot not in mirror._stops:
+                if not register(rust, request, slot):
+                    continue
+                mirror._stops.add(slot)
+            slots.append(slot)
+            expect.append((req_id, len(gen)))
+            toks.extend(gen)
+            cu.append(len(toks))
+            # Read BEFORE the loop appends anything -- exactly the values check_stop would
+            # see on its first iteration.
+            n_out.append(request.num_output_tokens)
+            n_tok.append(request.num_tokens)
+        if not slots:
+            return None
+        out = rust.update_step(slots, cu, toks, n_out, n_tok, int(self.max_model_len))
+        return {rid: (n, *v) for (rid, n), v in zip(expect, out)}
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        self._vtl_ufo = None
+        kv = self.kv_cache_manager
+        if (
+            hasattr(kv, "_rust")
+            and model_runner_output.sampled_token_ids
+            and not scheduler_output.scheduled_spec_decode_tokens
+            and not model_runner_output.pooler_output
+        ):
+            try:
+                self._vtl_ufo = decide(self, kv, scheduler_output, model_runner_output)
+            except BaseException as exc:
+                reraise_fatal(exc)
+                log.exception("rust_sched: UFO batch failed; this step uses check_stop")
+                self._vtl_ufo = None
+        try:
+            return wrapped_ufo(self, scheduler_output, model_runner_output)
+        finally:
+            self._vtl_ufo = None
+
+    def _update_request_with_output(self, request, new_token_ids):
+        decided = self._vtl_ufo
+        answer = decided.pop(request.request_id, None) if decided else None
+        # 255 = unregistered slot; a length mismatch means something mutated the request
+        # between the batch and here. Either way, stock decides.
+        if answer is None or answer[2] == 255 or answer[0] != len(new_token_ids):
+            return wrapped_urwo(self, request, new_token_ids)
+        _, num_keep, status, stop_reason = answer
+
+        if shadow:
+            kept, stopped = wrapped_urwo(self, request, new_token_ids)
+            want = status != 0
+            if stopped != want or len(kept) != num_keep:
+                log.error(
+                    "rust_sched: UFO shadow divergence on %s -- python (%d kept, stopped=%s) "
+                    "vs rust (%d kept, status=%d)",
+                    request.request_id, len(kept), stopped, num_keep, status,
+                )
+            elif want:
+                # stop_reason is compared too: EOS-also-in-stop_token_ids is the one
+                # branch where status matches but the precedence choice shows only here.
+                rust_reason = stop_reason if stop_reason >= 0 else None
+                if (request.status is not _STATUS_FROM_CODE[status]
+                        or request.stop_reason != rust_reason):
+                    log.error(
+                        "rust_sched: UFO shadow status divergence on %s -- python "
+                        "(%s, reason=%s) vs rust (%s, reason=%s)",
+                        request.request_id, request.status, request.stop_reason,
+                        _STATUS_FROM_CODE[status], rust_reason,
+                    )
+            return kept, stopped
+
+        for token_id in new_token_ids[:num_keep]:
+            request.append_output_token_ids(token_id)
+        if status == 0:
+            return new_token_ids, False
+        del new_token_ids[num_keep:]
+        request.status = _STATUS_FROM_CODE[status]
+        if stop_reason >= 0:
+            request.stop_reason = stop_reason
+        return new_token_ids, True
+
+    mark_patched(update_from_output, wrapped_ufo, patch="rust_sched_ufo")
+    mark_patched(_update_request_with_output, wrapped_urwo, patch="rust_sched_ufo")
+    scheduler_cls.update_from_output = update_from_output
+    scheduler_cls._update_request_with_output = _update_request_with_output
+    log.info("rust_sched: UFO batched stop decision active (shadow=%s)", shadow)
+
+
 def _install_full_schedule(scheduler_cls, sjf_enabled: bool):
     """Replace ``Scheduler.schedule`` with the Rust-driven decision loop."""
     import time
@@ -1120,6 +1312,11 @@ def apply() -> None:
         _install_full_schedule(Scheduler, sjf)
         Scheduler.schedule.__vtl_rust_full__ = True
 
+        if m["ufo"] and not already_patched(
+            Scheduler, "update_from_output", patch="rust_sched_ufo"
+        ):
+            _install_update_from_output(Scheduler, m["ufo_shadow"])
+
 
 # --------------------------------------------------------------------------
 # self-check -- runs with neither vLLM nor the compiled crate
@@ -1130,13 +1327,14 @@ def _self_check() -> None:
     saved = {k: os.environ.get(k) for k in (
         "VTL_RUST_SCHED", "VTL_RUST_SCHED_SHADOW", "VTL_RUST_SCHED_FULL",
         "VTL_RUST_SCHED_SHADOW_STRICT", "VTL_RUST_SCHED_RADIX",
+        "VTL_RUST_SCHED_UFO", "VTL_RUST_SCHED_UFO_SHADOW",
     )}
     try:
         for k in saved:
             os.environ.pop(k, None)
         assert modes() == {
             "shadow": False, "strict": False, "authority": False,
-            "full": False, "radix": False,
+            "full": False, "radix": False, "ufo": False, "ufo_shadow": False,
         }, modes()
         assert env_on("VTL_RUST_SCHED") is False
         for truthy in ("1", "true", "YES", " on "):
@@ -1148,6 +1346,11 @@ def _self_check() -> None:
         os.environ.pop("VTL_RUST_SCHED")
         os.environ["VTL_RUST_SCHED_FULL"] = "1"
         assert modes()["authority"] is True and modes()["full"] is True
+        # UFO needs the full loop: it reads the Rust manager's slot interning.
+        os.environ["VTL_RUST_SCHED_UFO"] = "1"
+        assert modes()["ufo"] is True
+        os.environ["VTL_RUST_SCHED_FULL"] = "0"
+        assert modes()["ufo"] is False, "UFO must not arm without the full Rust loop"
     finally:
         for k, v in saved.items():
             if v is None:

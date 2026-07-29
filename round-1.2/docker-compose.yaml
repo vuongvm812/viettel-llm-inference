@@ -123,8 +123,7 @@ services:
       VTL_V2_FORCE_CUTLASS_FP8: "1"      # force fp8 layers off Marlin (its stable-ABI aten::empty
                                          #   crashes under V2's dynamic-shape graph) onto CUTLASS.
                                          #   Only matters under V2; "0" reverts. See quant_fp8.py.
-      # VTL_V2_FUSED_CONV_ALIGN reserved for the on-box fused conv+align kernel (Part B Target 1);
-      # inert until that .cu is built and parity-checked -- stock precopy runs meanwhile.
+      # VTL_V2_FUSED_CONV_ALIGN now lands for real in the hotpath batch block below.
 
       # vLLM only pins torch's CPU thread count in set_multiprocessing_worker_envs(), which the
       # MULTIPROC executor calls. At --tensor-parallel-size=1 we get UniProcExecutor, which
@@ -231,6 +230,42 @@ services:
       # Interpolated so `make sweep-schedule` can drive it from the host env with no file edit.
       # Unset resolves to empty, i.e. the kernel heuristic -- what submissions ship.
       VTL_W4A8_SCHEDULE: ""
+
+      # ---- round-1.2 hot-path batch (docs/round-1.2-hotpath-batch-plan.md). ALL ENABLED by
+      # decision, 2026-07-29. INERT UNTIL THE IMAGE CARRIES THIS CODE: three of the six items
+      # are new CUDA / new fork patches, so `make vllm-fork PUSH=1` -> re-pin the digest above
+      # -> `make build` must run first, or these envs land on an image that has never heard of
+      # them (harmless, but they buy nothing). Every runtime gate fails CLOSED to the stock
+      # path -- a missing op, a wrong layout or too little occupancy disarms the feature at
+      # boot, it does not crash. If TPOT/TTFT regresses, bisect by flipping these to 0 ONE AT
+      # A TIME (bench/ab_summary.py); they are independent.
+      VTL_ENABLE_DECODE_FASTPATH: "1"    # skip the metadata build that FULL cudagraph discards
+                                         #   on repeat pure-decode steps. Revert: "0".
+      VTL_DECODE_FASTPATH_SHADOW: "0"    # DEBUG ARM: run both paths and diff the persistent
+                                         #   buffers every step. Doubles the host work; "1" only
+                                         #   to investigate a suspected divergence.
+      VTL_UVA_POOL: "1"                  # pooled pinned staging instead of pin_memory() (i.e. a
+                                         #   cudaHostAlloc) twice per step. Revert: "0".
+      VTL_RUST_SCHED_UFO: "1"            # batch update_from_output's stop decision into one Rust
+                                         #   call. Needs VTL_RUST_SCHED_FULL. Revert: "0".
+      VTL_RUST_SCHED_UFO_SHADOW: "0"     # keep python's check_stop authoritative, log Rust
+                                         #   disagreement. Soak arm; "1" costs both paths.
+      VTL_V2_FUSED_CONV_ALIGN: "1"       # mamba align pre-copy: 1 launch instead of 2 (state
+                                         #   advance + conv window migration). Revert: "0".
+      VTL_ENABLE_CONV_ALIGN_FUSED: "1"   # registers the op the line above calls. Revert: "0".
+      VTL_SHORTCONV_MEGA: "1"            # the WHOLE short-conv decode block in one launch
+                                         #   (quant -> in_proj W4A8 -> conv+gate -> out_proj).
+                                         #   Only fires at <=8 decode tokens, decode-only, and
+                                         #   only when the kernel's measured co-residency covers
+                                         #   its device barrier. Revert: "0".
+      VTL_ENABLE_SHORTCONV_MEGA: "1"     # registers the op + its persistent scratch and the
+                                         #   megakernel's own int4 weight view (~84 MB; the
+                                         #   CUTLASS-packed weights are not readable by hand).
+                                         #   Revert: "0" -- also frees that memory.
+      VTL_WARMUP_CONCURRENCY: "8"        # warm cudagraph capture sizes 2/4/8 by replaying the
+                                         #   baked trace slice concurrently after line 0 (which
+                                         #   stays serial, to seed the shared prefix unraced).
+                                         #   Revert to the sequential prime: "1".
 
       # ---- opt/round12-5ws knobs. ALL ENABLED (2026-07-28, by decision) on the strongest
       # un-benchmarked hypothesis per feature. NONE of these has cleared a 3-boot A/B on the
