@@ -262,7 +262,7 @@ services:
       # ranked below the decode arms -- and it has never been measured. Sweep with
       # `make sweep-schedule PREFILL=1` before turning it on.
       # Legal names: 128x128_1x2x1_pf (cluster + AlongN) 128x128_1x1x1_pf (AlongN + swizzle).
-      VTL_W4A8_SCHEDULE_V2_PREFILL: ""
+      VTL_W4A8_SCHEDULE_V2_PREFILL: "128x128_1x2x1_pf"
       VTL_W4A8_V2_PREFILL_MAX: "0"
 
       # Overrides the SM count CUTLASS schedules against. EMPTY = query the device, which is
