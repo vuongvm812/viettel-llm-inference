@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:4e2b68d05b2ddacbcb37ba44f421ce673507bfc368de60d4426d7f531787b042 # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:caded74f7268072579e4054ebefaaadf61d8bb9b5105cda212495f94e80599c2 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -32,7 +32,6 @@ services:
       - --max-model-len=32768
       - --gpu-memory-utilization=0.90
       - --tensor-parallel-size=1
-      - --attention-backend=FLASHINFER
 
       # Intra-conversation prefix reuse is the biggest win now (turn N reuses turns 0..N-1).
       # LFM2 is a hybrid (short-conv state + attn KV): mamba_cache_mode MUST be `align` --
