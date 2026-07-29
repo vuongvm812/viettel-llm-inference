@@ -321,17 +321,6 @@ struct W4A8GemmKernelV2 {
           AlignmentA, ElementAccumulator, TileShape, ClusterShape,
           StageCountType, KernelSchedule>::CollectiveOp;
 
-  // VTL: CUTLASS does NOT bounds-check an explicit StageCount -- compute_stage_count_or_override
-  // returns the requested number unchanged, and an over-budget kernel first fails inside
-  // initialize(), where cudaFuncSetAttribute(MaxDynamicSharedMemorySize) rejects it. That is a
-  // CUTLASS_CHECK throw at the first forward of a benchmark. With no H200 to test on, the Docker
-  // build is the only place this can be caught, so assert it at compile time.
-  // 232448 = cutlass::detail::sm90_smem_capacity_bytes (227 KB, not 228).
-  static_assert(sizeof(typename CollectiveMainloopShuffled::SharedStorage) +
-                        sizeof(typename CollectiveEpilogue::SharedStorage) <=
-                    232448,
-                "vtl w4a8 v2: mainloop+epilogue smem exceeds Hopper's 227KB/SM; lower Stages");
-
   // VTL: 4th GemmUniversal param. Upstream omits it, which defaults to void ->
   // PersistentScheduler; passing PersistentScheduler explicitly is the same kernel.
   using GemmKernelShuffled = cutlass::gemm::kernel::GemmUniversal<
@@ -339,6 +328,22 @@ struct W4A8GemmKernelV2 {
       CollectiveMainloopShuffled, CollectiveEpilogue, TileScheduler>;
   using GemmShuffled =
       cutlass::gemm::device::GemmUniversalAdapter<GemmKernelShuffled>;
+
+  // VTL: CUTLASS does NOT bounds-check an explicit StageCount -- compute_stage_count_or_override
+  // returns the requested number unchanged, and an over-budget kernel first fails inside
+  // initialize(), where cudaFuncSetAttribute(MaxDynamicSharedMemorySize) rejects it. That is a
+  // CUTLASS_CHECK throw at the first forward of a benchmark. With no H200 to test on, the Docker
+  // build is the only place this can be caught, so assert it at compile time.
+  //
+  // Assert on the KERNEL's SharedStorage, which is the exact byte count CUTLASS hands to
+  // cudaFuncSetAttribute. Summing the two collectives' SharedStorage instead over-counts and
+  // rejects arms that fit: StageCountAutoCarveout already subtracts the epilogue before sizing
+  // the mainloop pipeline, and GemmUniversal overlaps the two in its own storage layout. That
+  // version of this assert failed the build on 128x32_1x1x1_sk and 128x8_1x1x1, both of which
+  // are upstream-shaped arms that have always compiled.
+  // 232448 = cutlass::detail::sm90_smem_capacity_bytes (227 KB, not 228).
+  static_assert(sizeof(typename GemmKernelShuffled::SharedStorage) <= 232448,
+                "vtl w4a8 v2: kernel smem exceeds Hopper's 227KB/SM; lower Stages");
 
   using StrideC = typename GemmKernelShuffled::StrideC;
   using StrideD = typename GemmKernelShuffled::StrideD;
