@@ -31,7 +31,7 @@ import logging
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl.msgspec_json")
 
 
 def _decode_body(body, decode):

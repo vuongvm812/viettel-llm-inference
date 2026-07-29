@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:4e2b68d05b2ddacbcb37ba44f421ce673507bfc368de60d4426d7f531787b042 # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:7dd03555e12fa396a088d6d14d4d7cbeb33322f48e4bbaa6459772078b227375 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -32,7 +32,7 @@ services:
       - --max-model-len=32768
       - --gpu-memory-utilization=0.90
       - --tensor-parallel-size=1
-      - --attention-backend=FLASHINFER
+      # - --attention-backend=FLASHINFER
 
       # Intra-conversation prefix reuse is the biggest win now (turn N reuses turns 0..N-1).
       # LFM2 is a hybrid (short-conv state + attn KV): mamba_cache_mode MUST be `align` --
@@ -236,14 +236,48 @@ services:
       # v2 CUTLASS W4A8 schedules (vtl._C_w4a8: Stream-K / cluster / small-tile arms).
       # EMPTY = feature off, stock kernel everywhere. Either one bare name or a per-shape map
       # "n<out>k<in>=<name>;...;*=<name>". Legal names: 128x16_1x1x1_sk 128x32_1x1x1_sk
-      # 128x16_2x1x1 128x8_1x1x1 64x16_1x1x1_pp 64x32_1x1x1_pp. Only fires at M <= MTHRESH;
-      # prefill always keeps the stock heuristic. Driven by `make sweep-schedule V2=1`.
+      # 128x16_1x1x1_sk_nd 128x32_1x1x1_sk_nd 128x16_1x1x1_splitk4 128x32_1x1x1_splitk4
+      # 128x16_1x1x1_s4 128x16_1x1x1_s8 128x16_2x1x1 128x8_1x1x1 64x16_1x1x1_pp 64x32_1x1x1_pp.
+      # Only fires at M <= MTHRESH. Driven by `make sweep-schedule V2=1`.
       # ENABLED with the primary hypothesis: Stream-K on every decode GEMM (the stock choice
       # at these shapes is 128x16_1x1x1 with no k-split; w2 runs 16 CTAs x 64 k-iters on
       # 16 SMs). Swap the map for the sweep winner once `make sweep-schedule V2=1` has run.
+      # NOT the _sk_nd variant: nondeterministic reduction is a sweep arm only, because it makes
+      # results non-reproducible run-to-run and a flake then looks like a regression.
       VTL_W4A8_SCHEDULE_V2: "*=128x16_1x1x1_sk"
-      VTL_W4A8_V2_MTHRESH: "32"              # decode/prefill boundary for the v2 arms; 0 = control
-                                             # arm (always forward to the stock kernel)
+      VTL_W4A8_V2_MTHRESH: "32"              # decode band upper bound; 0 = control arm
+                                             # (always forward to the stock kernel)
+
+      # Prefill band, M in (MTHRESH, PREFILL_MAX]. This is the ONLY place cluster multicast of
+      # the WEIGHTS and raster order do anything: CUTLASS multicasts operand A (the weights,
+      # after swap+transpose) along the cluster's N dim, and that dim tiles TOKENS -- so at
+      # decode's single token tile no cluster shape can share a weight byte, while at M~512 with
+      # TileN=128 there are four tiles and a ClusterN=2 pair shares an 8 KB int4 tile per
+      # k-iteration. Raster order matters for the same reason and is probably the larger half:
+      # CUTLASS's heuristic picks AlongM here, which reuses the ACTIVATION (~2 KB) and re-reads
+      # every weight tile, where AlongN reuses the weights. Both *_pf arms force AlongN.
+      #
+      # OFF BY DEFAULT (max 0 = band closed = the stock heuristic runs, exactly as before).
+      # This is a TTFT play and the ERS gradient values 1 ms TPOT at ~23x 1 ms TTFT, so it is
+      # ranked below the decode arms -- and it has never been measured. Sweep with
+      # `make sweep-schedule PREFILL=1` before turning it on.
+      # Legal names: 128x128_1x2x1_pf (cluster + AlongN) 128x128_1x1x1_pf (AlongN + swizzle).
+      VTL_W4A8_SCHEDULE_V2_PREFILL: ""
+      VTL_W4A8_V2_PREFILL_MAX: "0"
+
+      # Overrides the SM count CUTLASS schedules against. EMPTY = query the device, which is
+      # what upstream does. Set this ONLY if the boot line "vtl: w4a8 v2 armed -- cutlass
+      # sm_count=N" reports the physical H200's 132 rather than the slice's ~16: every
+      # persistent grid and every Stream-K split is sized from that number, so a wrong one
+      # silently mis-schedules every GEMM. One-line fix, no rebuild.
+      VTL_W4A8_SM_COUNT: ""
+
+      # Read-only go/no-go for a cooperative-grid decode megakernel: cooperative-launch support,
+      # the co-resident block ceiling, and whether MPS is on (the one thing CUDA documents as
+      # incompatible with cooperative launch -- stream capture into a CUDA graph is fine). Two
+      # device-attribute queries at load; launches nothing, allocates nothing. Reports "GO" or
+      # "NO-GO" on the boot line. 0 to silence.
+      VTL_ENABLE_MEGAKERNEL_PROBE: 1
 
       # iceoryx2 shm data plane frontend<->EngineCore (ZMQ stays for handshake/death/fallback).
       # BOTH the registry gate and the master switch must be 1 to activate; RAW additionally

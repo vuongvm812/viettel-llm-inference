@@ -30,7 +30,7 @@ import time
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl.msgspec_stream")
 
 _OBJ = "chat.completion.chunk"
 

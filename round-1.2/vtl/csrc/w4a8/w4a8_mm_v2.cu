@@ -3,7 +3,11 @@
 // WHY THIS EXISTS. vLLM's W4A8 kernel ships ten instantiations and a heuristic that keys only
 // on M/N/K (w4a8_mm_entry.cu:341-372). It was tuned on a full 132-SM Hopper; the judge runs an
 // H200 MIG 1g.18gb slice with ~16 SMs, so the *wave* structure the heuristic implicitly assumes
-// is wrong here. Concretely, at decode (M=1-8) after the kernel's swap+transpose:
+// is wrong here. It also never takes over prefill, so the two Hopper knobs that require more
+// than one TOKEN tile -- cluster multicast of the weights, and raster order -- had no path to
+// fire at all; the *_pf arms and the prefill band exist for that.
+//
+// Concretely, at decode (M=1-8) after the kernel's swap+transpose:
 //
 //   layer          CTAs @ TileM=128    waves on 16 SMs    k-iters (K/128)
 //   qkv  n3072     24                  1.5  (ragged)      16
@@ -13,7 +17,8 @@
 // A single deep wave (w2) and a ragged 1.5 waves (qkv) are exactly the two cases Stream-K was
 // designed for, and `cutlass_w4a8` has no Stream-K arm anywhere. Nine of its ten instantiations
 // are also cluster 1x1x1, so TMA multicast is never used. This extension adds the missing arms
-// so they can be swept on the box; it changes nothing unless VTL_W4A8_SCHEDULE_V2 is set.
+// so they can be swept on the box; it changes nothing unless VTL_W4A8_SCHEDULE_V2 (decode) or
+// VTL_W4A8_SCHEDULE_V2_PREFILL + VTL_W4A8_V2_PREFILL_MAX (prefill) is set.
 //
 // WHY A SEPARATE .so. Built for sm_90a ONLY, with no PTX (deliberate -- a JIT fallback would
 // hide an arch mismatch until the first launch). A non-Hopper box therefore cannot load this
@@ -42,12 +47,14 @@
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <type_traits>
 #include <vector>
 
 #include "cutlass/cutlass.h"
+#include "cutlass/kernel_hardware_info.h"
 
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
@@ -168,6 +175,86 @@ using OperatorClass = cutlass::arch::OpClassTensorOp;  // Operator class tag
 using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
 // ----------------------------------------------------------------------------
+// Hardware info -- queried ONCE per process
+// ----------------------------------------------------------------------------
+// Upstream leaves Arguments::hw_info default-constructed (sm_count = 0). That is not inert:
+// every initialize() then runs KernelHardwareInfo::query_device_multiprocessor_count(), i.e. a
+// cudaDeviceGetAttribute round-trip, and this model issues ~50 W4A8 GEMMs per decode step on a
+// host-sensitive path. Querying once and caching removes ~50 host round-trips/step.
+//
+// It also buys the escape hatch this whole extension needs. sm_count is what BOTH schedulers
+// size themselves from -- the persistent one launches min(sm_count, tiles) CTAs, and Stream-K
+// derives its k-split units and its workspace from it. If a MIG 1g.18gb slice reports 132
+// (the physical H200) rather than its own ~16, every persistent grid is 8x oversubscribed and
+// Stream-K splits for a device that is not there. Whether MIG reports the slice or the physical
+// GPU could not be settled from NVIDIA's docs, so VTL_W4A8_SM_COUNT overrides it without a
+// rebuild. The value CUTLASS ends up using is logged at load by quant_w4a8.py.
+//
+// Function-local static: one CUDA device per process, which is what a MIG slice gives us.
+static cutlass::KernelHardwareInfo const& hardware_info() {
+  static cutlass::KernelHardwareInfo const info = [] {
+    cutlass::KernelHardwareInfo hw;
+    char const* env = std::getenv("VTL_W4A8_SM_COUNT");
+    int const override_sm = (env && *env) ? std::atoi(env) : 0;
+    hw.sm_count = override_sm > 0
+                      ? override_sm
+                      : cutlass::KernelHardwareInfo::query_device_multiprocessor_count();
+    return hw;
+  }();
+  return info;
+}
+
+// Reported through `vllm_cuda::w4a8_sm_count()` so the boot log can state the number CUTLASS is
+// actually scheduling against, rather than the one torch reports.
+int64_t sm_count() { return hardware_info().sm_count; }
+
+// ----------------------------------------------------------------------------
+// Scheduler tuning -- the runtime half of an arm
+// ----------------------------------------------------------------------------
+// Tile/cluster/schedule are types; decomposition mode, k-split count, reduction mode, raster
+// order and swizzle are runtime fields on Arguments::scheduler. Carrying them as a traits type
+// keeps one arm = one `using`, and lets the illegal combination below be a compile error.
+//
+// raster: 0 = leave CUTLASS's Heuristic, 1 = AlongM, 2 = AlongN. NOT an enum, because the enum
+// lives on the scheduler type and each arm would have to name its own.
+struct SchedDefault {
+  static constexpr int kSplits = 1;
+  static constexpr bool kSplitK = false;
+  static constexpr bool kNondeterministic = false;
+  static constexpr int kRaster = 0;
+  static constexpr int kMaxSwizzle = 1;
+};
+
+// Nondeterministic reduction. Deterministic makes Stream-K peers hand off in K order behind a
+// lock; nondeterministic drops that to two rendezvous (first writer, last accumulator). The
+// numerical cost is fp32 partials summed out of order -- ~1e-7 relative, four orders below the
+// 1e-2 the parity test allows. The REAL cost is that results stop being bit-reproducible
+// run-to-run, so a flake and a regression become indistinguishable by re-running. Sweep-only:
+// do not make this the shipped default.
+struct SchedNondet : SchedDefault {
+  static constexpr bool kNondeterministic = true;
+};
+
+// Fixed split-K. For w2 (k=8192 -> 64 k-iters over 16 tiles = exactly one deep wave) an even
+// 4-way split is a cleaner decomposition than Stream-K's ragged unit assignment. CUTLASS clamps
+// to min(splits, sm_count, k_tiles) internally.
+struct SchedSplitK4 : SchedDefault {
+  static constexpr int kSplits = 4;
+  static constexpr bool kSplitK = true;
+};
+
+// Weight-major raster. Only meaningful when the token grid has more than one tile, i.e. prefill
+// -- see the note on the prefill arms below.
+struct SchedRasterN : SchedDefault {
+  static constexpr int kRaster = 2;
+};
+
+struct SchedRasterNSwizzle4 : SchedDefault {
+  static constexpr int kRaster = 2;
+  static constexpr int kMaxSwizzle = 4;
+};
+
+// ----------------------------------------------------------------------------
 // Kernel template -- Tile/Cluster shapes, kernel/epilogue schedule, scheduler
 // ----------------------------------------------------------------------------
 // VTL: upstream's W4A8GemmKernel takes <TileShape_MN, ClusterShape_MNK> and hardcodes the
@@ -177,11 +264,21 @@ using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 template <class TileShape_MN, class ClusterShape_MNK,
           class KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative,
           class EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative,
-          class TileScheduler = cutlass::gemm::PersistentScheduler>
+          class TileScheduler = cutlass::gemm::PersistentScheduler,
+          class SchedTune = SchedDefault,
+          int Stages = 0>  // 0 = CUTLASS's auto carveout, i.e. upstream
 struct W4A8GemmKernelV2 {
   using TileShape =
       decltype(cute::append(TileShape_MN{}, cute::Int<TileShapeK>{}));
   using ClusterShape = ClusterShape_MNK;
+
+  // VTL: splits > 1 is a HARD can_implement rejection under forced StreamK -- CUTLASS only
+  // honours it for SplitK or Heuristic (sm90_tile_scheduler_stream_k.hpp can_implement). Left
+  // to runtime that is a CUTLASS_CHECK throw at the first forward, i.e. mid-benchmark.
+  static_assert(SchedTune::kSplits == 1 || SchedTune::kSplitK,
+                "vtl w4a8 v2: kSplits > 1 requires kSplitK (StreamK rejects an explicit split)");
+  static_assert(SchedTune::kRaster >= 0 && SchedTune::kRaster <= 2,
+                "vtl w4a8 v2: kRaster is 0 (Heuristic), 1 (AlongM) or 2 (AlongN)");
 
   // Epilogue per-tok, per-chan scales
   using ChTokScalesEpilogue =
@@ -203,6 +300,16 @@ struct W4A8GemmKernelV2 {
                              // swap + transpose.
           EVTCompute>::CollectiveOp;
 
+  // VTL: Stages == 0 keeps upstream's auto carveout verbatim; any other value pins the mainloop
+  // pipeline depth. Auto lands around 19 stages at 128x16 (~11.3 KB/stage against Hopper's
+  // 227 KB), so the only interesting direction is shallower -- fewer stages means less TMA in
+  // flight, which may not matter on the 16-k-iteration shapes.
+  using StageCountType = std::conditional_t<
+      Stages == 0,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::collective::StageCount<Stages>>;
+
   // The Scale information must get paired with the operand that will be scaled.
   // In this example, B is scaled so we make a tuple of B's information and the
   // scale information.
@@ -212,9 +319,18 @@ struct W4A8GemmKernelV2 {
           cute::tuple<ElementB, cutlass::Array<ElementScale, ScalePackSize>>,
           LayoutB_Reordered, AlignmentB, ElementA, LayoutA_Transpose,
           AlignmentA, ElementAccumulator, TileShape, ClusterShape,
-          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-              sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          KernelSchedule>::CollectiveOp;
+          StageCountType, KernelSchedule>::CollectiveOp;
+
+  // VTL: CUTLASS does NOT bounds-check an explicit StageCount -- compute_stage_count_or_override
+  // returns the requested number unchanged, and an over-budget kernel first fails inside
+  // initialize(), where cudaFuncSetAttribute(MaxDynamicSharedMemorySize) rejects it. That is a
+  // CUTLASS_CHECK throw at the first forward of a benchmark. With no H200 to test on, the Docker
+  // build is the only place this can be caught, so assert it at compile time.
+  // 232448 = cutlass::detail::sm90_smem_capacity_bytes (227 KB, not 228).
+  static_assert(sizeof(typename CollectiveMainloopShuffled::SharedStorage) +
+                        sizeof(typename CollectiveEpilogue::SharedStorage) <=
+                    232448,
+                "vtl w4a8 v2: mainloop+epilogue smem exceeds Hopper's 227KB/SM; lower Stages");
 
   // VTL: 4th GemmUniversal param. Upstream omits it, which defaults to void ->
   // PersistentScheduler; passing PersistentScheduler explicitly is the same kernel.
@@ -231,6 +347,13 @@ struct W4A8GemmKernelV2 {
   static constexpr bool kStreamK =
       std::is_same_v<TileScheduler, cutlass::gemm::StreamKScheduler>;
 
+  // VTL: reported by w4a8_stages() so the boot log can state the pipeline depth CUTLASS chose,
+  // which is otherwise invisible for the Stages == 0 (auto carveout) arms.
+  static constexpr int kStages = CollectiveMainloopShuffled::DispatchPolicy::Stages;
+  // After swap+transpose the problem is {n, m, k}: CUTLASS's N dim tiles TOKENS.
+  static constexpr int kTileN = cute::size<1>(TileShape{});
+  static constexpr int kClusterN = cute::size<1>(ClusterShape{});
+
   static at::Tensor mm(at::Tensor const& A,
                        at::Tensor const& B,             // already packed
                        at::Tensor const& group_scales,  // already packed
@@ -242,6 +365,20 @@ struct W4A8GemmKernelV2 {
     int m = A.size(0);
     int k = A.size(1);
     int n = B.size(1);
+
+    // VTL: a cluster wider than the token grid is a SILENT 2x regression, not an error.
+    // get_grid_shape rounds the logical grid up to a whole number of clusters, blocks_per_problem
+    // is computed from the PADDED value, and the scheduler hands those phantom tiles out as valid
+    // work -- so the extra CTAs run the whole mainloop and the epilogue predicates their output
+    // away. can_implement checks nothing about clusters against the grid, so nothing else catches
+    // it. Cheap host-side compare against a GEMM that is microseconds at its cheapest.
+    if constexpr (kClusterN > 1) {
+      TORCH_CHECK(cutlass::ceil_div(m, kTileN) >= kClusterN,
+                  "vtl w4a8 v2: cluster N=", kClusterN, " needs at least that many token tiles, "
+                  "but m=", m, " with TileN=", kTileN, " gives ",
+                  cutlass::ceil_div(m, kTileN),
+                  " -- half the slice would compute discarded output. Use a 1x1x1 arm here.");
+    }
 
     // safely cast group_size to int
     TORCH_CHECK(
@@ -296,23 +433,49 @@ struct W4A8GemmKernelV2 {
         D_ptr,
         stride_D};
 
+    // VTL: hw_info is the 5th member of the Arguments aggregate; scheduler is the 6th. Upstream
+    // brace-initializes only the first four, leaving sm_count = 0 and a device query inside
+    // every initialize(). See hardware_info() for why that matters on a MIG slice.
     Args arguments{cutlass::gemm::GemmUniversalMode::kGemm,
                    {n, m, k, 1},  // shape
                    mainloop_arguments,
-                   epilogue_arguments};
+                   epilogue_arguments,
+                   hardware_info()};
 
     // VTL: the ONLY behavioural addition. CUTLASS's Stream-K scheduler defaults to
     // DecompositionMode::Heuristic, which falls back to plain data-parallel whenever the tile
     // grid already covers the device -- and at decode our grids are 16-128 CTAs, so the
     // heuristic would silently give us the arm we already have. Forcing StreamK is what makes
-    // the *_sk arms mean anything. hw_info is left default on purpose: CUTLASS then queries the
-    // SM count, which is what upstream's persistent scheduler does too (on a MIG slice CUDA
-    // reports the slice's SMs, which is the number Stream-K should be splitting for -- worth
-    // confirming on the box, because a 132 here would size the splits for the wrong device).
+    // the *_sk arms mean anything.
     if constexpr (kStreamK) {
-      using DecompositionMode =
-          typename GemmKernelShuffled::TileScheduler::DecompositionMode;
-      arguments.scheduler.decomposition_mode = DecompositionMode::StreamK;
+      using TS = typename GemmKernelShuffled::TileScheduler;
+      if constexpr (SchedTune::kSplitK) {
+        arguments.scheduler.decomposition_mode = TS::DecompositionMode::SplitK;
+        arguments.scheduler.splits = SchedTune::kSplits;
+      } else {
+        arguments.scheduler.decomposition_mode = TS::DecompositionMode::StreamK;
+      }
+      if constexpr (SchedTune::kNondeterministic) {
+        arguments.scheduler.reduction_mode = TS::ReductionMode::Nondeterministic;
+      }
+    }
+
+    // Raster order and swizzle live on the BASE scheduler Arguments, so both the persistent and
+    // the Stream-K schedulers carry them.
+    //
+    // Both are provable no-ops at decode and are only wired up for the prefill arms: CUTLASS
+    // derives the swizzle from min(tiles_m, tiles_n) and the raster order only reorders a 2-D
+    // walk, and at m <= 8 with any TileN >= 8 the token grid is a single tile -- so tiles_n == 1
+    // collapses the swizzle to 0 and makes both raster directions enumerate identically.
+    if constexpr (SchedTune::kRaster != 0) {
+      using RasterOrderOptions =
+          typename GemmKernelShuffled::TileScheduler::RasterOrderOptions;
+      arguments.scheduler.raster_order = SchedTune::kRaster == 1
+                                             ? RasterOrderOptions::AlongM
+                                             : RasterOrderOptions::AlongN;
+    }
+    if constexpr (SchedTune::kMaxSwizzle > 1) {
+      arguments.scheduler.max_swizzle_size = SchedTune::kMaxSwizzle;
     }
 
     // Workspace. Stream-K needs this ZEROED (it holds the reduction barriers), which is what
@@ -351,9 +514,61 @@ using Kernel_128x32_1x1x1_sk =
                      cutlass::epilogue::TmaWarpSpecializedCooperative,
                      cutlass::gemm::StreamKScheduler>;
 
+// Nondeterministic Stream-K reduction. Same decomposition as the *_sk arms, minus the K-ordered
+// turnstile between peers. Sweep-only -- see SchedNondet for why this must not become the ship.
+using Kernel_128x16_1x1x1_sk_nd =
+    W4A8GemmKernelV2<Shape<_128, _16>, Shape<_1, _1, _1>,
+                     cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                     cutlass::epilogue::TmaWarpSpecializedCooperative,
+                     cutlass::gemm::StreamKScheduler, SchedNondet>;
+
+using Kernel_128x32_1x1x1_sk_nd =
+    W4A8GemmKernelV2<Shape<_128, _32>, Shape<_1, _1, _1>,
+                     cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                     cutlass::epilogue::TmaWarpSpecializedCooperative,
+                     cutlass::gemm::StreamKScheduler, SchedNondet>;
+
+// Fixed 4-way split-K. The competing hypothesis to Stream-K for w2's single deep wave: an even
+// split costs one reduction and no per-unit bookkeeping, where Stream-K pays for a raggedness
+// that a 16-CTA/16-SM problem does not actually have.
+using Kernel_128x16_1x1x1_splitk4 =
+    W4A8GemmKernelV2<Shape<_128, _16>, Shape<_1, _1, _1>,
+                     cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                     cutlass::epilogue::TmaWarpSpecializedCooperative,
+                     cutlass::gemm::StreamKScheduler, SchedSplitK4>;
+
+using Kernel_128x32_1x1x1_splitk4 =
+    W4A8GemmKernelV2<Shape<_128, _32>, Shape<_1, _1, _1>,
+                     cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                     cutlass::epilogue::TmaWarpSpecializedCooperative,
+                     cutlass::gemm::StreamKScheduler, SchedSplitK4>;
+
+// Shallower mainloop pipeline. Auto carveout lands near 19 stages at 128x16; these test whether
+// that depth is doing anything on the 16-k-iteration shapes (qkv, w13). Expected to be a null --
+// the mainloop is DRAM-bound, not latency-bound -- but it is two `using` lines to find out.
+using Kernel_128x16_1x1x1_s4 =
+    W4A8GemmKernelV2<Shape<_128, _16>, Shape<_1, _1, _1>,
+                     cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                     cutlass::epilogue::TmaWarpSpecializedCooperative,
+                     cutlass::gemm::PersistentScheduler, SchedDefault, 4>;
+
+using Kernel_128x16_1x1x1_s8 =
+    W4A8GemmKernelV2<Shape<_128, _16>, Shape<_1, _1, _1>,
+                     cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                     cutlass::epilogue::TmaWarpSpecializedCooperative,
+                     cutlass::gemm::PersistentScheduler, SchedDefault, 8>;
+
 // Cluster multicast. HONEST NOTE: after swap+transpose the multicast operand is the
 // ACTIVATION, which at decode is 1-8 tokens -- there is very little to share. Swept anyway
 // because the pair of CTAs also halves the number of TMA loads issued for it.
+//
+// This is ClusterM=2. Sharing WEIGHT bytes would need ClusterN=2 (CUTLASS multicasts operand A
+// -- the weights, post-swap -- along the cluster's N dim), and the N dim tiles tokens: two CTAs
+// share a weight tile only when they compute the same output channels for DIFFERENT token
+// tiles. At m <= 8 there is exactly one token tile, so no cluster shape whatsoever shares weight
+// bytes at decode. That is a property of the decode shape, not of this configuration -- every
+// output channel's weights must cross DRAM once per forward pass regardless of tiling, which is
+// the decode roofline. Weight multicast becomes real only at prefill; see the arms below.
 using Kernel_128x16_2x1x1 =
     W4A8GemmKernelV2<Shape<_128, _16>, Shape<_2, _1, _1>>;
 
@@ -378,6 +593,37 @@ using Kernel_64x32_1x1x1_pp =
                      cutlass::gemm::KernelTmaWarpSpecializedPingpong,
                      cutlass::epilogue::TmaWarpSpecialized>;
 #endif
+
+// ---------------------------------------------------------------------------------------
+// Prefill arms -- the only place cluster multicast and raster order are not no-ops
+// ---------------------------------------------------------------------------------------
+// Both knobs need at least two TOKEN tiles. TileN=128 gives that from m >= 129 onward:
+// m=512 -> 4 token tiles, so ClusterN=2 pairs CTAs that want the SAME 128x128 int4 weight tile
+// (8 KB per k-iteration) and TMA multicasts it once over the SM-to-SM interconnect instead of
+// pulling it twice from HBM. This is the technique the decode arms structurally cannot use.
+//
+// Raster order matters here for the same reason and is arguably the larger effect. CUTLASS's
+// Heuristic picks AlongM whenever tiles_n > tiles_m, which is the common prefill shape -- and
+// AlongM walks OUTPUT CHANNELS, so consecutive CTAs share the activation tile and each pulls its
+// own weight tile. Per 16-CTA wave per k-iteration that is 16 weight tiles + 1 activation tile
+// (~130 KB) against AlongN's 1 + 16 (~40 KB). On a slice whose HBM bandwidth is the binding
+// constraint, the stock heuristic optimizes reuse of the operand that is nearly free.
+//
+// The cluster guard in mm() is what keeps these honest: routed at m <= TileN they raise instead
+// of silently burning half the slice.
+using Kernel_128x128_1x2x1_pf =
+    W4A8GemmKernelV2<Shape<_128, _128>, Shape<_1, _2, _1>,
+                     cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                     cutlass::epilogue::TmaWarpSpecializedCooperative,
+                     cutlass::gemm::PersistentScheduler, SchedRasterN>;
+
+// Raster/swizzle without the cluster, so a win can be attributed to one or the other. Also the
+// arm to use when m is between the thresholds but below 2*TileN, where the cluster cannot fire.
+using Kernel_128x128_1x1x1_pf =
+    W4A8GemmKernelV2<Shape<_128, _128>, Shape<_1, _1, _1>,
+                     cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                     cutlass::epilogue::TmaWarpSpecializedCooperative,
+                     cutlass::gemm::PersistentScheduler, SchedRasterNSwizzle4>;
 
 // VTL: the param validation upstream left as a TODO. Every argument below is immediately cast
 // to a raw device pointer and handed to a kernel that derives its extents from OTHER arguments,
@@ -476,6 +722,30 @@ at::Tensor mm_dispatch_v2(at::Tensor const& A, at::Tensor const& B,
   } else if (schedule == "128x32_1x1x1_sk") {
     return Kernel_128x32_1x1x1_sk::mm(A, B, group_scales, group_size,
                                       channel_scales, token_scales);
+  } else if (schedule == "128x16_1x1x1_sk_nd") {
+    return Kernel_128x16_1x1x1_sk_nd::mm(A, B, group_scales, group_size,
+                                         channel_scales, token_scales);
+  } else if (schedule == "128x32_1x1x1_sk_nd") {
+    return Kernel_128x32_1x1x1_sk_nd::mm(A, B, group_scales, group_size,
+                                         channel_scales, token_scales);
+  } else if (schedule == "128x16_1x1x1_splitk4") {
+    return Kernel_128x16_1x1x1_splitk4::mm(A, B, group_scales, group_size,
+                                           channel_scales, token_scales);
+  } else if (schedule == "128x32_1x1x1_splitk4") {
+    return Kernel_128x32_1x1x1_splitk4::mm(A, B, group_scales, group_size,
+                                           channel_scales, token_scales);
+  } else if (schedule == "128x16_1x1x1_s4") {
+    return Kernel_128x16_1x1x1_s4::mm(A, B, group_scales, group_size,
+                                      channel_scales, token_scales);
+  } else if (schedule == "128x16_1x1x1_s8") {
+    return Kernel_128x16_1x1x1_s8::mm(A, B, group_scales, group_size,
+                                      channel_scales, token_scales);
+  } else if (schedule == "128x128_1x2x1_pf") {
+    return Kernel_128x128_1x2x1_pf::mm(A, B, group_scales, group_size,
+                                       channel_scales, token_scales);
+  } else if (schedule == "128x128_1x1x1_pf") {
+    return Kernel_128x128_1x1x1_pf::mm(A, B, group_scales, group_size,
+                                       channel_scales, token_scales);
   } else if (schedule == "128x16_2x1x1") {
     return Kernel_128x16_2x1x1::mm(A, B, group_scales, group_size,
                                    channel_scales, token_scales);
@@ -527,22 +797,68 @@ at::Tensor stock_mm(at::Tensor const& A, at::Tensor const& B,
   return stack[0].toTensor();
 }
 
+// Pipeline depth of an arm, for the boot log. Only the auto-carveout arms are interesting (their
+// stage count is chosen by CUTLASS and otherwise invisible), but every name resolves so the
+// caller does not need to know which is which. -1 = unknown name, never throws: this is a
+// diagnostic and must not be able to fail a boot that would otherwise serve.
+int64_t stages_of(std::string const& schedule) {
+  if (schedule == "128x16_1x1x1_sk") return Kernel_128x16_1x1x1_sk::kStages;
+  if (schedule == "128x32_1x1x1_sk") return Kernel_128x32_1x1x1_sk::kStages;
+  if (schedule == "128x16_1x1x1_sk_nd") return Kernel_128x16_1x1x1_sk_nd::kStages;
+  if (schedule == "128x32_1x1x1_sk_nd") return Kernel_128x32_1x1x1_sk_nd::kStages;
+  if (schedule == "128x16_1x1x1_splitk4") return Kernel_128x16_1x1x1_splitk4::kStages;
+  if (schedule == "128x32_1x1x1_splitk4") return Kernel_128x32_1x1x1_splitk4::kStages;
+  if (schedule == "128x16_1x1x1_s4") return Kernel_128x16_1x1x1_s4::kStages;
+  if (schedule == "128x16_1x1x1_s8") return Kernel_128x16_1x1x1_s8::kStages;
+  if (schedule == "128x128_1x2x1_pf") return Kernel_128x128_1x2x1_pf::kStages;
+  if (schedule == "128x128_1x1x1_pf") return Kernel_128x128_1x1x1_pf::kStages;
+  if (schedule == "128x16_2x1x1") return Kernel_128x16_2x1x1::kStages;
+#if VTL_W4A8_ENABLE_N8
+  if (schedule == "128x8_1x1x1") return Kernel_128x8_1x1x1::kStages;
+#endif
+#if VTL_W4A8_ENABLE_PP
+  if (schedule == "64x16_1x1x1_pp") return Kernel_64x16_1x1x1_pp::kStages;
+  if (schedule == "64x32_1x1x1_pp") return Kernel_64x32_1x1x1_pp::kStages;
+#endif
+  return -1;
+}
+
 // The M branch lives HERE, not in Python, on purpose: `VtlW4A8LinearMethod.apply` is traced by
 // support_torch_compile with fullgraph=True, where a branch on the symbolic token count is
 // either a graph break (= engine crash) or a recompile per batch bucket. Inside an opaque
 // custom op it is neither -- the graph sees one node.
+//
+// VTL: three bands, not two. Prefill used to go straight to the stock kernel, which meant the
+// two knobs that only work with more than one token tile -- cluster multicast of the weights,
+// and raster order -- had no path to ever fire. `prefill_max` bounds the new band so a long
+// prompt still lands on the stock heuristic rather than an arm tuned for m ~ 512.
+//
+//   m <= m_threshold                     -> decode arm  (`schedule`)
+//   m_threshold < m <= prefill_max       -> prefill arm (`prefill_schedule`)
+//   otherwise                            -> stock kernel
+//
+// An empty schedule string means "that band is off" and falls through to stock, so the default
+// configuration (prefill_schedule = "", prefill_max = 0) is byte-for-byte the previous behaviour.
 at::Tensor w4a8_mm_v2(at::Tensor const& a, at::Tensor const& b_q,
                       at::Tensor const& group_scales, int64_t group_size,
                       at::Tensor const& channel_scales,
                       at::Tensor const& token_scales,
-                      std::string const& schedule, int64_t m_threshold) {
+                      std::string const& schedule, int64_t m_threshold,
+                      std::string const& prefill_schedule,
+                      int64_t prefill_max) {
   check_args(a, b_q, group_scales, group_size, channel_scales, token_scales);
-  if (a.size(0) > m_threshold) {
-    return stock_mm(a, b_q, group_scales, group_size, channel_scales,
-                    token_scales);
+  int64_t const m = a.size(0);
+
+  if (m <= m_threshold && !schedule.empty()) {
+    return mm_dispatch_v2(a, b_q, group_scales, group_size, channel_scales,
+                          token_scales, schedule);
   }
-  return mm_dispatch_v2(a, b_q, group_scales, group_size, channel_scales,
-                        token_scales, schedule);
+  if (m > m_threshold && m <= prefill_max && !prefill_schedule.empty()) {
+    return mm_dispatch_v2(a, b_q, group_scales, group_size, channel_scales,
+                          token_scales, prefill_schedule);
+  }
+  return stock_mm(a, b_q, group_scales, group_size, channel_scales,
+                  token_scales);
 }
 
 }  // namespace vtl::w4a8_v2
@@ -553,11 +869,20 @@ TORCH_LIBRARY_FRAGMENT(vllm_cuda, m) {
   m.def(
       "w4a8_mm_v2(Tensor a, Tensor b_q, Tensor group_scales, int group_size, "
       "Tensor channel_scales, Tensor token_scales, str schedule, "
-      "int m_threshold) -> Tensor");
+      "int m_threshold, str prefill_schedule, int prefill_max) -> Tensor");
+  // Diagnostics, CompositeExplicitAutograd so they resolve without a device dispatch: they take
+  // no tensors and are called once at load, from the boot log path.
+  m.def("w4a8_sm_count() -> int");
+  m.def("w4a8_stages(str schedule) -> int");
 }
 
 TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
   m.impl("w4a8_mm_v2", TORCH_FN(vtl::w4a8_v2::w4a8_mm_v2));
+}
+
+TORCH_LIBRARY_IMPL(vllm_cuda, CompositeExplicitAutograd, m) {
+  m.impl("w4a8_sm_count", TORCH_FN(vtl::w4a8_v2::sm_count));
+  m.impl("w4a8_stages", TORCH_FN(vtl::w4a8_v2::stages_of));
 }
 
 // The ops arrive through the static initializers above, at dlopen. This exists only so that

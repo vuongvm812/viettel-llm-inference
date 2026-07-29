@@ -25,7 +25,7 @@ import logging
 
 from vtl.registry import register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl.dynamic_per_token_quant")
 
 
 OP = "_C::dynamic_per_token_scaled_fp8_quant"

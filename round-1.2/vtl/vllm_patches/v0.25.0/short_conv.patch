@@ -303,7 +303,7 @@
 +                )
 +            except Exception:
 +                self.out_proj._vtl_mul_quant_ok = False  # stop retrying; no log-spam
-+                logging.getLogger("vtl").exception(
++                logging.getLogger("vllm.vtl.short_conv").exception(
 +                    "vtl: short-conv fp8 staging buffer alloc failed; using stock"
 +                )
 +                use_fused = use_conv_gate = False

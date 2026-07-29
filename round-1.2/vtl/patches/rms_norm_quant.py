@@ -45,7 +45,7 @@ import logging
 
 from vtl.registry import register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl.rms_norm_quant")
 
 
 OP = "_C::rms_norm_dynamic_per_token_quant"

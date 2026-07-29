@@ -9,7 +9,7 @@ from __future__ import annotations
 import importlib
 import logging
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl.patches")
 
 # Patch modules, in apply order. Add names here as they land.
 # The served model is LFM2.5-1.2B (Lfm2ForCausalLM): 16 layers = 10 short-conv + 6 GQA attention,
@@ -54,6 +54,9 @@ _MODULES: tuple[str, ...] = (
                         # BaseModelLoader.load_model, and quant_w4a8's summary hook must be
                         # the inner one so the w4a8 tallies are already final when we read
                         # weight_packed.
+    "megakernel_probe",  # read-only go/no-go for a cooperative-grid decode megakernel. Same
+                         # load_model seam as the two above, so it goes after them; it only
+                         # reads device attributes, so the order between them does not matter.
 )
 
 for _name in _MODULES:

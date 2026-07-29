@@ -16,7 +16,7 @@ import logging
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl.qk_norm_rope")
 
 
 @register_patch("qk_norm_rope", default=True)

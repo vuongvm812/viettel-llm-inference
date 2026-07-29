@@ -35,7 +35,9 @@ torch = pytest.importorskip("torch", reason="w4a8 v2 parity needs torch + an sm_
 
 # Same names quant_w4a8 will accept, imported rather than restated: a name that exists in only
 # one of the two lists is an arm that is either swept and rejected or accepted and never swept.
-VALID_SCHEDULES_V2 = pytest.importorskip("vtl.patches.quant_w4a8").VALID_SCHEDULES_V2
+_qw = pytest.importorskip("vtl.patches.quant_w4a8")
+VALID_SCHEDULES_V2 = _qw.VALID_SCHEDULES_V2
+VALID_SCHEDULES_V2_PREFILL = _qw.VALID_SCHEDULES_V2_PREFILL
 
 FP8 = torch.float8_e4m3fn
 
@@ -48,6 +50,17 @@ SHAPES = [(3072, 2048), (2048, 2048), (16384, 2048), (2048, 8192), (6144, 2048),
 # off-by-one silently routes all of decode to the stock kernel.
 MS = [1, 4, 8, 16, 32, 33, 512]
 MTHRESH = 32
+
+# The prefill band: MTHRESH < m <= PREFILL_MAX takes a *_pf arm, above it the stock heuristic.
+# PF_MS straddles both edges -- 33 is the first token count in the band, 1025 the first outside.
+# 256/512 are where the ClusterN=2 arm has enough token tiles (TileN=128) for its multicast to
+# mean anything; 129 is the smallest m with more than one such tile.
+PREFILL_MAX = 1024
+PF_MS = [33, 129, 256, 512, 1024, 1025]
+# Prefill arms tile tokens 128 wide, and a ClusterN=2 arm needs two of those tiles or the op's
+# cluster guard (correctly) raises. Keyed by name so the skip is derived, not hardcoded per test.
+PF_TILE_N = 128
+PF_CLUSTER_N = {"128x128_1x2x1_pf": 2}
 
 
 def _skip_reason() -> str | None:
@@ -74,6 +87,7 @@ pytestmark = pytest.mark.skipif(SKIP is not None, reason=SKIP or "")
 # is discovered at runtime by available(), not listed here -- dropping an arm must not turn into
 # a failing test. sorted() so the parametrize ids are stable across runs.
 ALL_SCHEDULES = sorted(VALID_SCHEDULES_V2)
+PF_SCHEDULES = sorted(VALID_SCHEDULES_V2_PREFILL)
 
 _packed_cache: dict[tuple[int, int], tuple] = {}
 
@@ -113,11 +127,20 @@ def stock_mm(xq, scales, packed):
     )
 
 
-def v2_mm(xq, scales, packed, schedule, m_threshold=MTHRESH):
+def v2_mm(xq, scales, packed, schedule, m_threshold=MTHRESH,
+          prefill_schedule="", prefill_max=0):
     b_q, group_scales, chan_scales = packed
     return torch.ops.vllm_cuda.w4a8_mm_v2(
-        xq, b_q, group_scales, 128, chan_scales, scales, schedule, m_threshold
+        xq, b_q, group_scales, 128, chan_scales, scales, schedule, m_threshold,
+        prefill_schedule, prefill_max,
     )
+
+
+def pf_mm(xq, scales, packed, schedule, prefill_max=PREFILL_MAX):
+    """Route through the PREFILL band: decode schedule empty, so the only arm that can fire is
+    the prefill one, and only for MTHRESH < m <= prefill_max."""
+    return v2_mm(xq, scales, packed, "", m_threshold=MTHRESH,
+                 prefill_schedule=schedule, prefill_max=prefill_max)
 
 
 _available_cache: dict[str, bool] = {}
@@ -196,6 +219,90 @@ def test_threshold_is_honoured():
         v2_mm(xq1, s1, packed, schedule, m_threshold=1).float(),
         stock_mm(xq1, s1, packed).float(), rtol=1e-2, atol=1e-2,
     )
+
+
+def pf_available(schedule: str) -> bool:
+    """available(), for a prefill arm. Probed at m=256 -- these tile tokens 128 wide, so at the
+    decode m=16 the cluster arm would trip its own grid guard and read as "not built"."""
+    key = f"pf:{schedule}"
+    if key not in _available_cache:
+        try:
+            xq, scales = activation(256, 128)
+            pf_mm(xq, scales, packed_weight(256, 128), schedule)
+            torch.cuda.synchronize()
+            _available_cache[key] = True
+        except RuntimeError as exc:
+            if _NOT_BUILT not in str(exc):
+                raise
+            _available_cache[key] = False
+    return _available_cache[key]
+
+
+@pytest.mark.parametrize("schedule", PF_SCHEDULES)
+@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: f"n{s[0]}k{s[1]}")
+@pytest.mark.parametrize("m", PF_MS)
+def test_prefill_matches_stock(schedule, shape, m):
+    """The prefill band is the only place cluster multicast and raster order are not no-ops, so
+    it is also the only place a wrong ClusterShape can quietly change results."""
+    if not pf_available(schedule):
+        pytest.skip(f"{schedule} is not compiled into this build")
+    # Only inside the band does the arm actually run; above it the op forwards to stock, so the
+    # cluster is irrelevant there and the m>PREFILL_MAX row below stays meaningful.
+    cluster_n = PF_CLUSTER_N.get(schedule, 1)
+    if m <= PREFILL_MAX and -(-m // PF_TILE_N) < cluster_n:
+        pytest.skip(f"{schedule} needs {cluster_n} token tiles; m={m} gives fewer (guard raises)")
+    n, k = shape
+    packed = packed_weight(n, k)
+    xq, scales = activation(m, k)
+
+    got = pf_mm(xq, scales, packed, schedule)
+    exp = stock_mm(xq, scales, packed)
+
+    assert got.shape == (m, n) and got.dtype == torch.bfloat16
+    if m > PREFILL_MAX:
+        # Outside the band: the same stock call, so bit-exact or the band edge is wrong.
+        assert torch.equal(got, exp), f"M={m} > {PREFILL_MAX} must be the stock kernel, bit for bit"
+    else:
+        torch.testing.assert_close(got.float(), exp.float(), rtol=1e-2, atol=1e-2)
+
+
+def test_prefill_band_edges():
+    """m <= MTHRESH must NOT take a prefill arm even when one is configured, and m > prefill_max
+    must fall through to stock. Both edges wrong in the same direction would look like a win in
+    a sweep while actually running the baseline everywhere."""
+    schedule = next((s for s in PF_SCHEDULES if pf_available(s)), None)
+    if schedule is None:
+        pytest.skip("no prefill arm compiled into this build")
+    packed = packed_weight(2048, 2048)
+
+    for m in (1, MTHRESH):          # decode side: prefill arm configured but must not fire
+        xq, s = activation(m, 2048)
+        assert torch.equal(pf_mm(xq, s, packed, schedule), stock_mm(xq, s, packed)), (
+            f"M={m} <= MTHRESH took the prefill arm; the decode band is being swallowed"
+        )
+    # 256, not 64: enough token tiles for either arm's cluster, so this test does not depend on
+    # which of the two happened to compile.
+    xq, s = activation(256, 2048)   # inside the band: a different kernel, so only close
+    torch.testing.assert_close(
+        pf_mm(xq, s, packed, schedule).float(), stock_mm(xq, s, packed).float(),
+        rtol=1e-2, atol=1e-2,
+    )
+    # ...unless the band is closed, which is the shipped default: then it is stock, bit for bit.
+    assert torch.equal(pf_mm(xq, s, packed, schedule, prefill_max=0), stock_mm(xq, s, packed))
+
+
+def test_cluster_guard_rejects_undersized_token_grid():
+    """A ClusterN=2 arm at one token tile is a SILENT 2x regression in CUTLASS -- the grid is
+    padded, the phantom CTAs are handed out as real work, and the epilogue discards their output.
+    The op must raise instead. This is the test for the guard that makes the prefill arms safe to
+    ship next to the decode ones."""
+    if not pf_available("128x128_1x2x1_pf"):
+        pytest.skip("128x128_1x2x1_pf is not compiled into this build")
+    packed = packed_weight(2048, 2048)
+    # m=64 <= TileN=128 -> one token tile -> the cluster cannot be fed.
+    xq, scales = activation(64, 2048)
+    with pytest.raises(RuntimeError, match="cluster"):
+        pf_mm(xq, scales, packed, "128x128_1x2x1_pf")
 
 
 def test_unknown_schedule_raises():

@@ -38,14 +38,14 @@ METRICS = (("TPOT p50", "itl_ms", 3), ("TTFT p50", "ttft_ms", 1))
 
 
 def makefile_schedules(makefile):
-    """``{'STOCK_SCHEDULES': [...], 'V2_SCHEDULES': [...]}`` from the root Makefile.
+    """``{'STOCK_SCHEDULES': [...], ...}`` from the root Makefile, one key per arm list.
 
-    Backslash continuations are joined first -- both lists are wrapped across two lines, and a
+    Backslash continuations are joined first -- the lists are wrapped across several lines, and a
     regex that stops at the newline would silently see half the arms.
     """
     text = makefile.read_text().replace("\\\n", " ")
     found = {}
-    for name in ("STOCK_SCHEDULES", "V2_SCHEDULES"):
+    for name in ("STOCK_SCHEDULES", "V2_SCHEDULES", "V2_PREFILL_SCHEDULES"):
         m = re.search(rf"^{name}\s*[:?]?=\s*(.*)$", text, re.M)
         found[name] = m.group(1).split() if m else []
     return found
@@ -171,14 +171,19 @@ def _check_schedule_names():
         return
     sys.path.insert(0, str(here.parents[1]))  # the round dir, so `vtl` imports off-box
     try:
-        from vtl.patches.quant_w4a8 import VALID_SCHEDULES, VALID_SCHEDULES_V2
+        from vtl.patches.quant_w4a8 import (
+            VALID_SCHEDULES,
+            VALID_SCHEDULES_V2,
+            VALID_SCHEDULES_V2_PREFILL,
+        )
     except ImportError as exc:  # a bare bench/ checkout: report, don't fail
         print(f"  (schedule cross-check skipped: {exc})")
         return
 
     names = makefile_schedules(makefile)
     for key, valid in (("STOCK_SCHEDULES", VALID_SCHEDULES),
-                       ("V2_SCHEDULES", VALID_SCHEDULES_V2)):
+                       ("V2_SCHEDULES", VALID_SCHEDULES_V2),
+                       ("V2_PREFILL_SCHEDULES", VALID_SCHEDULES_V2_PREFILL)):
         swept = names[key]
         assert swept, f"Makefile {key} is empty or unparsed -- the sweep would boot no arms"
         unknown = sorted(set(swept) - set(valid))

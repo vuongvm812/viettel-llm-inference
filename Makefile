@@ -316,23 +316,38 @@ STOCK_SCHEDULES := 256x128_1x1x1 256x64_1x1x1 256x32_1x1x1 256x16_1x1x1 128x256_
 ## WS2's planned v2 instantiations. Opt-in (V2=1): they need the sm_90a vtl._C_w4a8 build, and
 ## sweeping them against an image that lacks it just burns boots.
 V2_SCHEDULES ?= 128x16_1x1x1_sk 128x32_1x1x1_sk 128x16_2x1x1 128x8_1x1x1 \
-                64x16_1x1x1_pp 64x32_1x1x1_pp
-SCHEDULES ?= heuristic $(STOCK_SCHEDULES) $(if $(V2),$(V2_SCHEDULES))
+                64x16_1x1x1_pp 64x32_1x1x1_pp \
+                128x16_1x1x1_sk_nd 128x32_1x1x1_sk_nd \
+                128x16_1x1x1_splitk4 128x32_1x1x1_splitk4 \
+                128x16_1x1x1_s4 128x16_1x1x1_s8
+## Prefill-band arms. NOT in the default sweep: they select a different env knob
+## (VTL_W4A8_SCHEDULE_V2_PREFILL) and only fire when VTL_W4A8_V2_PREFILL_MAX is non-zero, so
+## sweeping them alongside the decode arms would silently measure the baseline. Sweep with
+## `make sweep-schedule PREFILL=1`, which sets both.
+V2_PREFILL_SCHEDULES ?= 128x128_1x2x1_pf 128x128_1x1x1_pf
+SCHEDULES ?= heuristic $(STOCK_SCHEDULES) $(if $(V2),$(V2_SCHEDULES)) \
+             $(if $(PREFILL),$(V2_PREFILL_SCHEDULES))
 BOOTS ?= 3
 # Named for the knob it sweeps, NOT /tmp/vtl-sched.yaml -- that reads like the vtl-sched Rust
 # crate (WS4), which has nothing to do with W4A8 tiles.
 SWEEP_OVERLAY := /tmp/vtl-w4a8-sweep.yaml
+# Upper bound of the prefill band while sweeping a *_pf arm. Only applied to those arms: left at
+# 0 the band cannot fire at all, which is what keeps every other arm a clean decode measurement.
+PREFILL_MAX ?= 1024
 # One line, duplicated in the micro target rather than abstracted: stock name -> $$s, heuristic
-# -> neither, anything else -> $$v2.
-SWEEP_CLASSIFY = s=""; v2=""; case " $(STOCK_SCHEDULES) " in *" $$name "*) s="$$name";; \
-	  *) case "$$name" in heuristic) ;; *) v2="$$name";; esac;; esac
+# -> neither, a *_pf name -> $$pf (a different env knob), anything else -> $$v2.
+SWEEP_CLASSIFY = s=""; v2=""; pf=""; pfmax=0; \
+	  case " $(STOCK_SCHEDULES) " in *" $$name "*) s="$$name";; \
+	  *) case "$$name" in heuristic) ;; \
+	     *_pf) pf="$$name"; pfmax=$(PREFILL_MAX);; \
+	     *) v2="$$name";; esac;; esac
 sweep-schedule: $(if $(MICRO),sweep-schedule-micro)
 	@for name in $(SCHEDULES); do \
 	  $(SWEEP_CLASSIFY); \
-	  printf 'services:\n  model:\n    environment:\n      VTL_W4A8_SCHEDULE: "%s"\n      VTL_W4A8_SCHEDULE_V2: "%s"\n' \
-	    "$$s" "$$v2" > $(SWEEP_OVERLAY); \
+	  printf 'services:\n  model:\n    environment:\n      VTL_W4A8_SCHEDULE: "%s"\n      VTL_W4A8_SCHEDULE_V2: "%s"\n      VTL_W4A8_SCHEDULE_V2_PREFILL: "%s"\n      VTL_W4A8_V2_PREFILL_MAX: "%s"\n' \
+	    "$$s" "$$v2" "$$pf" "$$pfmax" > $(SWEEP_OVERLAY); \
 	  b=0; while [ $$b -lt $(BOOTS) ]; do b=$$((b+1)); \
-	    echo "=== $$name boot $$b/$(BOOTS) (VTL_W4A8_SCHEDULE='$$s' VTL_W4A8_SCHEDULE_V2='$$v2')"; \
+	    echo "=== $$name boot $$b/$(BOOTS) (VTL_W4A8_SCHEDULE='$$s' VTL_W4A8_SCHEDULE_V2='$$v2' PREFILL='$$pf'/$$pfmax)"; \
 	    ( cd $(ROUND) && $(DC) -f $(SWEEP_OVERLAY) up -d --force-recreate --wait \
 	      && python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	           --out bench-sched-$$name-b$$b.json \
@@ -350,8 +365,9 @@ sweep-schedule: $(if $(MICRO),sweep-schedule-micro)
 sweep-schedule-micro: build
 	@for name in $(SCHEDULES); do \
 	  $(SWEEP_CLASSIFY); \
-	  echo "=== micro $$name (VTL_W4A8_SCHEDULE='$$s' VTL_W4A8_SCHEDULE_V2='$$v2')"; \
-	  $(KRUN) "export VTL_W4A8_SCHEDULE='$$s' VTL_W4A8_SCHEDULE_V2='$$v2'; \
+	  echo "=== micro $$name (VTL_W4A8_SCHEDULE='$$s' VTL_W4A8_SCHEDULE_V2='$$v2' PREFILL='$$pf'/$$pfmax)"; \
+	  $(KRUN) "export VTL_W4A8_SCHEDULE='$$s' VTL_W4A8_SCHEDULE_V2='$$v2' \
+	    VTL_W4A8_SCHEDULE_V2_PREFILL='$$pf' VTL_W4A8_V2_PREFILL_MAX='$$pfmax'; \
 	    for t in /bench/test_*.py; do echo \"--- \$$t\"; python3 \$$t || exit 1; done" || exit 1; \
 	done
 

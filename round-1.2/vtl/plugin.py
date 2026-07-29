@@ -15,9 +15,50 @@ import logging
 import os
 import sys
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl.plugin")
 
 _REGISTERED = False
+_LOGGING_READY = False
+
+
+def _install_log_handler() -> None:
+    """Give ``vllm.vtl`` its own INFO handler, independent of ``VLLM_LOGGING_LEVEL``.
+
+    Two separate gates used to eat every vtl INFO record, and between them ``make verify``
+    could not pass on a healthy server:
+
+    * Name. vLLM attaches its handler to the ``vllm`` logger with ``propagate: False``
+      (``vllm/logger.py`` DEFAULT_LOGGING_CONFIG) and configures nothing on root, so records
+      on a bare ``vtl`` logger fell through to ``logging.lastResort``, which is WARNING-only.
+      Fixed by naming every vtl logger ``vllm.vtl.<module>``.
+    * Level. Being a child of ``vllm`` then inherits its level, and the submission compose pins
+      ``VLLM_LOGGING_LEVEL: WARNING`` -- so INFO is still dropped, now one gate later.
+
+    Lowering vLLM's own handler would un-gate all of vLLM's INFO output, which is not what we
+    want in a scored run. A dedicated handler on the ``vllm.vtl`` subtree is the narrow fix: it
+    makes exactly our lines visible, at their real severity, and leaves vLLM's verbosity alone.
+    ``propagate = False`` so records stop here rather than being emitted a second time by the
+    ``vllm`` handler whenever VLLM_LOGGING_LEVEL happens to be INFO or below.
+
+    ``VTL_LOG_LEVEL`` overrides; it is read once, and a bad value leaves INFO.
+    """
+    global _LOGGING_READY
+    if _LOGGING_READY:
+        return
+    _LOGGING_READY = True
+
+    vtl_log = logging.getLogger("vllm.vtl")
+    level = getattr(logging, os.environ.get("VTL_LOG_LEVEL", "INFO").strip().upper(), logging.INFO)
+    vtl_log.setLevel(level)
+    if not vtl_log.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setLevel(level)
+        # Same shape as vLLM's own formatter so the two interleave readably in `docker logs`.
+        handler.setFormatter(
+            logging.Formatter("%(levelname)s %(asctime)s [%(name)s] %(message)s", "%m-%d %H:%M:%S")
+        )
+        vtl_log.addHandler(handler)
+    vtl_log.propagate = False
 
 
 def _tune_gil_switch_interval() -> None:
@@ -52,6 +93,9 @@ def register() -> None:
     _REGISTERED = True
 
     try:
+        # First, before anything can log: every line below this is otherwise invisible.
+        _install_log_handler()
+
         if os.environ.get("VTL_DISABLE", "").strip().lower() in ("1", "true", "yes", "on"):
             log.info("vtl: disabled via VTL_DISABLE, running stock vLLM")
             return
@@ -74,3 +118,33 @@ def register() -> None:
         )
     except Exception:
         log.exception("vtl: register() failed, continuing with stock vLLM")
+
+
+def _self_check() -> None:
+    """The thing `make verify` needs: a vtl INFO record survives a WARNING-level `vllm` parent."""
+    import io
+
+    global _LOGGING_READY
+    parent = logging.getLogger("vllm")
+    parent.setLevel(logging.WARNING)  # what the submission compose pins
+
+    _LOGGING_READY = False
+    logging.getLogger("vllm.vtl").handlers.clear()
+    _install_log_handler()
+
+    sink = io.StringIO()
+    handler = logging.getLogger("vllm.vtl").handlers[0]
+    handler.setStream(sink)
+    logging.getLogger("vllm.vtl.w4a8").info("vtl: w4a8 device = FakeGPU, 16 SMs")
+    assert "16 SMs" in sink.getvalue(), "vtl INFO dropped under VLLM_LOGGING_LEVEL=WARNING"
+
+    # Idempotent: a second register() must not double-emit (vLLM may call us more than once).
+    _install_log_handler()
+    assert len(logging.getLogger("vllm.vtl").handlers) == 1
+    assert logging.getLogger("vllm.vtl").propagate is False
+
+    print("vtl/plugin.py: ok")
+
+
+if __name__ == "__main__":
+    _self_check()
