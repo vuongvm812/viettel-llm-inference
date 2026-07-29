@@ -823,6 +823,22 @@ int64_t stages_of(std::string const& schedule) {
   return -1;
 }
 
+// Smallest token count an arm can legally run: a ClusterN of C needs C token tiles, so
+// m > (C-1)*TileN. 1 for every non-clustered arm, which is all of them but one.
+//
+// WHY THIS IS NOT JUST THE GUARD IN mm(). That guard raises, which is right for a test and
+// wrong for a server: with the prefill band open, chunked prefill hands this op every chunk
+// size, and a 33-128 token chunk routed to the ClusterN=2 arm would be a 500 in the middle of
+// the benchmark. Below the floor the band falls through to the stock kernel instead -- the same
+// kernel the band was carved out of, so the fallback is exactly the previous behaviour. The
+// guard in mm() stays as the backstop for anything that dispatches an arm directly.
+int64_t min_m_of(std::string const& schedule) {
+  if (schedule == "128x128_1x2x1_pf") {
+    return (Kernel_128x128_1x2x1_pf::kClusterN - 1) * Kernel_128x128_1x2x1_pf::kTileN + 1;
+  }
+  return 1;
+}
+
 // The M branch lives HERE, not in Python, on purpose: `VtlW4A8LinearMethod.apply` is traced by
 // support_torch_compile with fullgraph=True, where a branch on the symbolic token count is
 // either a graph break (= engine crash) or a recompile per batch bucket. Inside an opaque
@@ -853,7 +869,8 @@ at::Tensor w4a8_mm_v2(at::Tensor const& a, at::Tensor const& b_q,
     return mm_dispatch_v2(a, b_q, group_scales, group_size, channel_scales,
                           token_scales, schedule);
   }
-  if (m > m_threshold && m <= prefill_max && !prefill_schedule.empty()) {
+  if (m > m_threshold && m <= prefill_max && !prefill_schedule.empty() &&
+      m >= min_m_of(prefill_schedule)) {
     return mm_dispatch_v2(a, b_q, group_scales, group_size, channel_scales,
                           token_scales, prefill_schedule);
   }

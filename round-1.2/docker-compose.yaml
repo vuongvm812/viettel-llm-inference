@@ -77,6 +77,14 @@ services:
     environment:
       VLLM_PLUGINS: vtl
       VLLM_LOGGING_LEVEL: WARNING             # INFO does per-request log work on the hot path
+      # Level for the `vllm.vtl` logger subtree ONLY, which vtl/plugin.py gives its own handler.
+      # It has to be separate: vtl loggers are children of `vllm`, so they would otherwise
+      # inherit the WARNING above and every vtl INFO line would vanish -- which is exactly what
+      # used to happen, and it took `make verify`'s seven greps with it (plugin loaded, w4a8
+      # registered, layers quantized, lm_head outcome, the cutlass sm_count readout).
+      # INFO is safe on the hot path here because vtl logs at load, not per request. WARNING to
+      # quiet it; DEBUG adds nothing today.
+      VTL_LOG_LEVEL: INFO
       # Pin the axum/tower/hyper HTTP stack to WARN independent of the app default above, so
       # the per-request tower_http TraceLayer span stays disabled even if you raise
       # VLLM_LOGGING_LEVEL to INFO/DEBUG to debug the app. Per-target directives only (no
@@ -257,10 +265,17 @@ services:
       # CUTLASS's heuristic picks AlongM here, which reuses the ACTIVATION (~2 KB) and re-reads
       # every weight tile, where AlongN reuses the weights. Both *_pf arms force AlongN.
       #
-      # OFF BY DEFAULT (max 0 = band closed = the stock heuristic runs, exactly as before).
-      # This is a TTFT play and the ERS gradient values 1 ms TPOT at ~23x 1 ms TTFT, so it is
-      # ranked below the decode arms -- and it has never been measured. Sweep with
-      # `make sweep-schedule PREFILL=1` before turning it on.
+      # ENABLED on the strongest hypothesis (cluster + AlongN), like the rest of this block.
+      # UNMEASURED: this is a TTFT play and the ERS gradient values 1 ms TPOT at ~23x 1 ms TTFT,
+      # so it is ranked below the decode arms. `make sweep-schedule PREFILL=1` settles it.
+      # Revert = set MAX back to "0" (band closed, stock heuristic, exactly as before).
+      #
+      # MAX bounds the band: above 1024 tokens the stock heuristic runs, because these arms are
+      # shaped for a few hundred tokens and a 4k prompt is a different problem. The LOWER bound
+      # is not a knob -- the op refuses to run a ClusterN=2 arm below 129 tokens (it needs two
+      # 128-wide token tiles, and CUTLASS would otherwise pad the grid and burn half the slice
+      # on discarded output) and falls back to stock there. That matters with chunked prefill
+      # on: a 33-128 token chunk is normal traffic and must not fault.
       # Legal names: 128x128_1x2x1_pf (cluster + AlongN) 128x128_1x1x1_pf (AlongN + swizzle).
       VTL_W4A8_SCHEDULE_V2_PREFILL: "128x128_1x2x1_pf"
       VTL_W4A8_V2_PREFILL_MAX: "1024"

@@ -246,11 +246,6 @@ def test_prefill_matches_stock(schedule, shape, m):
     it is also the only place a wrong ClusterShape can quietly change results."""
     if not pf_available(schedule):
         pytest.skip(f"{schedule} is not compiled into this build")
-    # Only inside the band does the arm actually run; above it the op forwards to stock, so the
-    # cluster is irrelevant there and the m>PREFILL_MAX row below stays meaningful.
-    cluster_n = PF_CLUSTER_N.get(schedule, 1)
-    if m <= PREFILL_MAX and -(-m // PF_TILE_N) < cluster_n:
-        pytest.skip(f"{schedule} needs {cluster_n} token tiles; m={m} gives fewer (guard raises)")
     n, k = shape
     packed = packed_weight(n, k)
     xq, scales = activation(m, k)
@@ -258,10 +253,16 @@ def test_prefill_matches_stock(schedule, shape, m):
     got = pf_mm(xq, scales, packed, schedule)
     exp = stock_mm(xq, scales, packed)
 
+    # Two ways to land on the stock kernel, and both must be bit-exact because it IS the same
+    # call: outside the band at all, or inside it but below this arm's cluster token floor.
+    cluster_n = PF_CLUSTER_N.get(schedule, 1)
+    runs_arm = m <= PREFILL_MAX and -(-m // PF_TILE_N) >= cluster_n
+
     assert got.shape == (m, n) and got.dtype == torch.bfloat16
-    if m > PREFILL_MAX:
-        # Outside the band: the same stock call, so bit-exact or the band edge is wrong.
-        assert torch.equal(got, exp), f"M={m} > {PREFILL_MAX} must be the stock kernel, bit for bit"
+    if not runs_arm:
+        assert torch.equal(got, exp), (
+            f"M={m} is outside {schedule}'s range and must be the stock kernel, bit for bit"
+        )
     else:
         torch.testing.assert_close(got.float(), exp.float(), rtol=1e-2, atol=1e-2)
 
@@ -291,18 +292,32 @@ def test_prefill_band_edges():
     assert torch.equal(pf_mm(xq, s, packed, schedule, prefill_max=0), stock_mm(xq, s, packed))
 
 
-def test_cluster_guard_rejects_undersized_token_grid():
+def test_cluster_arm_falls_back_below_its_token_floor():
     """A ClusterN=2 arm at one token tile is a SILENT 2x regression in CUTLASS -- the grid is
     padded, the phantom CTAs are handed out as real work, and the epilogue discards their output.
-    The op must raise instead. This is the test for the guard that makes the prefill arms safe to
-    ship next to the decode ones."""
+
+    The op must not run it there. It must also not RAISE there: with the band open, chunked
+    prefill hands this op every chunk size, so a 33-128 token chunk raising would be a 500 in the
+    middle of the benchmark. Below the floor it falls through to stock, bit for bit.
+    """
     if not pf_available("128x128_1x2x1_pf"):
         pytest.skip("128x128_1x2x1_pf is not compiled into this build")
     packed = packed_weight(2048, 2048)
-    # m=64 <= TileN=128 -> one token tile -> the cluster cannot be fed.
-    xq, scales = activation(64, 2048)
-    with pytest.raises(RuntimeError, match="cluster"):
-        pf_mm(xq, scales, packed, "128x128_1x2x1_pf")
+
+    # 64 and 128 are in the band but give one token tile at TileN=128 -> stock, bit for bit.
+    for m in (33, 64, 128):
+        xq, scales = activation(m, 2048)
+        got = pf_mm(xq, scales, packed, "128x128_1x2x1_pf")
+        assert torch.equal(got, stock_mm(xq, scales, packed)), (
+            f"m={m} is below the ClusterN=2 floor and must fall back to stock, not run the arm"
+        )
+
+    # 129 is the first m with two token tiles: the arm runs, so only close.
+    xq, scales = activation(129, 2048)
+    torch.testing.assert_close(
+        pf_mm(xq, scales, packed, "128x128_1x2x1_pf").float(),
+        stock_mm(xq, scales, packed).float(), rtol=1e-2, atol=1e-2,
+    )
 
 
 def test_unknown_schedule_raises():
