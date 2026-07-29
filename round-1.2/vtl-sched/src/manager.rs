@@ -19,19 +19,44 @@
 //! `take_events` is not ported: `enable_kv_cache_events` is rejected at construction and
 //! the Python wrapper returns `[]` for it.
 
-use rustc_hash::FxHashMap;
+use std::hash::{Hash, Hasher};
+
+use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::block_pool::BlockPool;
 use crate::config::Config;
 use crate::coordinator::Coordinator;
 use crate::hash::Digest32;
+use crate::journal::{Journal, Undo};
 use crate::single_type::{cdiv, Kind, TypeManager};
+
+/// R6b: the resident mirror of the `Request` fields the scheduling loop reads. Same
+/// struct as the marshalled tuple — sharing it is the point, so a resident step and a
+/// resync step cannot disagree about what a field means.
+pub use crate::sched::SchedReq as SchedEntry;
 
 /// Request status values the allocator's watermark branch cares about
 /// (`RequestStatus`, vllm/v1/request.py).
 pub const STATUS_WAITING: u8 = 0;
 pub const STATUS_RUNNING: u8 = 1;
 pub const STATUS_PREEMPTED: u8 = 2;
+
+/// Field-by-field hash of a table entry. Hand-written rather than `#[derive(Hash)]` on
+/// `SchedReq` so the fingerprint is stable if the struct ever gains a field that is not
+/// part of the scheduling decision.
+fn hash_entry<H: Hasher>(e: &SchedEntry, h: &mut H) {
+    e.slot.hash(h);
+    e.num_tokens.hash(h);
+    e.num_tokens_with_spec.hash(h);
+    e.num_computed_tokens.hash(h);
+    e.num_output_placeholders.hash(h);
+    e.num_prompt_tokens.hash(h);
+    e.max_tokens.hash(h);
+    e.status.hash(h);
+    e.num_preemptions.hash(h);
+    e.is_prefill_chunk.hash(h);
+    e.skip_reading_prefix_cache.hash(h);
+}
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefixCacheStats {
@@ -82,6 +107,12 @@ pub struct Manager {
     /// slot interning does, so `forget` drops both halves of a request in one place.
     pub stops: crate::update::StopTable,
 
+    /// R6b: slot -> the scheduling loop's view of the request. Dense (slots are interned
+    /// with reuse), so a `Vec` beats a map on the hot lookup. Written wholesale by the
+    /// marshalled [`crate::sched::ScheduleCore::schedule`] (the resync path), then kept
+    /// current by the post-schedule commit and `update_step`.
+    pub(crate) table: Vec<Option<SchedEntry>>,
+
     /// Reusable per-group buffers (allocated once at construction).
     pub pending_hit: Vec<Vec<u32>>,
     pub new_blocks: Vec<Vec<u32>>,
@@ -89,7 +120,7 @@ pub struct Manager {
     pub scratch_flat: Vec<u32>,
     pub common_prefix: Vec<usize>,
     /// Last `get_computed_blocks` result, per request slot.
-    hit_len: FxHashMap<u32, usize>,
+    pub(crate) hit_len: FxHashMap<u32, usize>,
 }
 
 impl Manager {
@@ -151,6 +182,7 @@ impl Manager {
             reqs: FxHashMap::default(),
             stats: PrefixCacheStats::default(),
             stops: Default::default(),
+            table: Vec::new(),
             pending_hit: (0..n).map(|_| Vec::with_capacity(64)).collect(),
             new_blocks: (0..n).map(|_| Vec::with_capacity(64)).collect(),
             empty_groups: (0..n).map(|_| Vec::new()).collect(),
@@ -194,8 +226,194 @@ impl Manager {
             }
             self.hit_len.remove(&id);
             self.stops.forget(id);
+            self.table_clear(id);
             self.free_slots.push(id);
         }
+    }
+
+    // ---- R6b: the resident request table ----------------------------------
+
+    /// Overwrite one slot's entry. Journaled, because the post-schedule commit runs
+    /// inside the speculative window.
+    pub fn table_set(&mut self, slot: u32, entry: SchedEntry) {
+        let i = slot as usize;
+        if self.table.len() <= i {
+            self.table.resize(i + 1, None);
+        }
+        if let Some(j) = self.coord.pool.arena.journal.as_mut() {
+            j.push(Undo::TableEntry(slot, self.table[i]));
+        }
+        self.table[i] = Some(entry);
+    }
+
+    /// `free` deliberately does NOT clear the table: it is also the preemption path
+    /// inside the scheduling loop, where the entry must survive to be re-stamped
+    /// PREEMPTED by the post-schedule commit. Request death goes through `forget`.
+    pub fn table_clear(&mut self, slot: u32) {
+        let i = slot as usize;
+        if i < self.table.len() {
+            if let Some(j) = self.coord.pool.arena.journal.as_mut() {
+                j.push(Undo::TableEntry(slot, self.table[i]));
+            }
+            self.table[i] = None;
+        }
+    }
+
+    #[inline]
+    pub fn table_get(&self, slot: u32) -> Option<SchedEntry> {
+        self.table.get(slot as usize).copied().flatten()
+    }
+
+    /// Journal-only: restores a slot verbatim, growing the table if the speculative run
+    /// was what created it.
+    pub(crate) fn table_restore(&mut self, slot: u32, entry: Option<SchedEntry>) {
+        let i = slot as usize;
+        if self.table.len() <= i {
+            self.table.resize(i + 1, None);
+        }
+        self.table[i] = entry;
+    }
+
+    /// Apply the post-schedule commit to one slot (see [`crate::sched`]).
+    pub(crate) fn table_with<F: FnOnce(&mut SchedEntry)>(&mut self, slot: u32, f: F) {
+        let Some(mut e) = self.table_get(slot) else {
+            return;
+        };
+        f(&mut e);
+        self.table_set(slot, e);
+    }
+
+    /// FxHash over the entries at `slots`, in the given order. Cheap enough to call every
+    /// step from Python as a spot check against its own request objects.
+    pub fn table_fingerprint(&self, slots: &[u32]) -> u64 {
+        let mut h = FxHasher::default();
+        for &s in slots {
+            match self.table_get(s) {
+                Some(e) => {
+                    1u8.hash(&mut h);
+                    hash_entry(&e, &mut h);
+                }
+                None => 0u8.hash(&mut h),
+            }
+        }
+        h.finish()
+    }
+
+    // ---- speculation support (see `journal.rs` / `spec.rs`) ---------------
+
+    #[inline]
+    pub fn journal_armed(&self) -> bool {
+        self.coord.pool.arena.journal.is_some()
+    }
+
+    /// Start recording. Panics if already armed — double-arming would silently discard
+    /// the first journal and make the state unrecoverable.
+    pub fn arm_journal(&mut self) {
+        assert!(!self.journal_armed(), "journal armed twice");
+        self.coord.pool.arena.journal = Some(Journal::default());
+    }
+
+    /// Stop recording and THROW AWAY the journal: the speculative run is being kept.
+    pub fn commit_journal(&mut self) {
+        self.coord.pool.arena.journal = None;
+    }
+
+    /// Stop recording and reverse-apply. State afterwards is bit-identical to the
+    /// pre-arm state (asserted by `state_fingerprint` in the property tests).
+    pub fn rollback_journal(&mut self) {
+        if let Some(j) = self.coord.pool.arena.journal.take() {
+            j.rollback(self);
+        }
+    }
+
+    /// True when the in-flight journal has grown past its soft cap — the signal for the
+    /// scheduling loop to abandon a speculative run instead of ballooning memory.
+    pub fn journal_over_cap(&self) -> bool {
+        self.coord
+            .pool
+            .arena
+            .journal
+            .as_ref()
+            .is_some_and(|j| j.over_soft_cap())
+    }
+
+    /// Order-sensitive hash of EVERYTHING the scheduler can observe. Exists to prove the
+    /// journal: `fingerprint == fingerprint_after_arm_run_rollback`. O(pool size), so it
+    /// is a test/diagnostic call, never a hot path.
+    pub fn state_fingerprint(&self) -> u64 {
+        let mut h = FxHasher::default();
+        let pool = &self.coord.pool;
+        for b in pool.arena.blocks.iter() {
+            b.ref_cnt.hash(&mut h);
+            match &b.hash {
+                Some(k) => {
+                    1u8.hash(&mut h);
+                    k.hash.hash(&mut h);
+                    k.group.hash(&mut h);
+                }
+                None => 0u8.hash(&mut h),
+            }
+            b.hash_num_tokens.hash(&mut h);
+            b.prev.hash(&mut h);
+            b.next.hash(&mut h);
+            b.is_null.hash(&mut h);
+        }
+        pool.arena.num_free_blocks.hash(&mut h);
+        pool.arena.free_order().hash(&mut h);
+
+        let mut idx = pool.cached.entries();
+        idx.sort_by(|a, b| (a.0.hash, a.0.group).cmp(&(b.0.hash, b.0.group)));
+        for (k, ids) in &idx {
+            k.hash.hash(&mut h);
+            k.group.hash(&mut h);
+            ids.as_slice().hash(&mut h);
+        }
+        let mut cbb: Vec<_> = pool
+            .cached_by_block
+            .iter()
+            .map(|(b, ks)| (*b, ks.iter().map(|k| (k.hash, k.group)).collect::<Vec<_>>()))
+            .collect();
+        cbb.sort();
+        cbb.hash(&mut h);
+        pool.evicted_this_step.hash(&mut h);
+
+        for m in self.coord.managers.iter() {
+            let mut rb: Vec<_> = m.req_to_blocks.iter().map(|(r, v)| (*r, v.clone())).collect();
+            rb.sort();
+            rb.hash(&mut h);
+            let mut nc: Vec<_> = m.num_cached_block.iter().map(|(r, n)| (*r, *n)).collect();
+            nc.sort();
+            nc.hash(&mut h);
+            m.new_block_ids.hash(&mut h);
+            let mut cs: Vec<_> = m
+                .cached_blocks_this_step
+                .iter()
+                .map(|k| (k.hash, k.group))
+                .collect();
+            cs.sort();
+            cs.hash(&mut h);
+            let mut ls: Vec<_> = m.last_state_block_idx.iter().map(|(r, n)| (*r, *n)).collect();
+            ls.sort();
+            ls.hash(&mut h);
+            let mut ar: Vec<_> = m.allocated_block_reqs.iter().copied().collect();
+            ar.sort();
+            ar.hash(&mut h);
+        }
+
+        self.coord.num_uncached_common_prefix_tokens.hash(&mut h);
+        let mut hl: Vec<_> = self.hit_len.iter().map(|(r, n)| (*r, *n)).collect();
+        hl.sort();
+        hl.hash(&mut h);
+        for (i, e) in self.table.iter().enumerate() {
+            match e {
+                Some(e) => {
+                    i.hash(&mut h);
+                    hash_entry(e, &mut h);
+                }
+                None => (i, 0u8).hash(&mut h),
+            }
+        }
+        h.finish()
     }
 
     /// Append newly-computed block hashes for a request (Python owns the hasher).
@@ -386,6 +604,16 @@ impl Manager {
     /// `free` (`:466`).
     pub fn free(&mut self, req: u32) {
         self.coord.free(req);
+        if self.journal_armed() {
+            let old = self.hit_len.get(&req).copied();
+            self.coord
+                .pool
+                .arena
+                .journal
+                .as_mut()
+                .unwrap()
+                .push(Undo::HitLen(req, old));
+        }
         self.hit_len.remove(&req);
     }
 
@@ -452,6 +680,54 @@ impl Manager {
     /// Drain the eviction victims recorded since the last call (shadow-mode comparison).
     pub fn take_evicted(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.coord.pool.evicted_this_step)
+    }
+
+    /// R6a + R6b: one step's stop decisions AND the resident table's update-time delta.
+    ///
+    /// Mirrors `AsyncScheduler._update_request_with_output` (async_scheduler.py:52): the
+    /// real tokens that survived `check_stop` are appended (so `num_tokens` grows by
+    /// exactly `num_accepted`) and `num_output_placeholders` drops by the same amount.
+    ///
+    /// `num_tokens[i]` is Python's authoritative pre-append count, so the entry is SYNCED
+    /// to it rather than blindly incremented — the same number of instructions, and it
+    /// makes every out-of-band mutation Python performs (spec rejection, KV-load
+    /// rollback, a resumed request) self-heal on the next step instead of drifting.
+    /// Slots that Rust refused (`status == u8::MAX`) are left alone: Python ran stock
+    /// `check_stop` for those and owns the result. The placeholder decrement saturates
+    /// where vLLM asserts `>= 0`: the table is a cache of Python's state, so clamping and
+    /// letting the next full resync repair it beats taking the engine down.
+    pub fn update_step(
+        &mut self,
+        slots: &[u32],
+        cu_lens: &[u32],
+        token_ids: &[i64],
+        num_output_tokens: &[u32],
+        num_tokens: &[u32],
+        max_model_len: usize,
+    ) -> Result<&[crate::update::Verdict], String> {
+        self.stops.update_step(
+            slots,
+            cu_lens,
+            token_ids,
+            num_output_tokens,
+            num_tokens,
+            max_model_len,
+        )?;
+        for (i, &slot) in slots.iter().enumerate() {
+            let v = self.stops.out[i];
+            if v.status == u8::MAX {
+                continue;
+            }
+            let accepted = v.num_accepted as usize;
+            let authoritative = num_tokens[i] as usize + accepted;
+            self.table_with(slot, |e| {
+                let delta = authoritative as i64 - e.num_tokens as i64;
+                e.num_tokens = authoritative;
+                e.num_tokens_with_spec = (e.num_tokens_with_spec as i64 + delta).max(0) as usize;
+                e.num_output_placeholders = e.num_output_placeholders.saturating_sub(accepted);
+            });
+        }
+        Ok(&self.stops.out)
     }
 }
 

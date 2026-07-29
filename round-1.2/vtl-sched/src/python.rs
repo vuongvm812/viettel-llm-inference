@@ -9,6 +9,23 @@
 //!     ([`KvManager::buffer`]); Python slices a view (`buf[:n]`) instead of building a
 //!     list. `block_ids_lists()` exists only where vLLM's own contract demands
 //!     `tuple[list[int], ...]` (`KVCacheBlocks.get_block_ids`).
+//!
+//! THREADING. The mutable core (`Manager` + `ScheduleCore` + the speculation state) lives
+//! behind one `Arc<Mutex<Shared>>` so the `vtl-sched-spec` worker can run a whole
+//! scheduling step without the GIL (`spec.rs`). Every method here is lock -> op:
+//!
+//!   * [`KvManager::w`] — the WRITE guard. Rolls back any in-flight speculation FIRST
+//!     (invariant 2 in `spec.rs`), then hands over the state. Used by every method that
+//!     mutates OR that reads state a speculative run would have already changed.
+//!   * [`KvManager::r`] — the READ guard. Only for state speculation cannot touch
+//!     (interning, block hashes, stop params) plus the two table probes, which are
+//!     documented to read through a pending speculation on purpose.
+//!
+//! The lock is uncontended in steady state: the engine core is single-threaded and the
+//! worker only holds it between a `kick` and the following `take_speculative`.
+//! The numpy buffers stay OUTSIDE the mutex — they are GIL-protected, as before.
+
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -19,8 +36,9 @@ use crate::config::{Config, GroupConfig};
 use crate::hash;
 use crate::hash::{Digest32, Key, HASH_LEN};
 use crate::manager::Manager;
-use crate::sched::{Params, SchedReq, ScheduleCore};
+use crate::sched::{Decisions, Params, SchedReq};
 use crate::single_type::{cdiv, Kind};
+use crate::spec::{lock_shared, Shared, SpecDriver};
 use crate::update::StopParams;
 
 
@@ -59,12 +77,33 @@ fn write_buf(py: Python<'_>, buf: &Py<PyArray1<i64>>, cap: usize, src: &[u32]) -
 
 #[pyclass(module = "vtl_sched")]
 pub struct KvManager {
-    inner: Manager,
+    /// The mutable core, shared with the `vtl-sched-spec` worker (`spec.rs`).
+    pub(crate) shared: Arc<Mutex<Shared>>,
+    /// Spawned on the first `kick`; `None` means speculation was never asked for.
+    driver: Option<SpecDriver>,
     /// One persistent numpy buffer per KV cache group; block IDs are written here and
-    /// Python takes a zero-copy `[:n]` view.
+    /// Python takes a zero-copy `[:n]` view. Outside the mutex — GIL-protected.
     bufs: Vec<Py<PyArray1<i64>>>,
     buf_cap: usize,
     flat: Vec<u32>,
+    n_groups: usize,
+}
+
+impl KvManager {
+    /// READ guard. Only for state a speculative run cannot have changed — plus the two
+    /// table probes, which deliberately read through a pending speculation.
+    #[inline]
+    fn r(&self) -> MutexGuard<'_, Shared> {
+        lock_shared(&self.shared)
+    }
+
+    /// WRITE guard: rolls back any in-flight speculation before handing over the state.
+    #[inline]
+    fn w(&self) -> MutexGuard<'_, Shared> {
+        let mut g = lock_shared(&self.shared);
+        g.invalidate();
+        g
+    }
 }
 
 #[pymethods]
@@ -135,22 +174,24 @@ impl KvManager {
             .max()
             .unwrap_or(0);
         let buf_cap = cdiv(cfg.max_model_len, min_block) + max_spec + 2;
-        let n = cfg.groups.len();
+        let n_groups = cfg.groups.len();
         let inner = Manager::new(cfg).map_err(err)?;
-        let bufs = (0..n)
+        let bufs = (0..n_groups)
             .map(|_| PyArray1::<i64>::zeros_bound(py, buf_cap, false).unbind())
             .collect();
         Ok(KvManager {
-            inner,
+            shared: Arc::new(Mutex::new(Shared::new(inner))),
+            driver: None,
             bufs,
             buf_cap,
             flat: Vec::with_capacity(256),
+            n_groups,
         })
     }
 
     #[getter]
     fn num_groups(&self) -> usize {
-        self.inner.coord.managers.len()
+        self.n_groups
     }
 
     /// The persistent per-group block-ID buffer. Python holds these once and slices
@@ -161,21 +202,21 @@ impl KvManager {
 
     // ---- request registry -------------------------------------------------
 
-    fn intern(&mut self, req_id: &str) -> u32 {
-        self.inner.intern(req_id)
+    fn intern(&self, req_id: &str) -> u32 {
+        self.w().manager.intern(req_id)
     }
 
     fn lookup(&self, req_id: &str) -> Option<u32> {
-        self.inner.lookup(req_id)
+        self.r().manager.lookup(req_id)
     }
 
-    fn forget(&mut self, req_id: &str) {
-        self.inner.forget(req_id)
+    fn forget(&self, req_id: &str) {
+        self.w().manager.forget(req_id)
     }
 
     /// Append the request's new block hashes (32 bytes each, concatenated).
     fn push_hashes(
-        &mut self,
+        &self,
         slot: u32,
         packed: &Bound<'_, PyBytes>,
         num_prompt_tokens: usize,
@@ -187,12 +228,12 @@ impl KvManager {
                 b.len()
             )));
         }
-        self.inner.push_hashes(slot, b, num_prompt_tokens);
+        self.w().manager.push_hashes(slot, b, num_prompt_tokens);
         Ok(())
     }
 
     fn num_hashes(&self, slot: u32) -> usize {
-        self.inner.num_hashes(slot)
+        self.r().manager.num_hashes(slot)
     }
 
     // ---- R6a: batched stop decision (update_from_output) -------------------
@@ -201,14 +242,14 @@ impl KvManager {
     /// sees the request; `forget()` drops it along with the id.
     #[pyo3(signature = (slot, min_tokens, max_tokens, eos_token_id, stop_token_ids))]
     fn set_stop_params(
-        &mut self,
+        &self,
         slot: u32,
         min_tokens: usize,
         max_tokens: usize,
         eos_token_id: Option<i64>,
         stop_token_ids: Vec<i64>,
     ) {
-        self.inner.stops.set(
+        self.w().manager.stops.set(
             slot,
             StopParams {
                 min_tokens,
@@ -220,16 +261,21 @@ impl KvManager {
     }
 
     fn has_stop_params(&self, slot: u32) -> bool {
-        self.inner.stops.has(slot)
+        self.r().manager.stops.has(slot)
     }
 
-    /// One step's stop decisions. Flat in, flat out: request `i` owns
-    /// `token_ids[cu_lens[i]..cu_lens[i + 1]]`, and gets back
-    /// `(num_accepted, status, stop_reason)`. `status == 255` means the slot has no
-    /// interned params and Python must run `check_stop` itself for that request.
+    /// One step's stop decisions, plus the resident table's update-time delta (R6b).
+    ///
+    /// Flat in, flat out: request `i` owns `token_ids[cu_lens[i]..cu_lens[i + 1]]`, and
+    /// gets back `(num_accepted, status, stop_reason)`. `status == 255` means the slot has
+    /// no interned params and Python must run `check_stop` itself for that request — the
+    /// table is left untouched for those slots, so Python owns the fix-up via `table_set`.
+    ///
+    /// Runs with the GIL RELEASED: this is pure integer work over data already copied in.
     #[allow(clippy::too_many_arguments)]
     fn update_step(
-        &mut self,
+        &self,
+        py: Python<'_>,
         slots: Vec<u32>,
         cu_lens: Vec<u32>,
         token_ids: Vec<i64>,
@@ -237,62 +283,110 @@ impl KvManager {
         num_tokens: Vec<u32>,
         max_model_len: usize,
     ) -> PyResult<Vec<(u32, u8, i64)>> {
-        let out = self
-            .inner
-            .stops
-            .update_step(
-                &slots,
-                &cu_lens,
-                &token_ids,
-                &num_output_tokens,
-                &num_tokens,
-                max_model_len,
-            )
-            .map_err(err)?;
-        Ok(out
-            .iter()
-            .map(|v| (v.num_accepted, v.status, v.stop_reason))
-            .collect())
+        let shared = self.shared.clone();
+        py.allow_threads(move || {
+            let mut sh = lock_shared(&shared);
+            sh.invalidate();
+            sh.manager
+                .update_step(
+                    &slots,
+                    &cu_lens,
+                    &token_ids,
+                    &num_output_tokens,
+                    &num_tokens,
+                    max_model_len,
+                )
+                .map(|out| {
+                    out.iter()
+                        .map(|v| (v.num_accepted, v.status, v.stop_reason))
+                        .collect()
+                })
+        })
+        .map_err(err)
+    }
+
+    // ---- R6b: the resident request table ----------------------------------
+
+    /// Overwrite one slot's entry. Same tuple layout as `pack_req` / `Scheduler.schedule`.
+    /// The escape hatch for anything Python mutates out of band.
+    fn table_set(&self, slot: u32, req: ReqTuple) {
+        self.w().manager.table_set(slot, unpack(&req));
+    }
+
+    fn table_clear(&self, slot: u32) {
+        self.w().manager.table_clear(slot);
+    }
+
+    /// One slot's entry in `pack_req` field order, for shadow-mode comparison.
+    ///
+    /// NON-INVALIDATING on purpose, so a shadow build can probe it without killing every
+    /// speculation. The flip side: between a `kick` and its `take_speculative` this reads
+    /// the SPECULATIVE post-commit values. Call it outside that window.
+    fn table_entry(&self, slot: u32) -> Option<ReqTuple> {
+        self.r().manager.table_get(slot).map(pack)
+    }
+
+    /// FxHash over the entries at `slots`, in order. Same non-invalidating caveat as
+    /// [`KvManager::table_entry`].
+    fn table_fingerprint(&self, slots: Vec<u32>) -> u64 {
+        self.r().manager.table_fingerprint(&slots)
+    }
+
+    /// `(hits, misses, rollbacks, disabled)` for the speculation path.
+    fn spec_stats(&self) -> (u64, u64, u64, bool) {
+        let sh = self.r();
+        (
+            sh.spec.hits,
+            sh.spec.misses,
+            sh.spec.rollbacks,
+            sh.spec.disabled,
+        )
+    }
+
+    /// Order-sensitive hash of the entire KV state. O(pool size) — a diagnostic, not a
+    /// hot-path call. Exposed because it is what proves a speculative rollback was exact.
+    fn state_fingerprint(&self) -> u64 {
+        self.w().manager.state_fingerprint()
     }
 
     // ---- KVCacheManager surface -------------------------------------------
 
-    fn new_step_starts(&mut self) {
-        self.inner.new_step_starts()
+    fn new_step_starts(&self) {
+        self.w().manager.new_step_starts()
     }
 
     /// Returns `num_new_computed_tokens`; the hit blocks stay pending for the following
     /// `allocate_slots(use_pending_hit=True)`.
     fn get_computed_blocks(
-        &mut self,
+        &self,
         slot: u32,
         num_tokens: usize,
         num_preemptions: u32,
         skip_reading_prefix_cache: bool,
     ) -> usize {
-        self.inner
-            .get_computed_blocks(slot, num_tokens, num_preemptions, skip_reading_prefix_cache)
+        self.w().manager.get_computed_blocks(
+            slot,
+            num_tokens,
+            num_preemptions,
+            skip_reading_prefix_cache,
+        )
     }
 
     /// Read-only cache-hit walk that does not touch `prefix_cache_stats`
     /// (`vtl/patches/kv_cache_manager.py::plan_request`).
-    fn peek_cache_hit(&mut self, slot: u32, num_tokens: usize) -> usize {
-        self.inner.peek_cache_hit(slot, num_tokens)
+    fn peek_cache_hit(&self, slot: u32, num_tokens: usize) -> usize {
+        self.w().manager.peek_cache_hit(slot, num_tokens)
     }
 
     /// Copy the pending prefix-cache hit for `group` into its buffer; returns the count.
-    fn pending_hit_into_buffer(&mut self, py: Python<'_>, group: usize) -> PyResult<usize> {
-        write_buf(
-            py,
-            &self.bufs[group],
-            self.buf_cap,
-            &self.inner.pending_hit[group],
-        )
+    fn pending_hit_into_buffer(&self, py: Python<'_>, group: usize) -> PyResult<usize> {
+        let sh = self.w();
+        write_buf(py, &self.bufs[group], self.buf_cap, &sh.manager.pending_hit[group])
     }
 
     #[allow(clippy::too_many_arguments)]
     fn allocate_slots(
-        &mut self,
+        &self,
         slot: u32,
         num_new_tokens: usize,
         num_new_computed_tokens: usize,
@@ -303,7 +397,8 @@ impl KvManager {
         status: u8,
         has_scheduled_reqs: bool,
     ) -> PyResult<bool> {
-        self.inner
+        self.w()
+            .manager
             .allocate_slots(
                 slot,
                 num_new_tokens,
@@ -319,31 +414,30 @@ impl KvManager {
     }
 
     /// Blocks newly allocated by the last `allocate_slots`, per group.
-    fn new_blocks_into_buffer(&mut self, py: Python<'_>, group: usize) -> PyResult<usize> {
+    fn new_blocks_into_buffer(&self, py: Python<'_>, group: usize) -> PyResult<usize> {
+        let sh = self.w();
+        write_buf(py, &self.bufs[group], self.buf_cap, &sh.manager.new_blocks[group])
+    }
+
+    /// All blocks currently held by `slot` in `group` (`KVCacheManager.get_blocks`).
+    fn blocks_into_buffer(&self, py: Python<'_>, slot: u32, group: usize) -> PyResult<usize> {
+        let sh = self.w();
         write_buf(
             py,
             &self.bufs[group],
             self.buf_cap,
-            &self.inner.new_blocks[group],
+            sh.manager.group_blocks(slot, group),
         )
-    }
-
-    /// All blocks currently held by `slot` in `group` (`KVCacheManager.get_blocks`).
-    fn blocks_into_buffer(&mut self, py: Python<'_>, slot: u32, group: usize) -> PyResult<usize> {
-        let src = self.inner.group_blocks(slot, group);
-        write_buf(py, &self.bufs[group], self.buf_cap, src)
     }
 
     /// `KVCacheBlocks.get_block_ids` shape: `tuple[list[int], ...]`. vLLM's own
     /// consumers (`NewRequestData`, `_make_cached_request_data`) require real lists, so
     /// this is the one place the port materialises them.
     fn block_ids_lists<'py>(&self, py: Python<'py>, slot: u32) -> Bound<'py, PyTuple> {
-        let per_group: Vec<Bound<'py, PyList>> = (0..self.num_groups())
+        let sh = self.w();
+        let per_group: Vec<Bound<'py, PyList>> = (0..self.n_groups)
             .map(|g| {
-                PyList::new_bound(
-                    py,
-                    self.inner.group_blocks(slot, g).iter().map(|&b| b as i64),
-                )
+                PyList::new_bound(py, sh.manager.group_blocks(slot, g).iter().map(|&b| b as i64))
             })
             .collect();
         PyTuple::new_bound(py, per_group)
@@ -356,72 +450,81 @@ impl KvManager {
         slot: u32,
         num_computed_tokens: usize,
     ) -> Bound<'py, PyTuple> {
-        let per_group: Vec<Bound<'py, PyList>> = (0..self.num_groups())
+        let sh = self.w();
+        let per_group: Vec<Bound<'py, PyList>> = (0..self.n_groups)
             .map(|g| {
-                let n = self
-                    .inner
+                let n = sh
+                    .manager
                     .num_blocks_for_computed_tokens(slot, g, num_computed_tokens);
                 PyList::new_bound(
                     py,
-                    self.inner.group_blocks(slot, g)[..n].iter().map(|&b| b as i64),
+                    sh.manager.group_blocks(slot, g)[..n].iter().map(|&b| b as i64),
                 )
             })
             .collect();
         PyTuple::new_bound(py, per_group)
     }
 
-    fn cache_blocks(&mut self, slot: u32, num_computed_tokens: usize) {
-        self.inner.cache_blocks(slot, num_computed_tokens)
+    fn cache_blocks(&self, slot: u32, num_computed_tokens: usize) {
+        self.w().manager.cache_blocks(slot, num_computed_tokens)
     }
 
-    fn free(&mut self, slot: u32) {
-        self.inner.free(slot)
+    fn free(&self, slot: u32) {
+        self.w().manager.free(slot)
     }
 
     fn pop_blocks_for_free<'py>(&mut self, py: Python<'py>, slot: u32) -> Bound<'py, PyList> {
         let mut out = std::mem::take(&mut self.flat);
         out.clear();
-        self.inner.pop_blocks_for_free(slot, &mut out);
+        {
+            let mut sh = self.w();
+            sh.manager.pop_blocks_for_free(slot, &mut out);
+        }
         let list = PyList::new_bound(py, out.iter().map(|&b| b as i64));
         self.flat = out;
         list
     }
 
-    fn remove_skipped_blocks(&mut self, slot: u32, total_computed_tokens: usize) {
-        self.inner.remove_skipped_blocks(slot, total_computed_tokens)
+    fn remove_skipped_blocks(&self, slot: u32, total_computed_tokens: usize) {
+        self.w()
+            .manager
+            .remove_skipped_blocks(slot, total_computed_tokens)
     }
 
-    fn evict_blocks(&mut self, block_ids: Vec<u32>) {
-        self.inner.evict_blocks(&block_ids)
+    fn evict_blocks(&self, block_ids: Vec<u32>) {
+        self.w().manager.evict_blocks(&block_ids)
     }
 
-    fn reset_prefix_cache(&mut self) -> bool {
-        self.inner.reset_prefix_cache()
+    fn reset_prefix_cache(&self) -> bool {
+        self.w().manager.reset_prefix_cache()
     }
 
     #[getter]
     fn usage(&self) -> f64 {
-        self.inner.usage()
+        self.w().manager.usage()
     }
 
     #[getter]
     fn num_free_blocks(&self) -> usize {
-        self.inner.num_free_blocks()
+        self.w().manager.num_free_blocks()
     }
 
     /// Marconi hint read by `_mamba_block_aligned_split` (scheduler.py:730).
     #[getter]
     fn num_uncached_common_prefix_tokens(&self) -> usize {
-        self.inner.coord.num_uncached_common_prefix_tokens
+        self.w().manager.coord.num_uncached_common_prefix_tokens
     }
 
     /// Number of blocks currently held by `slot` in `group` — cheap parity probe.
     fn num_blocks(&self, slot: u32, group: usize) -> usize {
-        self.inner.group_blocks(slot, group).len()
+        self.w().manager.group_blocks(slot, group).len()
     }
 
-    fn take_prefix_cache_stats<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let Some(s) = self.inner.take_prefix_cache_stats() else {
+    fn take_prefix_cache_stats<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(s) = self.w().manager.take_prefix_cache_stats() else {
             return Ok(None);
         };
         let d = PyDict::new_bound(py);
@@ -438,26 +541,32 @@ impl KvManager {
     fn take_new_block_ids<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyList> {
         let mut out = std::mem::take(&mut self.flat);
         out.clear();
-        self.inner.take_new_block_ids(&mut out);
+        {
+            let mut sh = self.w();
+            sh.manager.take_new_block_ids(&mut out);
+        }
         let list = PyList::new_bound(py, out.iter().map(|&b| b as i64));
         self.flat = out;
         list
     }
 
-    fn num_common_prefix_blocks(&mut self, slot: u32) -> Vec<usize> {
-        self.inner.get_num_common_prefix_blocks(slot).to_vec()
+    fn num_common_prefix_blocks(&self, slot: u32) -> Vec<usize> {
+        self.w().manager.get_num_common_prefix_blocks(slot).to_vec()
     }
 
-    fn take_evicted(&mut self) -> Vec<u32> {
-        self.inner.take_evicted()
+    fn take_evicted(&self) -> Vec<u32> {
+        self.w().manager.take_evicted()
     }
 }
 
 #[pyclass(module = "vtl_sched")]
 pub struct Scheduler {
-    core: ScheduleCore,
     /// Engine constants, handed over once by `set_params` instead of rebuilt from a dict
     /// on every step. None until `set_params` runs.
+    ///
+    /// The scheduling STATE (`ScheduleCore`) lives in the `KvManager`'s `Shared` — the
+    /// speculation worker needs the manager and the core under one lock, and this class
+    /// stays a thin, backward-compatible handle.
     params: Option<Params>,
 }
 
@@ -480,14 +589,46 @@ fn unpack(t: &ReqTuple) -> SchedReq {
     }
 }
 
+fn pack(r: SchedReq) -> ReqTuple {
+    (
+        r.slot,
+        r.num_tokens,
+        r.num_tokens_with_spec,
+        r.num_computed_tokens,
+        r.num_output_placeholders,
+        r.num_prompt_tokens,
+        r.max_tokens,
+        r.status,
+        r.num_preemptions,
+        r.is_prefill_chunk,
+        r.skip_reading_prefix_cache,
+    )
+}
+
+fn decisions_dict<'py>(py: Python<'py>, d: &Decisions) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new_bound(py);
+    out.set_item("scheduled_running", d.scheduled_running.clone())?;
+    out.set_item(
+        "running_new_blocks",
+        PyList::new_bound(py, d.running_new_blocks.iter().map(|&b| b as i64)),
+    )?;
+    out.set_item(
+        "running_new_lens",
+        PyList::new_bound(py, d.running_new_lens.iter().map(|&n| n as i64)),
+    )?;
+    out.set_item("scheduled_admitted", d.scheduled_admitted.clone())?;
+    out.set_item("preempted", d.preempted.clone())?;
+    out.set_item("waiting_order", d.waiting_order.clone())?;
+    out.set_item("num_common_prefix_blocks", d.num_common_prefix_blocks.clone())?;
+    out.set_item("token_budget_left", d.token_budget_left)?;
+    Ok(out)
+}
+
 #[pymethods]
 impl Scheduler {
     #[new]
     fn new() -> Self {
-        Scheduler {
-            core: ScheduleCore::new(),
-            params: None,
-        }
+        Scheduler { params: None }
     }
 
     /// Install the engine constants. Called once at first schedule; every field is fixed
@@ -513,12 +654,17 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Run one scheduling step. Returns the decisions; `SchedulerOutput` assembly and
-    /// all request/queue mutation stay in Python.
+    /// Run one scheduling step from marshalled snapshots. Returns the decisions;
+    /// `SchedulerOutput` assembly and all request/queue mutation stay in Python.
+    ///
+    /// Also the resident table's FULL RESYNC: every `running` tuple is written into the
+    /// table, so a step that bailed to stock vLLM is repaired by the next Rust step.
+    ///
+    /// The loop runs with the GIL released.
     fn schedule<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
-        kv: &mut KvManager,
+        kv: &KvManager,
         running: Vec<ReqTuple>,
         waiting: Vec<ReqTuple>,
     ) -> PyResult<Bound<'py, PyDict>> {
@@ -527,26 +673,107 @@ impl Scheduler {
             .ok_or_else(|| PyRuntimeError::new_err("Scheduler.set_params was never called"))?;
         let running: Vec<SchedReq> = running.iter().map(unpack).collect();
         let waiting: Vec<SchedReq> = waiting.iter().map(unpack).collect();
-        self.core
-            .schedule(&mut kv.inner, &running, &waiting, &p)
+        let shared = kv.shared.clone();
+        // The decisions are CLONED under the lock, not read back afterwards: a kick that
+        // is still sitting in the worker's mailbox could be picked up in the gap between
+        // dropping this guard and taking another, and would overwrite `core.decisions`
+        // with a speculative run's answer.
+        let d = py
+            .allow_threads(|| {
+                let mut sh = lock_shared(&shared);
+                sh.invalidate();
+                let Shared { manager, core, .. } = &mut *sh;
+                core.schedule(manager, &running, &waiting, &p).cloned()
+            })
             .map_err(err)?;
-        let d = &self.core.decisions;
-        let out = PyDict::new_bound(py);
-        out.set_item("scheduled_running", d.scheduled_running.clone())?;
-        out.set_item(
-            "running_new_blocks",
-            PyList::new_bound(py, d.running_new_blocks.iter().map(|&b| b as i64)),
-        )?;
-        out.set_item(
-            "running_new_lens",
-            PyList::new_bound(py, d.running_new_lens.iter().map(|&n| n as i64)),
-        )?;
-        out.set_item("scheduled_admitted", d.scheduled_admitted.clone())?;
-        out.set_item("preempted", d.preempted.clone())?;
-        out.set_item("waiting_order", d.waiting_order.clone())?;
-        out.set_item("num_common_prefix_blocks", d.num_common_prefix_blocks.clone())?;
-        out.set_item("token_budget_left", d.token_budget_left)?;
-        Ok(out)
+        decisions_dict(py, &d)
+    }
+
+    /// R6b: the same step with the running set read from the Rust-resident table.
+    /// `running_slots` carries Python's queue ORDER, which stays authoritative.
+    fn schedule_resident<'py>(
+        &self,
+        py: Python<'py>,
+        kv: &KvManager,
+        running_slots: Vec<u32>,
+        waiting: Vec<ReqTuple>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let p = self
+            .params
+            .ok_or_else(|| PyRuntimeError::new_err("Scheduler.set_params was never called"))?;
+        let waiting: Vec<SchedReq> = waiting.iter().map(unpack).collect();
+        let shared = kv.shared.clone();
+        let d = py
+            .allow_threads(|| {
+                let mut sh = lock_shared(&shared);
+                sh.invalidate();
+                let Shared { manager, core, .. } = &mut *sh;
+                core.schedule_resident(manager, &running_slots, &waiting, &p)
+                    .cloned()
+            })
+            .map_err(err)?;
+        decisions_dict(py, &d)
+    }
+
+    /// Ask the background worker to precompute the next step. Returns immediately.
+    ///
+    /// ONLY valid when the waiting queue is empty — the worker speculates with an empty
+    /// waiting slice, and consuming its answer for a step that has admissions would be
+    /// wrong. `generation` is Python's counter of state mutations: `take_speculative`
+    /// accepts the result only if it is unchanged.
+    ///
+    /// Returns False when speculation is unavailable (thread spawn failed, or it was
+    /// permanently disabled by a worker panic).
+    fn kick(&self, kv: &mut KvManager, generation: u64, running_slots: Vec<u32>) -> PyResult<bool> {
+        let p = self
+            .params
+            .ok_or_else(|| PyRuntimeError::new_err("Scheduler.set_params was never called"))?;
+        if kv.r().spec.disabled {
+            return Ok(false);
+        }
+        if kv.driver.is_none() {
+            let shared = kv.shared.clone();
+            match SpecDriver::spawn(shared) {
+                Ok(d) => kv.driver = Some(d),
+                Err(e) => {
+                    kv.r().spec.disabled = true;
+                    return Err(PyRuntimeError::new_err(format!(
+                        "could not spawn the vtl-sched-spec thread: {e}"
+                    )));
+                }
+            }
+        }
+        let driver = kv.driver.as_ref().unwrap();
+        if driver.is_disabled() {
+            return Ok(false);
+        }
+        driver.kick(generation, running_slots, p);
+        Ok(true)
+    }
+
+    /// Consume a speculative run. `Some(decisions)` only if `generation`, the slot order
+    /// AND the params are identical to the kick — in which case the speculative mutations
+    /// are COMMITTED (they were the real ones). Anything else rolls back and returns None,
+    /// and the caller must fall back to `schedule_resident`.
+    fn take_speculative<'py>(
+        &self,
+        py: Python<'py>,
+        kv: &KvManager,
+        generation: u64,
+        running_slots: Vec<u32>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let p = self
+            .params
+            .ok_or_else(|| PyRuntimeError::new_err("Scheduler.set_params was never called"))?;
+        let shared = kv.shared.clone();
+        let taken = py.allow_threads(|| {
+            let mut sh = lock_shared(&shared);
+            sh.take_speculative(generation, &running_slots, &p)
+        });
+        match taken {
+            Some(d) => Ok(Some(decisions_dict(py, &d)?)),
+            None => Ok(None),
+        }
     }
 }
 

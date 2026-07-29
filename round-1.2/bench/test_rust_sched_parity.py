@@ -1034,6 +1034,401 @@ def test_update_step_refuses_unregistered_and_malformed_batches():
     assert not kv.has_stop_params(reused)
 
 
+# ---------------------------------------------------------------------------
+# tier 5 -- R6b/R6c: the resident request table and the speculative precompute
+# ---------------------------------------------------------------------------
+#
+# Both are decision-preserving optimisations, so the oracle is the SAME crate driven the
+# SAME way through the marshalled `Scheduler.schedule`. Three arms run in lockstep over one
+# scripted workload -- marshalled / resident / resident+speculation -- and every step's
+# decisions dict must be identical, block IDs included. A wrong block ID is not a slower
+# schedule, it is corrupted KV state.
+#
+# THE HARNESS MODELS ASYNC SCHEDULING: `schedule(N)` runs BEFORE `update_from_output(N-1)`
+# (v0.25.0 AsyncScheduler). That is the whole reason `num_output_placeholders` exists, and
+# it is transient WITHIN a step -- a driver that updated before scheduling would leave the
+# placeholder arithmetic in `sched.rs::advance` / `manager.rs::update_step` untested.
+
+ST_WAITING, ST_RUNNING, ST_PREEMPTED = 0, 1, 2
+SPEC_TOKEN = 4242  # never an eos and never a stop id, so only max_tokens ends a request
+# The worker is parked on a condvar and a decode-step schedule is microseconds of work;
+# 20ms is four orders of magnitude of slack for a loaded CI box. Only the HIT count
+# depends on it -- every correctness assertion below holds whether or not it lands.
+SPEC_SETTLE = 0.02
+
+
+class Req:
+    """The `pack_req` fields plus the two counters `update_step` needs. Deliberately a
+    plain object: the point is to mirror what `rust_sched.py` reads off a vLLM Request."""
+
+    __slots__ = (
+        "rid", "tokens", "slot", "num_tokens", "num_tokens_with_spec",
+        "num_computed_tokens", "num_output_placeholders", "num_prompt_tokens",
+        "max_tokens", "status", "num_preemptions", "is_prefill_chunk",
+        "skip_reading_prefix_cache", "num_output_tokens", "finished", "pushed",
+    )
+
+    def __init__(self, rid, tokens, max_tokens):
+        self.rid, self.tokens, self.max_tokens = rid, tokens, max_tokens
+        self.slot = -1
+        self.num_tokens = self.num_tokens_with_spec = self.num_prompt_tokens = len(tokens)
+        self.num_computed_tokens = self.num_output_placeholders = 0
+        self.num_output_tokens = self.num_preemptions = 0
+        self.status = ST_WAITING
+        self.is_prefill_chunk = False
+        self.skip_reading_prefix_cache = False
+        self.finished = False
+        self.pushed = 0
+
+
+def pack(r):
+    """`rust_sched.py::pack_req`, field for field."""
+    return (
+        r.slot, r.num_tokens, r.num_tokens_with_spec, r.num_computed_tokens,
+        r.num_output_placeholders, r.num_prompt_tokens, r.max_tokens, r.status,
+        r.num_preemptions, r.is_prefill_chunk, r.skip_reading_prefix_cache,
+    )
+
+
+def advance(r, num_new, sampled=1):
+    """`sched.rs::advance` == `Scheduler._update_after_schedule` + the Async override."""
+    r.num_computed_tokens += num_new
+    r.is_prefill_chunk = r.num_computed_tokens < r.num_tokens + r.num_output_placeholders
+    if not r.is_prefill_chunk:
+        r.num_output_placeholders += sampled
+
+
+def sched_params(block_size=16, max_model_len=2048, max_tokens_per_step=96):
+    return {
+        "max_num_scheduled_tokens": max_tokens_per_step,
+        "max_num_running_reqs": 8,
+        "max_model_len": max_model_len,
+        "num_sampled_tokens_per_step": 1,
+        "long_prefill_token_threshold": 0,
+        "enable_chunked_prefill": True,
+        "need_mamba_block_aligned_split": True,
+        "cache_block_size": block_size,
+        "num_lookahead_tokens": 0,
+        "sjf_reorder": False,
+    }
+
+
+def _prompt(rid, length, shared):
+    """Shared prefix + a request-specific tail, so the prefix cache actually participates
+    in the block IDs the arms are compared on."""
+    rng = random.Random(rid)
+    return list(shared) + [rng.randrange(2000, 60000) for _ in range(length - len(shared))]
+
+
+class Engine:
+    """One arm. `mode` is 'marshalled' | 'resident' | 'spec'.
+
+    Everything Python-side (queues, counters, admission bookkeeping) is identical across
+    arms; only the Rust entry point differs. `unregistered` names requests whose stop
+    params are never interned, which is how the status-255 fallback is provoked.
+    """
+
+    def __init__(self, mode, script, num_blocks=48, unregistered=(), inject=None,
+                 block_size=16, max_model_len=2048):
+        self.mode = mode
+        self.script = script
+        self.unregistered = set(unregistered)
+        self.inject = list(inject or ())
+        self.block_size = block_size
+        self.max_model_len = max_model_len
+        self.none_hash = vtl_sched.none_hash_from_seed("0")
+        self.kv = vtl_sched.KvManager(
+            rust_config(num_blocks=num_blocks, block_size=block_size,
+                        max_model_len=max_model_len)
+        )
+        self.core = vtl_sched.Scheduler()
+        self.core.set_params(sched_params(block_size, max_model_len))
+        self.shared = [1000 + i for i in range(64)]
+        self.running, self.waiting, self.by_slot = [], [], {}
+        self.n = 0
+        self.prev_batch = []
+        # rust_sched.py::TableState, in miniature.
+        self.dirty, self.gen, self.armed, self.clean = True, 0, False, True
+        self.hits, self.resyncs, self.resident_steps = 0, 0, 0
+        self.probes = {}  # injection kind -> how many times it actually refused one
+
+    # -- driver ----------------------------------------------------------
+
+    def step(self):
+        self.n += 1
+        for rid, plen, max_tokens in self.script.get(self.n, ()):
+            self._arrive(rid, plen, max_tokens)
+        prev = self.prev_batch
+        d = self._schedule()
+        self.prev_batch = self._apply(d)
+        self._update(prev)
+        return d
+
+    def _arrive(self, rid, plen, max_tokens):
+        r = Req(rid, _prompt(rid, plen, self.shared), max_tokens)
+        r.slot = self.kv.intern(rid)
+        self._push(r)
+        if rid not in self.unregistered:
+            self.kv.set_stop_params(r.slot, 0, max_tokens, None, [])
+        self.by_slot[r.slot] = r
+        self.waiting.append(r)
+        self.gen += 1  # rust_sched.py bump site 1 (Scheduler.add_request)
+        self.armed = False
+
+    def _push(self, r):
+        """`RustMirror.slot`: hand Rust the block hashes Python's hasher produced, for the
+        prompt at arrival and for every full block the generated tokens complete after.
+
+        Deliberately NOT a generation bump: `push_hashes` goes through the crate's
+        invalidating `w()` guard, so a pending speculation is rolled back by Rust itself
+        and the following `take_speculative` simply misses -- which is what serving does.
+        """
+        hashes = vtl_sched.block_hashes(self.none_hash, self.block_size, r.tokens)
+        if len(hashes) > r.pushed:
+            self.kv.push_hashes(
+                r.slot, b"".join(hashes[r.pushed:]), r.num_prompt_tokens
+            )
+            r.pushed = len(hashes)
+
+    def _schedule(self):
+        # Hashes are pushed BEFORE scheduling on every path, exactly as rust_sched.py's
+        # marshalling loop does.
+        for r in self.running:
+            self._push(r)
+        for r in self.waiting:
+            self._push(r)
+        slots = [r.slot for r in self.running]
+        waiting = [pack(r) for r in self.waiting]
+        if self.mode == "marshalled" or self.dirty:
+            if self.dirty and self.mode != "marshalled":
+                self.resyncs += 1
+            d = self.core.schedule(self.kv, [pack(r) for r in self.running], waiting)
+            self.dirty = self.armed = False
+            return d
+        # Clean resident step. The table must already equal what pack_req would send;
+        # assert it directly, but only outside a kick/take window (`table_entry` reads
+        # through a pending speculation by design -- python.rs).
+        self.resident_steps += 1
+        if self.mode == "resident":
+            for r in self.running:
+                assert self.kv.table_entry(r.slot) == pack(r), f"step {self.n}: {r.rid}"
+        d = None
+        if self.mode == "spec" and self.armed and not waiting:
+            d = self._take(slots)
+        self.armed = False
+        if d is None:
+            d = self.core.schedule_resident(self.kv, slots, waiting)
+        return d
+
+    def _take(self, slots):
+        """Consume the speculation, or prove that an invalidation refused it.
+
+        Injections are consumed by ORDINAL armed take, not by step number: which steps end
+        up with a speculation armed depends on the pool pressure, so a fixed step list
+        silently degrades into no coverage at all.
+        """
+        probe = self.inject[0] if self.inject else None
+        if probe == "order" and len(slots) < 2:
+            probe = None  # needs two running requests to be a different order at all
+        if probe is not None:
+            self.inject.pop(0)
+            self.probes[probe] = self.probes.get(probe, 0) + 1
+        if probe == "gen":
+            assert self.core.take_speculative(self.kv, self.gen + 1, slots) is None, (
+                "a stale generation must not be consumed"
+            )
+            return None
+        if probe == "order":
+            assert len(slots) > 1, "the slot-order probe needs at least two running reqs"
+            assert self.core.take_speculative(self.kv, self.gen, slots[::-1]) is None, (
+                "a different running order must not be consumed"
+            )
+            return None
+        if probe == "table_set":
+            # Simulates an out-of-band mutation (abort, KV-load rollback): writing the
+            # SAME values back still invalidates, so the decisions cannot change.
+            self.kv.table_set(slots[0], pack(self.by_slot[slots[0]]))
+            assert self.core.take_speculative(self.kv, self.gen, slots) is None, (
+                "table_set between kick and take must invalidate"
+            )
+            return None
+        d = self.core.take_speculative(self.kv, self.gen, slots)
+        if d is not None:
+            self.hits += 1
+        return d
+
+    def _apply(self, d):
+        """`rust_sched.py`'s phase C, python-object half. Returns the requests that will
+        carry a sampled token into the next `update_step`."""
+        sampled = []
+        for slot, num_new in d["scheduled_running"]:
+            r = self.by_slot[slot]
+            advance(r, num_new)
+            if not r.is_prefill_chunk:
+                sampled.append(r)
+        self.waiting = [self.by_slot[s] for s in d["waiting_order"]]
+        for slot in d["preempted"]:
+            r = self.by_slot[slot]
+            self.running.remove(r)
+            r.status = ST_PREEMPTED
+            r.num_computed_tokens = 0
+            r.num_preemptions += 1
+            self.waiting.insert(0, r)  # one-at-a-time prepend, as `_preempt_request` does
+        for slot, num_new, num_computed in d["scheduled_admitted"]:
+            r = self.by_slot[slot]
+            self.running.append(r)
+            r.status = ST_RUNNING
+            r.num_computed_tokens = num_computed
+            advance(r, num_new)
+            if not r.is_prefill_chunk:
+                sampled.append(r)
+        return sampled
+
+    def _update(self, batch):
+        """`update_from_output` for the PREVIOUS step, then the kick."""
+        self.clean = True
+        batch = [r for r in batch if not r.finished]
+        if batch:
+            slots, cu, toks, n_out, n_tok = [], [0], [], [], []
+            for r in batch:
+                slots.append(r.slot)
+                toks.append(SPEC_TOKEN)
+                cu.append(len(toks))
+                n_out.append(r.num_output_tokens)
+                n_tok.append(r.num_tokens)
+            out = self.kv.update_step(slots, cu, toks, n_out, n_tok, self.max_model_len)
+            for r, (accepted, status, _reason) in zip(batch, out):
+                if status == 255:
+                    # No interned params: Rust refused and left the table untouched, so
+                    # python owns both the verdict and the resync.
+                    accepted, status, _ = ref_check_stop(
+                        (0, r.max_tokens, None, ()), [SPEC_TOKEN],
+                        r.num_output_tokens, r.num_tokens, self.max_model_len,
+                    )
+                    self.dirty = True
+                    self.clean = False
+                    self.gen += 1
+                    self.armed = False
+                r.tokens.extend([SPEC_TOKEN] * accepted)
+                r.num_tokens += accepted
+                r.num_tokens_with_spec += accepted
+                r.num_output_tokens += accepted
+                r.num_output_placeholders = max(0, r.num_output_placeholders - accepted)
+                if status != NOT_STOPPED:
+                    self._finish(r)
+        if self.mode == "spec":
+            self._kick()
+
+    def _finish(self, r):
+        r.finished = True
+        if r in self.running:
+            self.running.remove(r)
+        if r in self.waiting:
+            self.waiting.remove(r)
+        self.kv.free(r.slot)
+        self.kv.forget(r.rid)
+        self.gen += 1  # rust_sched.py bump site 2 (finish_requests / _free_request)
+        self.armed = False
+
+    def _kick(self):
+        if self.dirty or not self.clean or self.waiting or not self.running:
+            return
+        # Push the hashes the tokens just appended completed, BEFORE kicking: the worker
+        # walks the resident table, which already counts those tokens. rust_sched.py's
+        # kick site does the same, via `mirror.slot`.
+        for r in self.running:
+            self._push(r)
+        slots = [r.slot for r in self.running]
+        if self.core.kick(self.kv, self.gen, slots):
+            self.armed = True
+            time.sleep(SPEC_SETTLE)
+
+
+def _workload():
+    """One script that reaches every state transition the table has to survive.
+
+    * step 1-6 arrivals -> admissions, and 260-token prompts against a 96-token step
+      budget -> chunked prefill over three steps each
+    * 48 blocks x 16 tokens = 768 tokens of pool against ~1300 tokens of running set
+      -> preemption, and the preempted requests resume from the waiting queue
+    * max_tokens 4-7 -> finishes through `update_step`, mid-run, at different steps
+    * `c3` never registers its stop params -> a status-255 step and the resync after it
+    """
+    return {
+        1: [("c0", 260, 16)],
+        2: [("c1", 260, 12)],
+        3: [("c2", 300, 20)],
+        5: [("c3", 220, 9)],
+        6: [("c4", 300, 14)],
+        11: [("c5", 180, 18)],
+    }
+
+
+def _run(mode, steps=70, **kw):
+    eng = Engine(mode, _workload(), **kw)
+    return eng, [eng.step() for _ in range(steps)]
+
+
+@requires_crate
+def test_resident_table_matches_the_marshalled_schedule():
+    """R6b: `schedule_resident` must decide exactly what `schedule` decides, every step."""
+    ref, want = _run("marshalled", unregistered=("c3",))
+    got_eng, got = _run("resident", unregistered=("c3",))
+
+    for i, (a, b) in enumerate(zip(want, got), 1):
+        assert a == b, f"step {i}: marshalled {a} != resident {b}"
+    assert got_eng.resyncs, "the status-255 fallback never forced a resync"
+    assert got_eng.resident_steps > got_eng.resyncs * 2, (
+        f"only {got_eng.resident_steps} steps actually took the resident path"
+    )
+    assert ref.kv.num_free_blocks == got_eng.kv.num_free_blocks
+
+    # The fixture has to actually reach the transitions it claims to cover, or this tier
+    # passes vacuously.
+    kinds = {
+        "admitted": sum(len(d["scheduled_admitted"]) for d in want),
+        "preempted": sum(len(d["preempted"]) for d in want),
+        "running": sum(len(d["scheduled_running"]) for d in want),
+    }
+    assert kinds["admitted"] >= 6, kinds
+    assert kinds["preempted"] >= 1, kinds
+    assert kinds["running"] >= 20, kinds
+    assert any(r.finished for r in ref.by_slot.values()), "no request finished"
+
+
+@requires_crate
+def test_speculation_returns_the_same_decisions():
+    """R6c: a consumed speculation is the real schedule, and it must be bit-identical."""
+    _ref, want = _run("marshalled")
+    eng, got = _run("spec")
+    for i, (a, b) in enumerate(zip(want, got), 1):
+        assert a == b, f"step {i}: marshalled {a} != speculative {b}"
+    assert eng.hits > 0, "no speculation was ever consumed -- the tier proved nothing"
+    hits, misses, rollbacks, disabled = eng.kv.spec_stats()
+    assert not disabled, "the worker disabled itself (panic or poisoned lock)"
+    assert hits == eng.hits, (hits, eng.hits)
+    assert misses + rollbacks >= 0
+
+
+@requires_crate
+def test_speculation_refuses_every_invalidation():
+    """Each injection must return None from `take_speculative` AND leave the fallback
+    schedule identical to the no-speculation oracle -- i.e. the rollback was exact."""
+    _ref, want = _run("marshalled")
+    inject = ["gen", "order", "table_set", "order", "gen", "table_set"]
+    eng, got = _run("spec", inject=inject)
+    for i, (a, b) in enumerate(zip(want, got), 1):
+        assert a == b, f"step {i}: marshalled {a} != post-invalidation {b}"
+    # An injection only proves something on a step that actually had a speculation armed;
+    # all three KINDS must have refused one, or the tier is vacuous.
+    assert set(eng.probes) == {"gen", "order", "table_set"}, eng.probes
+    hits, misses, rollbacks, disabled = eng.kv.spec_stats()
+    assert not disabled
+    # Each refusal is a miss, and a refusal with a pending speculation is also a rollback.
+    assert misses >= sum(eng.probes.values()), (misses, eng.probes)
+    assert rollbacks >= len(eng.probes), rollbacks
+
+
 if __name__ == "__main__":
     if "--bench" in sys.argv:
         bench()

@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 
 use crate::block_pool::HashKey;
 
-type Bucket = SmallVec<[(HashKey, u32); 2]>;
+pub type Bucket = SmallVec<[(HashKey, u32); 2]>;
 
 #[derive(Default)]
 pub struct RadixIndex {
@@ -85,6 +85,36 @@ impl RadixIndex {
     pub fn clear(&mut self) {
         self.buckets.clear();
         self.len = 0;
+    }
+
+    /// Speculative journal support (`journal.rs`). The unit of undo is the whole bucket
+    /// plus `len`, because `len` counts DISTINCT keys across the bucket and cannot be
+    /// recomputed from one key alone.
+    pub(crate) fn snapshot(&self, key: &HashKey) -> (Option<Bucket>, usize) {
+        (self.buckets.get(&Self::prefix(key)).cloned(), self.len)
+    }
+
+    pub(crate) fn restore(&mut self, key: &HashKey, bucket: Option<Bucket>, len: usize) {
+        let prefix = Self::prefix(key);
+        match bucket {
+            Some(b) => {
+                self.buckets.insert(prefix, b);
+            }
+            None => {
+                self.buckets.remove(&prefix);
+            }
+        }
+        self.len = len;
+    }
+
+    pub(crate) fn entries(&self) -> Vec<(HashKey, SmallVec<[u32; 4]>)> {
+        let mut acc: FxHashMap<HashKey, SmallVec<[u32; 4]>> = FxHashMap::default();
+        for b in self.buckets.values() {
+            for (k, v) in b.iter() {
+                acc.entry(*k).or_default().push(*v);
+            }
+        }
+        acc.into_iter().collect()
     }
 }
 

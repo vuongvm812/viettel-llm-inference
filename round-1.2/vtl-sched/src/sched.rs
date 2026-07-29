@@ -19,10 +19,10 @@
 //! prefill throttling, PP decode cadence, `scheduler_reserve_full_isl`. Their branches
 //! are therefore absent from this loop by construction, not by accident.
 
-use crate::manager::{Manager, STATUS_PREEMPTED, STATUS_WAITING};
+use crate::manager::{Manager, STATUS_PREEMPTED, STATUS_RUNNING, STATUS_WAITING};
 
 /// Mirror of the `Request` fields the scheduling loop reads.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SchedReq {
     pub slot: u32,
     pub num_tokens: usize,
@@ -37,7 +37,7 @@ pub struct SchedReq {
     pub skip_reading_prefix_cache: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
     pub max_num_scheduled_tokens: usize,
     pub max_num_running_reqs: usize,
@@ -53,7 +53,7 @@ pub struct Params {
     pub sjf_usage_tight: f64,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Decisions {
     /// `(slot, num_new_tokens)` for requests already in `running`.
     pub scheduled_running: Vec<(u32, usize)>,
@@ -174,19 +174,67 @@ impl ScheduleCore {
         std::mem::swap(&mut self.waiting, &mut self.reorder_buf);
     }
 
-    /// The scheduling loop. `running` and `waiting` are queue-ordered snapshots.
+    /// The marshalled entry point: `running` / `waiting` are queue-ordered snapshots
+    /// packed by `rust_sched.py::pack_req`.
+    ///
+    /// This is ALSO the resident table's full-resync path — every running request's
+    /// packed fields are written into the table before the loop runs, so a step that
+    /// bails to Python and comes back still finds a table that matches reality.
     pub fn schedule(
         &mut self,
         kv: &mut Manager,
         running: &[SchedReq],
         waiting: &[SchedReq],
         params: &Params,
-    ) -> Result<(), String> {
-        self.decisions.clear();
+    ) -> Result<&Decisions, String> {
         self.running.clear();
         self.running.extend_from_slice(running);
+        for r in running {
+            kv.table_set(r.slot, *r);
+        }
         self.waiting.clear();
         self.waiting.extend_from_slice(waiting);
+        self.run(kv, params)
+    }
+
+    /// R6b: the same loop, reading the running set out of the Rust-resident table instead
+    /// of a marshalled slice. `running_slots` carries Python's queue ORDER, which is
+    /// load-bearing twice over — FCFS admission and tail-pop preemption both depend on
+    /// it — so it stays Python's authority even though the fields no longer cross.
+    pub fn schedule_resident(
+        &mut self,
+        kv: &mut Manager,
+        running_slots: &[u32],
+        waiting: &[SchedReq],
+        params: &Params,
+    ) -> Result<&Decisions, String> {
+        self.running.clear();
+        self.running.reserve(running_slots.len());
+        for &slot in running_slots {
+            match kv.table_get(slot) {
+                Some(e) => self.running.push(e),
+                None => {
+                    return Err(format!(
+                        "slot {slot} has no resident entry; a full resync is required"
+                    ))
+                }
+            }
+        }
+        self.waiting.clear();
+        self.waiting.extend_from_slice(waiting);
+        self.run(kv, params)
+    }
+
+    /// THE loop body, shared by both entry points so they cannot drift apart. `running`
+    /// and `waiting` are already loaded.
+    fn run(&mut self, kv: &mut Manager, params: &Params) -> Result<&Decisions, String> {
+        // Speculation's scope invariant (see `journal.rs`): the waiting half of the loop
+        // reaches prefix-cache lookup paths that are deliberately not journaled. Refuse
+        // rather than approximate.
+        if kv.journal_armed() && !self.waiting.is_empty() {
+            return Err("speculation refuses a non-empty waiting queue".into());
+        }
+        self.decisions.clear();
 
         kv.new_step_starts();
         if params.sjf_reorder {
@@ -287,6 +335,9 @@ impl ScheduleCore {
             }
             token_budget -= num_new_tokens;
             req_index += 1;
+            if kv.journal_over_cap() {
+                return Err("speculation journal exceeded its soft cap".into());
+            }
         }
 
         // ---- 2. WAITING requests (scheduler.py:636) ------------------------
@@ -396,7 +447,62 @@ impl ScheduleCore {
         for r in &self.waiting[admitted_from_waiting..] {
             self.decisions.waiting_order.push(r.slot);
         }
-        Ok(())
+
+        self.commit(kv, params);
+        Ok(&self.decisions)
+    }
+
+    /// R6b post-schedule commit — the Rust half of what `rust_sched.py` does to the
+    /// Python `Request` objects right after `schedule()` returns, applied to the resident
+    /// table so the next step can read the running set from Rust.
+    ///
+    /// Ports, in the order Python applies them:
+    ///   * the preempt loop (rust_sched.py, mirroring `_preempt_request`, scheduler.py:1212)
+    ///   * `Scheduler._update_after_schedule` (scheduler.py:1236) — advance
+    ///     `num_computed_tokens`, then recompute `is_prefill_chunk`
+    ///   * `AsyncScheduler._update_after_schedule` (async_scheduler.py:20) — bump
+    ///     `num_output_placeholders` by `num_sampled_tokens_per_step`, but ONLY for
+    ///     requests that are no longer a prefill chunk, reading the value super() just set
+    ///
+    /// Preempted and scheduled slots are disjoint by construction: the preempt loop only
+    /// pops requests at or after `req_index`, and the waiting loop is gated on nothing
+    /// having been preempted.
+    fn commit(&mut self, kv: &mut Manager, params: &Params) {
+        let sampled = params.num_sampled_tokens_per_step;
+        for i in 0..self.decisions.preempted.len() {
+            let slot = self.decisions.preempted[i];
+            kv.table_with(slot, |e| {
+                e.status = STATUS_PREEMPTED;
+                e.num_computed_tokens = 0;
+                e.num_preemptions += 1;
+            });
+        }
+        for i in 0..self.decisions.scheduled_running.len() {
+            let (slot, num_new) = self.decisions.scheduled_running[i];
+            kv.table_with(slot, |e| advance(e, num_new, sampled));
+        }
+        for i in 0..self.decisions.scheduled_admitted.len() {
+            let (slot, num_new, num_computed) = self.decisions.scheduled_admitted[i];
+            // The admitted request was marshalled in `waiting`; this is where it enters
+            // the resident table. `self.running` holds it (pushed at admission).
+            if let Some(r) = self.running.iter().rev().find(|r| r.slot == slot) {
+                let mut e = *r;
+                e.status = STATUS_RUNNING;
+                e.num_computed_tokens = num_computed;
+                advance(&mut e, num_new, sampled);
+                kv.table_set(slot, e);
+            }
+        }
+    }
+}
+
+/// `_update_after_schedule`'s per-request arithmetic, both scheduler layers.
+#[inline]
+fn advance(e: &mut SchedReq, num_new_tokens: usize, num_sampled_tokens_per_step: usize) {
+    e.num_computed_tokens += num_new_tokens;
+    e.is_prefill_chunk = e.num_computed_tokens < e.num_tokens + e.num_output_placeholders;
+    if !e.is_prefill_chunk {
+        e.num_output_placeholders += num_sampled_tokens_per_step;
     }
 }
 

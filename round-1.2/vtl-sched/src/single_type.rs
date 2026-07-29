@@ -32,6 +32,7 @@ use smallvec::SmallVec;
 
 use crate::block_pool::{BlockPool, HashKey};
 use crate::hash::Digest32;
+use crate::journal::Undo;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -140,10 +141,44 @@ impl TypeManager {
         }
     }
 
+    /// Record an op on the speculative journal, if one is armed. `pool` is threaded into
+    /// every mutating method purely so the journal (which lives on the arena, the one
+    /// object every allocator path already holds) is reachable from here.
     #[inline]
-    fn blocks_mut(&mut self, req: u32) -> &mut Vec<u32> {
+    fn jrn(&self, pool: &mut BlockPool, op: impl FnOnce() -> Undo) {
+        if let Some(j) = pool.arena.journal.as_mut() {
+            j.push(op());
+        }
+    }
+
+    #[inline]
+    fn blocks_mut(&mut self, pool: &mut BlockPool, req: u32) -> &mut Vec<u32> {
         // `defaultdict(list)` — the entry must be created on read, because
         // `get_num_common_prefix_blocks` counts `len(self.req_to_blocks)`.
+        if pool.arena.journal.is_some() && !self.req_to_blocks.contains_key(&req) {
+            let g = self.group_id;
+            self.jrn(pool, || Undo::ReqBlocksInsert(g, req));
+        }
+        let cap = self.reserve_blocks;
+        self.req_to_blocks
+            .entry(req)
+            .or_insert_with(|| Vec::with_capacity(cap))
+    }
+
+    /// `blocks_mut` for callers that are about to APPEND: records the length to truncate
+    /// back to.
+    #[inline]
+    fn blocks_mut_for_push(&mut self, pool: &mut BlockPool, req: u32) -> &mut Vec<u32> {
+        if pool.arena.journal.is_some() {
+            let (g, len) = (self.group_id, self.blocks(req).len());
+            let existed = self.req_to_blocks.contains_key(&req);
+            if let Some(j) = pool.arena.journal.as_mut() {
+                if !existed {
+                    j.push(Undo::ReqBlocksInsert(g, req));
+                }
+                j.push(Undo::ReqBlocksLen(g, req, len));
+            }
+        }
         let cap = self.reserve_blocks;
         self.req_to_blocks
             .entry(req)
@@ -284,13 +319,15 @@ impl TypeManager {
         }
         let null = self.null_block;
         let n = {
-            let blocks = self.blocks_mut(req);
+            let blocks = self.blocks_mut_for_push(pool, req);
             for _ in 0..num_skipped_blocks {
                 blocks.push(null);
             }
             blocks.extend_from_slice(kept);
             blocks.len()
         };
+        let (g, old) = (self.group_id, self.num_cached_block.get(&req).copied());
+        self.jrn(pool, || Undo::NumCachedBlock(g, req, old));
         self.num_cached_block.insert(req, n);
         Ok(())
     }
@@ -313,18 +350,22 @@ impl TypeManager {
             num_tokens += self.block_size * self.num_speculative_blocks;
         }
         let num_required_blocks = cdiv(num_tokens, self.block_size);
-        let have = self.blocks_mut(req).len();
+        let have = self.blocks_mut(pool, req).len();
         if num_required_blocks <= have {
             return Ok(());
         }
         let num_new = num_required_blocks - have;
         let start = out.len();
         pool.get_new_blocks(num_new, out)?;
+        let (g, len) = (self.group_id, have);
+        self.jrn(pool, || Undo::ReqBlocksLen(g, req, len));
         self.req_to_blocks
             .get_mut(&req)
             .expect("entry created above")
             .extend_from_slice(&out[start..]);
         if self.tracks_new_block_ids {
+            let n = self.new_block_ids.len();
+            self.jrn(pool, || Undo::NewBlockIdsLen(g, n));
             self.new_block_ids.extend_from_slice(&out[start..]);
         }
         Ok(())
@@ -342,24 +383,34 @@ impl TypeManager {
         let num_spec = self.num_speculative_blocks;
         let num_required_blocks = cdiv(num_tokens_main_model, self.block_size) + num_spec;
         let null = self.null_block;
+        let g = self.group_id;
         let blocks_allocated = self.allocated_block_reqs.contains(&req);
-        let prev_block_len = self.blocks_mut(req).len();
+        let prev_block_len = self.blocks_mut(pool, req).len();
         if num_required_blocks <= prev_block_len {
             return Ok(());
         }
 
         if blocks_allocated {
             // The running state always lives at the last (1 + num_speculative) block.
+            let old = self.last_state_block_idx.get(&req).copied();
+            self.jrn(pool, || Undo::LastStateIdx(g, req, old));
             self.last_state_block_idx
                 .insert(req, prev_block_len - 1 - num_spec);
         } else if prev_block_len > 0 {
             // A fresh request that hit the prefix cache: the last block holds the hit state.
+            let old = self.last_state_block_idx.get(&req).copied();
+            self.jrn(pool, || Undo::LastStateIdx(g, req, old));
             self.last_state_block_idx.insert(req, prev_block_len - 1);
         }
 
         let num_skipped_blocks = num_required_blocks - num_spec - 1;
         {
-            let blocks = self.blocks_mut(req);
+            let armed = pool.arena.journal.is_some();
+            let mut ops: Vec<Undo> = Vec::new();
+            let blocks = self.req_to_blocks.get_mut(&req).expect("entry created above");
+            if armed {
+                ops.push(Undo::ReqBlocksLen(g, req, blocks.len()));
+            }
             if prev_block_len < num_skipped_blocks {
                 for _ in prev_block_len..num_skipped_blocks {
                     blocks.push(null);
@@ -370,14 +421,22 @@ impl TypeManager {
                     if block_idx < num_skipped_blocks {
                         let b = blocks[block_idx];
                         blocks.push(b);
+                        if armed {
+                            ops.push(Undo::ReqBlocksSet(g, req, block_idx, blocks[block_idx]));
+                        }
                         blocks[block_idx] = null;
                     } else {
                         break;
                     }
                 }
             }
+            if let Some(j) = pool.arena.journal.as_mut() {
+                for op in ops {
+                    j.push(op);
+                }
+            }
         }
-        let cur_len = self.blocks_mut(req).len();
+        let cur_len = self.blocks_mut(pool, req).len();
         let num_new_blocks = num_required_blocks - cur_len;
         if blocks_allocated {
             debug_assert!(num_new_blocks <= 1);
@@ -387,8 +446,11 @@ impl TypeManager {
         let mut fresh = std::mem::take(&mut self.scratch);
         fresh.clear();
         pool.get_new_blocks(num_new_blocks, &mut fresh)?;
-        self.blocks_mut(req).extend_from_slice(&fresh);
+        self.blocks_mut_for_push(pool, req)
+            .extend_from_slice(&fresh);
         self.scratch = fresh;
+        let was = self.allocated_block_reqs.contains(&req);
+        self.jrn(pool, || Undo::AllocatedReq(g, req, was));
         self.allocated_block_reqs.insert(req);
         // `return req_blocks[prev_block_len:]` — includes the recycled speculative blocks.
         out.extend_from_slice(&self.blocks(req)[prev_block_len..]);
@@ -410,8 +472,10 @@ impl TypeManager {
         }
         // `reachable_block_mask` returns None for full attention always, and for mamba
         // whenever retention is dense (the only configuration this port accepts).
-        // Lend the Vec out instead of cloning it: no per-step allocation.
-        let blocks = std::mem::take(self.blocks_mut(req));
+        // Lend the Vec out instead of cloning it: no per-step allocation. The take/insert
+        // pair is a net no-op on the map entry (contents are read-only in between), so
+        // only the entry's possible CREATION needs journaling — `blocks_mut` does that.
+        let blocks = std::mem::take(self.blocks_mut(pool, req));
         pool.cache_full_blocks(
             &blocks,
             hashes.hashes,
@@ -422,6 +486,8 @@ impl TypeManager {
             self.group_id,
             None,
         );
+        let (g, old) = (self.group_id, self.num_cached_block.get(&req).copied());
+        self.jrn(pool, || Undo::NumCachedBlock(g, req, old));
         self.num_cached_block.insert(req, num_full_blocks);
 
         if self.kind == Kind::Mamba {
@@ -431,6 +497,8 @@ impl TypeManager {
                     continue;
                 }
                 if let Some(h) = blk.hash {
+                    let was = self.cached_blocks_this_step.contains(&h);
+                    self.jrn(pool, || Undo::CachedThisStepInsert(g, h, was));
                     self.cached_blocks_this_step.insert(h);
                 }
             }
@@ -450,9 +518,12 @@ impl TypeManager {
             return;
         }
         let null = self.null_block;
+        let g = self.group_id;
         let mut freed = std::mem::take(&mut self.scratch);
         freed.clear();
         {
+            let armed = pool.arena.journal.is_some();
+            let mut ops: Vec<Undo> = Vec::new();
             let blocks = self.req_to_blocks.get_mut(&req).unwrap();
             let last_block = last_block.min(blocks.len());
             let mut i = last_block;
@@ -462,7 +533,15 @@ impl TypeManager {
                     break;
                 }
                 freed.push(blocks[i]);
+                if armed {
+                    ops.push(Undo::ReqBlocksSet(g, req, i, blocks[i]));
+                }
                 blocks[i] = null;
+            }
+            if let Some(j) = pool.arena.journal.as_mut() {
+                for op in ops {
+                    j.push(op);
+                }
             }
         }
         if !freed.is_empty() {
@@ -483,11 +562,12 @@ impl TypeManager {
             // Assume every draft token is rejected so we never free a needed state.
             computed = (computed - self.num_speculative_blocks as i64).max(0);
         }
+        let g = self.group_id;
         let num_skipped_tokens = self.num_skipped_tokens(computed);
         if num_skipped_tokens > 0 {
             let mut num_skipped_blocks =
                 floordiv(num_skipped_tokens, self.block_size as i64) as usize;
-            num_skipped_blocks = num_skipped_blocks.min(self.blocks_mut(req).len());
+            num_skipped_blocks = num_skipped_blocks.min(self.blocks_mut(pool, req).len());
             self.remove_blocks_in_range(pool, req, 0, num_skipped_blocks);
         }
         if self.kind == Kind::Mamba && self.mamba_align {
@@ -496,13 +576,16 @@ impl TypeManager {
             if let Some(idx) = last_state {
                 if (idx as i64) < limit {
                     let null = self.null_block;
-                    let blocks = self.req_to_blocks.get_mut(&req);
-                    if let Some(blocks) = blocks {
-                        if idx < blocks.len() && blocks[idx] != null {
-                            let b = blocks[idx];
-                            blocks[idx] = null;
-                            pool.free_blocks(&[b]);
+                    let hit = match self.req_to_blocks.get(&req) {
+                        Some(blocks) if idx < blocks.len() && blocks[idx] != null => {
+                            Some(blocks[idx])
                         }
+                        _ => None,
+                    };
+                    if let Some(b) = hit {
+                        self.jrn(pool, || Undo::ReqBlocksSet(g, req, idx, b));
+                        self.req_to_blocks.get_mut(&req).unwrap()[idx] = null;
+                        pool.free_blocks(&[b]);
                     }
                 }
             }
@@ -510,14 +593,27 @@ impl TypeManager {
     }
 
     /// `pop_blocks_for_free` (`:384`, mamba override `:1329`).
-    pub fn pop_blocks_for_free(&mut self, req: u32, out: &mut Vec<u32>) {
+    pub fn pop_blocks_for_free(&mut self, pool: &mut BlockPool, req: u32, out: &mut Vec<u32>) {
+        let g = self.group_id;
         if self.kind == Kind::Mamba && self.mamba_align {
+            let was = self.allocated_block_reqs.contains(&req);
+            self.jrn(pool, || Undo::AllocatedReq(g, req, was));
             self.allocated_block_reqs.remove(&req);
+            let old = self.last_state_block_idx.get(&req).copied();
+            self.jrn(pool, || Undo::LastStateIdx(g, req, old));
             self.last_state_block_idx.remove(&req);
+        }
+        if pool.arena.journal.is_some() {
+            if let Some(v) = self.req_to_blocks.get(&req) {
+                let v = v.clone();
+                self.jrn(pool, || Undo::ReqBlocksRemove(g, req, v));
+            }
         }
         if let Some(v) = self.req_to_blocks.remove(&req) {
             out.extend_from_slice(&v);
         }
+        let old = self.num_cached_block.get(&req).copied();
+        self.jrn(pool, || Undo::NumCachedBlock(g, req, old));
         self.num_cached_block.remove(&req);
     }
 
@@ -525,19 +621,19 @@ impl TypeManager {
     pub fn free(&mut self, pool: &mut BlockPool, req: u32) {
         let mut v = std::mem::take(&mut self.scratch);
         v.clear();
-        self.pop_blocks_for_free(req, &mut v);
+        self.pop_blocks_for_free(pool, req, &mut v);
         v.reverse();
         pool.free_blocks(&v);
         self.scratch = v;
     }
 
     /// `get_num_common_prefix_blocks` (`:614` full attention, `:1180` mamba -> always 0).
-    pub fn get_num_common_prefix_blocks(&mut self, pool: &BlockPool, req: u32) -> usize {
+    pub fn get_num_common_prefix_blocks(&mut self, pool: &mut BlockPool, req: u32) -> usize {
         if self.kind == Kind::Mamba {
             return 0; // cascade attention is not supported by mamba
         }
         let num_reqs = {
-            self.blocks_mut(req);
+            self.blocks_mut(pool, req);
             self.req_to_blocks.len() as i32
         };
         let mut n = 0;
@@ -556,8 +652,12 @@ impl TypeManager {
         self.new_block_ids.clear();
     }
 
-    pub fn new_step_starts(&mut self) {
+    pub fn new_step_starts(&mut self, pool: &mut BlockPool) {
         if self.kind == Kind::Mamba {
+            if pool.arena.journal.is_some() && !self.cached_blocks_this_step.is_empty() {
+                let (g, set) = (self.group_id, self.cached_blocks_this_step.clone());
+                self.jrn(pool, || Undo::CachedThisStep(g, set));
+            }
             self.cached_blocks_this_step.clear();
         }
     }
@@ -789,6 +889,6 @@ mod tests {
         // A second request sharing the first block only.
         pool.touch(&shared[..1]);
         m.req_to_blocks.insert(2, vec![shared[0]]);
-        assert_eq!(m.get_num_common_prefix_blocks(&pool, 1), 1);
+        assert_eq!(m.get_num_common_prefix_blocks(&mut pool, 1), 1);
     }
 }

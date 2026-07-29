@@ -12,10 +12,14 @@ pub mod block_pool;
 pub mod config;
 pub mod coordinator;
 pub mod hash;
+/// Crate-internal: the journal is an implementation detail of `spec.rs`, and every type
+/// in it (`Block`, the index snapshots) is one callers must not be able to forge.
+pub(crate) mod journal;
 pub mod manager;
 pub mod radix;
 pub mod sched;
 pub mod single_type;
+pub mod spec;
 pub mod update;
 
 #[cfg(feature = "python")]

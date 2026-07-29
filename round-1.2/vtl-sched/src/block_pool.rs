@@ -20,7 +20,8 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::hash::{Digest32, HASH_LEN};
-use crate::radix::RadixIndex;
+use crate::journal::{Journal, Undo};
+use crate::radix::{Bucket, RadixIndex};
 
 pub const NIL: u32 = u32::MAX;
 
@@ -68,9 +69,15 @@ impl Default for Block {
 ///
 /// vLLM allocates two extra `KVCacheBlock(block_id=-1)` sentinels; we place them at
 /// indices `n` (head) and `n + 1` (tail) of the same arena so the link math is uniform.
+///
+/// The speculative undo journal lives here because [`BlockArena::get_mut`] is the single
+/// choke point every block write in the crate goes through — ref counts, hashes and the
+/// free-queue links all land in the same `Block`, so one recording site covers the whole
+/// allocator. `journal` is `None` in steady state; the check is one predictable branch.
 pub struct BlockArena {
     pub blocks: Vec<Block>,
     pub num_free_blocks: usize,
+    pub(crate) journal: Option<Journal>,
     head: u32,
     tail: u32,
 }
@@ -100,6 +107,7 @@ impl BlockArena {
         BlockArena {
             blocks,
             num_free_blocks: num_blocks,
+            journal: None,
             head,
             tail,
         }
@@ -110,9 +118,23 @@ impl BlockArena {
         &self.blocks[id as usize]
     }
 
+    /// THE write choke point. Every mutation of any block — links, ref count, hash —
+    /// goes through here, which is what makes the speculative journal exhaustive over the
+    /// allocator without a recording call at each of the ~30 individual assignments.
     #[inline]
     pub fn get_mut(&mut self, id: u32) -> &mut Block {
+        if let Some(j) = self.journal.as_mut() {
+            j.push(Undo::Block(id, self.blocks[id as usize].clone()));
+        }
         &mut self.blocks[id as usize]
+    }
+
+    #[inline]
+    fn set_free(&mut self, n: usize) {
+        if let Some(j) = self.journal.as_mut() {
+            j.push(Undo::FreeCount(self.num_free_blocks));
+        }
+        self.num_free_blocks = n;
     }
 
     /// `FreeKVCacheBlockQueue.popleft` (kv_cache_utils.py:231).
@@ -131,11 +153,13 @@ impl BlockArena {
         if next == NIL {
             return Err("Invalid block found in popleft() without a valid next_free_block".into());
         }
-        self.blocks[self.head as usize].next = next;
-        self.blocks[next as usize].prev = self.head;
-        self.blocks[first as usize].prev = NIL;
-        self.blocks[first as usize].next = NIL;
-        self.num_free_blocks -= 1;
+        let head = self.head;
+        self.get_mut(head).next = next;
+        self.get_mut(next).prev = head;
+        let b = self.get_mut(first);
+        b.prev = NIL;
+        b.next = NIL;
+        self.set_free(self.num_free_blocks - 1);
         Ok(first)
     }
 
@@ -145,19 +169,21 @@ impl BlockArena {
             return;
         }
         debug_assert!(self.num_free_blocks >= n);
-        self.num_free_blocks -= n;
+        self.set_free(self.num_free_blocks - n);
         let mut curr = self.blocks[self.head as usize].next;
         for _ in 0..n {
             debug_assert_ne!(curr, NIL);
             out.push(curr);
             let last = curr;
             curr = self.blocks[curr as usize].next;
-            self.blocks[last as usize].prev = NIL;
-            self.blocks[last as usize].next = NIL;
+            let b = self.get_mut(last);
+            b.prev = NIL;
+            b.next = NIL;
         }
         if curr != NIL {
-            self.blocks[self.head as usize].next = curr;
-            self.blocks[curr as usize].prev = self.head;
+            let head = self.head;
+            self.get_mut(head).next = curr;
+            self.get_mut(curr).prev = head;
         }
     }
 
@@ -170,11 +196,12 @@ impl BlockArena {
         if prev == NIL || next == NIL {
             return Err(format!("remove() called on an invalid block: {id}"));
         }
-        self.blocks[prev as usize].next = next;
-        self.blocks[next as usize].prev = prev;
-        self.blocks[id as usize].prev = NIL;
-        self.blocks[id as usize].next = NIL;
-        self.num_free_blocks -= 1;
+        self.get_mut(prev).next = next;
+        self.get_mut(next).prev = prev;
+        let b = self.get_mut(id);
+        b.prev = NIL;
+        b.next = NIL;
+        self.set_free(self.num_free_blocks - 1);
         Ok(())
     }
 
@@ -186,13 +213,13 @@ impl BlockArena {
         let first = self.blocks[self.head as usize].next;
         let mut prev = self.head;
         for &id in ids {
-            self.blocks[id as usize].prev = prev;
-            self.blocks[prev as usize].next = id;
+            self.get_mut(id).prev = prev;
+            self.get_mut(prev).next = id;
             prev = id;
         }
-        self.blocks[prev as usize].next = first;
-        self.blocks[first as usize].prev = prev;
-        self.num_free_blocks += ids.len();
+        self.get_mut(prev).next = first;
+        self.get_mut(first).prev = prev;
+        self.set_free(self.num_free_blocks + ids.len());
     }
 
     /// `FreeKVCacheBlockQueue.append_n` (kv_cache_utils.py:365).
@@ -202,13 +229,14 @@ impl BlockArena {
         }
         let mut last = self.blocks[self.tail as usize].prev;
         for &id in ids {
-            self.blocks[id as usize].prev = last;
-            self.blocks[last as usize].next = id;
+            self.get_mut(id).prev = last;
+            self.get_mut(last).next = id;
             last = id;
         }
-        self.blocks[last as usize].next = self.tail;
-        self.blocks[self.tail as usize].prev = last;
-        self.num_free_blocks += ids.len();
+        self.get_mut(last).next = self.tail;
+        let tail = self.tail;
+        self.get_mut(tail).prev = last;
+        self.set_free(self.num_free_blocks + ids.len());
     }
 
     /// `FreeKVCacheBlockQueue.get_all_free_blocks` — test/debug only.
@@ -225,10 +253,20 @@ impl BlockArena {
 
 /// `BlockHashToBlockMap` (block_pool.py:34). The `One | Many` split mirrors upstream's
 /// `KVCacheBlock | dict[int, KVCacheBlock]` union, which exists to keep GC pressure down.
-#[derive(Debug)]
-enum Entry {
+#[derive(Debug, Clone)]
+pub(crate) enum Entry {
     One(u32),
     Many(SmallVec<[u32; 4]>),
+}
+
+/// One key's pre-mutation mapping, recorded by the speculative journal. Opaque on
+/// purpose: the two index implementations restore different things (a map entry vs a
+/// whole radix bucket plus the distinct-key count), and neither is expressible as an
+/// inverse `insert`/`pop` — `One`->`Many` promotion is not reversible by popping.
+#[derive(Debug)]
+pub(crate) enum IndexSnapshot {
+    Hash(Option<Entry>),
+    Radix(Option<Bucket>, usize),
 }
 
 #[derive(Default)]
@@ -310,6 +348,35 @@ impl HashIndex {
     pub fn clear(&mut self) {
         self.map.clear();
     }
+
+    pub(crate) fn snapshot(&self, key: &HashKey) -> Option<Entry> {
+        self.map.get(key).cloned()
+    }
+
+    pub(crate) fn restore(&mut self, key: &HashKey, snap: Option<Entry>) {
+        match snap {
+            Some(e) => {
+                self.map.insert(*key, e);
+            }
+            None => {
+                self.map.remove(key);
+            }
+        }
+    }
+
+    /// Order-independent content dump for [`crate::manager::Manager::state_fingerprint`].
+    pub(crate) fn entries(&self) -> Vec<(HashKey, SmallVec<[u32; 4]>)> {
+        self.map
+            .iter()
+            .map(|(k, e)| {
+                let v: SmallVec<[u32; 4]> = match e {
+                    Entry::One(b) => SmallVec::from_slice(&[*b]),
+                    Entry::Many(v) => v.clone(),
+                };
+                (*k, v)
+            })
+            .collect()
+    }
 }
 
 /// Selectable index implementation. `Hash` is upstream's flat map; `Radix` is the
@@ -351,6 +418,36 @@ impl Index {
             Index::Radix(i) => i.clear(),
         }
     }
+
+    /// Speculative journal support. The radix variant snapshots the WHOLE bucket the key
+    /// falls in: neighbouring keys that share the 16-bit prefix are restored along with
+    /// it, which is still exact because their own snapshots (taken earlier) are replayed
+    /// after this one in the reversed pass.
+    pub(crate) fn snapshot(&self, key: &HashKey) -> IndexSnapshot {
+        match self {
+            Index::Hash(i) => IndexSnapshot::Hash(i.snapshot(key)),
+            Index::Radix(i) => {
+                let (b, n) = i.snapshot(key);
+                IndexSnapshot::Radix(b, n)
+            }
+        }
+    }
+
+    pub(crate) fn restore(&mut self, key: &HashKey, snap: IndexSnapshot) {
+        match (self, snap) {
+            (Index::Hash(i), IndexSnapshot::Hash(e)) => i.restore(key, e),
+            (Index::Radix(i), IndexSnapshot::Radix(b, n)) => i.restore(key, b, n),
+            // Unreachable: the index implementation is fixed at construction.
+            _ => unreachable!("index snapshot kind does not match the live index"),
+        }
+    }
+
+    pub(crate) fn entries(&self) -> Vec<(HashKey, SmallVec<[u32; 4]>)> {
+        match self {
+            Index::Hash(i) => i.entries(),
+            Index::Radix(i) => i.entries(),
+        }
+    }
 }
 
 pub struct BlockPool {
@@ -359,10 +456,10 @@ pub struct BlockPool {
     pub enable_caching: bool,
     pub hash_block_size: usize,
     pub null_block: u32,
-    cached: Index,
+    pub(crate) cached: Index,
     /// `cached_block_hashes_by_block` (block_pool.py:186): secondary hash keys for a block
     /// that already owns a primary hash (partial-block aliases).
-    cached_by_block: FxHashMap<u32, SmallVec<[HashKey; 2]>>,
+    pub(crate) cached_by_block: FxHashMap<u32, SmallVec<[HashKey; 2]>>,
     /// Scratch buffers reused across calls — the "no per-step heap allocation" discipline.
     scratch_ids: Vec<u32>,
     scratch_with_hash: Vec<u32>,
@@ -428,11 +525,37 @@ impl BlockPool {
         true
     }
 
+    /// Record the pre-mutation mapping of `key` when a speculative run is in flight.
+    #[inline]
+    fn journal_index(&mut self, key: &HashKey) {
+        if self.arena.journal.is_some() {
+            // Snapshot first, THEN take the journal borrow: `cached` and `arena` are
+            // disjoint fields but the borrow checker still wants them sequenced.
+            let snap = self.cached.snapshot(key);
+            if let Some(j) = self.arena.journal.as_mut() {
+                j.push(Undo::Index(*key, snap));
+            }
+        }
+    }
+
+    #[inline]
+    fn journal_cached_by_block(&mut self, block_id: u32) {
+        if self.arena.journal.is_some() {
+            let old = self.cached_by_block.get(&block_id).cloned();
+            if let Some(j) = self.arena.journal.as_mut() {
+                j.push(Undo::CachedByBlock(block_id, old));
+            }
+        }
+    }
+
     /// `BlockPool._remove_cached_block_hashes` (block_pool.py:484).
     fn remove_cached_block_hashes(&mut self, block_id: u32) -> usize {
         let mut keys: SmallVec<[HashKey; 3]> = SmallVec::new();
         if let Some(h) = self.arena.get(block_id).hash {
             keys.push(h);
+        }
+        if self.cached_by_block.contains_key(&block_id) {
+            self.journal_cached_by_block(block_id);
         }
         if let Some(extra) = self.cached_by_block.remove(&block_id) {
             keys.extend(extra.into_iter());
@@ -442,7 +565,9 @@ impl BlockPool {
         }
         let mut removed = 0;
         for key in &keys {
-            if self.cached.pop(key, block_id).is_some() {
+            let key = *key;
+            self.journal_index(&key);
+            if self.cached.pop(&key, block_id).is_some() {
                 removed += 1;
             }
         }
@@ -465,8 +590,10 @@ impl BlockPool {
             b.hash = Some(key);
             b.hash_num_tokens = num_tokens;
         } else {
+            self.journal_cached_by_block(block_id);
             self.cached_by_block.entry(block_id).or_default().push(key);
         }
+        self.journal_index(&key);
         self.cached.insert(key, block_id);
     }
 
@@ -597,6 +724,9 @@ impl BlockPool {
         if evicted == 0 {
             return false;
         }
+        if let Some(j) = self.arena.journal.as_mut() {
+            j.push(Undo::EvictedLen(self.evicted_this_step.len()));
+        }
         self.evicted_this_step.push(block_id);
         true
     }
@@ -653,6 +783,10 @@ impl BlockPool {
 
     /// `BlockPool.reset_prefix_cache` (block_pool.py:656).
     pub fn reset_prefix_cache(&mut self) -> bool {
+        // Whole-arena sweep: deliberately NOT journaled. Unreachable while a speculative
+        // run is armed (see the scope invariant in `journal.rs`) — every PyO3 entry point
+        // rolls the speculation back before it mutates.
+        debug_assert!(self.arena.journal.is_none());
         let num_used = self.num_gpu_blocks - self.get_num_free_blocks();
         if num_used != 1 {
             return false;

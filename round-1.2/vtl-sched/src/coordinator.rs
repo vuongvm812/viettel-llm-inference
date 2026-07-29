@@ -347,8 +347,9 @@ impl Coordinator {
     }
 
     pub fn pop_blocks_for_free(&mut self, req: u32, out: &mut Vec<u32>) {
+        let pool = &mut self.pool;
         for m in self.managers.iter_mut() {
-            m.pop_blocks_for_free(req, out);
+            m.pop_blocks_for_free(pool, req, out);
         }
     }
 
@@ -364,15 +365,17 @@ impl Coordinator {
             out.extend(std::iter::repeat(0).take(self.managers.len()));
             return;
         }
-        for i in 0..self.managers.len() {
-            let n = self.managers[i].get_num_common_prefix_blocks(&self.pool, req);
+        let pool = &mut self.pool;
+        for m in self.managers.iter_mut() {
+            let n = m.get_num_common_prefix_blocks(pool, req);
             out.push(n);
         }
     }
 
     pub fn new_step_starts(&mut self) {
+        let pool = &mut self.pool;
         for m in self.managers.iter_mut() {
-            m.new_step_starts();
+            m.new_step_starts(pool);
         }
     }
 

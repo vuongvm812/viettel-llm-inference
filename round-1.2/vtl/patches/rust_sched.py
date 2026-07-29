@@ -21,6 +21,17 @@ Gates (all default OFF, all independent except where noted)::
                                    update_from_output into ONE Rust call (needs _FULL)
     VTL_RUST_SCHED_UFO_SHADOW=1    keep Python's check_stop authoritative and only log
                                    where the Rust verdict disagrees
+    VTL_RUST_SCHED_TABLE=1         R6b: schedule from the Rust-RESIDENT request table
+                                   instead of re-marshalling every running request each
+                                   step (needs _FULL *and* _UFO -- the per-step token
+                                   deltas ride on update_step)
+    VTL_RUST_SCHED_TABLE_SHADOW=1  keep the marshalled path authoritative and only log
+                                   where the resident table disagrees with pack_req
+    VTL_RUST_SCHED_SPEC=1          R6c: precompute the next step on the Rust worker
+                                   thread between update_from_output and schedule
+                                   (needs _TABLE; mutually exclusive with _TABLE_SHADOW)
+    VTL_SCHED_TIMING=1             log-only p50/p95 of the schedule() phases. Independent
+                                   of every other gate.
 
 Why shadow first: this replaces the most correctness-critical component in the engine,
 and LFM2's hybrid layout (6 full-attention + 10 short-conv/mamba groups,
@@ -101,16 +112,28 @@ def kv_transfer_configured():
 def modes() -> dict:
     """Resolve the gate combination. ``full`` implies ``authority``."""
     full = env_on("VTL_RUST_SCHED_FULL")
+    # R6a rides on the full loop: it needs the Rust manager's slot interning, and
+    # nothing else in the engine would be Rust-backed without it.
+    ufo = full and env_on("VTL_RUST_SCHED_UFO")
+    # R6b rides on R6a: the resident table's per-step token delta is applied by
+    # `update_step`, so without UFO the table would go stale on the very first decode.
+    table = ufo and env_on("VTL_RUST_SCHED_TABLE")
+    table_shadow = table and env_on("VTL_RUST_SCHED_TABLE_SHADOW")
     return {
         "shadow": env_on("VTL_RUST_SCHED_SHADOW"),
         "strict": env_on("VTL_RUST_SCHED_SHADOW_STRICT"),
         "authority": env_on("VTL_RUST_SCHED") or full,
         "full": full,
         "radix": env_on("VTL_RUST_SCHED_RADIX"),
-        # R6a rides on the full loop: it needs the Rust manager's slot interning, and
-        # nothing else in the engine would be Rust-backed without it.
-        "ufo": full and env_on("VTL_RUST_SCHED_UFO"),
+        "ufo": ufo,
         "ufo_shadow": env_on("VTL_RUST_SCHED_UFO_SHADOW"),
+        "table": table,
+        "table_shadow": table_shadow,
+        # Shadow keeps the MARSHALLED call authoritative, and that call is what resyncs
+        # the table -- so the resident fast path (and therefore speculation, which can
+        # only be consumed by it) must stay off while shadowing.
+        "spec": table and not table_shadow and env_on("VTL_RUST_SCHED_SPEC"),
+        "timing": env_on("VTL_SCHED_TIMING"),
     }
 
 
@@ -629,6 +652,8 @@ def _install_authority(base, mirror_modes):
                 raise RuntimeError(f"VTL_RUST_SCHED=1 but config unsupported: {reason}")
             self._rust = vtl_sched.KvManager(cfg)
             self._mirror = RustMirror(self._rust)
+            # R6b/R6c state. Always constructed (cheap); the gates decide who reads it.
+            self._vtl_table = TableState()
             self._empty = RustBlocks(tuple([] for _ in range(self._rust.num_groups)))
             # Plain attribute, not a property: the base __init__ assigns it (a getter-only
             # property makes super().__init__ raise). Overwrite the python value with ours.
@@ -785,9 +810,13 @@ def _install_authority(base, mirror_modes):
             )
 
         def evict_blocks(self, block_ids):
+            # Out-of-band pool surgery: every resident entry's block list may have moved
+            # under it, and a pending speculation was computed against the old pool.
+            self._vtl_table.resync("evict_blocks")
             self._rust.evict_blocks([int(b) for b in block_ids])
 
         def reset_prefix_cache(self):
+            self._vtl_table.resync("reset_prefix_cache")
             return self._rust.reset_prefix_cache()
 
         def get_num_common_prefix_blocks(self, running_request_id):
@@ -832,6 +861,135 @@ def _install_authority(base, mirror_modes):
 # --------------------------------------------------------------------------
 
 
+class TableState:
+    """R6b/R6c bookkeeping, one per Rust-backed KVCacheManager.
+
+    It lives on the MANAGER, not the scheduler, because the three writers are spread
+    across both wrappers: the schedule() wrapper, the update_from_output() wrapper, and
+    the manager's own ``reset_prefix_cache`` / ``evict_blocks``.
+
+    ``dirty`` means "the resident table may not match Python's request objects". It starts
+    dirty (nothing is resident yet) and clears ONLY when a marshalled ``Scheduler.schedule``
+    completes -- that call is the full resync.
+
+    ``gen`` is the speculation's staleness token: every mutation Python makes that the Rust
+    manager cannot see bumps it, and ``take_speculative`` refuses a result computed under
+    an older one. THE BUMP SITES, exhaustively (anything else reaches Rust through an
+    invalidating ``w()`` guard and needs no counter):
+
+      1. ``Scheduler.add_request``      -- a new request lands in the waiting queue
+      2. ``Scheduler.finish_requests``  -- abort/finish from outside the scheduler
+      3. ``reset_prefix_cache``         -- also dirties: it is a whole-pool event
+      4. ``evict_blocks``               -- ditto
+      5. any bail condition observed by the schedule() wrapper (stock vLLM then mutates
+         requests and queues with no Rust call at all)
+      6. any per-request UFO fallback (status 255 / length mismatch / unregistered slot):
+         Python ran check_stop itself, so the table missed that request's token delta
+      7. every dirty transition, so a speculation kicked before it cannot be consumed after
+    """
+
+    __slots__ = ("dirty", "gen", "armed", "off", "steps")
+
+    def __init__(self):
+        self.dirty = True
+        self.gen = 0
+        self.armed = False  # a kick is outstanding and not yet consumed
+        self.off = False    # permanent, process-lifetime fallback to the marshalled path
+        self.steps = 0
+
+    def bump(self) -> None:
+        self.gen += 1
+        # A pending speculation can no longer be consumed; dropping `armed` saves the
+        # crossing. Rolling it back is not our job -- the next schedule call goes through
+        # an invalidating guard either way.
+        self.armed = False
+
+    def resync(self, why: str) -> None:
+        if not self.dirty:
+            self.dirty = True
+            log.debug("rust_sched: resident table marked dirty -- %s", why)
+        self.bump()
+
+    def fail(self, where: str, exc: BaseException) -> None:
+        """Fail-open: one log, then the shipped marshalled behaviour forever."""
+        reraise_fatal(exc)
+        self.dirty = True
+        self.armed = False
+        if not self.off:
+            self.off = True
+            log.exception(
+                "rust_sched: resident-table path failed in %s; permanently marshalled", where
+            )
+
+
+# pack_req field order, for shadow-mode divergence reports.
+_REQ_FIELDS = (
+    "slot",
+    "num_tokens",
+    "num_tokens_with_spec",
+    "num_computed_tokens",
+    "num_output_placeholders",
+    "num_prompt_tokens",
+    "max_tokens",
+    "status",
+    "num_preemptions",
+    "is_prefill_chunk",
+    "skip_reading_prefix_cache",
+)
+
+
+class PhaseTimers:
+    """VTL_SCHED_TIMING: p50/p95 of the three schedule() phases plus the step gap.
+
+    Deliberately a plain ring of ints per phase -- no numpy, no histogram. 500 samples
+    sorted twice per 500 steps is noise next to one scheduling step.
+    """
+
+    PHASES = ("marshal", "rust", "apply", "gap")
+    EVERY = 500
+
+    def __init__(self):
+        self.rings = {p: [] for p in self.PHASES}
+        self.n = 0
+        self.last_exit = 0
+
+    def add(self, phase: str, ns: int) -> None:
+        self.rings[phase].append(ns)
+
+    def tick(self) -> None:
+        self.n += 1
+        if self.n % self.EVERY:
+            return
+        parts = []
+        for p in self.PHASES:
+            ring = self.rings[p]
+            if not ring:
+                continue
+            ring.sort()
+            parts.append(
+                f"{p} p50={ring[len(ring) // 2] / 1000:.1f}us "
+                f"p95={ring[min(len(ring) - 1, int(len(ring) * 0.95))] / 1000:.1f}us"
+            )
+            ring.clear()
+        log.info("rust_sched: schedule() timing over %d steps -- %s", self.EVERY, "  ".join(parts))
+
+
+def bail_reason(scheduler):
+    """Per-step conditions the Rust loop does not model (scheduler.py:637-664).
+
+    Module level because both wrappers consult it: the schedule() wrapper to decide the
+    step, and the update_from_output() wrapper to decide whether kicking is safe.
+    """
+    if getattr(scheduler, "skipped_waiting", None):
+        return "blocked requests are parked in skipped_waiting"
+    if getattr(scheduler, "num_waiting_for_streaming_input", 0):
+        return "paused streaming sessions hold model-runner slots"
+    pause = getattr(scheduler, "_pause_state", None)
+    if pause is not None and getattr(pause, "name", str(pause)) != "UNPAUSED":
+        return f"scheduler is paused ({pause})"
+    return None
+
+
 def pack_req(slot: int, request) -> tuple:
     """Field order must match ``lib.rs::ReqTuple``."""
     return (
@@ -849,7 +1007,7 @@ def pack_req(slot: int, request) -> tuple:
     )
 
 
-def _install_update_from_output(scheduler_cls, shadow: bool):
+def _install_update_from_output(scheduler_cls, m: dict):
     """R6a -- one Rust call per step for the whole batch's stop decision.
 
     THE SEAM, and why it is this one. ``update_from_output`` is 350 lines of
@@ -871,6 +1029,8 @@ def _install_update_from_output(scheduler_cls, shadow: bool):
     """
     from vllm.v1.request import RequestStatus
 
+    shadow = m["ufo_shadow"]
+    spec = m["spec"]
     wrapped_ufo = scheduler_cls.update_from_output
     wrapped_urwo = scheduler_cls._update_request_with_output
 
@@ -926,7 +1086,13 @@ def _install_update_from_output(scheduler_cls, shadow: bool):
             if request is None or request.is_finished():
                 continue
             gen = sampled[index]
-            if not gen or getattr(request, "async_tokens_to_discard", 0):
+            if not gen:
+                # No token for this request this step (a prefill chunk). Nothing to apply,
+                # and nothing the resident table could have missed.
+                continue
+            if getattr(request, "async_tokens_to_discard", 0):
+                # A spec-decode rollback rewinds num_tokens behind Rust's back.
+                self._vtl_ufo_clean = False
                 continue
             slot = mirror.slot(request)
             # Python-side registry, same rationale as RustMirror._pushed: asking Rust
@@ -935,6 +1101,7 @@ def _install_update_from_output(scheduler_cls, shadow: bool):
             # (slot recycled -> discarded in mirror.drop) just re-registers.
             if slot not in mirror._stops:
                 if not register(rust, request, slot):
+                    self._vtl_ufo_clean = False
                     continue
                 mirror._stops.add(slot)
             slots.append(slot)
@@ -950,12 +1117,52 @@ def _install_update_from_output(scheduler_cls, shadow: bool):
         out = rust.update_step(slots, cu, toks, n_out, n_tok, int(self.max_model_len))
         return {rid: (n, *v) for (rid, n), v in zip(expect, out)}
 
+    def maybe_kick(self, kv):
+        """Arm the next step's speculation. Called once wrapped_ufo has returned, so every
+        ``_free_request`` -> ``kv.free`` of this step has already landed in the Rust pool.
+
+        Refuses on anything the worker cannot model: a non-empty waiting queue (spec.rs
+        invariant 3 / journal.rs's scope invariant), a dirty table, a bail condition, or a
+        step where any request fell back to Python's check_stop.
+        """
+        tbl = getattr(kv, "_vtl_table", None)
+        core = getattr(self, "_vtl_rust_core", None)
+        if tbl is None or core is None or tbl.off:
+            return
+        if not self._vtl_ufo_clean:
+            tbl.resync("a UFO per-request fallback ran this step")
+            return
+        if tbl.dirty or self.waiting or bail_reason(self) is not None:
+            return
+        try:
+            # `mirror.slot`, not a bare lookup: the tokens this step just appended may
+            # have completed a block, and Python's hasher has ALREADY produced its hash
+            # (it runs inside append_output_token_ids). Pushing it here rather than at the
+            # next schedule() is what makes speculation survive a block boundary -- the
+            # worker would otherwise walk a table claiming more full blocks than the crate
+            # has hashes for, and the next schedule() would invalidate the result anyway.
+            # self.running is the post-update order, i.e. the one schedule() will marshal.
+            mirror = kv._mirror
+            slots = [mirror.slot(r) for r in self.running]
+        except BaseException as exc:
+            tbl.fail("kick slot refresh", exc)
+            return
+        try:
+            tbl.armed = bool(core.kick(kv._rust, tbl.gen, slots))
+        except BaseException as exc:
+            tbl.fail("kick", exc)
+
     def update_from_output(self, scheduler_output, model_runner_output):
         self._vtl_ufo = None
+        # False the moment ANY request in this step's batch was decided by Python instead
+        # of by update_step -- which is exactly when the resident table missed a token
+        # delta and must be resynced before it can be scheduled from again.
+        self._vtl_ufo_clean = True
         kv = self.kv_cache_manager
+        sampled = model_runner_output.sampled_token_ids
         if (
             hasattr(kv, "_rust")
-            and model_runner_output.sampled_token_ids
+            and sampled
             and not scheduler_output.scheduled_spec_decode_tokens
             and not model_runner_output.pooler_output
         ):
@@ -965,10 +1172,19 @@ def _install_update_from_output(scheduler_cls, shadow: bool):
                 reraise_fatal(exc)
                 log.exception("rust_sched: UFO batch failed; this step uses check_stop")
                 self._vtl_ufo = None
+            if self._vtl_ufo is None:
+                self._vtl_ufo_clean = False
+        elif sampled:
+            # Tokens were produced but nothing was portable: stock check_stop ran for the
+            # whole batch, so update_step applied no delta at all.
+            self._vtl_ufo_clean = False
         try:
-            return wrapped_ufo(self, scheduler_output, model_runner_output)
+            outputs = wrapped_ufo(self, scheduler_output, model_runner_output)
         finally:
             self._vtl_ufo = None
+        if spec:
+            maybe_kick(self, kv)
+        return outputs
 
     def _update_request_with_output(self, request, new_token_ids):
         decided = self._vtl_ufo
@@ -976,6 +1192,8 @@ def _install_update_from_output(scheduler_cls, shadow: bool):
         # 255 = unregistered slot; a length mismatch means something mutated the request
         # between the batch and here. Either way, stock decides.
         if answer is None or answer[2] == 255 or answer[0] != len(new_token_ids):
+            # Rust left this slot's table entry untouched; Python owns the delta now.
+            self._vtl_ufo_clean = False
             return wrapped_urwo(self, request, new_token_ids)
         _, num_keep, status, stop_reason = answer
 
@@ -1012,14 +1230,20 @@ def _install_update_from_output(scheduler_cls, shadow: bool):
             request.stop_reason = stop_reason
         return new_token_ids, True
 
+    # Class-level defaults: `_update_request_with_output` is also reachable from
+    # `_update_request_as_session`, i.e. without update_from_output having run first.
+    scheduler_cls._vtl_ufo = None
+    scheduler_cls._vtl_ufo_clean = True
     mark_patched(update_from_output, wrapped_ufo, patch="rust_sched_ufo")
     mark_patched(_update_request_with_output, wrapped_urwo, patch="rust_sched_ufo")
     scheduler_cls.update_from_output = update_from_output
     scheduler_cls._update_request_with_output = _update_request_with_output
-    log.info("rust_sched: UFO batched stop decision active (shadow=%s)", shadow)
+    log.info(
+        "rust_sched: UFO batched stop decision active (shadow=%s, kick=%s)", shadow, spec
+    )
 
 
-def _install_full_schedule(scheduler_cls, sjf_enabled: bool):
+def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     """Replace ``Scheduler.schedule`` with the Rust-driven decision loop."""
     import time
 
@@ -1034,16 +1258,34 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool):
     # (`sched.rs::reorder_waiting` reproduces the same key), so no unwrapping is needed.
     wrapped = scheduler_cls.schedule
 
-    def bail_reason(self):
-        """Per-step conditions the Rust loop does not model (scheduler.py:637-664)."""
-        if getattr(self, "skipped_waiting", None):
-            return "blocked requests are parked in skipped_waiting"
-        if getattr(self, "num_waiting_for_streaming_input", 0):
-            return "paused streaming sessions hold model-runner slots"
-        pause = getattr(self, "_pause_state", None)
-        if pause is not None and getattr(pause, "name", str(pause)) != "UNPAUSED":
-            return f"scheduler is paused ({pause})"
-        return None
+    # Gates resolved ONCE, into closure cells. An off gate then costs one LOAD_DEREF and a
+    # not-taken branch per step, which is why the timing arm below is inline rather than a
+    # second copy of this 180-line function.
+    TABLE, TABLE_SHADOW, SPEC = m["table"], m["table_shadow"], m["spec"]
+    RESIDENT = TABLE and not TABLE_SHADOW
+    TIMING = m["timing"]
+    ns = time.monotonic_ns
+    timers = PhaseTimers() if TIMING else None
+    table_shadow_state = ShadowState(strict=False) if TABLE_SHADOW else None
+
+    def shadow_table(kv, running, by_slot):
+        """Log where the resident table disagrees with this step's ``pack_req`` tuples.
+
+        Called only from the marshalled arm, and only in TABLE_SHADOW mode: ``table_entry``
+        is non-invalidating and therefore reads THROUGH a pending speculation, but
+        ``modes()`` forces SPEC off whenever TABLE_SHADOW is on, so none can be pending.
+        """
+        for us in running:
+            them = kv._rust.table_entry(us[0])
+            if them == us:
+                table_shadow_state.calls += 1
+                continue
+            rid = by_slot[us[0]].request_id
+            if them is None:
+                table_shadow_state.check("table_entry", "present", "missing", rid)
+                continue
+            for name, mine, theirs in zip(_REQ_FIELDS, us, them):
+                table_shadow_state.check(f"table.{name}", mine, theirs, rid)
 
     def schedule(self, *args, **kwargs):
         kv = self.kv_cache_manager
@@ -1080,20 +1322,38 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool):
                     "sjf_reorder": bool(sjf_enabled),
                 }
             )
-            log.info("rust_sched: FULL schedule() loop active (sjf=%s)", sjf_enabled)
+            log.info(
+                "rust_sched: FULL schedule() loop active "
+                "(sjf=%s, table=%s, table_shadow=%s, spec=%s, timing=%s)",
+                sjf_enabled, TABLE, TABLE_SHADOW, SPEC, TIMING,
+            )
+
+        if TIMING:
+            t_enter = ns()
+            if timers.last_exit:
+                timers.add("gap", t_enter - timers.last_exit)
 
         # Bail BEFORE `current_step += 1`: the fallback does its own increment.
         bail = bail_reason(self)
+        tbl = getattr(kv, "_vtl_table", None) if TABLE else None
+        # A dirty table means the marshalled call has to run anyway -- it IS the resync.
+        resident = RESIDENT and tbl is not None and not tbl.off and not tbl.dirty
         mirror = kv._mirror
         by_slot = {}
         running = []
+        running_slots = []
         waiting = []
         if bail is None:
             try:
                 for request in self.running:
+                    # `mirror.slot` still pushes new block hashes here, BEFORE scheduling,
+                    # exactly as the marshalled path always has -- the resident table
+                    # holds counters, never hashes.
                     slot = mirror.slot(request)
                     by_slot[slot] = request
-                    running.append(pack_req(slot, request))
+                    running_slots.append(slot)
+                    if not resident:
+                        running.append(pack_req(slot, request))
                 for request in self.waiting:
                     if request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
                         bail = f"waiting request in status {request.status!s}"
@@ -1104,6 +1364,9 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool):
             except NotImplementedError as exc:  # unported RequestStatus on a running req
                 bail = str(exc)
         if bail is not None:
+            if tbl is not None:
+                # Stock vLLM now mutates requests and queues with no Rust call at all.
+                tbl.resync(bail)
             seen = getattr(self, "_vtl_rust_bails", None)
             if seen is None:
                 seen = self._vtl_rust_bails = set()
@@ -1113,7 +1376,55 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool):
             return wrapped(self, *args, **kwargs)
 
         self.current_step += 1
-        decisions = core.schedule(kv._rust, running, waiting)
+        if TIMING:
+            t_marshal = ns()
+            timers.add("marshal", t_marshal - t_enter)
+
+        decisions = None
+        if resident:
+            try:
+                # The worker speculated with an EMPTY waiting slice (spec.rs), and
+                # `take_speculative` checks the generation and slot order but NOT the
+                # queue -- so refusing here is what makes an admission step safe.
+                if SPEC and tbl.armed and not waiting:
+                    decisions = core.take_speculative(kv._rust, tbl.gen, running_slots)
+                tbl.armed = False
+                if decisions is None:
+                    decisions = core.schedule_resident(kv._rust, running_slots, waiting)
+            except Exception as exc:
+                # The documented failure is "slot N has no resident entry", i.e. the
+                # resync signal; every other rejection wants the same answer.
+                tbl.resync(f"resident schedule refused ({exc!r})")
+                decisions = None
+            except BaseException as exc:  # a crate panic
+                tbl.fail("schedule_resident", exc)
+                decisions = None
+            if decisions is None:
+                running = [pack_req(s, by_slot[s]) for s in running_slots]
+        if decisions is None:
+            if TABLE_SHADOW and tbl is not None and not tbl.dirty:
+                try:
+                    shadow_table(kv, running, by_slot)
+                except BaseException as exc:
+                    tbl.fail("table shadow", exc)
+            decisions = core.schedule(kv._rust, running, waiting)
+            if tbl is not None:
+                # `Scheduler.schedule` rewrites every running entry: this call is the
+                # full resync, and the only place `dirty` clears.
+                tbl.dirty = False
+                tbl.armed = False
+        if tbl is not None:
+            tbl.steps += 1
+            if SPEC and tbl.steps % 2000 == 0:
+                hits, misses, rollbacks, disabled = kv._rust.spec_stats()
+                log.info(
+                    "rust_sched: speculation over %d steps -- hits=%d misses=%d "
+                    "rollbacks=%d disabled=%s",
+                    tbl.steps, hits, misses, rollbacks, disabled,
+                )
+        if TIMING:
+            t_rust = ns()
+            timers.add("rust", t_rust - t_marshal)
 
         # --- apply the decisions (scheduler.py:1045-1133 in Python) ----------
         timestamp = time.monotonic()
@@ -1229,9 +1540,44 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool):
         if self.defer_block_free and total > 0:
             self.sched_step_seq += 1
         self._update_after_schedule(scheduler_output)
+        if TIMING:
+            t_exit = ns()
+            timers.add("apply", t_exit - t_rust)
+            timers.last_exit = t_exit
+            timers.tick()
         return scheduler_output
 
     scheduler_cls.schedule = mark_patched(schedule, wrapped)
+
+
+def _install_generation_hooks(scheduler_cls):
+    """Bump ``TableState.gen`` on the two queue mutations that never reach Rust.
+
+    Everything else the engine does to the KV state goes through an invalidating ``w()``
+    guard inside the crate, which drops a pending speculation on its own. These two do
+    not: ``add_request`` only appends to a Python deque, and ``finish_requests`` retires
+    requests whose blocks may be freed later (or not at all, for a request still waiting).
+    """
+    wrapped_add = scheduler_cls.add_request
+    wrapped_finish = scheduler_cls.finish_requests
+
+    def bump(self):
+        tbl = getattr(self.kv_cache_manager, "_vtl_table", None)
+        if tbl is not None:
+            tbl.bump()
+
+    def add_request(self, request, *args, **kwargs):
+        bump(self)
+        return wrapped_add(self, request, *args, **kwargs)
+
+    def finish_requests(self, *args, **kwargs):
+        bump(self)
+        return wrapped_finish(self, *args, **kwargs)
+
+    scheduler_cls.add_request = mark_patched(add_request, wrapped_add, patch="rust_sched_spec")
+    scheduler_cls.finish_requests = mark_patched(
+        finish_requests, wrapped_finish, patch="rust_sched_spec"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1309,13 +1655,22 @@ def apply() -> None:
             log.info("rust_sched: SUPERSEDING sched_policy's schedule() wrapper "
                      "(its SJF key now runs inside the Rust loop)")
         sjf = os.environ.get("VTL_ENABLE_SCHED_POLICY", "1").strip().lower() in _TRUTHY
-        _install_full_schedule(Scheduler, sjf)
+        _install_full_schedule(Scheduler, sjf, m)
         Scheduler.schedule.__vtl_rust_full__ = True
+        log.info(
+            "rust_sched: resolved R6b/R6c mode -- table=%s table_shadow=%s spec=%s timing=%s",
+            m["table"], m["table_shadow"], m["spec"], m["timing"],
+        )
 
         if m["ufo"] and not already_patched(
             Scheduler, "update_from_output", patch="rust_sched_ufo"
         ):
-            _install_update_from_output(Scheduler, m["ufo_shadow"])
+            _install_update_from_output(Scheduler, m)
+
+        if m["spec"] and not already_patched(
+            Scheduler, "add_request", patch="rust_sched_spec"
+        ):
+            _install_generation_hooks(Scheduler)
 
 
 # --------------------------------------------------------------------------
@@ -1328,6 +1683,8 @@ def _self_check() -> None:
         "VTL_RUST_SCHED", "VTL_RUST_SCHED_SHADOW", "VTL_RUST_SCHED_FULL",
         "VTL_RUST_SCHED_SHADOW_STRICT", "VTL_RUST_SCHED_RADIX",
         "VTL_RUST_SCHED_UFO", "VTL_RUST_SCHED_UFO_SHADOW",
+        "VTL_RUST_SCHED_TABLE", "VTL_RUST_SCHED_TABLE_SHADOW",
+        "VTL_RUST_SCHED_SPEC", "VTL_SCHED_TIMING",
     )}
     try:
         for k in saved:
@@ -1335,6 +1692,7 @@ def _self_check() -> None:
         assert modes() == {
             "shadow": False, "strict": False, "authority": False,
             "full": False, "radix": False, "ufo": False, "ufo_shadow": False,
+            "table": False, "table_shadow": False, "spec": False, "timing": False,
         }, modes()
         assert env_on("VTL_RUST_SCHED") is False
         for truthy in ("1", "true", "YES", " on "):
@@ -1349,8 +1707,26 @@ def _self_check() -> None:
         # UFO needs the full loop: it reads the Rust manager's slot interning.
         os.environ["VTL_RUST_SCHED_UFO"] = "1"
         assert modes()["ufo"] is True
+        # The R6b/R6c ladder: TABLE needs UFO, SPEC needs TABLE, and TABLE_SHADOW keeps
+        # the marshalled path authoritative so it must switch SPEC off.
+        os.environ["VTL_RUST_SCHED_TABLE"] = "1"
+        os.environ["VTL_RUST_SCHED_SPEC"] = "1"
+        assert modes()["table"] is True and modes()["spec"] is True
+        os.environ["VTL_RUST_SCHED_TABLE_SHADOW"] = "1"
+        assert modes()["table_shadow"] is True
+        assert modes()["spec"] is False, "shadow keeps the marshalled path authoritative"
+        os.environ.pop("VTL_RUST_SCHED_TABLE_SHADOW")
+        os.environ["VTL_RUST_SCHED_UFO"] = "0"
+        assert modes()["table"] is False and modes()["spec"] is False, (
+            "TABLE must not arm without UFO -- update_step applies its token delta"
+        )
+        os.environ["VTL_RUST_SCHED_UFO"] = "1"
         os.environ["VTL_RUST_SCHED_FULL"] = "0"
         assert modes()["ufo"] is False, "UFO must not arm without the full Rust loop"
+        assert modes()["table"] is False and modes()["spec"] is False
+        # VTL_SCHED_TIMING is orthogonal: log-only, no dependency on any of the above.
+        os.environ["VTL_SCHED_TIMING"] = "1"
+        assert modes()["timing"] is True
     finally:
         for k, v in saved.items():
             if v is None:
@@ -1383,6 +1759,33 @@ def _self_check() -> None:
         assert "rust_sched shadow mismatch" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("strict shadow mode must raise")
+
+    # TableState: born dirty (nothing is resident yet); resync bumps the generation AND
+    # disarms, so a speculation kicked before it can never be consumed after; fail() is
+    # permanent. (Still inside the muted-logger region -- fail() logs at ERROR.)
+    tbl = TableState()
+    assert tbl.dirty and tbl.gen == 0 and not tbl.armed and not tbl.off
+    tbl.dirty, tbl.armed = False, True
+    tbl.resync("test")
+    assert tbl.dirty and tbl.gen == 1 and not tbl.armed
+    tbl.bump()
+    assert tbl.gen == 2
+    tbl.fail("test", RuntimeError("boom"))
+    assert tbl.off and tbl.dirty and not tbl.armed
+    try:
+        tbl.fail("test", KeyboardInterrupt())
+    except KeyboardInterrupt:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("fail() must not swallow interpreter signals")
+
+    # PhaseTimers: p50/p95 off a sorted ring, and the ring is drained each report.
+    pt = PhaseTimers()
+    for i in range(100):
+        pt.add("rust", i * 1000)
+    pt.n = PhaseTimers.EVERY - 1
+    pt.tick()
+    assert pt.rings["rust"] == [], "the ring must be drained after a report"
 
     # RustBlocks duck-types the pieces of KVCacheBlocks the scheduler touches.
     rb = RustBlocks(([1, 2], [3]))
