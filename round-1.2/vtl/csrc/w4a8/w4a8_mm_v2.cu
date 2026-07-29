@@ -844,6 +844,20 @@ int64_t min_m_of(std::string const& schedule) {
   return 1;
 }
 
+// Clustered arms also need the token-tile count to be a MULTIPLE of ClusterN: CUTLASS's
+// get_grid_shape rounds the N grid up to whole clusters, so an odd tile count (m in
+// (256,384], (512,640], (768,896] at TileN=128) adds a phantom column of tiles_m CTAs that
+// run the full mainloop and predicate the output away -- 25-33% extra tile work on ~39% of
+// the band. Below-floor and odd-tile cases both fall through to the stock kernel.
+bool cluster_tiles_align(std::string const& schedule, int64_t m) {
+  if (schedule == "128x128_1x2x1_pf") {
+    int64_t const tiles_n =
+        (m + Kernel_128x128_1x2x1_pf::kTileN - 1) / Kernel_128x128_1x2x1_pf::kTileN;
+    return tiles_n % Kernel_128x128_1x2x1_pf::kClusterN == 0;
+  }
+  return true;
+}
+
 // The M branch lives HERE, not in Python, on purpose: `VtlW4A8LinearMethod.apply` is traced by
 // support_torch_compile with fullgraph=True, where a branch on the symbolic token count is
 // either a graph break (= engine crash) or a recompile per batch bucket. Inside an opaque
@@ -875,7 +889,7 @@ at::Tensor w4a8_mm_v2(at::Tensor const& a, at::Tensor const& b_q,
                           token_scales, schedule);
   }
   if (m > m_threshold && m <= prefill_max && !prefill_schedule.empty() &&
-      m >= min_m_of(prefill_schedule)) {
+      m >= min_m_of(prefill_schedule) && cluster_tiles_align(prefill_schedule, m)) {
     return mm_dispatch_v2(a, b_q, group_scales, group_size, channel_scales,
                           token_scales, prefill_schedule);
   }

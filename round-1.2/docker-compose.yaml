@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:7dd03555e12fa396a088d6d14d4d7cbeb33322f48e4bbaa6459772078b227375 # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:1ceefaa68e65626e4ddb0af99415503edb59ce42c65877f3bd532c21d976108e # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -132,7 +132,10 @@ services:
       # libgomp would busy-spin after every parallel region. PASSIVE stops the spin-wait.
       OMP_NUM_THREADS: "3"
       MKL_NUM_THREADS: "3"
-      OMP_WAIT_POLICY: "ACTIVE"
+      OMP_WAIT_POLICY: "PASSIVE"             # was ACTIVE, contradicting the comment above:
+                                             # on 3 cores a spinning libgomp worker steals a
+                                             # third of the host budget from the decode loop.
+                                             # Revert: "ACTIVE".
 
       # CPython hands the GIL to a waiting thread only after sys.getswitchinterval() -- 5ms by
       # default, longer than a whole decode step. The engine-core main loop is tight pure
@@ -155,8 +158,14 @@ services:
       # dispatch handoff also collapses onto the tokio LIFO slot instead of waking a second
       # thread per token. Sweep 1<->2 if TTFT regresses (one zmq thread means a large msgpack
       # decode blocks request submission).
-      VLLM_RS_ZMQ_WORKER_THREADS: "3"
-      VLLM_RS_REQUEST_WORKER_THREADS: "3"
+      # Pinned to 1 (2026-07-29): the step is HOST-bound at the trace's mean batch (~2.5-3.4ms
+      # of 3ms TPOT is host work on 3 vCPUs), and with VTL_SHM_IPC=1 the iceoryx2 plane carries
+      # the per-step data -- ZMQ is handshake/death only, so its 4 hard-coded workers were idle
+      # spin candidates. This is the compose's own long-standing recommendation, finally taken.
+      # Revert: "3" each. If TTFT regresses, raise ZMQ to 2 first (large msgpack decode blocks
+      # request submission at 1).
+      VLLM_RS_ZMQ_WORKER_THREADS: "2"
+      VLLM_RS_REQUEST_WORKER_THREADS: "2"
       # Drop the per-request axum TraceLayer span (latency A/B). Unset = layer ON (default);
       # 1 removes it, which is what we ship. Set to 0 to restore it and measure the delta.
       # Trade-off: loses rejected-request log visibility (logs are already WARN-pinned anyway).
@@ -287,9 +296,15 @@ services:
       # 16 SMs). Swap the map for the sweep winner once `make sweep-schedule V2=1` has run.
       # NOT the _sk_nd variant: nondeterministic reduction is a sweep arm only, because it makes
       # results non-reproducible run-to-run and a flake then looks like a regression.
-      VTL_W4A8_SCHEDULE_V2: "*=128x16_1x1x1_sk"
-      VTL_W4A8_V2_MTHRESH: "32"              # decode band upper bound; 0 = control arm
-                                             # (always forward to the stock kernel)
+      # VTL_W4A8_SCHEDULE_V2: "*=128x16_1x1x1_sk"
+      VTL_W4A8_SCHEDULE_V2: "n3072k2048=128x16_1x1x1_sk"
+      VTL_W4A8_V2_MTHRESH: "16"              # decode band upper bound; 0 = control arm
+                                             # (always forward to the stock kernel).
+                                             # 16, not 32, at sm_count=16: TileN=16, so
+                                             # M 17-32 = 2 token tiles -> qkv 48 CTAs = 3
+                                             # EVEN waves (sk = pure overhead); the ragged
+                                             # 1.5-wave case sk exists for is M<=16 only.
+                                             # Revert: "32".
 
       # Prefill band, M in (MTHRESH, PREFILL_MAX]. This is the ONLY place cluster multicast of
       # the WEIGHTS and raster order do anything: CUTLASS multicasts operand A (the weights,

@@ -192,6 +192,15 @@ def _classify(runner):  # noqa: ANN001
                     return False
                 if runner.vllm_config.cache_config.mamba_cache_mode != "align":
                     return False
+                # _mamba_write gathers state indices for PADDED rows too (stock tail-fills
+                # NULL instead, mamba_attn.py:574). That is safe only while gather_block_tables
+                # zero-fills padded rows AND NULL_BLOCK_ID == 0 -- so pin the constant here
+                # rather than silently rotating a live block's conv state if it ever moves.
+                from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+                if NULL_BLOCK_ID != 0:
+                    log.info("vtl: decode_fastpath off -- NULL_BLOCK_ID=%d != 0", NULL_BLOCK_ID)
+                    return False
                 mamba.append((b, group_id, spec.block_size))
                 continue
             if not hasattr(b, "scheduler_metadata"):
@@ -325,8 +334,11 @@ def _fast_model_attn(runner, c: _Cache) -> None:  # noqa: ANN001
     ib = c.ib
     n = ib.num_reqs_after_padding
     seq_lens = runner.input_buffers.seq_lens[:n]
-    # max_seq_len is the ONE scalar FA3 needs off the host; it advances +1/step.
-    max_seq_len = int(c.seq_ub_np[:n].max())
+    # max_seq_len is the ONE scalar FA3 needs off the host; it advances +1/step. Max over
+    # the REAL rows only -- the padded tail is zero from the slow step's fresh array and
+    # stock reads [:num_reqs].max() too (mamba_hybrid.py:251); [:n] would be correct today
+    # but couples the max to the tail staying zero.
+    max_seq_len = int(c.seq_ub_np[: ib.num_reqs].max())
     for b, _ in fa:
         _fa_write(b, n, seq_lens, ib.query_start_loc, max_seq_len)
     for b, group_id, block_size in mamba:
