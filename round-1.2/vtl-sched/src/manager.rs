@@ -22,6 +22,7 @@
 use std::hash::{Hash, Hasher};
 
 use rustc_hash::{FxHashMap, FxHasher};
+use smallvec::SmallVec;
 
 use crate::block_pool::BlockPool;
 use crate::config::Config;
@@ -111,6 +112,15 @@ pub struct Manager {
     /// step packs into last step's allocation.
     pub raw: crate::update::RawPacker,
 
+    /// Port-2: slot -> token counters + unhashed tail (`tokens.rs`). Lives here for the
+    /// same reason `stops` does -- `forget` must drop every half of a request in one place,
+    /// and the hash catch-up writes into `reqs[slot].hashes`.
+    pub tokens: crate::tokens::TokenStore,
+    /// Scratch for `update_step_pack_store`'s flat inputs, reused across steps.
+    tok_cu: Vec<u32>,
+    tok_nout: Vec<u32>,
+    tok_ntok: Vec<u32>,
+
     /// R6b: slot -> the scheduling loop's view of the request. Dense (slots are interned
     /// with reuse), so a `Vec` beats a map on the hot lookup. Written wholesale by the
     /// marshalled [`crate::sched::ScheduleCore::schedule`] (the resync path), then kept
@@ -187,6 +197,10 @@ impl Manager {
             stats: PrefixCacheStats::default(),
             stops: Default::default(),
             raw: Default::default(),
+            tokens: crate::tokens::TokenStore::new(cfg.hash_block_size),
+            tok_cu: Vec::with_capacity(16),
+            tok_nout: Vec::with_capacity(16),
+            tok_ntok: Vec::with_capacity(16),
             table: Vec::new(),
             pending_hit: (0..n).map(|_| Vec::with_capacity(64)).collect(),
             new_blocks: (0..n).map(|_| Vec::with_capacity(64)).collect(),
@@ -246,6 +260,9 @@ impl Manager {
             }
             self.hit_len.remove(&id);
             self.stops.forget(id);
+            // Port-2: the token store is slot-keyed too, so a recycled slot must not
+            // inherit the dead request's counters, tail or output tokens.
+            self.tokens.forget(id);
             self.table_clear(id);
             self.free_slots.push(id);
         }
@@ -810,6 +827,37 @@ impl Manager {
         timestamp: f64,
         finished: &[String],
     ) -> Result<(&[crate::update::Verdict], bool), String> {
+        let packed = self.pack_inner(
+            slots,
+            cu_lens,
+            token_ids,
+            num_output_tokens,
+            num_tokens,
+            max_model_len,
+            engine_index,
+            timestamp,
+            finished,
+        )?;
+        Ok((&self.stops.out, packed))
+    }
+
+    /// [`Manager::update_step_pack`] without the verdict borrow, so the store variant can
+    /// run it and then keep mutating `self`. The ONE implementation of the record layout:
+    /// both public entry points go through here, which is what makes the bytes identical
+    /// with and without the token store (asserted by `record_is_identical_with_the_store`).
+    #[allow(clippy::too_many_arguments)]
+    fn pack_inner(
+        &mut self,
+        slots: &[u32],
+        cu_lens: &[u32],
+        token_ids: &[i64],
+        num_output_tokens: &[u32],
+        num_tokens: &[u32],
+        max_model_len: usize,
+        engine_index: u32,
+        timestamp: f64,
+        finished: &[String],
+    ) -> Result<bool, String> {
         self.update_step(
             slots,
             cu_lens,
@@ -819,9 +867,8 @@ impl Manager {
             max_model_len,
         )?;
         // Disjoint field borrows: `stops.out` and `names`/`ids` read, `raw` written.
-        let verdicts = &self.stops.out;
-        if verdicts.iter().any(|v| v.status == u8::MAX) {
-            return Ok((verdicts, false));
+        if self.stops.out.iter().any(|v| v.status == u8::MAX) {
+            return Ok(false);
         }
         let raw = &mut self.raw;
         raw.begin(
@@ -833,9 +880,9 @@ impl Manager {
         for (i, &slot) in slots.iter().enumerate() {
             let name = match self.names.get(slot as usize) {
                 Some(n) if self.ids.get(n.as_str()) == Some(&slot) => n.as_str(),
-                _ => return Ok((verdicts, false)),
+                _ => return Ok(false),
             };
-            let v = verdicts[i];
+            let v = self.stops.out[i];
             let lo = cu_lens[i] as usize;
             let hi = lo + v.num_accepted as usize;
             let stop = (v.stop_reason >= 0).then_some(v.stop_reason);
@@ -848,15 +895,170 @@ impl Manager {
                 )
                 .is_err()
             {
-                return Ok((verdicts, false));
+                return Ok(false);
             }
         }
         for req_id in finished {
             if raw.push_finished(req_id).is_err() {
-                return Ok((verdicts, false));
+                return Ok(false);
             }
         }
-        Ok((verdicts, raw.finish().is_ok()))
+        Ok(raw.finish().is_ok())
+    }
+
+    // ---- Port-2: the token store ------------------------------------------
+
+    /// Arm the store with vLLM's live `NONE_HASH`. Until this runs, `store_init` refuses.
+    pub fn store_arm(&mut self, none_hash: Digest32) {
+        self.tokens.arm(none_hash);
+    }
+
+    /// Take over one slot's token bookkeeping. `pending` is the request's token tail past
+    /// the last block hash Python already produced.
+    pub fn store_init(
+        &mut self,
+        slot: u32,
+        pending: &[i64],
+        num_tokens: usize,
+        num_output_tokens: usize,
+    ) -> Result<(), String> {
+        self.tokens.init(slot, pending, num_tokens, num_output_tokens)
+    }
+
+    /// Output tokens the store has appended for this slot. The rare-path materialization.
+    pub fn slot_tokens(&self, slot: u32) -> Option<&[i64]> {
+        self.tokens.tokens(slot)
+    }
+
+    /// The slot's whole block-hash chain, 32 bytes per hash. Python rebuilds
+    /// `Request.block_hashes` from this when it hands a request back to the stock path.
+    pub fn slot_hashes(&self, slot: u32) -> Option<Vec<u8>> {
+        let st = self.reqs.get(&slot)?;
+        let mut out = Vec::with_capacity(st.hashes.len() * crate::hash::HASH_LEN);
+        for h in &st.hashes {
+            out.extend_from_slice(h);
+        }
+        Some(out)
+    }
+
+    /// Append this step's ACCEPTED tokens to the store and run the block-hash catch-up.
+    ///
+    /// Shared by the authoritative numpy path and by the shadow arm, so the two cannot
+    /// drift. `accepted[i]` is `Verdict::num_accepted`, i.e. stop truncation already
+    /// applied -- a token past a stop was never computed into KV and must not be hashed.
+    pub fn store_apply(
+        &mut self,
+        slots: &[u32],
+        cu_lens: &[u32],
+        token_ids: &[i64],
+        accepted: &[u32],
+    ) -> Result<(), String> {
+        let n = slots.len();
+        if cu_lens.len() != n + 1 || accepted.len() != n {
+            return Err(format!(
+                "store_apply arity mismatch: {n} slots, {} cu_lens, {} accepted",
+                cu_lens.len(),
+                accepted.len()
+            ));
+        }
+        // Disjoint field borrows: the store mutates `tokens`, the chain lives in `reqs`.
+        let Manager { tokens, reqs, .. } = self;
+        for i in 0..n {
+            let lo = cu_lens[i] as usize;
+            let hi = lo + accepted[i] as usize;
+            if lo > hi || hi > token_ids.len() || hi > cu_lens[i + 1] as usize {
+                return Err("store_apply accepted count is out of range".into());
+            }
+            let st = reqs
+                .get_mut(&slots[i])
+                .ok_or_else(|| format!("store_apply: slot {} has no request state", slots[i]))?;
+            tokens.append(slots[i], &token_ids[lo..hi], &mut st.hashes)?;
+        }
+        Ok(())
+    }
+
+    /// [`Manager::update_step_pack`] with the per-request counters sourced from the token
+    /// store instead of from Python, and this step's kept tokens appended to it.
+    ///
+    /// The record is built by the same [`Manager::pack_inner`], so the bytes are identical
+    /// to the non-store path for identical inputs. On a refused slot (`status == u8::MAX`,
+    /// which `pack_inner` reports as "not packed") NOTHING is appended: Python is about to
+    /// materialize the whole step onto the stock path, and it owns the append from there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_step_pack_store(
+        &mut self,
+        slots: &[u32],
+        counts: &[u32],
+        token_ids: &[i64],
+        max_model_len: usize,
+        engine_index: u32,
+        timestamp: f64,
+        finished: &[String],
+    ) -> Result<(&[crate::update::Verdict], bool), String> {
+        let n = slots.len();
+        if counts.len() != n {
+            return Err(format!(
+                "update_step_pack_store arity mismatch: {n} slots, {} counts",
+                counts.len()
+            ));
+        }
+        // Take the scratch out so the slices can be handed to the `&mut self` calls below;
+        // put it back before returning so the next step reuses this step's allocation.
+        let mut cu = std::mem::take(&mut self.tok_cu);
+        let mut nout = std::mem::take(&mut self.tok_nout);
+        let mut ntok = std::mem::take(&mut self.tok_ntok);
+        cu.clear();
+        nout.clear();
+        ntok.clear();
+        cu.push(0);
+        let mut result = Ok(false);
+        for i in 0..n {
+            match self.tokens.counts(slots[i]) {
+                Some((num_tokens, num_output_tokens)) => {
+                    ntok.push(num_tokens as u32);
+                    nout.push(num_output_tokens as u32);
+                }
+                None => {
+                    result = Err(format!("token store has no entry for slot {}", slots[i]));
+                    break;
+                }
+            }
+            cu.push(cu[i] + counts[i]);
+        }
+        if result.is_ok() {
+            result = if cu[n] as usize != token_ids.len() {
+                Err(format!(
+                    "update_step_pack_store expected {} flat tokens, got {}",
+                    cu[n],
+                    token_ids.len()
+                ))
+            } else {
+                self.pack_inner(
+                    slots,
+                    &cu,
+                    token_ids,
+                    &nout,
+                    &ntok,
+                    max_model_len,
+                    engine_index,
+                    timestamp,
+                    finished,
+                )
+                .and_then(|packed| {
+                    if packed {
+                        let acc: SmallVec<[u32; 16]> =
+                            self.stops.out.iter().map(|v| v.num_accepted).collect();
+                        self.store_apply(slots, &cu, token_ids, &acc)?;
+                    }
+                    Ok(packed)
+                })
+            };
+        }
+        self.tok_cu = cu;
+        self.tok_nout = nout;
+        self.tok_ntok = ntok;
+        let packed = result?;
+        Ok((&self.stops.out, packed))
     }
 }
 
@@ -1129,5 +1331,169 @@ mod tests {
             .unwrap();
         assert_eq!(verdicts[1].status, u8::MAX);
         assert!(!packed, "a partial record must never be produced");
+    }
+
+    // ---- Port-2: the token store ----------------------------------------------------
+
+    /// A manager with the store armed and one slot taken over at `(num_tokens, 0)`.
+    fn store_mgr(name: &str, num_tokens: usize) -> (Manager, u32) {
+        let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+        m.store_arm(crate::hash::none_hash_from_seed("0"));
+        let slot = m.intern(name);
+        m.stops.set(slot, stop_params());
+        m.store_init(slot, &[], num_tokens, 0).unwrap();
+        (m, slot)
+    }
+
+    #[test]
+    fn record_is_identical_with_the_store() {
+        // THE GOLDEN EQUIVALENCE. Same request, same tokens, same counters: the store path
+        // must emit byte-identical bytes to the path Python's counters drive, or R8's wire
+        // format silently forks between the two arms.
+        let mut plain = Manager::new(hybrid_cfg(64)).unwrap();
+        let a = plain.intern("req-a");
+        plain.stops.set(a, stop_params());
+        plain
+            .update_step_pack(&[a], &[0, 2], &[5, 6], &[3], &[103], 1000, 0, 1.5, &[])
+            .unwrap();
+        let want = plain.raw.finish().unwrap().to_vec();
+
+        let (mut m, slot) = store_mgr("req-a", 103);
+        m.store_init(slot, &[], 103, 3).unwrap();
+        let (verdicts, packed) = m
+            .update_step_pack_store(&[slot], &[2], &[5, 6], 1000, 0, 1.5, &[])
+            .unwrap();
+        assert!(packed);
+        assert_eq!(verdicts[0].num_accepted, 2);
+        assert_eq!(m.raw.finish().unwrap(), &want[..]);
+        // ...and the counters advanced by exactly the accepted tokens.
+        assert_eq!(m.tokens.counts(slot), Some((105, 5)));
+        assert_eq!(m.slot_tokens(slot), Some(&[5i64, 6][..]));
+    }
+
+    #[test]
+    fn the_store_path_truncates_at_a_stop_everywhere() {
+        let (mut m, slot) = store_mgr("req-a", 10);
+        // EOS (2) is the second of three -> record, counters and store all keep 2.
+        let (verdicts, packed) = m
+            .update_step_pack_store(&[slot], &[3], &[5, 2, 9], 1000, 0, 0.0, &[])
+            .unwrap();
+        assert_eq!(verdicts[0].num_accepted, 2);
+        assert!(packed);
+        assert_eq!(u32::from_le_bytes(m.raw.buf[28..32].try_into().unwrap()), 2);
+        assert_eq!(m.tokens.counts(slot), Some((12, 2)));
+        assert_eq!(m.slot_tokens(slot), Some(&[5i64, 2][..]), "the rejected 9 is gone");
+    }
+
+    #[test]
+    fn a_refused_slot_leaves_the_store_untouched() {
+        // Python is about to materialize the whole step; appending here would double-count.
+        let (mut m, a) = store_mgr("req-a", 10);
+        let b = m.intern("req-b");
+        m.store_init(b, &[], 10, 0).unwrap(); // ...but no stop params
+        let (verdicts, packed) = m
+            .update_step_pack_store(&[a, b], &[1, 1], &[7, 7], 1000, 0, 0.0, &[])
+            .unwrap();
+        assert_eq!(verdicts[1].status, u8::MAX);
+        assert!(!packed);
+        assert_eq!(m.tokens.counts(a), Some((10, 0)), "no append on a refused step");
+        assert_eq!(m.slot_tokens(a), Some(&[][..]));
+    }
+
+    #[test]
+    fn the_store_path_refuses_a_slot_it_never_took_over() {
+        let (mut m, _a) = store_mgr("req-a", 10);
+        let b = m.intern("req-b");
+        m.stops.set(b, stop_params());
+        assert!(m
+            .update_step_pack_store(&[b], &[1], &[7], 1000, 0, 0.0, &[])
+            .is_err());
+        // Arity and flat-length mismatches are Errs, not panics or short records.
+        let (mut m2, a2) = store_mgr("req-a", 10);
+        assert!(m2
+            .update_step_pack_store(&[a2], &[1, 1], &[7], 1000, 0, 0.0, &[])
+            .is_err());
+        assert!(m2
+            .update_step_pack_store(&[a2], &[2], &[7], 1000, 0, 0.0, &[])
+            .is_err());
+    }
+
+    #[test]
+    fn the_store_hash_chain_matches_push_hashes_over_the_same_tokens() {
+        // hash_block_size is 16 here. A request with a 16-token prompt has one pushed hash
+        // and an empty tail; 16 decode tokens then complete exactly one more block, and it
+        // must equal what the reference hasher produces over the whole 32-token sequence.
+        let nh = crate::hash::none_hash_from_seed("0");
+        let all: Vec<i64> = (100..132).collect();
+        let want = crate::hash::hash_request_tokens(&nh, 16, &all, None);
+        assert_eq!(want.len(), 2);
+
+        let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+        m.store_arm(nh);
+        let slot = m.intern("req-a");
+        m.stops.set(
+            slot,
+            crate::update::StopParams {
+                min_tokens: 0,
+                max_tokens: 1000,
+                eos_token_id: None,
+                stop_token_ids: Default::default(),
+            },
+        );
+        m.push_hashes(slot, &packed(&[want[0]]), 16);
+        assert_eq!(m.num_hashes(slot), 1);
+        m.store_init(slot, &[], 16, 0).unwrap();
+        for tok in &all[16..] {
+            m.update_step_pack_store(&[slot], &[1], &[*tok], 100000, 0, 0.0, &[])
+                .unwrap();
+        }
+        assert_eq!(m.num_hashes(slot), 2, "one new full block");
+        let hashes = m.slot_hashes(slot).unwrap();
+        assert_eq!(hashes.len(), 64);
+        assert_eq!(&hashes[..32], &want[0][..]);
+        assert_eq!(&hashes[32..], &want[1][..], "the chain must match the reference hasher");
+        assert_eq!(m.tokens.counts(slot), Some((32, 16)));
+    }
+
+    #[test]
+    fn store_apply_is_the_shadow_arm_and_agrees_with_the_authoritative_path() {
+        // Same tokens through `store_apply` (what the shadow arm calls) and through the
+        // authoritative `update_step_pack_store`: identical chain and identical counters.
+        let (mut auth, a) = store_mgr("req-a", 16);
+        for t in 200..216i64 {
+            auth.update_step_pack_store(&[a], &[1], &[t], 100000, 0, 0.0, &[])
+                .unwrap();
+        }
+        let (mut shadow, b) = store_mgr("req-a", 16);
+        let toks: Vec<i64> = (200..216).collect();
+        let acc = vec![16u32];
+        shadow.store_apply(&[b], &[0, 16], &toks, &acc).unwrap();
+        assert_eq!(auth.slot_hashes(a), shadow.slot_hashes(b));
+        assert_eq!(auth.tokens.counts(a), shadow.tokens.counts(b));
+        assert_eq!(auth.slot_tokens(a), shadow.slot_tokens(b));
+        // Out-of-range accepted counts are refused rather than slicing past the batch.
+        assert!(shadow.store_apply(&[b], &[0, 1], &toks, &[2]).is_err());
+        assert!(shadow.store_apply(&[b], &[0, 1], &toks, &[1, 1]).is_err());
+    }
+
+    #[test]
+    fn forget_clears_the_store_so_a_recycled_slot_starts_clean() {
+        let (mut m, a) = store_mgr("req-a", 10);
+        m.update_step_pack_store(&[a], &[1], &[7], 1000, 0, 0.0, &[])
+            .unwrap();
+        assert_eq!(m.tokens.counts(a), Some((11, 1)));
+        m.forget("req-a");
+        assert_eq!(m.tokens.counts(a), None);
+        let b = m.intern("req-b");
+        assert_eq!(b, a, "the slot is recycled -- that is the hazard being tested");
+        assert!(m.slot_tokens(b).is_none());
+        assert_eq!(m.num_hashes(b), 0, "forget also cleared the chain");
+    }
+
+    #[test]
+    fn an_unarmed_store_refuses_instead_of_hashing_against_a_guess() {
+        let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+        let a = m.intern("req-a");
+        assert!(m.store_init(a, &[], 10, 0).is_err());
     }
 }

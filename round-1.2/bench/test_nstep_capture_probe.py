@@ -8,12 +8,33 @@ is a test result instead of a boot-time surprise, and they stay as regressions.
     pytest bench/test_nstep_capture_probe.py -q      # on the H200, inside the image
     make test-kernel                                  # runs them with everything else
 
+WHAT SHIPS NOW (2026-07-30 follow-up), so the probes are read against the real code:
+``nstep_decode`` no longer has just ONE graph per decode size. The in-graph ladder is
+
+    unrolled burst graph (prologue + N-1 bodies + the accumulator store, ONE replay)
+      -> prologue graph (``compute_logits`` + ``argmax`` off the persistent
+         ``cudagraph_manager.hidden_states`` buffer) + N-1 per-iteration body replays
+      -> per-iteration body graphs with token 1 host-launched
+      -> eager body
+
+and the PROLOGUE graph is also what ``VTL_SAMPLE_IN_GRAPH=1`` replays on a plain greedy
+1-token decode step, in place of the V2 sampler. So probe A is no longer only about the burst:
+it is the go/no-go for the prologue graph and therefore for in-graph N=1 sampling too, which
+is the one rung that pays when bursts stay dormant. Every rung is captured separately at boot
+and every failure demotes to the rung below (``_Burst.demote``), so a FAIL here is still a
+performance answer, never a correctness one.
+
 PROBE A -- lm_head + argmax inside a graph, under the vtl W4A8 head.
     The stock FULL decode graph ENDS at hidden states (cudagraph_utils.py:540-556); the
     burst graph has to carry ``compute_logits`` and ``argmax`` too, and ``lm_head_quant``
     replaces that head with a CUTLASS W4A8 GEMM whose capturability nothing else proves.
     FAIL => ``VTL_NSTEP_MODE=eager`` permanently; the P1b full-graph phase is dropped, not
-    debugged.
+    debugged, and ``VTL_SAMPLE_IN_GRAPH`` is inert with it.
+
+    ``test_probe_a_reads_a_persistent_buffer_not_its_argument`` is the fold-in's specific
+    premise: the prologue graph reads a buffer it does NOT own, written by the stock FULL
+    replay that ran earlier in the same step. A graph that baked the VALUES rather than the
+    address would pass the plain probe A and silently emit last step's tokens.
 
 PROBE B -- FA3 ``get_scheduler_metadata`` inside a graph, with ``max_seqlen_k`` baked.
     The burst body recomputes the AOT schedule every iteration
@@ -28,8 +49,8 @@ PROBE B -- FA3 ``get_scheduler_metadata`` inside a graph, with ``max_seqlen_k`` 
 PROBE C -- replay-loop overhead.
     Prices the architecture choice: N replays of one body vs one N-unrolled capture.
     Expected ~0.05-0.1 ms for the three extra replays at N=4, i.e. well under the ~1.5 ms
-    the burst saves. If it is NOT, the unroll (6 more graphs per size) becomes worth
-    building. Reported, never asserted -- it is a measurement, not a contract.
+    the burst saves. The unroll is now BUILT (``VTL_NSTEP_UNROLL=1``), so this probe no
+    longer gates it -- it sizes what turning it off costs. Reported, never asserted.
 """
 
 from __future__ import annotations
@@ -127,6 +148,46 @@ def test_probe_a_logits_argmax_capture_is_bit_equal_to_eager(m, quantized):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, want), f"replay {seed} diverged from eager"
+
+
+@pytest.mark.parametrize("m", [1, 8])
+def test_probe_a_reads_a_persistent_buffer_not_its_argument(m):
+    """The token-1 fold-in / in-graph N=1 sampling premise, isolated.
+
+    ``_prologue`` captures ``argmax(compute_logits(cudagraph_manager.hidden_states[:rows]))``
+    -- a buffer written by the stock FULL replay EARLIER IN THE SAME STEP, not by anything
+    inside our graph. So the graph must have baked the ADDRESS. Overwriting the buffer between
+    replays and checking the tokens move is the whole test; ``nstep_decode``'s boot-time
+    ``_graph_matches_eager`` shadow is the runtime version of it.
+    """
+    head = _head(quantized=False)
+    # Stand-in for `ModelCudaGraphManager.hidden_states`: allocated once, sliced per step.
+    persistent = torch.zeros(16, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    out = torch.zeros(m, dtype=torch.int64, device="cuda")
+
+    def prologue():
+        torch.argmax(head(persistent[:m]), dim=-1, out=out)
+
+    prologue()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        prologue()
+
+    seen = set()
+    for seed in range(4):
+        torch.manual_seed(seed)
+        persistent[:m].copy_(torch.randn(m, HIDDEN, dtype=torch.bfloat16, device="cuda"))
+        want = torch.argmax(head(persistent[:m]), dim=-1)
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, want), (
+            "PROBE A2 FAILED: the prologue graph did not track the persistent buffer; "
+            "VTL_NSTEP_FOLD_T1 and VTL_SAMPLE_IN_GRAPH must stay 0"
+        )
+        seen.add(tuple(out.tolist()))
+    assert len(seen) > 1, "the probe's inputs did not actually change the argmax"
 
 
 # ---------------------------------------------------------------------------------------

@@ -47,6 +47,9 @@ _MODULES: tuple[str, ...] = (
     "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)
     "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
+    "step0_eos_ban",    # mask EOS out of each request's FIRST sampled token (the
+                        # 8-failures fix: int4 lm_head argmax -> <|im_end|> at step 0
+                        # -> empty stream -> unscoreable). V2 sampler seam.
     "decode_fastpath",  # V2 runner: skip the dead metadata build on repeat pure-decode steps,
                         # + pooled pinned staging instead of pin_memory-per-step
     # AFTER decode_fastpath: nstep reuses its `_fa_write` helper and its builder

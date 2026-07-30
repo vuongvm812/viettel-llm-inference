@@ -62,9 +62,33 @@ MODES (``VTL_NSTEP_MODE``), a ladder that degrades on its own:
   ``eager``   -- the same body, host-launched. Ships most of the win.
   ``off``     -- nothing installed.
 
+IN-GRAPH LADDER (each rung is captured independently at boot and each failure demotes to the
+rung below, logging once; nothing is ever retried):
+
+  1. ``VTL_NSTEP_UNROLL=1``  -- ONE graph per burst size holding the prologue, all N-1
+     bodies AND the final accumulator store. The whole burst is a single ``replay()``.
+  2. ``VTL_NSTEP_FOLD_T1=1`` -- the PROLOGUE graph: ``compute_logits`` on the
+     ``cudagraph_manager.hidden_states`` persistent buffer plus the ``argmax`` for token 1.
+     Replayed once ahead of the N-1 body replays, so no logits/argmax is host-launched.
+     This is also the graph ``VTL_SAMPLE_IN_GRAPH`` reuses.
+  3. per-iteration body graphs (the shipped behaviour) -- token 1 host-launched.
+  4. eager body.
+
+``VTL_SAMPLE_IN_GRAPH=1`` is the generalisation that pays even when a burst never fires: on a
+plain greedy 1-token decode step the SCHEDULER commits ``vtl_sample_in_graph`` (same handshake
+as the burst, minus the align gate and the queue-empty gate -- N=1 crosses no block boundary
+and delays no admission), and ``sample_tokens`` replays the prologue graph and synthesises the
+``SamplerOutput`` instead of calling ``self.sample()``. That skips the V2 sampler's numpy
+gathers, its ``new_ones`` alloc and its SamplerOutput build. It does NOT re-run the forward:
+``execute_model`` already replayed the stock FULL graph and left the hidden states in the
+persistent buffer, which the prologue graph reads -- proved per step by a pointer check
+against ``execute_model_state.hidden_states``, not assumed.
+
 REVERTS: ``VTL_ENABLE_NSTEP_DECODE=0`` (runner does nothing), ``VTL_NSTEP=0`` (the scheduler
-never commits, so this module never fires), ``VTL_NSTEP_MODE=eager`` (no capture),
-``VTL_NSTEP_N=1`` (a burst of 1 is a normal step).
+never commits a burst), ``VTL_NSTEP_MODE=eager`` (no capture, so rungs 1-2 and
+``VTL_SAMPLE_IN_GRAPH`` are all inert), ``VTL_NSTEP_N=1`` (a burst of 1 is a normal step;
+in-graph N=1 sampling still installs), ``VTL_NSTEP_UNROLL=0`` / ``VTL_NSTEP_FOLD_T1=0`` /
+``VTL_SAMPLE_IN_GRAPH=0`` (one rung each).
 """
 
 from __future__ import annotations
@@ -83,11 +107,18 @@ BURST_SIZES = (1, 2, 4, 8)
 MAX_BURST_REQS = BURST_SIZES[-1]
 
 
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
 def _int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, "").strip() or default)
     except ValueError:
         return default
+
+
+def _flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() in _TRUTHY
 
 
 # ---------------------------------------------------------------------------------------
@@ -102,7 +133,11 @@ class _Burst:
     __slots__ = (
         "armed", "ready", "key", "n", "mode", "runner", "graphs",
         "accum", "tok", "step", "num_sampled", "num_rejected", "desc", "pending",
-        "bursts", "iters", "advance", "bump", "idx_map", "max_seq_len",
+        "bursts", "iters", "graph_bursts", "steps", "advance", "bump", "idx_map",
+        "max_seq_len",
+        # in-graph ladder (VTL_NSTEP_FOLD_T1 / VTL_NSTEP_UNROLL / VTL_SAMPLE_IN_GRAPH)
+        "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs",
+        "ones", "zeros", "pending1", "unroll_bursts", "fold_bursts", "g1_steps",
     )
 
     def __init__(self) -> None:
@@ -126,6 +161,20 @@ class _Burst:
         self.pending = 0         # burst factor committed for the step being executed
         self.bursts = 0
         self.iters = 0
+        self.graph_bursts = 0    # bursts that rode the captured graph (rest ran eager)
+        self.steps = 0           # every sample_tokens call, burst or not
+        # --- the in-graph ladder ---
+        self.fold = False        # capture the token-1 prologue (VTL_NSTEP_FOLD_T1)
+        self.unroll = False      # capture prologue + N-1 bodies as ONE graph
+        self.sample1 = False     # in-graph greedy sampling for plain N=1 decode steps
+        self.pro_graphs: dict = {}     # rows -> (graph, desc): the prologue alone
+        self.unroll_graphs: dict = {}  # rows -> (graph, desc, n): the whole burst
+        self.ones = None         # [max_num_reqs] int32 filled with 1  (num_sampled, N=1)
+        self.zeros = None        # [max_num_reqs] int32 filled with 0  (num_rejected, N=1)
+        self.pending1 = False    # in-graph N=1 sampling committed for this step
+        self.unroll_bursts = 0
+        self.fold_bursts = 0
+        self.g1_steps = 0
 
     def disable(self, why: str) -> None:
         """Permanent, process-lifetime fallback to one token per step."""
@@ -134,6 +183,21 @@ class _Burst:
         self.armed = False
         self.ready = False
         self.pending = 0
+        self.pending1 = False
+
+    def demote(self, rung: str, why: str) -> None:
+        """Drop ONE rung of the in-graph ladder for the boot. Never touches the others."""
+        log.warning("vtl: nstep %s disabled for this boot -- %s", rung, why)
+        if rung == "unroll":
+            self.unroll = False
+            self.unroll_graphs = {}
+        elif rung == "fold":
+            self.fold = False
+            self.sample1 = False
+            self.pro_graphs = {}
+            # The unroll graph CONTAINS the prologue, so it cannot outlive it.
+            self.unroll = False
+            self.unroll_graphs = {}
 
 
 BURST = _Burst()
@@ -161,6 +225,20 @@ def burst_factor(num_scheduled_tokens) -> int:
     if b.key != commit_key(num_scheduled_tokens):
         return 1
     return b.n
+
+
+def sample_in_graph_ready(num_scheduled_tokens) -> bool:
+    """Same handshake as ``burst_factor``, for the N=1 in-graph sampling commit.
+
+    Independent of ``b.n``: a burst of 1 is a normal step but its SAMPLING can still ride
+    the prologue graph, which is the whole point of this rung (it pays even when the align
+    gate keeps refusing bursts). ``pro_graphs`` non-empty is the boot-time proof that the
+    capture succeeded -- the runner re-checks the exact size and descriptor per step.
+    """
+    b = BURST
+    if not b.armed or not b.ready or not b.sample1 or not b.pro_graphs:
+        return False
+    return b.key == commit_key(num_scheduled_tokens)
 
 
 # ---------------------------------------------------------------------------------------
@@ -280,20 +358,92 @@ def _burst_body(runner, b: _Burst, rows: int, pad: int, forward):
     torch.argmax(logits, dim=-1, out=b.tok[:rows])
 
 
+def _prologue(runner, b: _Burst, rows: int) -> None:
+    """Token 1: logits + argmax off the PERSISTENT hidden-state buffer. Capturable.
+
+    ``ModelCudaGraphManager.run_fullgraph`` returns ``self.hidden_states[:num_tokens]``
+    (cudagraph_utils.py:576-577) -- a slice of a buffer allocated once at capture and
+    overwritten in place by every FULL replay. So the pair below reads a fixed address and
+    can live inside a graph, which is what deletes the last two host dispatches from
+    ``_run_burst``'s graph arm.
+
+    On a 1-token-per-request decode step ``logits_indices`` is ``arange(num_reqs)``, so the
+    ``[:rows]`` slice IS stock's gather -- and unlike ``logits_indices`` it allocates nothing.
+    """
+    import torch
+
+    hidden = runner.cudagraph_manager.hidden_states
+    torch.argmax(
+        runner.model.compute_logits(hidden[:rows]), dim=-1, out=b.tok[:rows]
+    )
+
+
+def _accum_tail(runner, b: _Burst, rows: int) -> None:
+    """Store the LAST iteration's token into the accumulator, in-graph.
+
+    The final token is sampled after the final feedback, so no ``_advance`` wrote it. Running
+    the same kernel with ``FEED=False`` writes column ``step`` (which is ``n-1`` after the
+    N-1 bumps) and touches nothing else -- so the unroll graph ends the burst completely and
+    ``_run_burst`` has no tail work left.
+    """
+    ibuf = runner.input_buffers
+    b.advance[(rows,)](
+        b.tok, b.accum, b.accum.stride(0), b.step,
+        ibuf.input_ids, ibuf.positions, ibuf.seq_lens,
+        runner.max_model_len,
+        FEED=False,
+    )
+
+
+def _burst_all(runner, b: _Burst, rows: int, pad: int, forward, n: int) -> None:
+    """The WHOLE burst: reset, prologue, N-1 bodies, accumulator tail. One capture unit.
+
+    The counter reset is INSIDE so the graph is self-contained -- ``_run_burst`` then has
+    literally nothing left to launch on the host but the idx_map copy.
+    """
+    b.step.zero_()
+    _prologue(runner, b, rows)
+    for _ in range(n - 1):
+        _burst_body(runner, b, rows, pad, forward)
+    _accum_tail(runner, b, rows)
+
+
+def _hidden_is_persistent(runner, hidden, rows: int) -> bool:
+    """Is ``hidden`` the cudagraph manager's persistent buffer, at exactly ``rows`` rows?
+
+    The proof that replaying a prologue graph is equivalent to ``compute_logits(hidden)``:
+    the graph baked the buffer's address, so it is only correct while THIS step's hidden
+    states live at that address. Checked per step rather than inferred from
+    ``desc.cg_mode == FULL``, because a stale ``b.desc`` (a step that never called
+    ``run_fullgraph``) is exactly the failure this must not silently accept.
+    """
+    buf = getattr(runner.cudagraph_manager, "hidden_states", None)
+    return (
+        buf is not None
+        and hidden is not None
+        and hidden.shape[0] == rows
+        and hidden.data_ptr() == buf.data_ptr()
+    )
+
+
 # ---------------------------------------------------------------------------------------
 # Graph mode: capture the body once per decode size.
 # ---------------------------------------------------------------------------------------
 
 
-def _graph_matches_eager(runner, b: _Burst, graph, forward, rows: int) -> bool:
-    """Boot-time shadow: one graph replay vs one eager body, from the same state.
+def _graph_matches_eager(runner, b: _Burst, graph, eager, rows: int, what: str) -> bool:
+    """Boot-time shadow: one graph replay vs the same work host-launched, from ONE state.
 
-    The graph bakes every pointer at capture. If any input the body reads turns out NOT to
-    be a persistent buffer, the replay silently computes from stale memory and produces
+    The graph bakes every pointer at capture. If any input it reads turns out NOT to be a
+    persistent buffer, the replay silently computes from stale memory and produces
     plausible-but-wrong tokens -- the worst failure mode in this batch, because nothing
     crashes and the output only drifts. Running both once at boot on the dummy batch and
-    comparing the sampled tokens is the cheapest thing that catches it. A mismatch drops
-    the whole boot to eager.
+    comparing the sampled tokens is the cheapest thing that catches it.
+
+    THE HIDDEN STATES ARE PART OF THE SNAPSHOT, which is what makes the token-1 fold-in
+    covered: its whole premise is that ``cudagraph_manager.hidden_states`` is the address the
+    graph may bake, so the two arms must provably start from the same bytes there. ``accum``
+    is compared too -- the unroll graph is the only thing that fills it in-graph.
 
     NOT a proof of runtime correctness (the dummy batch has no padded rows and no stale
     block tables); it is a smoke test for the pointer-staleness class specifically.
@@ -301,12 +451,15 @@ def _graph_matches_eager(runner, b: _Burst, graph, forward, rows: int) -> bool:
     import torch
 
     ibuf = runner.input_buffers
+    hidden = getattr(runner.cudagraph_manager, "hidden_states", None)
     snap = (
         ibuf.input_ids[:rows].clone(),
         ibuf.positions[:rows].clone(),
         ibuf.seq_lens[:rows].clone(),
         b.tok[:rows].clone(),
         b.step.clone(),
+        b.accum[:rows].clone(),
+        None if hidden is None else hidden[:rows].clone(),
     )
 
     def restore():
@@ -315,30 +468,40 @@ def _graph_matches_eager(runner, b: _Burst, graph, forward, rows: int) -> bool:
         ibuf.seq_lens[:rows].copy_(snap[2])
         b.tok[:rows].copy_(snap[3])
         b.step.copy_(snap[4])
+        b.accum[:rows].copy_(snap[5])
+        if snap[6] is not None:
+            hidden[:rows].copy_(snap[6])
 
     restore()
     graph.replay()
     torch.cuda.synchronize()
-    from_graph = b.tok[:rows].clone()
+    from_graph = (b.tok[:rows].clone(), b.accum[:rows].clone())
 
     restore()
-    _burst_body(runner, b, rows, rows, forward)
+    eager()
     torch.cuda.synchronize()
-    from_eager = b.tok[:rows].clone()
+    from_eager = (b.tok[:rows].clone(), b.accum[:rows].clone())
 
-    if not torch.equal(from_graph, from_eager):
-        log.error(
-            "vtl: nstep burst graph at num_reqs=%d DIVERGED from the eager body "
-            "(graph=%s eager=%s); eager mode for this boot",
-            rows, from_graph.tolist(), from_eager.tolist(),
-        )
-        return False
     restore()
+    for i, name in enumerate(("tok", "accum")):
+        if not torch.equal(from_graph[i], from_eager[i]):
+            log.error(
+                "vtl: nstep %s graph at num_reqs=%d DIVERGED from eager in %s "
+                "(graph=%s eager=%s)",
+                what, rows, name, from_graph[i].tolist(), from_eager[i].tolist(),
+            )
+            return False
     return True
 
 
 def _capture_burst_graphs(runner, b: _Burst) -> None:
-    """One CUDA graph per FULL decode size, holding the whole ``_burst_body``.
+    """Up to THREE CUDA graphs per FULL decode size: body, prologue, whole unrolled burst.
+
+    All three go through the same local ``capture()``: warm up (the first call allocates
+    workspaces and JITs the Triton kernels, neither of which is capturable), capture, then
+    boot-shadow against the identical work host-launched. A failure returns ``None`` and
+    DEMOTES exactly one rung -- the body graph is the floor of graph mode, so losing it drops
+    the boot to eager, while losing the prologue or the unroll only costs that rung.
 
     Runs after stock ``capture_model()``, into the SAME memory pool, replaying against the
     attention state stock captured for that descriptor -- so the forward inside our graph
@@ -410,44 +573,93 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
             ):
                 return runner.model(**_mi)
 
-        try:
-            # Warm up outside the capture: the first call allocates workspaces and JITs
-            # the Triton kernels, neither of which is capturable.
+        def capture(work, what):
+            """Warm up, capture, shadow-compare. ``None`` on any failure -- never raises."""
+            try:
+                # Warm up outside the capture: the first call allocates workspaces and JITs
+                # the Triton kernels, neither of which is capturable.
+                b.step.zero_()
+                work()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                b.step.zero_()
+                with torch.cuda.graph(graph, mgr.pool):
+                    work()
+            except Exception:
+                log.exception("vtl: nstep %s capture failed at num_reqs=%d", what, rows)
+                return None
+
+            def eager():
+                b.step.zero_()
+                work()
+
             b.step.zero_()
-            _burst_body(runner, b, rows, rows, forward)
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            b.step.zero_()
-            with torch.cuda.graph(graph, mgr.pool):
-                _burst_body(runner, b, rows, rows, forward)
-            if not _graph_matches_eager(runner, b, graph, forward, rows):
-                b.graphs.clear()
-                b.mode = "eager"
-                return
-            b.graphs[rows] = (graph, desc)
-            captured += 1
-        except Exception:
-            log.exception(
-                "vtl: nstep burst capture failed at num_reqs=%d; eager mode for this boot",
-                rows,
-            )
+            if not _graph_matches_eager(runner, b, graph, eager, rows, what):
+                return None
+            return graph
+
+        graph = capture(lambda: _burst_body(runner, b, rows, rows, forward), "burst body")
+        if graph is None:
+            # Rung 3 is the floor of graph mode: without a body graph there is nothing to
+            # replay, so the whole boot goes eager.
+            log.error("vtl: nstep graph mode off at num_reqs=%d; eager for this boot", rows)
             b.graphs.clear()
+            b.demote("fold", "the burst body graph did not capture")
             b.mode = "eager"
             return
+        b.graphs[rows] = (graph, desc)
+        captured += 1
+
+        if b.fold:
+            pro = capture(lambda: _prologue(runner, b, rows), "token-1 prologue")
+            if pro is None:
+                b.demote("fold", "the prologue did not capture")
+            else:
+                b.pro_graphs[rows] = (pro, desc)
+
+        if b.unroll and b.fold and b.n > 1:
+            whole = capture(
+                lambda: _burst_all(runner, b, rows, rows, forward, b.n), "unrolled burst"
+            )
+            if whole is None:
+                b.demote("unroll", "the unrolled burst did not capture")
+            else:
+                b.unroll_graphs[rows] = (whole, desc, b.n)
+
     if not captured:
         log.warning("vtl: nstep graph mode off -- no FULL decode descriptor matched %s",
                     BURST_SIZES)
+        b.demote("fold", "no FULL decode descriptor matched")
         b.mode = "eager"
         return
     log.info(
-        "vtl: nstep captured %d burst graph(s) for sizes %s (+%.1f MiB)",
+        "vtl: nstep captured %d burst body graph(s) for sizes %s "
+        "(+%.1f MiB; prologue=%s unroll=%s sample1=%s)",
         captured, sorted(b.graphs), (torch.cuda.memory_allocated() - before) / (1 << 20),
+        sorted(b.pro_graphs), sorted(b.unroll_graphs), b.sample1,
     )
 
 
 # ---------------------------------------------------------------------------------------
 # sample_tokens: the burst itself.
 # ---------------------------------------------------------------------------------------
+
+
+def _graph_shape_ok(b: _Burst, ib, num_reqs: int, entry) -> bool:
+    """Is ``entry``'s captured graph usable for THIS step's batch?
+
+    A burst graph is used ONLY when the real batch is exactly the captured size. With padded
+    rows the graph's baked grid would advance positions/seq_lens for rows that do not exist,
+    so those steps take the eager loop -- which recomputes the grid per iteration and is
+    always correct. ``==``, not ``is``: ``BatchExecutionDescriptor`` is a frozen dataclass, so
+    equal descriptors need not be the same object.
+    """
+    return (
+        entry is not None
+        and entry[1] == b.desc
+        and ib.num_reqs_after_padding == num_reqs
+        and ib.num_tokens_after_padding == num_reqs
+    )
 
 
 def _run_burst(runner, b: _Burst, n: int, ib, hidden):
@@ -460,41 +672,90 @@ def _run_burst(runner, b: _Burst, n: int, ib, hidden):
     # value, so iteration j wants base + j. Read once, incremented on the host -- no sync.
     base_max_seq_len = int(ib.seq_lens_cpu_upper_bound[:num_reqs].max())
     b.idx_map[:num_reqs].copy_(ib.idx_mapping, non_blocking=True)
-
     b.step.zero_()
-    # Token 1 comes from the hidden states the stock forward already produced. On a
-    # 1-token-per-request decode step `logits_indices` is arange(num_reqs), so the slice
-    # is the gather -- and unlike `logits_indices` it is not a fresh allocation.
-    torch.argmax(
-        runner.model.compute_logits(hidden[:num_reqs]), dim=-1, out=b.tok[:num_reqs]
-    )
 
-    # The burst graph is used ONLY when the real batch is exactly the captured size. With
-    # padded rows the graph's baked grid would advance positions/seq_lens for rows that do
-    # not exist, so those steps take the eager loop -- which recomputes the grid per
-    # iteration and is always correct. `==`, not `is`: BatchExecutionDescriptor is a
-    # frozen dataclass, so equal descriptors need not be the same object.
-    entry = b.graphs.get(num_reqs) if b.mode == "graph" else None
-    if (
-        entry is not None
-        and entry[1] == b.desc
-        and ib.num_reqs_after_padding == num_reqs
-        and ib.num_tokens_after_padding == num_reqs
-    ):
+    graph_mode = b.mode == "graph"
+    entry = b.graphs.get(num_reqs) if graph_mode else None
+    shape_ok = _graph_shape_ok(b, ib, num_reqs, entry)
+    # The prologue/unroll graphs bake the address of `cudagraph_manager.hidden_states`, so
+    # they are only usable when this step's hidden states actually live there.
+    folded = shape_ok and b.fold and _hidden_is_persistent(runner, hidden, num_reqs)
+
+    if folded:
+        whole = b.unroll_graphs.get(num_reqs)
+        if whole is not None and whole[1] == b.desc and whole[2] == n:
+            # ONE replay for the whole burst: prologue, N-1 bodies, accumulator tail.
+            whole[0].replay()
+            b.bursts += 1
+            b.iters += n
+            b.graph_bursts += 1
+            b.unroll_bursts += 1
+            return _burst_output(b, num_reqs, n, SamplerOutput)
+
+    pro = b.pro_graphs.get(num_reqs) if folded else None
+    if pro is not None and pro[1] == b.desc:
+        pro[0].replay()
+        b.fold_bursts += 1
+    else:
+        # Token 1 from the hidden states the stock forward already produced, host-launched.
+        torch.argmax(
+            runner.model.compute_logits(hidden[:num_reqs]), dim=-1, out=b.tok[:num_reqs]
+        )
+
+    if shape_ok:
         graph = entry[0]
         for _ in range(n - 1):
             graph.replay()
+        b.graph_bursts += 1
     else:
         forward = lambda: runner.cudagraph_manager.run_fullgraph(b.desc)  # noqa: E731
         for j in range(1, n):
             b.max_seq_len = base_max_seq_len + j
             _burst_body(runner, b, num_reqs, ib.num_reqs_after_padding, forward)
     # The last token was sampled after the final feedback, so nothing wrote it into the
-    # accumulator; the column index is n-1 by construction.
+    # accumulator; the column index is n-1 by construction. (The unroll graph did this
+    # itself, in-graph, and returned above.)
     b.accum[:num_reqs, n - 1].copy_(b.tok[:num_reqs])
 
     b.bursts += 1
     b.iters += n
+    return _burst_output(b, num_reqs, n, SamplerOutput)
+
+
+def _sample_one_in_graph(runner, b: _Burst, ib, hidden):
+    """In-graph greedy sampling for a plain 1-token decode step. ``None`` = use stock.
+
+    ``execute_model`` already replayed the stock FULL graph, so the forward is DONE and its
+    hidden states are in the persistent buffer; the only thing left to put in a graph is the
+    ``compute_logits`` + ``argmax`` pair, which is exactly the prologue graph the fold-in
+    already captured. One replay replaces three host dispatch points and the whole V2 sampler
+    (its numpy gathers, its ``new_ones`` allocation and its SamplerOutput build).
+
+    Deliberately NOT a second capture of the forward: re-running it would double the step's
+    GPU work to save host work, which is the wrong trade at 1 ms of GPU per step.
+    """
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+    rows = ib.num_reqs
+    entry = b.pro_graphs.get(rows)
+    if not _graph_shape_ok(b, ib, rows, entry):
+        return None
+    if not _hidden_is_persistent(runner, hidden, rows):
+        return None
+    entry[0].replay()
+    b.g1_steps += 1
+    return SamplerOutput(
+        # CLONED for the same reason the burst's accumulator is: `AsyncOutput` copies it on
+        # a second stream and the copy outlives this call.
+        sampled_token_ids=b.tok[:rows].view(-1, 1).clone(),
+        logprobs_tensors=None,
+        num_nans=None,
+        num_sampled=b.ones[:rows],
+        num_rejected=b.zeros[:rows],
+    )
+
+
+def _burst_output(b: _Burst, num_reqs: int, n: int, SamplerOutput):
     return SamplerOutput(
         # CLONED, not a view of the persistent accumulator: `AsyncOutput` copies this to
         # the host on a SECOND stream and the copy is still in flight when the next step
@@ -528,6 +789,10 @@ def _alloc(runner, b: _Burst) -> None:
     b.idx_map = torch.zeros(m, dtype=torch.int32, device=dev)
     b.num_sampled = torch.full((m,), b.n, dtype=torch.int32, device=dev)
     b.num_rejected = torch.full((m,), -(b.n - 1), dtype=torch.int32, device=dev)
+    # The N=1 in-graph sampling shapes: one token, nothing rejected -- i.e. exactly what
+    # `post_update`'s `computed_delta = query_len - num_rejected` reads on a normal step.
+    b.ones = torch.ones(m, dtype=torch.int32, device=dev)
+    b.zeros = torch.zeros(m, dtype=torch.int32, device=dev)
 
 
 def _patch_runner(b: _Burst) -> None:
@@ -584,6 +849,7 @@ def _patch_runner(b: _Burst) -> None:
     def wrap_execute_model(original):
         def execute_model(self, scheduler_output, *args, **kwargs):
             b.pending = getattr(scheduler_output, "vtl_burst_n", 0) or 0
+            b.pending1 = bool(getattr(scheduler_output, "vtl_sample_in_graph", False))
             return original(self, scheduler_output, *args, **kwargs)
 
         return execute_model
@@ -592,25 +858,40 @@ def _patch_runner(b: _Burst) -> None:
     def wrap_sample_tokens(original):
         def sample_tokens(self, grammar_output):
             n = b.pending
+            one = b.pending1
             b.pending = 0
+            b.pending1 = False
+            b.steps += 1
+            if b.steps % 2000 == 0:
+                log.info(
+                    "vtl: nstep engagement -- %d bursts (%d graph / %d eager, "
+                    "%d unrolled / %d folded), %d tokens over %d steps, "
+                    "%d in-graph N=1 samples (mode=%s)",
+                    b.bursts, b.graph_bursts, b.bursts - b.graph_bursts,
+                    b.unroll_bursts, b.fold_bursts, b.iters, b.steps,
+                    b.g1_steps, b.mode,
+                )
             state = self.execute_model_state
-            # `grammar_output is not None` cannot happen on a committed burst (the gate
-            # refuses structured output), but the burst's bare argmax would ignore the
-            # bitmask if it ever did -- so refuse here too rather than sample past a
-            # grammar.
-            if n < 2 or state is None or grammar_output is not None:
+            # `grammar_output is not None` cannot happen on a committed burst or a committed
+            # in-graph sample (the gate refuses structured output), but a bare argmax would
+            # ignore the bitmask if it ever did -- so refuse here too rather than sample past
+            # a grammar.
+            if state is None or grammar_output is not None or (n < 2 and not one):
                 out = original(self, grammar_output)
                 _publish_ready(self, state)
                 return out
             try:
-                out = _sample_burst(self, b, n, state, grammar_output, original)
+                if n < 2:
+                    out = _sample_in_graph(self, b, state, original)
+                else:
+                    out = _sample_burst(self, b, n, state)
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 # A committed burst that produced fewer than N tokens IS reconciled by
                 # the scheduler (rust_sched's `_burst_uncommit`), so this is recoverable
                 # -- but it means the burst body is broken, so never try again.
-                log.exception("vtl: nstep burst failed mid-step; permanently disabled")
+                log.exception("vtl: nstep sampling failed mid-step; permanently disabled")
                 b.disable("burst body raised")
                 self.execute_model_state = state
                 out = original(self, grammar_output)
@@ -618,6 +899,21 @@ def _patch_runner(b: _Burst) -> None:
             return out
 
         return sample_tokens
+
+    def _sample_in_graph(runner, b, state, original):
+        """One replay in place of ``self.sample()``. Falls through to stock on any refusal.
+
+        The refusals are shape checks only (captured size, matching descriptor, hidden states
+        in the persistent buffer), so falling through costs nothing and changes nothing: no
+        request state has been touched at that point.
+        """
+        sampler_output = _sample_one_in_graph(
+            runner, b, state.input_batch, state.hidden_states
+        )
+        if sampler_output is None:
+            return original(runner, None)
+        runner.execute_model_state = None
+        return _emit(runner, state, sampler_output)
 
     def _publish_ready(runner, state) -> None:
         """Tell the scheduler whether the NEXT step with this exact shape may burst."""
@@ -646,11 +942,16 @@ def _patch_runner(b: _Burst) -> None:
             log.exception("vtl: nstep readiness probe failed; no more bursts")
             b.disable("readiness probe raised")
 
-    def _sample_burst(runner, b, n, state, grammar_output, original):
-        """``sample_tokens``' last-rank tail, with the burst in place of one argmax.
+    def _sample_burst(runner, b, n, state):
+        ib = state.input_batch
+        runner.execute_model_state = None
+        return _emit(runner, state, _run_burst(runner, b, n, ib, state.hidden_states))
 
-        Reproduced rather than wrapped because the burst has to sit between
-        ``self.sample()`` and ``AsyncOutput``. Every branch this drops is one the
+    def _emit(runner, state, sampler_output):
+        """``sample_tokens``' last-rank tail, with ``sampler_output`` already produced.
+
+        Reproduced rather than wrapped because the burst (and the in-graph N=1 sample) has to
+        sit between ``self.sample()`` and ``AsyncOutput``. Every branch this drops is one the
         readiness probe and the scheduler's commit gate have already excluded: PP
         (``is_last_pp_rank``), pooling, the speculator, draft tokens, structured output,
         and prompt logprobs (which need a prefilling row).
@@ -659,9 +960,6 @@ def _patch_runner(b: _Burst) -> None:
         from vllm.v1.worker.gpu.async_utils import AsyncOutput
 
         ib = state.input_batch
-        runner.execute_model_state = None
-        sampler_output = _run_burst(runner, b, n, ib, state.hidden_states)
-
         model_runner_output = ModelRunnerOutput(
             req_ids=ib.req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(ib.req_ids)},
@@ -699,16 +997,24 @@ def apply() -> None:
     b = BURST
     b.mode = os.environ.get("VTL_NSTEP_MODE", "graph").strip().lower() or "graph"
     b.n = max(1, min(_int("VTL_NSTEP_N", 4), 16))
+    graph = b.mode == "graph"
+    # Every in-graph rung needs a capture, so eager mode turns all three off rather than
+    # pretending they are available and refusing per step.
+    b.fold = graph and _flag("VTL_NSTEP_FOLD_T1")
+    b.unroll = b.fold and _flag("VTL_NSTEP_UNROLL")
+    b.sample1 = b.fold and _flag("VTL_SAMPLE_IN_GRAPH")
     if b.mode not in ("graph", "eager"):
         log.info("vtl: nstep decode off (VTL_NSTEP_MODE=%s)", b.mode)
         return
-    if b.n < 2:
-        log.info("vtl: nstep decode off (VTL_NSTEP_N=%d)", b.n)
+    if b.n < 2 and not b.sample1:
+        log.info("vtl: nstep decode off (VTL_NSTEP_N=%d, no in-graph sampling)", b.n)
         return
     b.advance, b.bump = _build_kernels()
     _patch_runner(b)
-    log.info("vtl: nstep decode installed (N=%d, mode=%s); the scheduler arms it",
-             b.n, b.mode)
+    log.info(
+        "vtl: nstep decode installed (N=%d, mode=%s, fold_t1=%s, unroll=%s, sample1=%s); "
+        "the scheduler arms it", b.n, b.mode, b.fold, b.unroll, b.sample1,
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -717,7 +1023,7 @@ def apply() -> None:
 def _self_check() -> None:
     """No torch, no vLLM: the handshake and the eligibility matrix are what can be wrong."""
     b = BURST
-    saved = (b.armed, b.ready, b.key, b.n)
+    saved = (b.armed, b.ready, b.key, b.n, b.sample1, dict(b.pro_graphs))
     try:
         b.n = 4
         b.armed = True
@@ -727,6 +1033,32 @@ def _self_check() -> None:
         nst = {"a": 1, "b": 1}
         assert commit_key(nst) == ("a", "b")
         assert burst_factor(nst) == 4
+
+        # --- the N=1 in-graph sampling handshake ------------------------------------
+        # Same key agreement as the burst, but independent of N *and* gated on a graph
+        # actually having been captured -- `sample1` alone is only an intent.
+        b.sample1 = True
+        b.pro_graphs = {}
+        assert sample_in_graph_ready(nst) is False, "no captured prologue graph"
+        b.pro_graphs = {2: (object(), object())}
+        assert sample_in_graph_ready(nst) is True
+        assert sample_in_graph_ready({"b": 1, "a": 1}) is False, "order is load-bearing"
+        b.n = 1
+        assert sample_in_graph_ready(nst) is True, "N=1 sampling does not need a burst"
+        assert burst_factor(nst) == 1
+        b.n = 4
+        b.sample1 = False
+        assert sample_in_graph_ready(nst) is False
+        b.sample1 = True
+        b.ready = False
+        assert sample_in_graph_ready(nst) is False, "the runner published no clean step"
+        b.ready = True
+        b.armed = False
+        assert sample_in_graph_ready(nst) is False, "the patch is not installed"
+        b.armed = True
+        assert sample_in_graph_ready(nst) is True
+        b.sample1 = False
+        b.pro_graphs = {}
 
         # Every disqualifier, one at a time.
         assert burst_factor({"b": 1, "a": 1}) == 1, "order is load-bearing (it is idx_mapping)"
@@ -749,8 +1081,9 @@ def _self_check() -> None:
         log.disabled = False
         assert burst_factor(nst) == 1
         assert not b.armed and not b.ready
+        assert b.pending == 0 and b.pending1 is False
     finally:
-        b.armed, b.ready, b.key, b.n = saved
+        b.armed, b.ready, b.key, b.n, b.sample1, b.pro_graphs = saved
 
     # num_rejected arithmetic: post_update's `computed_delta = query_len - num_rejected`
     # must come out as exactly N for a decode step (query_len == 1).
@@ -772,8 +1105,38 @@ def _self_check() -> None:
     # most expensive place to find out.
     for name in ("advance", "bump", "idx_map", "max_seq_len", "accum", "tok", "step",
                  "num_sampled", "num_rejected", "desc", "pending", "graphs", "runner",
-                 "armed", "ready", "key", "n", "mode", "bursts", "iters"):
+                 "armed", "ready", "key", "n", "mode", "bursts", "iters",
+                 "graph_bursts", "steps",
+                 "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs",
+                 "ones", "zeros", "pending1", "unroll_bursts", "fold_bursts", "g1_steps"):
         setattr(BURST, name, getattr(BURST, name))
+    assert set(_Burst.__slots__) == {
+        "armed", "ready", "key", "n", "mode", "runner", "graphs", "accum", "tok", "step",
+        "num_sampled", "num_rejected", "desc", "pending", "bursts", "iters",
+        "graph_bursts", "steps", "advance", "bump", "idx_map", "max_seq_len",
+        "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs", "ones", "zeros",
+        "pending1", "unroll_bursts", "fold_bursts", "g1_steps",
+    }, "the slot list above and __slots__ must not drift"
+
+    # The in-graph ladder demotes ONE rung at a time, and `fold` takes `unroll` with it
+    # (the unrolled graph CONTAINS the prologue, so it cannot outlive it).
+    saved_ladder = (b.fold, b.unroll, b.sample1)
+    try:
+        log.disabled = True
+        b.fold = b.unroll = b.sample1 = True
+        b.unroll_graphs = {1: object()}
+        b.demote("unroll", "test")
+        assert not b.unroll and b.unroll_graphs == {}
+        assert b.fold and b.sample1, "an unroll failure must not cost the prologue"
+        b.unroll = True
+        b.pro_graphs = {1: object()}
+        b.demote("fold", "test")
+        assert not b.fold and not b.sample1 and not b.unroll
+        assert b.pro_graphs == {} and b.unroll_graphs == {}
+    finally:
+        log.disabled = False
+        b.fold, b.unroll, b.sample1 = saved_ladder
+        b.pro_graphs, b.unroll_graphs = {}, {}
 
     assert _int("VTL_NOT_SET_ANYWHERE", 4) == 4
     os.environ["VTL_NOT_SET_ANYWHERE"] = "not-a-number"
@@ -781,6 +1144,16 @@ def _self_check() -> None:
         assert _int("VTL_NOT_SET_ANYWHERE", 4) == 4, "a bad literal falls back, never raises"
         os.environ["VTL_NOT_SET_ANYWHERE"] = "2"
         assert _int("VTL_NOT_SET_ANYWHERE", 4) == 2
+    finally:
+        del os.environ["VTL_NOT_SET_ANYWHERE"]
+
+    # `_flag` defaults ON (all three ladder knobs ship at "1") and takes an explicit off.
+    assert _flag("VTL_NOT_SET_ANYWHERE") is True
+    os.environ["VTL_NOT_SET_ANYWHERE"] = "0"
+    try:
+        assert _flag("VTL_NOT_SET_ANYWHERE") is False
+        os.environ["VTL_NOT_SET_ANYWHERE"] = "on"
+        assert _flag("VTL_NOT_SET_ANYWHERE") is True
     finally:
         del os.environ["VTL_NOT_SET_ANYWHERE"]
 

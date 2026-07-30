@@ -32,6 +32,13 @@ Gates (all default OFF, all independent except where noted)::
                                    (needs _TABLE; mutually exclusive with _TABLE_SHADOW)
     VTL_SCHED_TIMING=1             log-only p50/p95 of the schedule() phases. Independent
                                    of every other gate.
+    VTL_RUST_SCHED_TOKSTORE=1      Port-2: Rust owns each slot's output tokens, counters and
+                                   block-hash chain (needs R8 *and* VTL_RUST_HASHER). The
+                                   sampled ids cross as numpy, Python's ``Request`` degrades
+                                   to three int counters, and the rare paths that need the
+                                   real lists materialize them back from the crate.
+    VTL_RUST_SCHED_TOKSTORE_SHADOW=1  keep Python authoritative and only drive + diff the
+                                   Rust store (hash chains + both counters) per step.
 
 Why shadow first: this replaces the most correctness-critical component in the engine,
 and LFM2's hybrid layout (6 full-attention + 10 short-conv/mamba groups,
@@ -156,6 +163,32 @@ def modes() -> dict:
         # C1a: N-step decode burst commitment. Needs the full Rust loop (the commit
         # extends the resident table in the same place the schedule decisions land).
         "nstep": full and env_on("VTL_NSTEP"),
+        # Port-2: Rust owns the per-slot token list, counters and block-hash chain.
+        #
+        # Rides on R8 (it IS `update_step_pack`, driven off the sampler's numpy array) and on
+        # the Rust hasher -- with two hash implementations live, one would own the prompt
+        # blocks and the other the decode blocks, and a divergence between them is a silent
+        # prefix-cache key-space fork, not an exception.
+        #
+        # ...and refuses the two OTHER shadow arms outright: both keep Python's
+        # `append_output_token_ids` authoritative, and the store has already appended the
+        # same tokens by then, so the pair would double-count every token. Those arms are
+        # diagnostics; the token store simply is not available while one is on.
+        "tokstore": (
+            r8
+            and not env_on("VTL_RUST_SCHED_R8_SHADOW")
+            and not env_on("VTL_RUST_SCHED_UFO_SHADOW")
+            and env_on("VTL_RUST_HASHER")
+            and env_on("VTL_RUST_SCHED_TOKSTORE")
+        ),
+        "tokstore_shadow": (
+            r8
+            and not env_on("VTL_RUST_SCHED_R8_SHADOW")
+            and not env_on("VTL_RUST_SCHED_UFO_SHADOW")
+            and env_on("VTL_RUST_HASHER")
+            and env_on("VTL_RUST_SCHED_TOKSTORE")
+            and env_on("VTL_RUST_SCHED_TOKSTORE_SHADOW")
+        ),
     }
 
 
@@ -299,6 +332,10 @@ class RustMirror:
             self._pushed[slot] = self.rust.num_hashes(slot)
         hashes = request.block_hashes
         have = self._pushed[slot]
+        # Port-2: for a store-owned request Python's list is FROZEN at the count Rust
+        # already has (the crate grew the chain itself in `tokens.rs`), so this comparison
+        # is False forever and the hash count is sourced from Rust state at zero FFI cost.
+        # `tok_materialize` re-syncs both sides when a request goes back to the stock path.
         if len(hashes) > have:
             self.rust.push_hashes(
                 slot, b"".join(hashes[have:]), int(request.num_prompt_tokens)
@@ -1017,14 +1054,12 @@ def bail_reason(scheduler):
 # --------------------------------------------------------------------------
 
 
-def burst_blocked(so, waiting_nonempty: bool, queue_empty_only: bool, cap: int) -> str | None:
-    """Why this step cannot carry a burst, or ``None`` if it can. Pure -- self-checked.
+def burst_blocked_batch(so, cap: int) -> str | None:
+    """The batch-level gate MINUS the queue-empty guard. Pure -- self-checked.
 
-    Batch-level half of the gate; ``burst_request_blocked`` is the per-request half.
-    Refusing an admission step is what keeps the burst's TTFT cost bounded: a new request
-    would otherwise wait behind N decode iterations instead of one
-    (``VTL_NSTEP_QUEUE_EMPTY_ONLY``, on by default, extends that to a merely non-empty
-    queue).
+    Split out because the N=1 in-graph sampling commit wants exactly this and not the queue
+    guard: sampling one token in a graph delays no admission, so a non-empty waiting queue is
+    irrelevant to it while it is the whole TTFT argument against a burst.
     """
     if so.scheduled_new_reqs:
         return "new requests admitted this step"
@@ -1044,28 +1079,40 @@ def burst_blocked(so, waiting_nonempty: bool, queue_empty_only: bool, cap: int) 
     for num in nst.values():
         if num != 1:
             return "not a pure 1-token-per-request decode batch"
+    return None
+
+
+def burst_blocked(so, waiting_nonempty: bool, queue_empty_only: bool, cap: int) -> str | None:
+    """Why this step cannot carry a BURST, or ``None`` if it can. Pure -- self-checked.
+
+    Batch-level half of the gate; ``burst_request_blocked`` is the per-request half.
+    Refusing an admission step is what keeps the burst's TTFT cost bounded: a new request
+    would otherwise wait behind N decode iterations instead of one
+    (``VTL_NSTEP_QUEUE_EMPTY_ONLY``, on by default, extends that to a merely non-empty
+    queue).
+    """
+    why = burst_blocked_batch(so, cap)
+    if why is not None:
+        return why
     if queue_empty_only and waiting_nonempty:
         return "waiting queue is not empty"
     return None
 
 
-def burst_request_blocked(request, computed_before: int, n: int, block_size: int,
+def burst_sampler_blocked(request, computed_before: int, n: int,
                           max_model_len: int) -> str | None:
-    """Why this request cannot ride a burst, or ``None``. Pure -- self-checked.
+    """The per-request gate MINUS the align gate: everything about the SAMPLER.
 
-    ``computed_before`` is ``num_computed_tokens`` BEFORE ``_update_after_schedule``
-    advanced it, i.e. the position of the token this step is about to feed.
+    The burst (and the N=1 in-graph path) samples a bare ``argmax``, so anything that would
+    move the token away from it -- temperature, penalties, a logit bias, bad words, an unmet
+    ``min_tokens`` -- keeps the request on the stock sampler. Also the length caps, which N=1
+    still needs: a request one token from ``max_tokens`` must go through the code that
+    truncates, not through a bare argmax.
 
-    THE ALIGN GATE is the first check and the load-bearing one: with
-    ``computed_before % block_size + n <= block_size`` the whole burst lives inside one KV
-    block and one mamba state column, so no allocation, no state migration and no block
-    table change can happen between iterations. Everything else here is about the sampler:
-    the burst samples a bare ``argmax``, so anything that would move the token away from it
-    -- temperature, penalties, a logit bias, bad words, an unmet ``min_tokens`` -- keeps the
-    request on the one-token path.
+    Split out because N=1 needs it without the align gate: one token crosses no block
+    boundary by construction, so the whole "the block tables the graph baked stay valid"
+    argument is vacuous for it.
     """
-    if computed_before % block_size + n > block_size:
-        return "burst would cross a block boundary"
     sp = request.sampling_params
     if sp is None or request.pooling_params is not None:
         return "not a generation request"
@@ -1089,6 +1136,24 @@ def burst_request_blocked(request, computed_before: int, n: int, block_size: int
     if sp.presence_penalty or sp.frequency_penalty or sp.repetition_penalty != 1.0:
         return "penalties"
     return None
+
+
+def burst_request_blocked(request, computed_before: int, n: int, block_size: int,
+                          max_model_len: int) -> str | None:
+    """Why this request cannot ride a burst, or ``None``. Pure -- self-checked.
+
+    ``computed_before`` is ``num_computed_tokens`` BEFORE ``_update_after_schedule``
+    advanced it, i.e. the position of the token this step is about to feed.
+
+    THE ALIGN GATE is the first check and the load-bearing one: with
+    ``computed_before % block_size + n <= block_size`` the whole burst lives inside one KV
+    block and one mamba state column, so no allocation, no state migration and no block
+    table change can happen between iterations. The rest is
+    ``burst_sampler_blocked``.
+    """
+    if computed_before % block_size + n > block_size:
+        return "burst would cross a block boundary"
+    return burst_sampler_blocked(request, computed_before, n, max_model_len)
 
 
 def burst_commit(request, delta: int) -> None:
@@ -1144,6 +1209,350 @@ def pack_req(slot: int, request) -> tuple:
     )
 
 
+# --------------------------------------------------------------------------
+# Port-2 -- the Rust-owned token store: the Python half
+# --------------------------------------------------------------------------
+#
+# THE CONSUMER SWEEP THAT MAKES THIS POSSIBLE (2026-07-30, deployed config: V2 runner,
+# Rust frontend, R8, UFO, Rust hasher; no PP / LoRA / spec / connector / structured output).
+# Only TWO live consumers need the token INTS:
+#
+#   1. ``NewRequestData.prefill_token_ids`` at admission and at preemption-resume;
+#   2. the block hasher's block-aligned slices.
+#
+# Everything else reads ``num_tokens`` / ``num_output_tokens``, i.e. counts -- ten sites, all
+# of which see a plain int just as happily as a ``len()``. And there is exactly ONE writer,
+# the bulk ``append_output_token_ids`` in ``_urwo_inner``. So: (2) moves into Rust
+# (``tokens.rs`` owns the chain, ``hash.rs`` does the sha256), the counts become plain int
+# attributes bumped by the writer, ``_all_token_ids`` stops growing, and (1) is handled by
+# MATERIALIZATION -- rebuilding the real lists from prompt + ``slot_tokens(slot)`` on the
+# rare paths that need them (admission, preemption, any pack refusal, any UFO fallback).
+#
+# THE FACADE IS PER INSTANCE, NEVER GLOBAL. ``Request.num_tokens`` is a property on the
+# class, and a data descriptor on the class beats an instance ``__dict__`` entry -- so a
+# plain attribute cannot shadow it. Rebinding ``request.__class__`` to a subclass whose
+# ``num_tokens`` is a plain CLASS attribute (not a descriptor) puts the instance dict back in
+# front. Mutating vLLM's own ``Request`` would do this to every request in the process,
+# including the ones this patch refuses; the subclass swap is scoped to the requests the
+# store actually took over, and materialization swaps it straight back.
+
+
+class _TokState:
+    """Port-2 process state. One engine core per process, so a module global is the whole
+    lifetime story -- same shape as ``nstep_decode.BURST``."""
+
+    __slots__ = ("live", "shadow", "armed", "hash_block_size", "facaded",
+                 "materialized", "divergences", "warned")
+
+    def __init__(self) -> None:
+        self.live = False          # numpy fast path + facade installation
+        self.shadow = False        # python authoritative, store driven and compared
+        self.armed = False         # NONE_HASH handed to the crate
+        self.hash_block_size = 0
+        self.facaded = 0
+        self.materialized = 0
+        self.divergences = 0
+        self.warned = False
+
+    def disable(self, why: str) -> None:
+        """Permanent, boot-lifetime fallback. Requests already facaded keep working: the
+        per-request writer branch keys off the FACADE, not off this flag, and the next step
+        that cannot take the numpy path materializes them back onto the stock path."""
+        if self.live or self.shadow:
+            log.error("rust_sched: token store disabled for this boot -- %s", why)
+        self.live = False
+        self.shadow = False
+
+
+TOK = _TokState()
+
+
+class _Row:
+    """One request's sampled tokens, as a length and a promise.
+
+    ``decide()`` needs only ``len()`` and truthiness; ``r8_apply`` hands this straight to
+    ``_update_request_with_output``, which on the fast path also needs only the length. So
+    the row is never converted to Python ints unless something actually asks for the values
+    -- which is exactly the ``tolist()`` this port exists to delete.
+    """
+
+    __slots__ = ("arr", "i", "n")
+
+    def __init__(self, arr, i: int, n: int) -> None:
+        self.arr = arr
+        self.i = i
+        self.n = n
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __bool__(self) -> bool:
+        return self.n > 0
+
+    def tolist(self) -> list:
+        row = self.arr[self.i][: self.n]
+        # ``ndarray.tolist()`` yields native Python ints, never np.int64 -- which is the
+        # whole np.int64 hazard (block-hash inputs are pickled, and np.int64 pickles
+        # differently from int, silently forking every prefix-cache key).
+        return row.tolist() if hasattr(row, "tolist") else [int(t) for t in row]
+
+    def __iter__(self):
+        return iter(self.tolist())
+
+
+class LazySampled:
+    """``ModelRunnerOutput.sampled_token_ids`` that has not been converted to lists yet.
+
+    ``AsyncOutput.get_output`` ends in two ``tolist()`` calls plus a per-row truncation loop;
+    with the token store there is nothing left in Python that wants the ints, so the arrays
+    are handed through and ``update_step_pack_np`` copies the ids out of the buffer directly.
+
+    Duck-types enough of ``list[list[int]]`` that every OTHER consumer still works:
+    ``materialize()`` does exactly what ``get_output`` did, and any step that takes the
+    object path (a pack refusal, the ZMQ/non-R8 output arm in ``shm_ipc.py``, stock
+    ``update_from_output``) calls it first, so those paths never see a ``_Row``.
+    """
+
+    __slots__ = ("arr", "counts", "_rows")
+
+    def __init__(self, arr, counts) -> None:
+        self.arr = arr
+        self.counts = counts
+        self._rows = None
+
+    def materialize(self) -> None:
+        if self._rows is not None:
+            return
+        rows = self.arr.tolist() if hasattr(self.arr, "tolist") else [list(r) for r in self.arr]
+        counts = self.counts.tolist() if hasattr(self.counts, "tolist") else list(self.counts)
+        for row, n in zip(rows, counts):
+            del row[n:]
+        self._rows = rows
+
+    def __len__(self) -> int:
+        return len(self.counts)
+
+    def __bool__(self) -> bool:
+        return len(self.counts) > 0
+
+    def __getitem__(self, i):
+        if self._rows is not None:
+            return self._rows[i]
+        return _Row(self.arr, i, int(self.counts[i]))
+
+    def __iter__(self):
+        self.materialize()
+        return iter(self._rows)
+
+
+_FACADE_CLASSES: dict = {}
+
+
+def facade_class(base):
+    """``base`` with the three count properties demoted to plain class attributes.
+
+    Cached per base class: there is one ``Request`` class in practice, and building the
+    subclass once keeps ``isinstance`` caches and method resolution stable.
+    """
+    cls = _FACADE_CLASSES.get(base)
+    if cls is None:
+        cls = _FACADE_CLASSES[base] = type(
+            "VtlTokStore" + base.__name__,
+            (base,),
+            {
+                # Non-descriptors, so the instance __dict__ wins the lookup. The values
+                # here are never read: install() writes the instance attributes first.
+                "num_tokens": 0,
+                "num_tokens_with_spec": 0,
+                "num_output_tokens": 0,
+                "__vtl_tokstore__": True,
+            },
+        )
+    return cls
+
+
+def facaded(request) -> bool:
+    return getattr(type(request), "__vtl_tokstore__", False)
+
+
+def tok_store_init(rust, request, slot: int, hash_block_size: int) -> bool:
+    """Hand this slot's token bookkeeping to Rust. ``False`` = refuse, stay on stock.
+
+    The seed is the request's token tail past the last block the Python hasher already
+    produced a hash for -- fewer than ``hash_block_size`` tokens -- which is the whole reason
+    Rust does not need the prompt: the chain state is (last hash, unhashed tail).
+    """
+    if (
+        request.cache_salt
+        or request.mm_features
+        or request.lora_request is not None
+        or request.prompt_embeds is not None
+    ):
+        # Exactly the refusal set of ``_install_rust_hasher``'s ``rust_block_hasher``:
+        # anything that needs ``extra_keys`` is hashed by stock Python, so Rust cannot
+        # continue that chain.
+        return False
+    hashed = len(request.block_hashes) * hash_block_size
+    n_tok = int(request.num_tokens)
+    tail = n_tok - hashed
+    if tail < 0 or tail >= hash_block_size:
+        # The hasher is behind (or ahead of) where the store expects it. Refuse rather
+        # than reconcile: a wrong boundary is a poisoned cache key, not an exception.
+        return False
+    pending = [int(t) for t in request.all_token_ids[hashed:]] if tail else []
+    rust.store_init(slot, pending, n_tok, int(request.num_output_tokens))
+    return True
+
+
+def tok_facade_on(request) -> None:
+    """Swap in the counter facade. Must run AFTER ``tok_store_init`` agreed."""
+    base = type(request)
+    n_tok = int(request.num_tokens)
+    n_spec = int(request.num_tokens_with_spec)
+    n_out = int(request.num_output_tokens)
+    # The class swap comes first: while `base` is bound, `num_tokens` is a getter-only
+    # property and the assignment below would raise.
+    request.__class__ = facade_class(base)
+    request.num_tokens = n_tok
+    request.num_tokens_with_spec = n_spec
+    request.num_output_tokens = n_out
+    request._vtl_tok_base = base
+    TOK.facaded += 1
+
+
+def tok_materialize(kv, request) -> None:
+    """Rebuild the real token lists and hash chain, then hand the request back to stock.
+
+    Called on every path that needs the INTS or that is about to let stock code mutate the
+    request: a pack refusal, a UFO per-request fallback, preemption, resume/admission. The
+    request is permanently stock afterwards (``_vtl_tok_off``) -- re-facading it would mean
+    re-deriving a seed tail from state stock may have edited.
+    """
+    if not facaded(request):
+        return
+    base = request._vtl_tok_base
+    toks = None
+    packed = None
+    slot = kv._mirror._slots.get(request.request_id)
+    if slot is None:
+        # The slot was already recycled, so the store cannot answer. The request is being
+        # retired on this path (that is the only way its slot goes away), so restoring the
+        # class is all that is owed -- but say so, because a silent short list would be a
+        # truncated completion.
+        log.error(
+            "rust_sched: token store cannot materialize %s -- its slot is gone",
+            request.request_id,
+        )
+    else:
+        try:
+            toks = kv._rust.slot_tokens(slot)
+            packed = kv._rust.slot_hashes(slot)
+            kv._rust.store_forget(slot)
+        except BaseException as exc:
+            reraise_fatal(exc)
+            log.exception("rust_sched: token store materialization failed for %s",
+                          request.request_id)
+            TOK.disable("materialization raised")
+    for name in ("num_tokens", "num_tokens_with_spec", "num_output_tokens"):
+        request.__dict__.pop(name, None)
+    request.__class__ = base
+    request._vtl_tok_off = True
+    request._vtl_tok_on = False
+    if toks:
+        # In place: `all_token_ids` / `output_token_ids` are ConstantList VIEWS over these
+        # two lists, so extending them keeps every existing view correct.
+        request._all_token_ids.extend(toks)
+        request._output_token_ids.extend(toks)
+    if packed is not None and slot is not None:
+        # Rust's chain is the complete one; Python's list froze at facade install. Replace
+        # it wholesale and tell the mirror the crate already has all of it, or the next
+        # `mirror.slot()` would push the tail a second time.
+        hashes = [packed[i * 32:(i + 1) * 32] for i in range(len(packed) // 32)]
+        request.block_hashes[:] = hashes
+        kv._mirror._pushed[slot] = len(hashes)
+    TOK.materialized += 1
+
+
+def store_step_fallback(kv, sampled, batch, why: str) -> None:
+    """Put a whole step back on the object path: real lists, real requests.
+
+    Runs BEFORE anything delegates to stock code, which is the contract -- stock
+    ``update_from_output`` builds ``EngineCoreOutput.new_token_ids`` out of
+    ``sampled[index]`` and stock ``check_stop`` reads ``request.num_output_tokens``.
+    """
+    if isinstance(sampled, LazySampled):
+        sampled.materialize()
+    for _rid, _n, request in batch:
+        tok_materialize(kv, request)
+    if not TOK.warned:
+        TOK.warned = True
+        log.info("rust_sched: token store step fallback (first time) -- %s", why)
+
+
+def store_full_fallback(scheduler, kv, scheduler_output, model_runner_output) -> None:
+    """``store_step_fallback`` over the whole step, from the SchedulerOutput.
+
+    Used where the batch decide() enumerated is not enough: stock ``update_from_output``
+    iterates ``scheduler_output.num_scheduled_tokens``, so any store-owned request in there
+    -- including one decide() skipped as finished -- must be materialized first.
+    """
+    batch = []
+    for req_id in scheduler_output.num_scheduled_tokens:
+        request = scheduler.requests.get(req_id)
+        if request is not None and facaded(request):
+            batch.append((req_id, 0, request))
+    store_step_fallback(kv, model_runner_output.sampled_token_ids, batch, "stock objects")
+
+
+def tok_arm(kv) -> bool:
+    """Give the crate vLLM's live ``NONE_HASH`` and learn the hash block size. Once."""
+    if TOK.armed:
+        return True
+    from vllm.v1.core import kv_cache_utils
+
+    hbs = int(getattr(kv.block_pool, "hash_block_size", 0) or 0)
+    if hbs <= 0:
+        return False
+    kv._rust.store_arm(bytes(kv_cache_utils.NONE_HASH))
+    TOK.hash_block_size = hbs
+    TOK.armed = True
+    log.info("rust_sched: token store armed (hash_block_size=%d, shadow=%s)", hbs, TOK.shadow)
+    return True
+
+
+def _install_async_output() -> None:
+    """Skip ``AsyncOutput.get_output``'s two ``tolist()`` calls when the store is live.
+
+    Wraps the class at runtime rather than editing
+    ``vllm/v1/worker/gpu/async_utils.py:49-70`` -- no fork patch, no rebuild. Anything the
+    fast path cannot express (logprobs, a nans batch) takes stock ``get_output``, and a
+    single failure disables the store for the boot.
+    """
+    from vllm.v1.worker.gpu.async_utils import AsyncOutput
+
+    if already_patched(AsyncOutput, "get_output", patch="rust_sched_tokstore"):
+        return
+    original = AsyncOutput.get_output
+
+    def get_output(self):
+        if TOK.live and self.logprobs_tensors is None and self.num_nans is None:
+            try:
+                self.copy_event.synchronize()
+                mro = self.model_runner_output
+                mro.sampled_token_ids = LazySampled(
+                    self.sampled_token_ids, self.num_sampled_tokens_np
+                )
+                mro.prompt_logprobs_dict = self.prompt_logprobs_dict
+                return mro
+            except BaseException as exc:
+                reraise_fatal(exc)
+                log.exception("rust_sched: lazy get_output failed; stock conversion")
+                TOK.disable("get_output raised")
+        return original(self)
+
+    AsyncOutput.get_output = mark_patched(get_output, original, patch="rust_sched_tokstore")
+
+
 def _install_update_from_output(scheduler_cls, m: dict):
     """R6a -- one Rust call per step for the whole batch's stop decision.
 
@@ -1172,6 +1581,11 @@ def _install_update_from_output(scheduler_cls, m: dict):
     shadow = m["ufo_shadow"]
     spec = m["spec"]
     r8_shadow = m["r8_shadow"]
+    # Port-2. STORE gates the crate-side bookkeeping (both arms); TOK.live gates the numpy
+    # fast path and the facade, and is the flag that a failure turns off for the boot.
+    STORE = m["tokstore"]
+    TOK.shadow = m["tokstore_shadow"]
+    TOK.live = STORE and not TOK.shadow
 
     # R8 emits `bytes` onto the output queue, which ONLY `shm_ipc`'s replacement output
     # thread understands -- stock's would do `outputs.engine_index = ...` on a bytes and
@@ -1239,6 +1653,33 @@ def _install_update_from_output(scheduler_cls, m: dict):
         )
         return True
 
+    def store_take_over(kv, request, slot) -> bool:
+        """Give this slot's token bookkeeping to Rust. ``False`` = it stays in Python.
+
+        Refusing is cheap and per REQUEST: the step then takes the object path (and any
+        request the store already owns is materialized first), so a single unsupported
+        request never costs correctness -- only the fast path, for that step.
+        """
+        if getattr(request, "_vtl_tok_off", False):
+            return False
+        try:
+            if not tok_arm(kv):
+                return False
+            if not tok_store_init(kv._rust, request, slot, TOK.hash_block_size):
+                request._vtl_tok_off = True
+                return False
+        except BaseException as exc:
+            reraise_fatal(exc)
+            log.exception("rust_sched: token store take-over failed for %s",
+                          request.request_id)
+            TOK.disable("store_init raised")
+            request._vtl_tok_off = True
+            return False
+        request._vtl_tok_on = True
+        if TOK.live:
+            tok_facade_on(request)
+        return True
+
     def step_packable(self, scheduler_output, mro) -> bool:
         """R8 gate: can this whole step's OUTPUT be a single Rust-built raw record?
 
@@ -1276,21 +1717,29 @@ def _install_update_from_output(scheduler_cls, m: dict):
         With ``pack``, the crossing is ``update_step_pack``, which also returns the whole
         step's shm output record; the bytes land in ``self._vtl_r8_record`` (``None`` when
         Rust refused to pack). The verdicts are identical either way.
+
+        With the TOKEN STORE live (Port-2) the crossing is ``update_step_pack_np`` instead:
+        the sampler's numpy array goes straight over, the per-request counters come off the
+        store, and no token id is ever turned into a Python int. ``lazy`` goes False the
+        moment anything in the batch cannot ride that path, and the tail then materializes
+        the step back onto the object path before it hands over.
         """
         rust, mirror = kv._rust, kv._mirror
         sampled = model_runner_output.sampled_token_ids
+        lazy = TOK.live and pack and isinstance(sampled, LazySampled)
         slots: list[int] = []
-        cu: list[int] = [0]
-        toks: list[int] = []
+        rows: list[int] = []
+        counts: list[int] = []
         n_out: list[int] = []
         n_tok: list[int] = []
-        expect: list[tuple[str, int]] = []
+        expect: list[tuple] = []
         for req_id, index in model_runner_output.req_id_to_index.items():
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 continue
             gen = sampled[index]
-            if not gen:
+            n_gen = len(gen)
+            if not n_gen:
                 # No token for this request this step (a prefill chunk). Nothing to apply,
                 # and nothing the resident table could have missed.
                 continue
@@ -1322,16 +1771,44 @@ def _install_update_from_output(scheduler_cls, m: dict):
                     pack = False
                     continue
                 mirror._stops.add(slot)
+            if STORE and not getattr(request, "_vtl_tok_on", False) \
+                    and not store_take_over(kv, request, slot):
+                # This request's tokens stay in Python, so the whole step does: the numpy
+                # crossing reads its counters off the store and there would be no entry.
+                # (`_vtl_tok_on`, not `facaded()`: the SHADOW arm installs no facade, and
+                # re-seeding the store every step would mask the drift it exists to catch.)
+                lazy = False
             slots.append(slot)
-            expect.append((req_id, len(gen)))
-            toks.extend(gen)
-            cu.append(len(toks))
-            # Read BEFORE the loop appends anything -- exactly the values check_stop would
-            # see on its first iteration.
+            rows.append(index)
+            counts.append(n_gen)
+            expect.append((req_id, n_gen, request))
+            # Read BEFORE anything appends -- exactly the values check_stop would see on
+            # its first iteration. Ignored by the numpy arm (the store holds them).
             n_out.append(request.num_output_tokens)
             n_tok.append(request.num_tokens)
         if not slots:
             return None
+        if lazy and pack:
+            out, record = rust.update_step_pack_np(
+                sampled.arr, rows, counts, slots, int(self.max_model_len),
+                0, monotonic(), (),
+            )
+            self._vtl_r8_record = record
+            # `record is None` (Rust refused the pack) is NOT handled here on purpose:
+            # `update_from_output` then takes the `wrapped_ufo` arm, whose
+            # `store_full_fallback` guard is strictly wider than anything this loop saw.
+            # Rust appended nothing to the store on that arm, so Python owns the append.
+            return {rid: (n, *v) for (rid, n, _r), v in zip(expect, out)}
+        if STORE:
+            # Objects for this step: stock code is about to read `sampled[index]` and the
+            # requests' real token lists, so both have to exist first.
+            store_step_fallback(kv, sampled, expect, "step is not numpy-packable")
+        cu: list[int] = [0]
+        toks: list[int] = []
+        for row, cnt in zip(rows, counts):
+            gen = sampled[row]
+            toks.extend(gen if len(gen) == cnt else gen[:cnt])
+            cu.append(len(toks))
         if pack:
             # engine_index is 0 for every non-DP boot (EngineCoreProc's default; only
             # DPEngineCoreProc passes the rank), and step_packable() already refused the
@@ -1345,7 +1822,46 @@ def _install_update_from_output(scheduler_cls, m: dict):
             self._vtl_r8_record = record
         else:
             out = rust.update_step(slots, cu, toks, n_out, n_tok, int(self.max_model_len))
-        return {rid: (n, *v) for (rid, n), v in zip(expect, out)}
+        if TOK.shadow:
+            self._vtl_tok_shadow = (slots, cu, toks, [v[0] for v in out], expect)
+        return {rid: (n, *v) for (rid, n, _r), v in zip(expect, out)}
+
+    def store_compare(self, kv) -> None:
+        """VTL_RUST_SCHED_TOKSTORE_SHADOW: Python stays authoritative, Rust is checked.
+
+        Runs AFTER stock's ``append_output_token_ids`` (so the request holds this step's
+        tokens and hashes), drives the store with the SAME accepted counts, and diffs the
+        two hash chains and both counters per request.
+
+        Deliberately NOT a record byte-compare: running both pack arms in one step would
+        apply every verdict twice. Record byte-identity is proved instead by the crate's
+        ``record_is_identical_with_the_store`` golden test, which is exhaustive and free.
+        """
+        state = self._vtl_tok_shadow
+        self._vtl_tok_shadow = None
+        if state is None:
+            return
+        slots, cu, toks, accepted, batch = state
+        try:
+            kv._rust.store_apply(slots, cu, toks, accepted)
+            for slot, (rid, _n, request) in zip(slots, batch):
+                want = (int(request.num_tokens), int(request.num_output_tokens))
+                got = kv._rust.store_counts(slot)
+                if got != want:
+                    TOK.divergences += 1
+                    log.error("rust_sched: token store COUNTER divergence on %s -- "
+                              "python=%r rust=%r", rid, want, got)
+                py_hashes = b"".join(request.block_hashes)
+                rs_hashes = kv._rust.slot_hashes(slot)
+                if rs_hashes != py_hashes:
+                    TOK.divergences += 1
+                    log.error("rust_sched: token store HASH CHAIN divergence on %s -- "
+                              "python=%d hashes, rust=%d hashes", rid,
+                              len(py_hashes) // 32, len(rs_hashes or b"") // 32)
+        except BaseException as exc:
+            reraise_fatal(exc)
+            log.exception("rust_sched: token store shadow comparison failed")
+            TOK.disable("shadow comparison raised")
 
     def r8_apply(self, model_runner_output):
         """``update_from_output``'s per-request bookkeeping, WITHOUT the output assembly.
@@ -1414,8 +1930,11 @@ def _install_update_from_output(scheduler_cls, m: dict):
             return
         try:
             # `mirror.slot`, not a bare lookup: the tokens this step just appended may
-            # have completed a block, and Python's hasher has ALREADY produced its hash
-            # (it runs inside append_output_token_ids). Pushing it here rather than at the
+            # have completed a block, and its hash ALREADY exists -- produced by Python's
+            # hasher inside append_output_token_ids, or (Port-2) by `tokens.rs` inside
+            # update_step_pack_np, in which case `slot()` pushes nothing because the crate
+            # already holds the chain. Either way the invariant this call protects holds.
+            # Pushing it here rather than at the
             # next schedule() is what makes speculation survive a block boundary -- the
             # worker would otherwise walk a table claiming more full blocks than the crate
             # has hashes for, and the next schedule() would invalidate the result anyway.
@@ -1469,13 +1988,27 @@ def _install_update_from_output(scheduler_cls, m: dict):
             if self._vtl_r8_record is not None and not r8_shadow:
                 outputs = r8_apply(self, model_runner_output)
             else:
+                if TOK.live:
+                    # THE COMPLETE GUARD. Stock's loop walks
+                    # `scheduler_output.num_scheduled_tokens`, which is a SUPERSET of what
+                    # decide() looked at -- an already-finished request, or a step decide()
+                    # refused outright (`_vtl_ufo is None`), still reaches
+                    # `sampled_token_ids[index]` and `request.num_output_tokens` here. So
+                    # every store-owned request in the step goes back to stock, not just the
+                    # ones decide() enumerated.
+                    store_full_fallback(
+                        self, kv, scheduler_output, model_runner_output
+                    )
                 outputs = wrapped_ufo(self, scheduler_output, model_runner_output)
                 if self._vtl_r8_record is not None:
                     r8_compare(self, outputs)
+            if TOK.shadow and self._vtl_tok_shadow is not None:
+                store_compare(self, kv)
         finally:
             self._vtl_ufo = None
             self._vtl_r8_record = None
             self._vtl_burst_n = 1
+            self._vtl_tok_shadow = None
         if spec:
             maybe_kick(self, kv)
         return outputs
@@ -1547,8 +2080,13 @@ def _install_update_from_output(scheduler_cls, m: dict):
         # 255 = unregistered slot; a length mismatch means something mutated the request
         # between the batch and here. Either way, stock decides.
         if answer is None or answer[2] == 255 or answer[0] != len(new_token_ids):
-            # Rust left this slot's table entry untouched; Python owns the delta now.
+            # Rust left this slot's table entry untouched; Python owns the delta now -- so
+            # the request needs its real token lists back before stock touches it.
             self._vtl_ufo_clean = False
+            if facaded(request):
+                tok_materialize(self.kv_cache_manager, request)
+            if isinstance(new_token_ids, _Row):
+                new_token_ids = new_token_ids.tolist()
             return wrapped_urwo(self, request, new_token_ids)
         _, num_keep, status, stop_reason = answer
 
@@ -1575,11 +2113,29 @@ def _install_update_from_output(scheduler_cls, m: dict):
                     )
             return kept, stopped
 
-        for token_id in new_token_ids[:num_keep]:
-            request.append_output_token_ids(token_id)
+        if facaded(request):
+            # Port-2: the tokens and the hash chain are already in Rust (appended by
+            # `update_step_pack_np` for exactly `num_keep`), so the whole writer is two
+            # counter bumps. `num_tokens_with_spec` moves with `num_tokens` because
+            # `spec_token_ids` is empty on every path that reaches here (the Rust schedule
+            # loop refuses a spec config outright).
+            request.num_tokens += num_keep
+            request.num_tokens_with_spec += num_keep
+            request.num_output_tokens += num_keep
+        else:
+            # One list-extend + ONE block-hasher catch-up call (the hasher loops over every
+            # complete block itself), not num_keep incremental appends: at burst N=4 this
+            # deletes 3 hasher invocations per request per step. Skip the slice copy in the
+            # common no-truncation case.
+            request.append_output_token_ids(
+                new_token_ids if num_keep == len(new_token_ids) else new_token_ids[:num_keep]
+            )
         if status == 0:
             return new_token_ids, False
-        del new_token_ids[num_keep:]
+        if isinstance(new_token_ids, _Row):
+            new_token_ids.n = num_keep      # the `_Row` form of `del ...[num_keep:]`
+        else:
+            del new_token_ids[num_keep:]
         request.status = _STATUS_FROM_CODE[status]
         if stop_reason >= 0:
             request.stop_reason = stop_reason
@@ -1591,13 +2147,44 @@ def _install_update_from_output(scheduler_cls, m: dict):
     scheduler_cls._vtl_ufo_clean = True
     scheduler_cls._vtl_r8_record = None
     scheduler_cls._vtl_burst_n = 1
+    scheduler_cls._vtl_tok_shadow = None
     mark_patched(update_from_output, wrapped_ufo, patch="rust_sched_ufo")
     mark_patched(_update_request_with_output, wrapped_urwo, patch="rust_sched_ufo")
     scheduler_cls.update_from_output = update_from_output
     scheduler_cls._update_request_with_output = _update_request_with_output
+    if STORE:
+        _install_preempt_hook(scheduler_cls)
+        if TOK.live:
+            _install_async_output()
     log.info(
-        "rust_sched: UFO batched stop decision active (shadow=%s, kick=%s, r8=%s%s)",
+        "rust_sched: UFO batched stop decision active "
+        "(shadow=%s, kick=%s, r8=%s%s, tokstore=%s%s)",
         shadow, spec, _r8[0], " SHADOW" if r8_shadow else "",
+        STORE, " SHADOW" if TOK.shadow else "",
+    )
+
+
+def _install_preempt_hook(scheduler_cls) -> None:
+    """Materialize before ANY preemption, wherever it comes from.
+
+    Preemption is the one transition that turns a running (possibly store-owned) request
+    back into a waiting one, and a resumed request is re-admitted through
+    ``NewRequestData.prefill_token_ids`` -- the one consumer that needs the real ints.
+    ``_preempt_request`` is the single chokepoint stock vLLM routes every preemption
+    through, so hooking it covers the Rust loop's bail path and ``reset_prefix_cache``'s
+    forced preemption as well as the ordinary one.
+    """
+    if already_patched(scheduler_cls, "_preempt_request", patch="rust_sched_tokstore"):
+        return
+    wrapped = scheduler_cls._preempt_request
+
+    def _preempt_request(self, request, *args, **kwargs):
+        if facaded(request):
+            tok_materialize(self.kv_cache_manager, request)
+        return wrapped(self, request, *args, **kwargs)
+
+    scheduler_cls._preempt_request = mark_patched(
+        _preempt_request, wrapped, patch="rust_sched_tokstore"
     )
 
 
@@ -1660,49 +2247,75 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             for name, mine, theirs in zip(_REQ_FIELDS, us, them):
                 table_shadow_state.check(f"table.{name}", mine, theirs, rid)
 
-    def commit_burst(self, kv, so, by_slot, decisions) -> None:
-        """Decide and commit this step's burst factor. Runs after ``_update_after_schedule``.
+    def skip_note(self, why: str) -> None:
+        """First-reason-only logging: names each new reason once, then stays quiet."""
+        seen = self._vtl_burst_skips
+        if why not in seen:
+            seen.add(why)
+            log.info("rust_sched: nstep skipped -- %s", why)
 
-        Silent no-op on every ineligible step -- the first-reason-only log keeps a steady
-        stream of "batch of 9 exceeds..." out of the log while still naming each new reason
-        once. On ANY exception the burst is disabled for the boot and the step is a plain
-        one-token step: nothing has been mutated at that point except, at worst, a partial
-        request loop, which is why the request mutation happens in a SECOND pass after every
-        request has been checked.
+    def commit_burst(self, kv, so, by_slot, decisions) -> None:
+        """Decide and commit this step's burst factor -- or, failing that, in-graph N=1
+        sampling. Runs after ``_update_after_schedule``.
+
+        TWO COMMITS, ONE GATE. The burst needs the align gate and the queue-empty guard;
+        in-graph N=1 sampling needs neither (one token crosses no block boundary and delays
+        no admission), so a step the burst refuses can still commit the cheaper rung. The
+        shared predicates are ``burst_blocked_batch`` / ``burst_sampler_blocked``.
+
+        Silent no-op on every ineligible step. On ANY exception the burst is disabled for the
+        boot and the step is a plain one-token step: nothing has been mutated at that point
+        except, at worst, a partial request loop, which is why the request mutation happens
+        in a SECOND pass after every request has been checked.
         """
         n = nstep_mod.burst_factor(so.num_scheduled_tokens)
-        if n < 2:
+        one = nstep_mod.sample_in_graph_ready(so.num_scheduled_tokens)
+        if n < 2 and not one:
             return
         try:
-            why = burst_blocked(
-                so, bool(self.waiting), NSTEP_QUEUE_EMPTY_ONLY, nstep_mod.MAX_BURST_REQS
-            )
-            slots = None
-            if why is None:
-                block_size = self.cache_config.block_size
-                slots = [slot for slot, _ in decisions["scheduled_running"]]
+            batch_why = burst_blocked_batch(so, nstep_mod.MAX_BURST_REQS)
+            if batch_why is not None:
+                skip_note(self, batch_why)
+                return
+            slots = [slot for slot, _ in decisions["scheduled_running"]]
+            # `- 1`: num_computed_tokens as it was BEFORE _update_after_schedule advanced it.
+            if n >= 2:
+                why = None
+                if NSTEP_QUEUE_EMPTY_ONLY and self.waiting:
+                    why = "waiting queue is not empty"
+                else:
+                    block_size = self.cache_config.block_size
+                    for slot in slots:
+                        request = by_slot[slot]
+                        why = burst_request_blocked(
+                            request, request.num_computed_tokens - 1, n,
+                            block_size, self.max_model_len,
+                        )
+                        if why is not None:
+                            break
+                if why is None:
+                    delta = n - 1
+                    for slot in slots:
+                        burst_commit(by_slot[slot], delta)
+                    kv._rust.table_burst(slots, delta)
+                    so.vtl_burst_n = n
+                    return
+                skip_note(self, why)
+            if one:
+                why = None
                 for slot in slots:
                     request = by_slot[slot]
-                    why = burst_request_blocked(
-                        request,
-                        request.num_computed_tokens - 1,  # pre-_update_after_schedule
-                        n,
-                        block_size,
-                        self.max_model_len,
+                    why = burst_sampler_blocked(
+                        request, request.num_computed_tokens - 1, 1, self.max_model_len
                     )
                     if why is not None:
                         break
-            if why is not None:
-                seen = self._vtl_burst_skips
-                if why not in seen:
-                    seen.add(why)
-                    log.info("rust_sched: nstep burst skipped -- %s", why)
-                return
-            delta = n - 1
-            for slot in slots:
-                burst_commit(by_slot[slot], delta)
-            kv._rust.table_burst(slots, delta)
-            so.vtl_burst_n = n
+                if why is None:
+                    # No bookkeeping at all: one token is exactly what the step already
+                    # committed to, so only the SAMPLING path changes.
+                    so.vtl_sample_in_graph = True
+                    return
+                skip_note(self, f"in-graph sampling: {why}")
         except BaseException as exc:
             reraise_fatal(exc)
             log.exception("rust_sched: nstep commit failed; bursts disabled for this boot")
@@ -1893,6 +2506,11 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
 
         for slot in decisions["preempted"]:
             request = by_slot[slot]
+            # Port-2: `num_computed_tokens = 0` below re-prefills from `_all_token_ids`, so
+            # the store has to hand the tokens back first. (This loop IS the Rust loop's
+            # `_preempt_request`; the hook on that method covers stock's path.)
+            if facaded(request):
+                tok_materialize(kv, request)
             self.running.remove(request)
             self.encoder_cache_manager.free(request)
             self._inflight_prefills.discard(request)
@@ -1925,6 +2543,13 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         if self.use_v2_model_runner:
             scheduled_new_reqs.extend(scheduled_resumed_reqs)
             scheduled_resumed_reqs = []
+            for r in scheduled_new_reqs:
+                # `prefill_token_ids` is one of only two consumers that needs the real ints.
+                # Belt to `_install_preempt_hook`'s braces: a resumed request should already
+                # be materialized, and an admission was never facaded, so this is normally
+                # one `type()` lookup per admitted request.
+                if facaded(r):
+                    tok_materialize(kv, r)
             new_reqs_data = [
                 NewRequestData.from_request(
                     r,
@@ -2209,6 +2834,7 @@ def _self_check() -> None:
         "VTL_RUST_SCHED_SPEC", "VTL_SCHED_TIMING",
         "VTL_RUST_SCHED_R8", "VTL_RUST_SCHED_R8_SHADOW", "VTL_RUST_HASHER",
         "VTL_SHM_IPC", "VTL_SHM_IPC_RAW", "VTL_NSTEP",
+        "VTL_RUST_SCHED_TOKSTORE", "VTL_RUST_SCHED_TOKSTORE_SHADOW",
     )}
     try:
         for k in saved:
@@ -2218,6 +2844,7 @@ def _self_check() -> None:
             "full": False, "radix": False, "ufo": False, "ufo_shadow": False,
             "table": False, "table_shadow": False, "spec": False, "timing": False,
             "r8": False, "r8_shadow": False, "hasher": False, "nstep": False,
+            "tokstore": False, "tokstore_shadow": False,
         }, modes()
         assert env_on("VTL_RUST_SCHED") is False
         for truthy in ("1", "true", "YES", " on "):
@@ -2279,11 +2906,38 @@ def _self_check() -> None:
         assert modes()["nstep"] is False
         os.environ["VTL_RUST_SCHED_FULL"] = "1"
 
-        # The hasher is independent: it needs only the extension, not the scheduler.
-        assert modes()["hasher"] is False
+        # Port-2 rides on R8 *and* the Rust hasher: two live hash implementations would
+        # each own half the chain, and a divergence between them is silent.
+        os.environ["VTL_RUST_SCHED_TOKSTORE"] = "1"
+        assert modes()["r8_shadow"] is True
+        assert modes()["tokstore"] is False, "the R8 shadow arm would double-count tokens"
+        os.environ["VTL_RUST_SCHED_R8_SHADOW"] = "0"
+        assert modes()["r8"] is True
+        assert modes()["tokstore"] is False, "no token store without the Rust hasher"
         os.environ["VTL_RUST_HASHER"] = "1"
+        assert modes()["tokstore"] is True
+        assert modes()["tokstore_shadow"] is False
+        os.environ["VTL_RUST_SCHED_TOKSTORE_SHADOW"] = "1"
+        assert modes()["tokstore_shadow"] is True
+        os.environ["VTL_RUST_SCHED_UFO_SHADOW"] = "1"
+        assert modes()["tokstore"] is False and modes()["tokstore_shadow"] is False, (
+            "the UFO shadow arm keeps python's append authoritative -> double count"
+        )
+        os.environ["VTL_RUST_SCHED_UFO_SHADOW"] = "0"
+        os.environ["VTL_RUST_SCHED_R8"] = "0"
+        assert modes()["tokstore"] is False and modes()["tokstore_shadow"] is False, (
+            "the store IS update_step_pack; it cannot arm without R8"
+        )
+        os.environ["VTL_RUST_SCHED_R8"] = "1"
+        os.environ.pop("VTL_RUST_SCHED_TOKSTORE")
+        os.environ.pop("VTL_RUST_SCHED_TOKSTORE_SHADOW")
+        assert modes()["tokstore"] is False
+
+        # The hasher is independent: it needs only the extension, not the scheduler.
         os.environ["VTL_RUST_SCHED_FULL"] = "0"
         assert modes()["hasher"] is True and modes()["full"] is False
+        os.environ.pop("VTL_RUST_HASHER")
+        assert modes()["hasher"] is False
     finally:
         for k, v in saved.items():
             if v is None:
@@ -2386,6 +3040,13 @@ def _self_check() -> None:
     # The waiting queue only blocks when the TTFT guard is on.
     assert burst_blocked(SO(), True, True, 8) == "waiting queue is not empty"
     assert burst_blocked(SO(), True, False, 8) is None
+    # ...and the split the N=1 in-graph sampling commit uses does NOT see the queue at all:
+    # one token delays no admission, so the TTFT argument that blocks a burst is vacuous.
+    assert burst_blocked_batch(SO(), 8) is None
+    assert burst_blocked_batch(SO(num_scheduled_tokens={"a": 2}), 8) is not None
+    for kw in ({"scheduled_new_reqs": [object()]}, {"preempted_req_ids": {"a"}},
+               {"has_structured_output_requests": True}):
+        assert burst_blocked_batch(SO(**kw), 8) is not None, kw
 
     class SP:
         def __init__(self, **kw):
@@ -2447,6 +3108,20 @@ def _self_check() -> None:
     # ...and max_model_len does the same.
     assert burst_request_blocked(REQ(max_tokens=1 << 20), 32766, 4, 16, 32768) is not None
 
+    # The align gate is the ONLY thing `burst_sampler_blocked` drops: at every offset in the
+    # block it says yes where `burst_request_blocked` says "would cross a block boundary",
+    # and it still refuses every non-greedy request and both length caps.
+    for c in range(16):
+        assert burst_sampler_blocked(REQ(), c, 1, 32768) is None, c
+    assert [c for c in range(16) if burst_request_blocked(REQ(), c, 4, 16, 32768) is None] \
+        == list(range(13)), "the align gate still applies to the BURST"
+    assert burst_sampler_blocked(REQ(sampling_params=SP(temperature=0.7)), 0, 1, 32768)
+    assert burst_sampler_blocked(REQ(sampling_params=SP(min_tokens=8)), 0, 1, 32768)
+    # limit = min(32768, 100 + 2) = 102, so offset 101 still fits and 102 does not.
+    assert burst_sampler_blocked(REQ(max_tokens=2), 101, 1, 32768) is None
+    assert burst_sampler_blocked(REQ(max_tokens=2), 102, 1, 32768), "max_tokens caps N=1 too"
+    assert burst_sampler_blocked(REQ(max_tokens=1 << 20), 32768, 1, 32768) is not None
+
     # commit -> uncommit is exactly symmetric on both counters, and `is_prefill_chunk` is
     # computed BEFORE the placeholder bump (the ordering `_update_after_schedule` uses).
     r = REQ(num_tokens=100, num_computed_tokens=101, num_output_placeholders=2)
@@ -2477,6 +3152,194 @@ def _self_check() -> None:
     r = REQ(num_computed_tokens=1, num_output_placeholders=1)
     burst_uncommit(r, 1000)
     assert (r.num_computed_tokens, r.num_output_placeholders) == (0, 0)
+
+    # ---- Port-2: LazySampled / _Row / the facade / materialization --------------------
+
+    # LazySampled over plain nested lists (no numpy needed): `_Row` must answer len and
+    # truthiness without converting anything, and materialize() must reproduce exactly what
+    # `AsyncOutput.get_output`'s truncation loop produced.
+    arr = [[11, 12, 13, 14], [21, 0, 0, 0], [0, 0, 0, 0]]
+    ls = LazySampled([row[:] for row in arr], [3, 1, 0])
+    assert len(ls) == 3 and bool(ls)
+    row = ls[0]
+    assert isinstance(row, _Row) and len(row) == 3 and bool(row)
+    assert row.tolist() == [11, 12, 13], row.tolist()
+    assert list(row) == [11, 12, 13]
+    assert not ls[2] and len(ls[2]) == 0
+    # `_Row.n = num_keep` is the `del new_token_ids[num_keep:]` of the fast path.
+    row.n = 2
+    assert len(row) == 2 and row.tolist() == [11, 12]
+    ls.materialize()
+    assert ls[0] == [11, 12, 13] and ls[1] == [21] and ls[2] == []
+    assert list(ls) == [[11, 12, 13], [21], []]
+    ls.materialize()  # idempotent
+    assert ls[1] == [21]
+    assert not isinstance(LazySampled(arr, [1]).arr[0][0], float)
+
+    # The facade: a subclass whose count "properties" are plain class attributes, so the
+    # instance dict wins. Getting this wrong is the whole reason it is not a global patch.
+    class FakeReq:
+        def __init__(self, prompt, outputs=()):
+            self.request_id = "r1"
+            self._all_token_ids = list(prompt) + list(outputs)
+            self._output_token_ids = list(outputs)
+            self.block_hashes = []
+            self.cache_salt = None
+            self.mm_features = []
+            self.lora_request = None
+            self.prompt_embeds = None
+            self.spec_token_ids = []
+            self.num_prompt_tokens = len(prompt)
+
+        @property
+        def all_token_ids(self):
+            return self._all_token_ids
+
+        @property
+        def num_tokens(self):
+            return len(self._all_token_ids)
+
+        @property
+        def num_tokens_with_spec(self):
+            return len(self._all_token_ids) + len(self.spec_token_ids)
+
+        @property
+        def num_output_tokens(self):
+            return len(self._output_token_ids)
+
+    r = FakeReq(range(100), [7, 8])
+    assert not facaded(r) and (r.num_tokens, r.num_output_tokens) == (102, 2)
+    tok_facade_on(r)
+    assert facaded(r), "the subclass swap must take"
+    assert type(r) is facade_class(FakeReq), "the facade class is cached per base"
+    assert (r.num_tokens, r.num_tokens_with_spec, r.num_output_tokens) == (102, 102, 2)
+    # The writer's counter bumps, and `_all_token_ids` deliberately NOT growing.
+    for keep in (1, 4):
+        before = r.num_tokens
+        r.num_tokens += keep
+        r.num_tokens_with_spec += keep
+        r.num_output_tokens += keep
+        assert r.num_tokens == before + keep
+    assert (r.num_tokens, r.num_output_tokens) == (107, 7)
+    assert len(r._all_token_ids) == 102, "the list must stop growing under the facade"
+
+    # Materialization: the store's 5 output tokens land in BOTH lists, the chain is replaced
+    # from Rust's packed bytes, the mirror's push watermark moves with it, and the request is
+    # bit-for-bit a stock request again -- with num_tokens back to a len().
+    class FakeRust:
+        def __init__(self, toks, packed):
+            self.toks = toks
+            self.packed = packed
+            self.forgotten = []
+
+        def slot_tokens(self, slot):
+            return list(self.toks)
+
+        def slot_hashes(self, slot):
+            return self.packed
+
+        def store_forget(self, slot):
+            self.forgotten.append(slot)
+
+    class FakeKv:
+        def __init__(self, rust, slot):
+            self._rust = rust
+            self._mirror = type("M", (), {"_slots": {"r1": slot}, "_pushed": {slot: 0}})()
+
+    packed = bytes(range(32)) * 3
+    kv = FakeKv(FakeRust([1, 2, 3, 4, 5], packed), 4)
+    tok_materialize(kv, r)
+    assert not facaded(r) and type(r) is FakeReq
+    assert r._all_token_ids[-5:] == [1, 2, 3, 4, 5]
+    assert r._output_token_ids == [7, 8, 1, 2, 3, 4, 5]
+    assert r.num_tokens == 107 == len(r._all_token_ids), "the facade's count was exact"
+    assert r.num_output_tokens == 7
+    assert len(r.block_hashes) == 3 and r.block_hashes[0] == packed[:32]
+    assert kv._mirror._pushed[4] == 3, "the mirror must not re-push Rust's own chain"
+    assert kv._rust.forgotten == [4]
+    assert r._vtl_tok_off is True, "a materialized request is permanently stock"
+    tok_materialize(kv, r)  # idempotent: not facaded any more, so a no-op
+    assert kv._rust.forgotten == [4]
+
+    # THE STEP FALLBACK, end to end: a facaded request plus a LazySampled batch, and after
+    # it every consumer of the object path sees real lists on both sides.
+    r2 = FakeReq(range(50), [9])
+    tok_facade_on(r2)
+    r2.num_tokens += 3        # ...matching the 3 tokens the fake store holds below
+    r2.num_output_tokens += 3
+    lazy = LazySampled([[31, 32, 0], [0, 0, 0]], [2, 0])
+    kv2 = FakeKv(FakeRust([4, 5, 6], b"h" * 32), 6)
+    TOK.warned = True  # keep the one-shot log out of `make check`'s output
+    store_step_fallback(kv2, lazy, [("r1", 2, r2)], "self-check")
+    assert lazy[0] == [31, 32] and lazy[1] == []
+    assert not facaded(r2) and type(r2) is FakeReq
+    assert r2._output_token_ids == [9, 4, 5, 6]
+    assert r2.num_tokens == len(r2._all_token_ids) == 54
+    assert r2.num_output_tokens == 4
+    assert kv2._mirror._pushed[6] == 1
+
+    # THE WIDER GUARD: stock's loop walks `scheduler_output.num_scheduled_tokens`, so a
+    # store-owned request decide() never enumerated (already finished, or a step it refused
+    # outright) still has to be handed back before stock reads its token lists.
+    r3 = FakeReq(range(10), [1])
+    tok_facade_on(r3)
+    r3.num_tokens += 2
+    r3.num_output_tokens += 2
+
+    class FakeSched:
+        requests = {"r1": r3, "gone": None}
+
+    class FakeSO:
+        num_scheduled_tokens = {"r1": 1, "gone": 1, "never-seen": 1}
+
+    class FakeMRO:
+        sampled_token_ids = LazySampled([[5, 0], [0, 0]], [1, 0])
+
+    kv3 = FakeKv(FakeRust([2, 3], b"z" * 32), 9)
+    store_full_fallback(FakeSched(), kv3, FakeSO(), FakeMRO())
+    assert not facaded(r3), "a request decide() never saw must still be materialized"
+    assert r3._output_token_ids == [1, 2, 3]
+    assert r3.num_tokens == len(r3._all_token_ids) == 13
+
+    # tok_store_init's refusals: anything the Rust hasher will not hash, and any seed tail
+    # that says the two hashers disagree about how many blocks are complete.
+    class NoopRust:
+        def __init__(self):
+            self.init = None
+
+        def store_init(self, slot, pending, n_tok, n_out):
+            self.init = (slot, pending, n_tok, n_out)
+
+    nr = NoopRust()
+    fresh = FakeReq(range(20), [7])
+    fresh.block_hashes = [b"x" * 32]        # 16 tokens hashed, 5-token tail
+    assert tok_store_init(nr, fresh, 3, 16) is True
+    assert nr.init == (3, [16, 17, 18, 19, 7], 21, 1), nr.init
+    for attr, value in (("cache_salt", "s"), ("mm_features", [object()]),
+                        ("lora_request", object()), ("prompt_embeds", object())):
+        bad = FakeReq(range(20), [7])
+        bad.block_hashes = [b"x" * 32]
+        setattr(bad, attr, value)
+        assert tok_store_init(NoopRust(), bad, 3, 16) is False, attr
+    behind = FakeReq(range(40), [7])
+    behind.block_hashes = [b"x" * 32]       # 16 hashed but 41 tokens -> a 25-token tail
+    assert tok_store_init(NoopRust(), behind, 3, 16) is False, "hasher is behind the store"
+    exact = FakeReq(range(32))
+    exact.block_hashes = [b"x" * 32, b"y" * 32]
+    nr2 = NoopRust()
+    assert tok_store_init(nr2, exact, 3, 16) is True
+    assert nr2.init == (3, [], 32, 0), "a block-aligned request seeds an empty tail"
+
+    # TOK.disable is permanent for the boot and closes both arms.
+    saved_tok = (TOK.live, TOK.shadow)
+    try:
+        TOK.live = TOK.shadow = True
+        log.setLevel(logging.CRITICAL)
+        TOK.disable("test")
+        log.setLevel(logging.NOTSET)
+        assert not TOK.live and not TOK.shadow
+    finally:
+        TOK.live, TOK.shadow = saved_tok
 
     # reraise_fatal: a crate panic (BaseException, not Exception) is swallowed by the
     # guards; interpreter signals still get through.

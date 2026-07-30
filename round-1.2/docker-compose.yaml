@@ -418,6 +418,44 @@ services:
       VTL_NSTEP_QUEUE_EMPTY_ONLY: "1"    # TTFT guard: no burst while a request is waiting, so
                                          # admission is never delayed by N-1 iterations.
                                          # Revert: "0" = burst regardless (a sweep arm).
+
+      # ---- 2026-07-30 follow-up: in-graph work (Port 1) + the Rust token store (Port 2).
+      # ALL ON, none A/B'd on the slice yet. The three NSTEP/SAMPLE knobs below are a
+      # LADDER: each is captured separately at boot and each failure demotes to the rung
+      # under it, logging once. INERT until a capture succeeds on the H200 -- and all three
+      # are inert outright under VTL_NSTEP_MODE=eager, since every one of them IS a capture.
+      VTL_NSTEP_FOLD_T1: "1"             # Fold token 1's compute_logits+argmax into the
+                                         # burst capture (reads the persistent
+                                         # cudagraph_manager.hidden_states buffer), so the
+                                         # graph arm host-launches no logits at all. Also
+                                         # the graph VTL_SAMPLE_IN_GRAPH reuses -- turning
+                                         # this off turns that off too.
+                                         # Revert: "0" = host-launched token 1.
+      VTL_NSTEP_UNROLL: "1"              # Capture prologue + N-1 bodies + the accumulator
+                                         # store as ONE graph per burst size: the whole
+                                         # burst becomes a single replay(). +1 graph per
+                                         # size (4), same memory pool. Needs FOLD_T1.
+                                         # Revert: "0" = N replays of the per-iteration
+                                         # graph (the previously shipped behaviour).
+      VTL_SAMPLE_IN_GRAPH: "1"           # The rung that pays even if bursts stay dormant:
+                                         # on a plain greedy 1-token decode step the
+                                         # scheduler commits vtl_sample_in_graph and
+                                         # sample_tokens replays the prologue graph instead
+                                         # of calling the V2 sampler. No align gate and no
+                                         # queue-empty gate (one token crosses no block
+                                         # boundary and delays no admission). Needs FOLD_T1.
+                                         # Revert: "0" = stock sampler every step.
+      VTL_RUST_SCHED_TOKSTORE: "1"       # Port 2: Rust owns each slot's output tokens,
+                                         # counters and block-hash chain. Deletes the two
+                                         # tolist()s in AsyncOutput.get_output, decide()'s
+                                         # per-request token loop, the append_output_token_ids
+                                         # extend and the per-step Python hasher call.
+                                         # Needs R8 + VTL_RUST_HASHER (modes() enforces).
+                                         # Revert: "0" = Python owns the token lists.
+      VTL_RUST_SCHED_TOKSTORE_SHADOW: "0"  # 1 = Python stays authoritative and the Rust
+                                         # store is driven alongside and diffed per step
+                                         # (hash chains + both counters). Soak arm; costs a
+                                         # second hash pass per step. Revert: "0".
       VTL_STREAM_PER_TOKEN: "1"          # Rust frontend: one SSE chunk per TOKEN instead of
                                          # per engine record. MANDATORY with the burst -- a
                                          # chunk-counting ITL metric would otherwise score it

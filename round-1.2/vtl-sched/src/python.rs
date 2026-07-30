@@ -27,7 +27,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use numpy::{PyArray1, PyArrayMethods};
+use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyTuple};
@@ -346,6 +346,165 @@ impl KvManager {
                     &token_ids,
                     &num_output_tokens,
                     &num_tokens,
+                    max_model_len,
+                    engine_index,
+                    timestamp,
+                    &finished,
+                )?;
+                let out: Vec<(u32, u8, i64)> = verdicts
+                    .iter()
+                    .map(|v| (v.num_accepted, v.status, v.stop_reason))
+                    .collect();
+                let rec = if packed {
+                    Some(sh.manager.raw.finish()?.to_vec())
+                } else {
+                    None
+                };
+                Ok::<_, String>((out, rec))
+            })
+            .map_err(err)?;
+        Ok((
+            verdicts,
+            record.map(|r| PyBytes::new_bound(py, &r).unbind()),
+        ))
+    }
+
+    // ---- Port-2: the Rust-owned token store -------------------------------
+
+    /// Hand over vLLM's live `NONE_HASH`. Until this runs, `store_init` refuses -- hashing
+    /// against a guessed seed would fork the prefix-cache key space silently.
+    fn store_arm(&self, none_hash: &Bound<'_, PyBytes>) -> PyResult<()> {
+        let b = none_hash.as_bytes();
+        if b.len() != HASH_LEN {
+            return Err(PyValueError::new_err(format!(
+                "none_hash must be {HASH_LEN} bytes, got {}",
+                b.len()
+            )));
+        }
+        let mut d: Digest32 = [0; HASH_LEN];
+        d.copy_from_slice(b);
+        self.w().manager.store_arm(d);
+        Ok(())
+    }
+
+    /// Take over one slot's token bookkeeping. `pending` is the request's token tail past
+    /// the last block hash Python already produced (so shorter than `hash_block_size`).
+    fn store_init(
+        &self,
+        slot: u32,
+        pending: Vec<i64>,
+        num_tokens: usize,
+        num_output_tokens: usize,
+    ) -> PyResult<()> {
+        self.w()
+            .manager
+            .store_init(slot, &pending, num_tokens, num_output_tokens)
+            .map_err(err)
+    }
+
+    /// `(num_tokens, num_output_tokens)` as the store holds them. The shadow arm's probe.
+    fn store_counts(&self, slot: u32) -> Option<(usize, usize)> {
+        self.r().manager.tokens.counts(slot)
+    }
+
+    /// The slot's output tokens, as native Python ints (PyO3 converts `i64` -> `int`, so
+    /// nothing numpy-shaped can reach a block-hash input or a `Request` token list).
+    fn slot_tokens(&self, slot: u32) -> Option<Vec<i64>> {
+        self.r().manager.slot_tokens(slot).map(|t| t.to_vec())
+    }
+
+    /// The slot's whole block-hash chain, 32 bytes per hash, for rebuilding
+    /// `Request.block_hashes` when a request is handed back to the stock path.
+    fn slot_hashes(&self, py: Python<'_>, slot: u32) -> Option<Py<PyBytes>> {
+        self.r()
+            .manager
+            .slot_hashes(slot)
+            .map(|v| PyBytes::new_bound(py, &v).unbind())
+    }
+
+    /// Release a slot from the store (materialization / permanent per-request fallback).
+    fn store_forget(&self, slot: u32) {
+        self.w().manager.tokens.forget(slot);
+    }
+
+    /// Shadow arm: append the accepted tokens and run the hash catch-up, with NO verdicts,
+    /// no table delta and no record. Python stays authoritative; the caller then compares
+    /// `store_counts` / `slot_hashes` against its own `Request`.
+    fn store_apply(
+        &self,
+        slots: Vec<u32>,
+        cu_lens: Vec<u32>,
+        token_ids: Vec<i64>,
+        accepted: Vec<u32>,
+    ) -> PyResult<()> {
+        self.w()
+            .manager
+            .store_apply(&slots, &cu_lens, &token_ids, &accepted)
+            .map_err(err)
+    }
+
+    /// Port-2: [`KvManager::update_step_pack`] driven straight off the sampler's numpy
+    /// output, with the per-request counters read from the token store.
+    ///
+    /// `sampled` is `AsyncOutput`'s `[max_num_reqs, num_sampled]` host array; `rows[i]` is
+    /// the row entry `i` owns and `counts[i]` how many of that row's columns are valid, so
+    /// the two `tolist()` calls in `AsyncOutput.get_output` and the per-request
+    /// `toks.extend` loop in `decide()` both disappear -- the ids are copied once, here,
+    /// straight out of the array's buffer.
+    ///
+    /// Same return contract as `update_step_pack`: `None` for the record means "not
+    /// packable", and on that arm NOTHING is appended to the store, because Python is about
+    /// to materialize the whole step back onto the stock path.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (sampled, rows, counts, slots, max_model_len, engine_index,
+                        timestamp, finished))]
+    fn update_step_pack_np(
+        &self,
+        py: Python<'_>,
+        sampled: PyReadonlyArray2<'_, i64>,
+        rows: Vec<u32>,
+        counts: Vec<u32>,
+        slots: Vec<u32>,
+        max_model_len: usize,
+        engine_index: u32,
+        timestamp: f64,
+        finished: Vec<String>,
+    ) -> PyResult<(Vec<(u32, u8, i64)>, Option<Py<PyBytes>>)> {
+        let n = slots.len();
+        if rows.len() != n || counts.len() != n {
+            return Err(PyValueError::new_err(format!(
+                "update_step_pack_np arity mismatch: {n} slots, {} rows, {} counts",
+                rows.len(),
+                counts.len()
+            )));
+        }
+        let shape = sampled.shape();
+        let (nrows, ncols) = (shape[0], shape[1]);
+        // Contiguity is a property of the caller's array, not something to assume: a
+        // non-contiguous one is refused so Python falls back rather than reading garbage.
+        let arr = sampled.as_slice().map_err(|_| {
+            PyValueError::new_err("update_step_pack_np needs a C-contiguous sampled array")
+        })?;
+        let mut flat: Vec<i64> = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let row = rows[i] as usize;
+            let cnt = counts[i] as usize;
+            if row >= nrows || cnt > ncols {
+                return Err(PyValueError::new_err(format!(
+                    "update_step_pack_np row {row} / count {cnt} outside [{nrows}, {ncols}]"
+                )));
+            }
+            flat.extend_from_slice(&arr[row * ncols..row * ncols + cnt]);
+        }
+        let shared = self.shared.clone();
+        let (verdicts, record) = py
+            .allow_threads(move || {
+                let mut sh = lock_shared(&shared);
+                sh.invalidate();
+                let (verdicts, packed) = sh.manager.update_step_pack_store(
+                    &slots,
+                    &counts,
+                    &flat,
                     max_model_len,
                     engine_index,
                     timestamp,
