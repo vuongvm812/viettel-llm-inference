@@ -42,7 +42,9 @@ ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.0
 # also swallow a genuinely broken crate.
 # ---------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS vtl-sched-builder
-ARG VTL_SCHED_RUST_TOOLCHAIN=1.83
+# 1.95 matches Dockerfile.vllm-fork's rust-builder; the crate's iceoryx2 0.9.3 dep
+# (shm output publisher) pulls iceoryx2-bb-linux, which needs edition2024 (cargo >= 1.85).
+ARG VTL_SCHED_RUST_TOOLCHAIN=1.95
 ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:${PATH}
 # Pin the ISA to baseline x86-64 explicitly: the wheel is served on the judge's H200 host,
 # not this builder, so no -native; the pin just keeps a toolchain-default drift from ever
