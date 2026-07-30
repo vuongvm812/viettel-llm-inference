@@ -116,6 +116,139 @@ pub fn apply_tokens(
     }
 }
 
+// ------------------------------------------------------------------------------------------
+// R8 -- the raw shm output record, built here instead of by Python.
+//
+// Byte-identical to `vtl/patches/shm_ipc.py`'s `raw_pack_into` (little-endian, unaligned,
+// tag byte first); the layout comment lives there and the GOLDEN VECTORS below are the same
+// hex strings that module's `_self_check` asserts, so a drift on either side fails a test
+// rather than silently handing the Rust frontend a record it decodes into garbage.
+//
+// A THIRD implementation of this layout is the frontend's decoder in
+// `vtl/vllm_patches/rust-frontend/shm_ipc.patch`. All three share these vectors.
+// ------------------------------------------------------------------------------------------
+
+pub const TAG_RAW: u8 = b'R';
+pub const RAW_VERSION: u8 = 1;
+pub const FLAG_FINISH_REASON: u8 = 0b0000_0001;
+pub const FLAG_STOP_TOKEN: u8 = 0b0000_0010;
+
+/// `FinishReason` (vllm/v1/engine/__init__.py) for the two statuses `check_stop` can reach.
+/// `ABORT`/`ERROR`/`REPETITION` never come out of [`check_stop`], so they are not mapped:
+/// a request that finishes for one of those reasons is retired on a path R8 refuses.
+pub const FINISH_STOP: u8 = 0;
+pub const FINISH_LENGTH: u8 = 1;
+
+/// `Verdict::status` -> `FinishReason`. `None` for a request that did not stop.
+pub fn finish_reason(status: u8) -> Option<u8> {
+    match status {
+        FINISHED_STOPPED => Some(FINISH_STOP),
+        FINISHED_LENGTH_CAPPED => Some(FINISH_LENGTH),
+        _ => None,
+    }
+}
+
+/// Streaming writer for one TAG_RAW record into a reused buffer.
+///
+/// Streaming rather than "build a Vec of rows then serialize": the row count is known
+/// before the loop starts, so the header can be written first and every row appended in
+/// place -- no per-step intermediate allocation, and the buffer survives across steps.
+#[derive(Default)]
+pub struct RawPacker {
+    pub buf: Vec<u8>,
+    /// Rows/finished ids still owed, so a truncated record cannot reach the wire.
+    owed_out: u32,
+    owed_fin: u32,
+}
+
+impl RawPacker {
+    /// Start a record. Clears the buffer and writes the 24-byte header.
+    pub fn begin(&mut self, engine_index: u32, timestamp: f64, n_out: u32, n_fin: u32) {
+        let buf = &mut self.buf;
+        buf.clear();
+        buf.reserve(24 + 32 * n_out as usize);
+        buf.push(TAG_RAW);
+        buf.push(RAW_VERSION);
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&engine_index.to_le_bytes());
+        buf.extend_from_slice(&timestamp.to_le_bytes());
+        buf.extend_from_slice(&n_out.to_le_bytes());
+        buf.extend_from_slice(&n_fin.to_le_bytes());
+        self.owed_out = n_out;
+        self.owed_fin = n_fin;
+    }
+
+    /// One `EngineCoreOutput`. `num_nans_in_logits` is always 0: a non-None nans batch is
+    /// not raw-packable in Python either, so the caller falls back before reaching here.
+    pub fn push_output(
+        &mut self,
+        request_id: &str,
+        tokens: &[i64],
+        finish: Option<u8>,
+        stop_reason: Option<i64>,
+    ) -> Result<(), String> {
+        if self.owed_out == 0 {
+            return Err("RawPacker: more outputs pushed than declared".into());
+        }
+        self.owed_out -= 1;
+        let id = request_id.as_bytes();
+        let mut flags = 0u8;
+        let finish_byte = match finish {
+            Some(f) => {
+                flags |= FLAG_FINISH_REASON;
+                f
+            }
+            None => 0,
+        };
+        let stop = match stop_reason {
+            Some(s) => {
+                flags |= FLAG_STOP_TOKEN;
+                u32::try_from(s).map_err(|_| format!("stop_reason {s} does not fit u32"))?
+            }
+            None => 0,
+        };
+        let buf = &mut self.buf;
+        buf.extend_from_slice(&(id.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // num_nans_in_logits
+        buf.push(flags);
+        buf.push(finish_byte);
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&stop.to_le_bytes());
+        buf.extend_from_slice(id);
+        for &tok in tokens {
+            let t = u32::try_from(tok).map_err(|_| format!("token id {tok} does not fit u32"))?;
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// One entry of the trailing `finished_requests` table. Callers push in SORTED order --
+    /// the Python packer sorts a set, and the bytes have to match.
+    pub fn push_finished(&mut self, request_id: &str) -> Result<(), String> {
+        if self.owed_fin == 0 {
+            return Err("RawPacker: more finished ids pushed than declared".into());
+        }
+        self.owed_fin -= 1;
+        let id = request_id.as_bytes();
+        self.buf.extend_from_slice(&(id.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(id);
+        Ok(())
+    }
+
+    /// The finished record. `Err` if the declared counts were not filled -- a short record
+    /// would decode as garbage on the frontend, so it must never leave this type.
+    pub fn finish(&self) -> Result<&[u8], String> {
+        if self.owed_out != 0 || self.owed_fin != 0 {
+            return Err(format!(
+                "RawPacker: record incomplete ({} outputs, {} finished ids missing)",
+                self.owed_out, self.owed_fin
+            ));
+        }
+        Ok(&self.buf)
+    }
+}
+
 /// Slot -> stop params. Lives on `Manager` so `forget()` drops it with the interned id.
 #[derive(Default)]
 pub struct StopTable {
@@ -297,6 +430,112 @@ mod tests {
         assert!(t.update_step(&[0], &[0], &[7], &[0], &[10], MML).is_err());
         assert!(t.update_step(&[0], &[1, 2], &[7], &[0], &[10], MML).is_err());
         assert!(t.update_step(&[0], &[0, 5], &[7], &[0], &[10], MML).is_err());
+    }
+
+    // ---- R8 record packer -----------------------------------------------------------
+    //
+    // The two hex strings below are copied VERBATIM from
+    // `round-1.2/vtl/patches/shm_ipc.py` (`GOLDEN_PLAIN_DECODE` / `GOLDEN_FINISHED`),
+    // which `make check` asserts against the Python packer. Same bytes on both sides or
+    // both test suites fail.
+
+    const GOLDEN_PLAIN_DECODE: &str = concat!(
+        "52", "01", "0000", "07000000", "000000000000f03f", "01000000", "00000000",
+        "06000000", "01000000", "00000000", "00", "00", "0000", "00000000", "7265712d3161",
+        "05000000",
+    );
+
+    const GOLDEN_FINISHED: &str = concat!(
+        "52", "01", "0000", "00000000", "0000000000000000", "02000000", "02000000",
+        "05000000", "02000000", "00000000", "03", "01", "0000", "02000000", "7265712d61",
+        "03000000", "04000000",
+        "05000000", "00000000", "00000000", "01", "02", "0000", "00000000", "7265712d62",
+        "05000000", "7265712d61",
+        "05000000", "7265712d62",
+    );
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn plain_decode_record_matches_the_python_golden_vector() {
+        let mut p = RawPacker::default();
+        p.begin(7, 1.0, 1, 0);
+        p.push_output("req-1a", &[5], None, None).unwrap();
+        assert_eq!(hex(p.finish().unwrap()), GOLDEN_PLAIN_DECODE);
+    }
+
+    #[test]
+    fn finished_record_matches_the_python_golden_vector() {
+        let mut p = RawPacker::default();
+        p.begin(0, 0.0, 2, 2);
+        // finish_reason=1 (LENGTH), stop_reason=2, two tokens.
+        p.push_output("req-a", &[3, 4], Some(1), Some(2)).unwrap();
+        // finish_reason=2 (ABORT in Python's enum -- the packer just carries the byte),
+        // no tokens, no stop_reason.
+        p.push_output("req-b", &[], Some(2), None).unwrap();
+        // Python sorts the finished SET; the packer here trusts the caller's order, so the
+        // caller must sort. This is that order.
+        p.push_finished("req-a").unwrap();
+        p.push_finished("req-b").unwrap();
+        assert_eq!(hex(p.finish().unwrap()), GOLDEN_FINISHED);
+    }
+
+    #[test]
+    fn record_buffer_is_reused_without_leaking_the_previous_record() {
+        let mut p = RawPacker::default();
+        p.begin(0, 0.0, 1, 0);
+        p.push_output("aaaaaaaaaaaaaaaaaaaa", &[1, 2, 3, 4, 5], None, None).unwrap();
+        let long = p.finish().unwrap().len();
+        p.begin(7, 1.0, 1, 0);
+        p.push_output("req-1a", &[5], None, None).unwrap();
+        assert!(p.finish().unwrap().len() < long);
+        assert_eq!(hex(p.finish().unwrap()), GOLDEN_PLAIN_DECODE);
+    }
+
+    #[test]
+    fn an_incomplete_or_overfull_record_is_refused_not_shipped() {
+        let mut p = RawPacker::default();
+        p.begin(0, 0.0, 2, 1);
+        p.push_output("a", &[1], None, None).unwrap();
+        assert!(p.finish().is_err(), "1 of 2 outputs written");
+        p.push_output("b", &[1], None, None).unwrap();
+        assert!(p.finish().is_err(), "finished id still owed");
+        p.push_finished("a").unwrap();
+        assert!(p.finish().is_ok());
+        assert!(p.push_output("c", &[1], None, None).is_err());
+        assert!(p.push_finished("b").is_err());
+    }
+
+    #[test]
+    fn out_of_range_ids_are_errors_not_truncations() {
+        let mut p = RawPacker::default();
+        p.begin(0, 0.0, 1, 0);
+        assert!(p.push_output("a", &[1 << 33], None, None).is_err());
+        p.begin(0, 0.0, 1, 0);
+        assert!(p.push_output("a", &[-1], None, None).is_err());
+        p.begin(0, 0.0, 1, 0);
+        assert!(p.push_output("a", &[1], None, Some(-2)).is_err());
+    }
+
+    #[test]
+    fn utf8_request_ids_are_length_prefixed_in_bytes() {
+        let mut p = RawPacker::default();
+        p.begin(0, 0.0, 1, 0);
+        p.push_output("req-é", &[1], None, None).unwrap();
+        let rec = p.finish().unwrap();
+        // 24 header + 20 row head + 6 utf-8 bytes ("req-" + 2-byte é) + 4 token bytes.
+        assert_eq!(rec.len(), 24 + 20 + 6 + 4);
+        assert_eq!(u32::from_le_bytes(rec[24..28].try_into().unwrap()), 6);
+    }
+
+    #[test]
+    fn finish_reason_maps_only_the_two_statuses_check_stop_can_reach() {
+        assert_eq!(finish_reason(NOT_STOPPED), None);
+        assert_eq!(finish_reason(FINISHED_STOPPED), Some(FINISH_STOP));
+        assert_eq!(finish_reason(FINISHED_LENGTH_CAPPED), Some(FINISH_LENGTH));
+        assert_eq!(finish_reason(u8::MAX), None);
     }
 
     #[test]

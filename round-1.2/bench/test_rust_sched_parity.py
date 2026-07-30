@@ -1006,6 +1006,207 @@ def test_update_step_matches_check_stop():
         assert tuple(rust) == want, (p, toks, o, t, rust, want)
 
 
+# ------------------------------------------------------------------------------------
+# R8 tier -- Rust's raw output record vs the Python packer, byte for byte.
+#
+# The Python packer (`vtl/patches/shm_ipc.py`) is the reference because it is the one the
+# frontend's decoder was written against and the one the golden vectors pin. If these two
+# ever disagree, the frontend decodes a record built by the other side into garbage --
+# silently, because the layout has no checksum.
+# ------------------------------------------------------------------------------------
+
+
+def _packer():
+    try:
+        from vtl.patches.shm_ipc import _Out, _Outs, raw_pack_into, raw_size
+    except Exception:  # pragma: no cover - PYTHONPATH without round-1.2
+        pytest.skip("vtl.patches.shm_ipc not importable")
+
+    def pack(outputs):
+        buf = bytearray(raw_size(outputs))
+        n = raw_pack_into(buf, outputs)
+        assert n == len(buf), (n, len(buf))
+        return bytes(buf)
+
+    return _Out, _Outs, pack
+
+
+# `FinishReason` (vllm/v1/engine/__init__.py) for the statuses check_stop can produce.
+FINISH_FROM_STATUS = {FIN_STOPPED: 0, FIN_LENGTH: 1}
+
+
+@requires_crate
+def test_update_step_pack_bytes_match_the_python_packer():
+    _Out, _Outs, pack = _packer()
+    max_model_len = 64
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+
+    # (name, params, offered tokens, num_output, num_tokens) covering: plain decode,
+    # multi-token bursts, a mid-burst EOS trim, a stop-token-id trim (the only case that
+    # carries a stop_reason), and the length cap.
+    cases = [
+        ("req-1a", (0, 8, 2, []), [5], 0, 10),
+        ("req-2", (0, 8, 2, []), [5, 6, 7, 8], 0, 10),
+        ("req-3", (0, 8, 2, []), [5, 2, 7, 8], 0, 10),       # EOS at index 1 -> keep 2
+        ("req-4", (0, 8, 2, [99]), [5, 99, 7], 0, 10),       # stop id -> stop_reason=99
+        ("req-5", (0, 3, 2, []), [5, 6, 7, 8], 0, 10),       # max_tokens caps at 3
+        ("req-\u00e9", (0, 8, 2, []), [5, 6], 0, 10),           # utf-8 id, byte-length prefix
+    ]
+
+    slots, cu, flat, n_out, n_tok = [], [0], [], [], []
+    for name, params, toks, o, t in cases:
+        slot = kv.intern(name)
+        kv.set_stop_params(slot, *params)
+        slots.append(slot)
+        flat.extend(toks)
+        cu.append(len(flat))
+        n_out.append(o)
+        n_tok.append(t)
+
+    verdicts, record = kv.update_step_pack(
+        slots, cu, flat, n_out, n_tok, max_model_len, 7, 1.5, []
+    )
+    assert record is not None, "every case here is packable"
+
+    # Same verdicts as the non-packing entry point, and the same as the Python oracle.
+    for (_name, params, toks, o, t), rust in zip(cases, verdicts):
+        assert tuple(rust) == ref_check_stop(params, toks, o, t, max_model_len)
+
+    outputs = []
+    for (name, _p, toks, _o, _t), (num_accepted, status, stop_reason) in zip(cases, verdicts):
+        outputs.append(
+            _Out(
+                name,
+                list(toks[:num_accepted]),
+                finish_reason=FINISH_FROM_STATUS.get(status),
+                stop_reason=stop_reason if stop_reason >= 0 else None,
+            )
+        )
+    want = pack(_Outs(engine_index=7, timestamp=1.5, outputs=outputs))
+    assert record == want, f"\n  rust  ={record.hex()}\n  python={want.hex()}"
+
+
+@requires_crate
+def test_update_step_pack_carries_sorted_finished_ids():
+    _Out, _Outs, pack = _packer()
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+    slot = kv.intern("req-a")
+    kv.set_stop_params(slot, 0, 8, 2, [])
+    finished = ["req-a", "req-b"]
+    _v, record = kv.update_step_pack([slot], [0, 1], [2], [0], [10], 64, 0, 0.0, finished)
+    want = pack(
+        _Outs(
+            outputs=[_Out("req-a", [2], finish_reason=0)],
+            finished_requests=set(finished),
+        )
+    )
+    assert record == want
+
+
+@requires_crate
+def test_update_step_pack_refuses_rather_than_emitting_a_partial_record():
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+    known = kv.intern("known")
+    kv.set_stop_params(known, 0, 8, 2, [])
+    unknown = kv.intern("unknown")
+    verdicts, record = kv.update_step_pack(
+        [known, unknown], [0, 1, 2], [7, 7], [0, 0], [1, 1], 64, 0, 0.0, []
+    )
+    assert verdicts[1][1] == 255
+    assert record is None, "one refused slot must drop the WHOLE record, not half of it"
+    # ...and the verdicts were still applied, so the resident table is not left behind.
+    assert verdicts[0][1] == NOT_STOPPED
+
+
+# ------------------------------------------------------------------------------------
+# C1a tier -- the N-step burst's num_computed_tokens trajectory in the resident table.
+#
+# This is the one that can poison the prefix cache: a burst that stops after j < N tokens
+# has N tokens' worth of num_computed committed, and the down-correction is the only thing
+# that stops `cache_blocks` from fingerprinting KV that was never computed.
+# ------------------------------------------------------------------------------------
+
+
+def _entry(kv, slot):
+    e = kv.table_entry(slot)
+    assert e is not None
+    # pack_req order: slot, num_tokens, num_tokens_with_spec, num_computed_tokens,
+    # num_output_placeholders, num_prompt_tokens, max_tokens, status, num_preemptions,
+    # is_prefill_chunk, skip_reading_prefix_cache
+    return {"num_tokens": e[1], "num_computed": e[3], "placeholders": e[4],
+            "is_prefill_chunk": e[9]}
+
+
+def _decode_entry(slot, num_tokens=100):
+    """A steady-state decode entry as the post-schedule commit leaves it."""
+    return (slot, num_tokens, num_tokens, num_tokens + 1, 2, 10, 4096, 1, 0, False, False)
+
+
+@requires_crate
+@pytest.mark.parametrize("n", [2, 4, 8])
+def test_table_burst_commits_and_reconciles_every_stop_point(n):
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+    slot = kv.intern("burst")
+    kv.set_stop_params(slot, 0, 1000, 2, [])
+
+    for kept in range(1, n + 1):
+        kv.table_set(slot, _decode_entry(slot))
+        base = _entry(kv, slot)
+        kv.table_burst([slot], n - 1)
+        after = _entry(kv, slot)
+        assert after["num_computed"] == base["num_computed"] + n - 1
+        assert after["placeholders"] == base["placeholders"] + n - 1
+
+        # The step comes back with `kept` tokens: EOS at index kept-1 trims the rest.
+        toks = [7] * (kept - 1) + ([2] if kept < n else [7]) + [7] * (n - kept)
+        verdicts = kv.update_step(
+            [slot], [0, n], toks[:n], [0], [base["num_tokens"]], 4096
+        )
+        assert verdicts[0][0] == kept, (kept, verdicts)
+        short = n - kept
+        if short:
+            kv.table_burst([slot], -short)
+        final = _entry(kv, slot)
+        # num_tokens is synced by update_step to Python's pre-append count + accepted,
+        # so the freed request never carries tokens kept+1..N anywhere.
+        assert final["num_tokens"] == base["num_tokens"] + kept
+
+        # THE INVARIANT. After any step -- burst or not, stopped or not -- the entry must
+        # satisfy `num_computed == num_tokens`: every token that exists has been through
+        # the model, and no position that was not computed is counted. A missing
+        # down-correction shows up here as a POSITIVE drift, which is exactly the shape
+        # that would make `cache_blocks` fingerprint KV that was never written.
+        assert final["num_computed"] == final["num_tokens"], (
+            f"N={n} kept={kept}: num_computed drifted by "
+            f"{final['num_computed'] - final['num_tokens']}"
+        )
+
+
+@requires_crate
+def test_table_burst_is_a_no_op_on_an_unknown_slot():
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+    kv.table_burst([4242], 3)  # must not raise
+    assert kv.table_entry(4242) is None
+
+
+@requires_crate
+def test_update_step_pack_multi_token_wire_shape():
+    """The wire format is length-prefixed per output, so N tokens need no wire work --
+    assert that directly rather than trusting the layout comment."""
+    _Out, _Outs, pack = _packer()
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+    slot = kv.intern("r")
+    kv.set_stop_params(slot, 0, 1000, 2, [])
+    for n in (1, 2, 4, 8):
+        toks = list(range(100, 100 + n))
+        _v, record = kv.update_step_pack(
+            [slot], [0, n], toks, [0], [10], 4096, 0, 0.0, []
+        )
+        assert record == pack(_Outs(outputs=[_Out("r", toks)])), n
+        # header(24) + row head(20) + id(1) + n * u32
+        assert len(record) == 24 + 20 + 1 + 4 * n
+
+
 @requires_crate
 def test_update_step_refuses_unregistered_and_malformed_batches():
     kv = vtl_sched.KvManager(rust_config(num_blocks=256))

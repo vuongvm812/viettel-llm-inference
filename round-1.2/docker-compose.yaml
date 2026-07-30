@@ -381,6 +381,48 @@ services:
       VTL_RUST_SCHED_SPEC: 1
       VTL_SCHED_TIMING: 0
 
+      # ---- 2026-07-30 batch: hotpath micro-opts (A), R8 output collapse (B), N-step
+      # decode burst (C). ALL ON, none A/B'd on the slice yet -- bisect by flipping one
+      # line at a time (each carries its own one-line revert).
+      #
+      # INERT UNTIL THE FORK IMAGE IS REBUILT: VTL_HOTPATH_MICROOPT (edits two installed
+      # .py files) and VTL_STREAM_PER_TOKEN (edits the vllm-rs frontend source) ride in
+      # fork patches, so they do nothing until `make vllm-fork PUSH=1` -> re-pin the
+      # digest above -> `make build`. Everything else is plugin/Rust-wheel code and is
+      # live on a plain `make build`.
+      VTL_HOTPATH_MICROOPT: "1"          # Item A: 5 per-step host micro-opts in
+                                         # model_runner.py + core.py, all behind this one
+                                         # in-file env read. Revert: "0" = stock control
+                                         # flow, byte for byte. (fork patch)
+      VTL_RUST_SCHED_R8: "1"             # Item B: Rust packs the shm output record and the
+                                         # EngineCoreOutput build is skipped. Needs UFO +
+                                         # SHM_IPC + SHM_IPC_RAW (modes() enforces).
+                                         # Revert: "0" = python builds the objects.
+      VTL_RUST_SCHED_R8_SHADOW: "0"      # 1 = build BOTH and byte-compare per step, python
+                                         # authoritative. Soak arm; costs a full pack per
+                                         # step. Revert: "0".
+      VTL_RUST_HASHER: "1"               # Item B3: block hashing via vtl_sched (sha256 over
+                                         # pickle in Rust). Request.block_hashes stays the
+                                         # source of truth. Revert: "0" = stock hasher.
+      VTL_ENABLE_NSTEP_DECODE: "1"       # Item C runner half: N decode iterations per engine
+                                         # step. Revert: "0" = one token per step, and the
+                                         # scheduler then never commits a burst either.
+      VTL_NSTEP: "1"                     # Item C scheduler half: commit the burst at schedule
+                                         # time. Revert: "0" = never burst (runner idle).
+      VTL_NSTEP_N: "4"                   # Burst width. 4 because the align gate covers 13/16
+                                         # of decode steps at N=4 vs 9/16 at N=8 and chunk
+                                         # burstiness (ITL p95) grows with N. Sweep 2/4/8.
+      VTL_NSTEP_MODE: "graph"            # Ladder: graph -> eager -> off. A capture failure at
+                                         # boot logs once and drops to eager on its own.
+                                         # Revert: "eager".
+      VTL_NSTEP_QUEUE_EMPTY_ONLY: "1"    # TTFT guard: no burst while a request is waiting, so
+                                         # admission is never delayed by N-1 iterations.
+                                         # Revert: "0" = burst regardless (a sweep arm).
+      VTL_STREAM_PER_TOKEN: "1"          # Rust frontend: one SSE chunk per TOKEN instead of
+                                         # per engine record. MANDATORY with the burst -- a
+                                         # chunk-counting ITL metric would otherwise score it
+                                         # N x worse. Revert: "0". (fork patch)
+
       # L2 persisting-cache window over the largest packed weight (w13). The boot probe runs
       # regardless (read-only, logs cudaDevAttrMaxPersistingL2CacheSize -- expected 0: the CUDA
       # docs say the L2 set-aside is disabled under MIG, which is exactly what the probe checks).

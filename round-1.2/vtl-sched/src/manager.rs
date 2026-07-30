@@ -107,6 +107,10 @@ pub struct Manager {
     /// slot interning does, so `forget` drops both halves of a request in one place.
     pub stops: crate::update::StopTable,
 
+    /// R8: reused buffer for the raw shm output record. Lives here (not in a local) so a
+    /// step packs into last step's allocation.
+    pub raw: crate::update::RawPacker,
+
     /// R6b: slot -> the scheduling loop's view of the request. Dense (slots are interned
     /// with reuse), so a `Vec` beats a map on the hot lookup. Written wholesale by the
     /// marshalled [`crate::sched::ScheduleCore::schedule`] (the resync path), then kept
@@ -182,6 +186,7 @@ impl Manager {
             reqs: FxHashMap::default(),
             stats: PrefixCacheStats::default(),
             stops: Default::default(),
+            raw: Default::default(),
             table: Vec::new(),
             pending_hit: (0..n).map(|_| Vec::with_capacity(64)).collect(),
             new_blocks: (0..n).map(|_| Vec::with_capacity(64)).collect(),
@@ -216,6 +221,21 @@ impl Manager {
 
     pub fn lookup(&self, name: &str) -> Option<u32> {
         self.ids.get(name).copied()
+    }
+
+    /// Reverse of [`Manager::intern`]: the request id a slot currently holds.
+    ///
+    /// `names` keeps a STALE string in a freed slot (`forget` only pushes the slot onto
+    /// `free_slots`), so the entry is cross-checked against the forward map. A recycled or
+    /// never-interned slot answers `None` rather than a dead request's id -- which, on the
+    /// R8 path, would otherwise put the wrong id on the wire.
+    pub fn name(&self, slot: u32) -> Option<&str> {
+        let name = self.names.get(slot as usize)?;
+        if self.ids.get(name.as_str()) == Some(&slot) {
+            Some(name.as_str())
+        } else {
+            None
+        }
     }
 
     pub fn forget(&mut self, name: &str) {
@@ -729,6 +749,115 @@ impl Manager {
         }
         Ok(&self.stops.out)
     }
+
+    /// C1a: the N-step burst's extra tokens, applied to the resident table.
+    ///
+    /// The Rust half of the post-schedule commit ([`crate::sched::ScheduleCore::commit`]'s
+    /// `advance`) already moved each slot by the ONE token `num_scheduled_tokens` says was
+    /// scheduled. A committed burst executes `delta` more in the same step, so both
+    /// counters move again and `is_prefill_chunk` is recomputed exactly as `advance` does.
+    ///
+    /// `delta` is negative on the reconcile path -- a burst request that stopped (or whose
+    /// runner produced fewer tokens than committed) gives the surplus back. Subtraction
+    /// saturates at 0: the table is a cache of Python's state, and clamping plus the next
+    /// full resync beats taking the engine down on an accounting skew.
+    ///
+    /// Slots with no resident entry are skipped: they are exactly the slots Python owns
+    /// this step, and `TableState` is already marked dirty for them.
+    pub fn table_burst(&mut self, slots: &[u32], delta: i64) {
+        for &slot in slots {
+            self.table_with(slot, |e| {
+                if delta >= 0 {
+                    // Literally one more `_update_after_schedule` of `delta` tokens --
+                    // same function, so the placeholder-bump ordering cannot drift.
+                    crate::sched::advance(e, delta as usize, delta as usize);
+                } else {
+                    let d = delta.unsigned_abs() as usize;
+                    e.num_computed_tokens = e.num_computed_tokens.saturating_sub(d);
+                    e.num_output_placeholders = e.num_output_placeholders.saturating_sub(d);
+                    e.is_prefill_chunk =
+                        e.num_computed_tokens < e.num_tokens + e.num_output_placeholders;
+                }
+            });
+        }
+    }
+
+    /// R8: [`Manager::update_step`] plus the complete TAG_RAW output record.
+    ///
+    /// One row per slot, in the order given -- every slot the caller passes has at least
+    /// one offered token (the caller drops empty ones), and `apply_tokens` never accepts
+    /// zero of a non-empty list, so "one slot = one `EngineCoreOutput`" holds exactly as
+    /// it does in `Scheduler.update_from_output`.
+    ///
+    /// Returns `Ok((verdicts, None))` -- verdicts still applied, no record -- whenever any
+    /// slot was refused (`status == u8::MAX`) or has no interned name. Python then builds
+    /// the objects itself for the whole step; a PARTIAL record is never produced, because
+    /// the wire format has no way to say "this row is somebody else's problem".
+    ///
+    /// `finished` is handed in rather than inferred: `finished_req_ids_dict` also collects
+    /// aborts and earlier steps' frees, which this crate cannot see. It must arrive SORTED
+    /// (Python sorts a set) or the bytes will not match the Python packer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_step_pack(
+        &mut self,
+        slots: &[u32],
+        cu_lens: &[u32],
+        token_ids: &[i64],
+        num_output_tokens: &[u32],
+        num_tokens: &[u32],
+        max_model_len: usize,
+        engine_index: u32,
+        timestamp: f64,
+        finished: &[String],
+    ) -> Result<(&[crate::update::Verdict], bool), String> {
+        self.update_step(
+            slots,
+            cu_lens,
+            token_ids,
+            num_output_tokens,
+            num_tokens,
+            max_model_len,
+        )?;
+        // Disjoint field borrows: `stops.out` and `names`/`ids` read, `raw` written.
+        let verdicts = &self.stops.out;
+        if verdicts.iter().any(|v| v.status == u8::MAX) {
+            return Ok((verdicts, false));
+        }
+        let raw = &mut self.raw;
+        raw.begin(
+            engine_index,
+            timestamp,
+            slots.len() as u32,
+            finished.len() as u32,
+        );
+        for (i, &slot) in slots.iter().enumerate() {
+            let name = match self.names.get(slot as usize) {
+                Some(n) if self.ids.get(n.as_str()) == Some(&slot) => n.as_str(),
+                _ => return Ok((verdicts, false)),
+            };
+            let v = verdicts[i];
+            let lo = cu_lens[i] as usize;
+            let hi = lo + v.num_accepted as usize;
+            let stop = (v.stop_reason >= 0).then_some(v.stop_reason);
+            if raw
+                .push_output(
+                    name,
+                    &token_ids[lo..hi],
+                    crate::update::finish_reason(v.status),
+                    stop,
+                )
+                .is_err()
+            {
+                return Ok((verdicts, false));
+            }
+        }
+        for req_id in finished {
+            if raw.push_finished(req_id).is_err() {
+                return Ok((verdicts, false));
+            }
+        }
+        Ok((verdicts, raw.finish().is_ok()))
+    }
 }
 
 #[cfg(test)]
@@ -872,5 +1001,133 @@ mod tests {
         assert!(m
             .allocate_slots(a, 640, 0, true, 0, 0, 640, STATUS_RUNNING, true)
             .unwrap());
+    }
+
+    // ---- R8 -------------------------------------------------------------------------
+
+    fn stop_params() -> crate::update::StopParams {
+        crate::update::StopParams {
+            min_tokens: 0,
+            max_tokens: 8,
+            eos_token_id: Some(2),
+            stop_token_ids: Default::default(),
+        }
+    }
+
+    #[test]
+    fn name_refuses_a_recycled_or_unknown_slot() {
+        let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+        let a = m.intern("a");
+        assert_eq!(m.name(a), Some("a"));
+        assert_eq!(m.name(a + 7), None);
+        m.forget("a");
+        // The string is still in `names`, but the slot is free -- it must not answer.
+        assert_eq!(m.name(a), None);
+        let b = m.intern("b");
+        assert_eq!(b, a, "the slot is recycled, which is what makes the check load-bearing");
+        assert_eq!(m.name(b), Some("b"));
+    }
+
+    #[test]
+    fn update_step_pack_builds_the_record_and_still_applies_verdicts() {
+        let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+        let a = m.intern("req-a");
+        m.stops.set(a, stop_params());
+        let (verdicts, packed) = m
+            .update_step_pack(&[a], &[0, 1], &[7], &[0], &[10], 1000, 3, 0.5, &[])
+            .unwrap();
+        assert_eq!(verdicts[0].num_accepted, 1);
+        assert_eq!(verdicts[0].status, crate::update::NOT_STOPPED);
+        assert!(packed);
+        let rec = m.raw.finish().unwrap();
+        assert_eq!(rec[0], crate::update::TAG_RAW);
+        assert_eq!(u32::from_le_bytes(rec[4..8].try_into().unwrap()), 3); // engine_index
+        assert_eq!(u32::from_le_bytes(rec[16..20].try_into().unwrap()), 1); // n_out
+        assert_eq!(u32::from_le_bytes(rec[20..24].try_into().unwrap()), 0); // n_fin
+        assert_eq!(&rec[44..49], b"req-a");
+    }
+
+    #[test]
+    fn update_step_pack_trims_the_record_at_a_stop_and_carries_finished_ids() {
+        let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+        let a = m.intern("req-a");
+        m.stops.set(a, stop_params());
+        // EOS (2) is the second of three offered tokens -> the record must carry 2.
+        let (verdicts, packed) = m
+            .update_step_pack(
+                &[a],
+                &[0, 3],
+                &[5, 2, 9],
+                &[0],
+                &[10],
+                1000,
+                0,
+                0.0,
+                &["req-a".to_string()],
+            )
+            .unwrap();
+        assert_eq!(verdicts[0].num_accepted, 2);
+        assert!(packed);
+        let rec = m.raw.finish().unwrap();
+        assert_eq!(u32::from_le_bytes(rec[28..32].try_into().unwrap()), 2, "n_tok");
+        assert_eq!(rec[36], crate::update::FLAG_FINISH_REASON, "no stop_reason for EOS");
+        assert_eq!(rec[37], crate::update::FINISH_STOP);
+        // header + row head + "req-a" + 2 tokens + (u32 len + "req-a")
+        assert_eq!(rec.len(), 24 + 20 + 5 + 8 + 4 + 5);
+    }
+
+    #[test]
+    fn table_burst_moves_both_counters_and_gives_them_back() {
+        let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+        let a = m.intern("a");
+        // Steady-state decode entry as `commit`/`advance` leaves it: one token scheduled,
+        // one already in flight, so num_computed is one past num_tokens and there are two
+        // outstanding placeholders.
+        let mut e = SchedEntry::default();
+        e.num_tokens = 100;
+        e.num_computed_tokens = 101;
+        e.num_output_placeholders = 2;
+        e.is_prefill_chunk = false;
+        m.table_set(a, e);
+
+        // A committed N=4 burst adds the 3 tokens the scheduler did not schedule.
+        m.table_burst(&[a], 3);
+        let got = m.table_get(a).unwrap();
+        assert_eq!(got.num_computed_tokens, 104);
+        assert_eq!(got.num_output_placeholders, 5);
+        assert!(!got.is_prefill_chunk, "104 < 100 + 5 is false");
+
+        // The burst stopped after 2 of 4 -> hand back 2, both counters, symmetrically.
+        m.table_burst(&[a], -2);
+        let got = m.table_get(a).unwrap();
+        assert_eq!(got.num_computed_tokens, 102);
+        assert_eq!(got.num_output_placeholders, 3);
+        assert_eq!(
+            got.is_prefill_chunk,
+            got.num_computed_tokens < got.num_tokens + got.num_output_placeholders
+        );
+
+        // Saturating, not panicking, on an accounting skew.
+        m.table_burst(&[a], -1000);
+        let got = m.table_get(a).unwrap();
+        assert_eq!(got.num_computed_tokens, 0);
+        assert_eq!(got.num_output_placeholders, 0);
+
+        // An unknown slot is skipped, not an error.
+        m.table_burst(&[a + 9], 3);
+    }
+
+    #[test]
+    fn update_step_pack_refuses_a_slot_with_no_interned_stop_params() {
+        let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+        let a = m.intern("req-a");
+        let b = m.intern("req-b");
+        m.stops.set(a, stop_params());
+        // b has no params -> status 255 -> the WHOLE step falls back to Python.
+        let (verdicts, packed) = m
+            .update_step_pack(&[a, b], &[0, 1, 2], &[7, 7], &[0, 0], &[10, 10], 1000, 0, 0.0, &[])
+            .unwrap();
+        assert_eq!(verdicts[1].status, u8::MAX);
+        assert!(!packed, "a partial record must never be produced");
     }
 }

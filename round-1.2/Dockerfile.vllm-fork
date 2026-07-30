@@ -109,7 +109,8 @@ RUN set -eu; \
     rm -rf /tmp/rust_patches; \
     grep -q sonic_rs /src/rust/src/server/src/routes/openai/utils/validated_json.rs; \
     test -f /src/rust/src/engine-core-client/src/shm_ipc.rs; \
-    echo "rust-frontend patches present (sonic_rs + shm_ipc)"
+    grep -q per_token_stream_enabled /src/rust/src/text/src/output/decoded.rs; \
+    echo "rust-frontend patches present (sonic_rs + shm_ipc + per_token_stream)"
 
 # PGO training assets (only used by the rust-builder-pgo stage below).
 COPY vtl/pgo_train.sh /src/pgo_train.sh
@@ -128,6 +129,7 @@ RUN set -eux; \
     export RUSTFLAGS="${PGO_TARGET_CPU:+-Ctarget-cpu=$PGO_TARGET_CPU}"; \
     cargo build --release --bin vllm-rs --features native-tls-vendored; \
     cargo test --release -p vllm-engine-core-client --lib; \
+    cargo test --release -p vllm-text --lib; \
     mkdir -p /out; \
     cp target/release/vllm-rs /out/vllm-rs; \
     /out/vllm-rs --help >/dev/null

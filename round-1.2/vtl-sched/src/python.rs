@@ -305,12 +305,83 @@ impl KvManager {
         .map_err(err)
     }
 
+    /// R8: [`KvManager::update_step`] that ALSO returns the finished shm output record.
+    ///
+    /// `(verdicts, record_or_none)`. `None` means "this step is not raw-packable" -- a
+    /// refused slot, an un-interned name, a token id outside u32 -- and Python then builds
+    /// `EngineCoreOutput` objects for the whole batch, exactly as it did before R8. The
+    /// verdicts are applied either way, so the resident table stays correct on both arms.
+    ///
+    /// `finished` must arrive SORTED; the Python packer sorts a set and the bytes have to
+    /// match. `engine_index` / `timestamp` are stamped by the output thread in stock vLLM,
+    /// so the caller hands them in rather than leaving two holes to patch over a loan.
+    ///
+    /// GIL released for the pack, like `update_step` -- it is byte pushing over data
+    /// already copied in. The record is copied once more on the way out (`PyBytes` cannot
+    /// be built without the GIL); that is ~50 bytes for a decode step.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (slots, cu_lens, token_ids, num_output_tokens, num_tokens,
+                        max_model_len, engine_index, timestamp, finished))]
+    fn update_step_pack(
+        &self,
+        py: Python<'_>,
+        slots: Vec<u32>,
+        cu_lens: Vec<u32>,
+        token_ids: Vec<i64>,
+        num_output_tokens: Vec<u32>,
+        num_tokens: Vec<u32>,
+        max_model_len: usize,
+        engine_index: u32,
+        timestamp: f64,
+        finished: Vec<String>,
+    ) -> PyResult<(Vec<(u32, u8, i64)>, Option<Py<PyBytes>>)> {
+        let shared = self.shared.clone();
+        let (verdicts, record) = py
+            .allow_threads(move || {
+                let mut sh = lock_shared(&shared);
+                sh.invalidate();
+                let (verdicts, packed) = sh.manager.update_step_pack(
+                    &slots,
+                    &cu_lens,
+                    &token_ids,
+                    &num_output_tokens,
+                    &num_tokens,
+                    max_model_len,
+                    engine_index,
+                    timestamp,
+                    &finished,
+                )?;
+                let out: Vec<(u32, u8, i64)> = verdicts
+                    .iter()
+                    .map(|v| (v.num_accepted, v.status, v.stop_reason))
+                    .collect();
+                let rec = if packed {
+                    Some(sh.manager.raw.finish()?.to_vec())
+                } else {
+                    None
+                };
+                Ok::<_, String>((out, rec))
+            })
+            .map_err(err)?;
+        Ok((
+            verdicts,
+            record.map(|r| PyBytes::new_bound(py, &r).unbind()),
+        ))
+    }
+
     // ---- R6b: the resident request table ----------------------------------
 
     /// Overwrite one slot's entry. Same tuple layout as `pack_req` / `Scheduler.schedule`.
     /// The escape hatch for anything Python mutates out of band.
     fn table_set(&self, slot: u32, req: ReqTuple) {
         self.w().manager.table_set(slot, unpack(&req));
+    }
+
+    /// C1a: apply an N-step burst's extra `delta` tokens to `slots` in the resident
+    /// table. Negative `delta` is the reconcile (the burst stopped short). One crossing
+    /// per burst step, not per request.
+    fn table_burst(&self, slots: Vec<u32>, delta: i64) {
+        self.w().manager.table_burst(&slots, delta)
     }
 
     fn table_clear(&self, slot: u32) {

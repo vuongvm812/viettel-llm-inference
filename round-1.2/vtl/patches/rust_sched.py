@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import logging
 import os
+import struct
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
@@ -71,6 +72,10 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # RequestStatus values the Rust core needs (vllm/v1/request.py).
 _ST_WAITING, _ST_RUNNING, _ST_PREEMPTED = 0, 1, 2
+
+# R8 shadow only: the record's f64 timestamp sits at byte 9 (tag + version + u16 reserved
+# + u32 engine_index). Layout owner is vtl/patches/shm_ipc.py.
+_RAW_TS = struct.Struct("<d")
 
 
 def env_on(name: str) -> bool:
@@ -119,6 +124,12 @@ def modes() -> dict:
     # `update_step`, so without UFO the table would go stale on the very first decode.
     table = ufo and env_on("VTL_RUST_SCHED_TABLE")
     table_shadow = table and env_on("VTL_RUST_SCHED_TABLE_SHADOW")
+    r8 = (
+        ufo
+        and env_on("VTL_RUST_SCHED_R8")
+        and env_on("VTL_SHM_IPC")
+        and env_on("VTL_SHM_IPC_RAW")
+    )
     return {
         "shadow": env_on("VTL_RUST_SCHED_SHADOW"),
         "strict": env_on("VTL_RUST_SCHED_SHADOW_STRICT"),
@@ -134,6 +145,17 @@ def modes() -> dict:
         # only be consumed by it) must stay off while shadowing.
         "spec": table and not table_shadow and env_on("VTL_RUST_SCHED_SPEC"),
         "timing": env_on("VTL_SCHED_TIMING"),
+        # R8 rides on UFO (it IS update_step, plus the pack) and on the shm raw record
+        # being the live wire format -- there is no point building bytes the output
+        # thread would have to decode again. Shadow keeps python authoritative.
+        "r8": r8,
+        "r8_shadow": r8 and env_on("VTL_RUST_SCHED_R8_SHADOW"),
+        # B3: block hashing in Rust. Independent of everything above -- it only needs the
+        # extension importable, so it stays armable with the scheduler flags off.
+        "hasher": env_on("VTL_RUST_HASHER"),
+        # C1a: N-step decode burst commitment. Needs the full Rust loop (the commit
+        # extends the resident table in the same place the schedule decisions land).
+        "nstep": full and env_on("VTL_NSTEP"),
     }
 
 
@@ -990,6 +1012,121 @@ def bail_reason(scheduler):
     return None
 
 
+# --------------------------------------------------------------------------
+# C1a -- N-step decode burst: the scheduler side
+# --------------------------------------------------------------------------
+
+
+def burst_blocked(so, waiting_nonempty: bool, queue_empty_only: bool, cap: int) -> str | None:
+    """Why this step cannot carry a burst, or ``None`` if it can. Pure -- self-checked.
+
+    Batch-level half of the gate; ``burst_request_blocked`` is the per-request half.
+    Refusing an admission step is what keeps the burst's TTFT cost bounded: a new request
+    would otherwise wait behind N decode iterations instead of one
+    (``VTL_NSTEP_QUEUE_EMPTY_ONLY``, on by default, extends that to a merely non-empty
+    queue).
+    """
+    if so.scheduled_new_reqs:
+        return "new requests admitted this step"
+    if so.preempted_req_ids:
+        return "a request was preempted"
+    if so.scheduled_spec_decode_tokens or so.scheduled_encoder_inputs:
+        return "spec-decode or encoder inputs scheduled"
+    if so.has_structured_output_requests:
+        return "structured output"
+    if so.new_block_ids_to_zero:
+        return "fresh blocks need zeroing"
+    nst = so.num_scheduled_tokens
+    if not nst:
+        return "empty step"
+    if len(nst) > cap:
+        return f"batch of {len(nst)} exceeds the captured burst sizes"
+    for num in nst.values():
+        if num != 1:
+            return "not a pure 1-token-per-request decode batch"
+    if queue_empty_only and waiting_nonempty:
+        return "waiting queue is not empty"
+    return None
+
+
+def burst_request_blocked(request, computed_before: int, n: int, block_size: int,
+                          max_model_len: int) -> str | None:
+    """Why this request cannot ride a burst, or ``None``. Pure -- self-checked.
+
+    ``computed_before`` is ``num_computed_tokens`` BEFORE ``_update_after_schedule``
+    advanced it, i.e. the position of the token this step is about to feed.
+
+    THE ALIGN GATE is the first check and the load-bearing one: with
+    ``computed_before % block_size + n <= block_size`` the whole burst lives inside one KV
+    block and one mamba state column, so no allocation, no state migration and no block
+    table change can happen between iterations. Everything else here is about the sampler:
+    the burst samples a bare ``argmax``, so anything that would move the token away from it
+    -- temperature, penalties, a logit bias, bad words, an unmet ``min_tokens`` -- keeps the
+    request on the one-token path.
+    """
+    if computed_before % block_size + n > block_size:
+        return "burst would cross a block boundary"
+    sp = request.sampling_params
+    if sp is None or request.pooling_params is not None:
+        return "not a generation request"
+    if getattr(request, "resumable", False) or request.use_structured_output:
+        return "resumable or structured-output request"
+    if request.num_output_placeholders < 0:
+        return "negative placeholder count"
+    max_tokens = getattr(request, "max_tokens", None) or 0
+    limit = min(max_model_len, request.num_prompt_tokens + max_tokens)
+    if computed_before + n > limit:
+        return "burst would run past max_tokens / max_model_len"
+    if sp.temperature != 0.0:
+        return "not greedy"
+    if sp.logprobs is not None or sp.prompt_logprobs is not None:
+        return "logprobs requested"
+    if getattr(sp, "min_tokens", 0):
+        # min_tokens is enforced by masking EOS in the logits; a bare argmax ignores it.
+        return "min_tokens masking is not applied by the burst argmax"
+    if sp.bad_words or sp.allowed_token_ids or sp.logit_bias:
+        return "logit-modifying sampling params"
+    if sp.presence_penalty or sp.frequency_penalty or sp.repetition_penalty != 1.0:
+        return "penalties"
+    return None
+
+
+def burst_commit(request, delta: int) -> None:
+    """Advance one request by the ``delta`` extra tokens the burst will compute.
+
+    Byte-for-byte ``Scheduler._update_after_schedule`` + ``AsyncScheduler``'s placeholder
+    bump, applied a second time -- INCLUDING the ordering, which is load-bearing:
+    ``is_prefill_chunk`` is computed from the placeholder count BEFORE the bump. The Rust
+    resident table applies the same thing via ``Manager::table_burst`` -> ``sched::advance``.
+    """
+    request.num_computed_tokens += delta
+    request.is_prefill_chunk = request.num_computed_tokens < (
+        request.num_tokens + request.num_output_placeholders
+    )
+    if not request.is_prefill_chunk:
+        request.num_output_placeholders += delta
+
+
+def burst_uncommit(request, short: int) -> None:
+    """Give back the ``short`` tokens a committed burst did not actually produce.
+
+    THE PREFIX-CACHE GUARD. A burst request that hits EOS at token j < N -- or, if the
+    runner ever bails, one that comes back with a single token -- had N tokens' worth of
+    ``num_computed_tokens`` committed at schedule time. Left uncorrected, the next
+    ``cache_blocks`` would fingerprint positions that were never computed and every later
+    request matching that prefix would read uninitialised KV.
+
+    ``AsyncScheduler._update_request_with_output`` calls ``cache_blocks(num_computed -
+    num_output_placeholders)`` right after this runs, and both counters are corrected by the
+    same amount, so the cached length is exactly the number of real tokens either way.
+    """
+    request.num_computed_tokens = max(0, request.num_computed_tokens - short)
+    request.num_output_placeholders = max(0, request.num_output_placeholders - short)
+    request.is_prefill_chunk = request.num_computed_tokens < (
+        request.num_tokens + request.num_output_placeholders
+    )
+
+
 def pack_req(slot: int, request) -> tuple:
     """Field order must match ``lib.rs::ReqTuple``."""
     return (
@@ -1027,12 +1164,43 @@ def _install_update_from_output(scheduler_cls, m: dict):
     a ``new_token_ids`` list whose length does not match what the batch was computed from,
     all fall through to stock ``check_stop`` for that request alone.
     """
+    import time
+
+    from vllm.v1.core.sched.utils import remove_all
     from vllm.v1.request import RequestStatus
 
     shadow = m["ufo_shadow"]
     spec = m["spec"]
+    r8_shadow = m["r8_shadow"]
+
+    # R8 emits `bytes` onto the output queue, which ONLY `shm_ipc`'s replacement output
+    # thread understands -- stock's would do `outputs.engine_index = ...` on a bytes and
+    # take EngineCore down. The env gates are not proof that module installed
+    # (VTL_ENABLE_SHM_IPC=0 disables the registry entry while VTL_SHM_IPC=1 is still set),
+    # and shm_ipc applies AFTER rust_sched, so the check is resolved lazily on the first
+    # step -- by which time every patch has run. Fail closed.
+    _r8 = [m["r8"], False]
+
+    def r8_live() -> bool:
+        if not _r8[1]:
+            _r8[1] = True
+            if _r8[0]:
+                try:
+                    from vtl.patches import shm_ipc
+
+                    ok = bool(getattr(shm_ipc, "RAW_OUTPUT_PATH", False))
+                except Exception:
+                    ok = False
+                if not ok:
+                    log.warning(
+                        "rust_sched: R8 disabled -- the shm raw output path is not "
+                        "installed, so nothing on the output queue could read the bytes"
+                    )
+                _r8[0] = ok
+        return _r8[0]
     wrapped_ufo = scheduler_cls.update_from_output
     wrapped_urwo = scheduler_cls._update_request_with_output
+    monotonic = time.monotonic
 
     # Mirrors update.rs's status codes; 255 = "Rust has no params for this slot".
     _STATUS_FROM_CODE = {
@@ -1071,8 +1239,44 @@ def _install_update_from_output(scheduler_cls, m: dict):
         )
         return True
 
-    def decide(self, kv, scheduler_output, model_runner_output):
-        """Build the flat batch and take the single crossing. None = nothing portable."""
+    def step_packable(self, scheduler_output, mro) -> bool:
+        """R8 gate: can this whole step's OUTPUT be a single Rust-built raw record?
+
+        Everything the fixed layout cannot express, evaluated on what Rust cannot see.
+        Mirrors ``shm_ipc.raw_packable``'s reject list plus the parts of
+        ``update_from_output`` that would otherwise be skipped: connector bookkeeping,
+        stats, structured output, routed experts, prompt logprobs. A `False` here costs
+        nothing -- the step takes the R6a path it took before R8 existed.
+
+        `finished_req_ids_dict is None` is the single-engine case, which is also the only
+        case where the record's `finished_requests` table is guaranteed empty; a
+        multi-engine boot keeps the stock object path rather than guessing at it.
+        """
+        return (
+            not mro.logprobs
+            and not mro.prompt_logprobs_dict
+            and not mro.pooler_output
+            and mro.num_nans_in_logits is None
+            and mro.kv_connector_output is None
+            and mro.routed_experts is None
+            and mro.cudagraph_stats is None
+            and not scheduler_output.has_structured_output_requests
+            and not self.log_stats
+            and self.connector is None
+            and self.finished_req_ids_dict is None
+            and not self.defer_block_free
+            and not self.enable_kv_cache_events
+            and not self.enable_return_routed_experts
+            and (self.perf_metrics is None or not self.perf_metrics.is_enabled())
+        )
+
+    def decide(self, kv, scheduler_output, model_runner_output, pack: bool):
+        """Build the flat batch and take the single crossing. None = nothing portable.
+
+        With ``pack``, the crossing is ``update_step_pack``, which also returns the whole
+        step's shm output record; the bytes land in ``self._vtl_r8_record`` (``None`` when
+        Rust refused to pack). The verdicts are identical either way.
+        """
         rust, mirror = kv._rust, kv._mirror
         sampled = model_runner_output.sampled_token_ids
         slots: list[int] = []
@@ -1093,7 +1297,20 @@ def _install_update_from_output(scheduler_cls, m: dict):
             if getattr(request, "async_tokens_to_discard", 0):
                 # A spec-decode rollback rewinds num_tokens behind Rust's back.
                 self._vtl_ufo_clean = False
+                pack = False
                 continue
+            if pack and not (
+                request.client_index == 0
+                and not request.resumable
+                and not request.has_encoder_inputs
+                and request.trace_headers is None
+                and request.prefill_stats is None
+                and not request.events
+            ):
+                # The record has no slot for any of these: a second client index, a
+                # resumable session's re-enqueue, encoder-cache frees, trace headers,
+                # prefill stats or lifecycle events. Objects for the whole step instead.
+                pack = False
             slot = mirror.slot(request)
             # Python-side registry, same rationale as RustMirror._pushed: asking Rust
             # `has_stop_params` here was one FFI crossing per request per step to re-learn
@@ -1102,6 +1319,7 @@ def _install_update_from_output(scheduler_cls, m: dict):
             if slot not in mirror._stops:
                 if not register(rust, request, slot):
                     self._vtl_ufo_clean = False
+                    pack = False
                     continue
                 mirror._stops.add(slot)
             slots.append(slot)
@@ -1114,8 +1332,68 @@ def _install_update_from_output(scheduler_cls, m: dict):
             n_tok.append(request.num_tokens)
         if not slots:
             return None
-        out = rust.update_step(slots, cu, toks, n_out, n_tok, int(self.max_model_len))
+        if pack:
+            # engine_index is 0 for every non-DP boot (EngineCoreProc's default; only
+            # DPEngineCoreProc passes the rank), and step_packable() already refused the
+            # multi-engine case via finished_req_ids_dict. finished stays empty for the
+            # same reason -- `EngineCoreOutputs.finished_requests` is only ever filled
+            # from finished_req_ids_dict.
+            out, record = rust.update_step_pack(
+                slots, cu, toks, n_out, n_tok, int(self.max_model_len),
+                0, monotonic(), (),
+            )
+            self._vtl_r8_record = record
+        else:
+            out = rust.update_step(slots, cu, toks, n_out, n_tok, int(self.max_model_len))
         return {rid: (n, *v) for (rid, n), v in zip(expect, out)}
+
+    def r8_apply(self, model_runner_output):
+        """``update_from_output``'s per-request bookkeeping, WITHOUT the output assembly.
+
+        The 90 lines this replaces (scheduler.py:1738-1822 and the branches feeding them)
+        are pure `EngineCoreOutput` / `EngineCoreOutputs` construction plus the connector,
+        stats, logprobs, routed-expert and structured-output arms that ``step_packable``
+        has already proved inert for this step. What survives is exactly the state
+        mutation: append the tokens (via the R6a-decided ``_update_request_with_output``),
+        retire stopped requests, and drop them from the two queues.
+
+        Returns ``{0: <record bytes>}``; ``EngineCoreProc._process_engine_step`` puts the
+        pair on the output queue verbatim and ``shm_ipc._process_output_sockets``
+        recognises the ``bytes`` payload. The queue is already typed for it (core.py:916).
+        """
+        sampled = model_runner_output.sampled_token_ids
+        stopped_running = None
+        stopped_preempted = None
+        for req_id, index in model_runner_output.req_id_to_index.items():
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            gen = sampled[index]
+            if not gen:
+                # A prefill chunk: no tokens, so stock emits no EngineCoreOutput either.
+                continue
+            status_before = request.status
+            _, is_stopped = self._update_request_with_output(request, gen)
+            if not is_stopped:
+                continue
+            # `resumable` is refused by decide(), so _handle_stopped_request is the
+            # constant-True branch; call it anyway so a future resumable request cannot
+            # silently take a path that skips the streaming re-enqueue.
+            if self._handle_stopped_request(request):
+                self._free_request(request)
+            if status_before == RequestStatus.RUNNING:
+                if stopped_running is None:
+                    stopped_running = set()
+                stopped_running.add(request)
+            else:
+                if stopped_preempted is None:
+                    stopped_preempted = set()
+                stopped_preempted.add(request)
+        if stopped_running:
+            self.running = remove_all(self.running, stopped_running)
+        if stopped_preempted:
+            self.waiting.remove_requests(stopped_preempted)
+        return {0: self._vtl_r8_record}
 
     def maybe_kick(self, kv):
         """Arm the next step's speculation. Called once wrapped_ufo has returned, so every
@@ -1154,6 +1432,11 @@ def _install_update_from_output(scheduler_cls, m: dict):
 
     def update_from_output(self, scheduler_output, model_runner_output):
         self._vtl_ufo = None
+        self._vtl_r8_record = None
+        # C1a side channel: how many tokens THIS step's schedule committed to. Read once
+        # per step (not per request) so the reconcile stays FIFO-correct under async
+        # scheduling, where two steps are in flight and each has its own factor.
+        self._vtl_burst_n = getattr(scheduler_output, "vtl_burst_n", 1) or 1
         # False the moment ANY request in this step's batch was decided by Python instead
         # of by update_step -- which is exactly when the resident table missed a token
         # delta and must be resynced before it can be scheduled from again.
@@ -1166,12 +1449,16 @@ def _install_update_from_output(scheduler_cls, m: dict):
             and not scheduler_output.scheduled_spec_decode_tokens
             and not model_runner_output.pooler_output
         ):
+            pack = r8_live() and step_packable(self, scheduler_output, model_runner_output)
             try:
-                self._vtl_ufo = decide(self, kv, scheduler_output, model_runner_output)
+                self._vtl_ufo = decide(
+                    self, kv, scheduler_output, model_runner_output, pack
+                )
             except BaseException as exc:
                 reraise_fatal(exc)
                 log.exception("rust_sched: UFO batch failed; this step uses check_stop")
                 self._vtl_ufo = None
+                self._vtl_r8_record = None
             if self._vtl_ufo is None:
                 self._vtl_ufo_clean = False
         elif sampled:
@@ -1179,14 +1466,82 @@ def _install_update_from_output(scheduler_cls, m: dict):
             # whole batch, so update_step applied no delta at all.
             self._vtl_ufo_clean = False
         try:
-            outputs = wrapped_ufo(self, scheduler_output, model_runner_output)
+            if self._vtl_r8_record is not None and not r8_shadow:
+                outputs = r8_apply(self, model_runner_output)
+            else:
+                outputs = wrapped_ufo(self, scheduler_output, model_runner_output)
+                if self._vtl_r8_record is not None:
+                    r8_compare(self, outputs)
         finally:
             self._vtl_ufo = None
+            self._vtl_r8_record = None
+            self._vtl_burst_n = 1
         if spec:
             maybe_kick(self, kv)
         return outputs
 
+    def r8_compare(self, outputs) -> None:
+        """VTL_RUST_SCHED_R8_SHADOW: Python stays authoritative, Rust's bytes are checked.
+
+        Packs the objects stock just built with the SAME layout the frontend decodes and
+        diffs the two byte strings. A mismatch is the only signal that matters -- if these
+        agree over a full replay, flipping the authority arm on cannot change the wire.
+        """
+        rust_bytes = self._vtl_r8_record
+        try:
+            from vtl.patches.shm_ipc import raw_packable, raw_pack_into, raw_size
+
+            eco = outputs.get(0) if outputs else None
+            if eco is None or len(outputs) != 1:
+                log.error("rust_sched: R8 shadow -- python produced %d client batches, "
+                          "rust produced 1", len(outputs or ()))
+                return
+            # Rust stamps its own timestamp; copy python's in so the diff is about the
+            # payload, not about which side called monotonic() first.
+            eco.engine_index = 0
+            eco.timestamp = _RAW_TS.unpack_from(rust_bytes, 9)[0]
+            if not raw_packable(eco):
+                log.error("rust_sched: R8 shadow -- rust packed a batch python refuses")
+                return
+            buf = bytearray(raw_size(eco))
+            raw_pack_into(buf, eco)
+            if bytes(buf) != rust_bytes:
+                log.error(
+                    "rust_sched: R8 shadow BYTE DIVERGENCE\n  python=%s\n  rust  =%s",
+                    buf.hex(), rust_bytes.hex(),
+                )
+        except BaseException as exc:
+            reraise_fatal(exc)
+            log.exception("rust_sched: R8 shadow comparison failed")
+
+    def reconcile_burst(self, request, kept: int) -> None:
+        """Hand back the tokens a committed burst did not produce. See ``burst_uncommit``.
+
+        Called from ``_update_request_with_output`` -- i.e. INSIDE
+        ``AsyncScheduler._update_request_with_output``, before its own placeholder
+        subtraction and its ``cache_blocks`` call, which is what makes the cached prefix
+        length come out exact on both the stop and the (should-never-happen) short-runner
+        path.
+        """
+        short = self._vtl_burst_n - kept
+        if short <= 0:
+            return
+        burst_uncommit(request, short)
+        kv = self.kv_cache_manager
+        slot = kv._mirror._slots.get(request.request_id)
+        if slot is not None:
+            # Same correction into the resident table. No resync: table_burst leaves the
+            # entry consistent with the Python object, which is the whole contract.
+            kv._rust.table_burst([slot], -short)
+
     def _update_request_with_output(self, request, new_token_ids):
+        if self._vtl_burst_n > 1:
+            kept, stopped = _urwo_inner(self, request, new_token_ids)
+            reconcile_burst(self, request, len(kept))
+            return kept, stopped
+        return _urwo_inner(self, request, new_token_ids)
+
+    def _urwo_inner(self, request, new_token_ids):
         decided = self._vtl_ufo
         answer = decided.pop(request.request_id, None) if decided else None
         # 255 = unregistered slot; a length mismatch means something mutated the request
@@ -1234,12 +1589,15 @@ def _install_update_from_output(scheduler_cls, m: dict):
     # `_update_request_as_session`, i.e. without update_from_output having run first.
     scheduler_cls._vtl_ufo = None
     scheduler_cls._vtl_ufo_clean = True
+    scheduler_cls._vtl_r8_record = None
+    scheduler_cls._vtl_burst_n = 1
     mark_patched(update_from_output, wrapped_ufo, patch="rust_sched_ufo")
     mark_patched(_update_request_with_output, wrapped_urwo, patch="rust_sched_ufo")
     scheduler_cls.update_from_output = update_from_output
     scheduler_cls._update_request_with_output = _update_request_with_output
     log.info(
-        "rust_sched: UFO batched stop decision active (shadow=%s, kick=%s)", shadow, spec
+        "rust_sched: UFO batched stop decision active (shadow=%s, kick=%s, r8=%s%s)",
+        shadow, spec, _r8[0], " SHADOW" if r8_shadow else "",
     )
 
 
@@ -1268,6 +1626,21 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     timers = PhaseTimers() if TIMING else None
     table_shadow_state = ShadowState(strict=False) if TABLE_SHADOW else None
 
+    # C1a. `nstep_decode` is the runner half; it publishes readiness and executes the
+    # burst. Importing it here (not at module import) keeps rust_sched loadable when the
+    # runner patch is disabled -- `nstep` then resolves to off.
+    NSTEP = m["nstep"]
+    nstep_mod = None
+    if NSTEP:
+        try:
+            from vtl.patches import nstep_decode as nstep_mod
+        except Exception:
+            log.exception("rust_sched: nstep runner patch not importable; no bursts")
+            NSTEP = False
+    NSTEP_QUEUE_EMPTY_ONLY = os.environ.get(
+        "VTL_NSTEP_QUEUE_EMPTY_ONLY", "1"
+    ).strip().lower() in _TRUTHY
+
     def shadow_table(kv, running, by_slot):
         """Log where the resident table disagrees with this step's ``pack_req`` tuples.
 
@@ -1287,6 +1660,54 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             for name, mine, theirs in zip(_REQ_FIELDS, us, them):
                 table_shadow_state.check(f"table.{name}", mine, theirs, rid)
 
+    def commit_burst(self, kv, so, by_slot, decisions) -> None:
+        """Decide and commit this step's burst factor. Runs after ``_update_after_schedule``.
+
+        Silent no-op on every ineligible step -- the first-reason-only log keeps a steady
+        stream of "batch of 9 exceeds..." out of the log while still naming each new reason
+        once. On ANY exception the burst is disabled for the boot and the step is a plain
+        one-token step: nothing has been mutated at that point except, at worst, a partial
+        request loop, which is why the request mutation happens in a SECOND pass after every
+        request has been checked.
+        """
+        n = nstep_mod.burst_factor(so.num_scheduled_tokens)
+        if n < 2:
+            return
+        try:
+            why = burst_blocked(
+                so, bool(self.waiting), NSTEP_QUEUE_EMPTY_ONLY, nstep_mod.MAX_BURST_REQS
+            )
+            slots = None
+            if why is None:
+                block_size = self.cache_config.block_size
+                slots = [slot for slot, _ in decisions["scheduled_running"]]
+                for slot in slots:
+                    request = by_slot[slot]
+                    why = burst_request_blocked(
+                        request,
+                        request.num_computed_tokens - 1,  # pre-_update_after_schedule
+                        n,
+                        block_size,
+                        self.max_model_len,
+                    )
+                    if why is not None:
+                        break
+            if why is not None:
+                seen = self._vtl_burst_skips
+                if why not in seen:
+                    seen.add(why)
+                    log.info("rust_sched: nstep burst skipped -- %s", why)
+                return
+            delta = n - 1
+            for slot in slots:
+                burst_commit(by_slot[slot], delta)
+            kv._rust.table_burst(slots, delta)
+            so.vtl_burst_n = n
+        except BaseException as exc:
+            reraise_fatal(exc)
+            log.exception("rust_sched: nstep commit failed; bursts disabled for this boot")
+            nstep_mod.BURST.disable("scheduler commit raised")
+
     def schedule(self, *args, **kwargs):
         kv = self.kv_cache_manager
         core = getattr(self, "_vtl_rust_core", None)
@@ -1301,6 +1722,15 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     self._vtl_rust_warned = True
                 return wrapped(self, *args, **kwargs)
             core = self._vtl_rust_core = vtl_sched.Scheduler()
+            if NSTEP and nstep_mod.BURST.n > 1:
+                # Reserve KV headroom for the burst's extra tokens at queue depth 2. The
+                # align gate already makes a mid-burst allocation impossible, so this is
+                # slack, not a requirement -- but `num_lookahead_tokens` is what every
+                # `can_allocate` check reads, and 43x KV headroom makes the reservation
+                # free. Plumbed end to end (scheduler.py:908 -> the Rust config key below).
+                self.num_lookahead_tokens = max(
+                    self.num_lookahead_tokens, 2 * (nstep_mod.BURST.n - 1)
+                )
             # Engine constants: handed over once, not re-parsed from a dict per step.
             core.set_params(
                 {
@@ -1540,6 +1970,8 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         if self.defer_block_free and total > 0:
             self.sched_step_seq += 1
         self._update_after_schedule(scheduler_output)
+        if NSTEP:
+            commit_burst(self, kv, scheduler_output, by_slot, decisions)
         if TIMING:
             t_exit = ns()
             timers.add("apply", t_exit - t_rust)
@@ -1547,7 +1979,87 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             timers.tick()
         return scheduler_output
 
+    # Per-reason log de-duplication for the burst gate; class level so the first step
+    # does not have to create it.
+    scheduler_cls._vtl_burst_skips = set()
     scheduler_cls.schedule = mark_patched(schedule, wrapped)
+
+
+def _install_rust_hasher() -> None:
+    """B3 -- ``get_request_block_hasher``'s product, backed by the ported Rust hasher.
+
+    THE CHEAP RUNG, deliberately. ``Request.block_hashes`` stays the single source of
+    truth, ``RustMirror.slot``'s ``push_hashes`` still ships the bytes over, ``maybe_kick``
+    ordering is untouched and every consumer is unchanged -- the only thing that moves is
+    WHERE the sha256-over-pickle happens. Full removal (Rust owning the list) couples to
+    the R6c kick ordering and is out of scope.
+
+    Rebinds the IMPORT-BOUND name in ``vllm.v1.engine.core`` -- patching
+    ``kv_cache_utils`` would do nothing, core.py does ``from ... import``.
+
+    Two shapes, because the prompt and the decode tail want different call patterns:
+      * request has NO hashes yet (admission, the whole prompt) -> ONE crossing for every
+        block via ``vtl_sched.block_hashes``, which chains internally from NONE_HASH;
+      * request already has hashes (a decode step completed a block) -> chain from the
+        last one with ``hash_block_tokens``. That is one crossing per NEW block, and a
+        decode step produces at most one.
+
+    Refusal guard: anything that needs ``extra_keys`` (cache_salt, LoRA, multimodal,
+    prompt embeds) keeps the stock hasher for that request. The served path is text-only,
+    so this never fires; guessing at extra-key pickling would be a silent cache-poisoning
+    bug if it ever did.
+    """
+    import vtl_sched
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.engine import core as core_mod
+
+    stock_factory = kv_cache_utils.get_request_block_hasher
+    if getattr(core_mod.get_request_block_hasher, "__vtl_rust_hasher__", False):
+        return
+
+    def factory(hash_block_size: int, caching_hash_fn):
+        stock = stock_factory(hash_block_size, caching_hash_fn)
+        # NONE_HASH is a module global written by init_none_hash(), which core.py calls
+        # immediately before this factory -- so it is readable now and constant after.
+        none_hash = bytes(kv_cache_utils.NONE_HASH)
+        block_hashes = vtl_sched.block_hashes
+        hash_block_tokens = vtl_sched.hash_block_tokens
+        BlockHash = kv_cache_utils.BlockHash
+
+        def rust_block_hasher(request):
+            if (
+                request.cache_salt
+                or request.mm_features
+                or request.lora_request is not None
+                or request.prompt_embeds is not None
+            ):
+                return stock(request)
+            have = len(request.block_hashes)
+            start = have * hash_block_size
+            num_tokens = request.num_tokens
+            if start + hash_block_size > num_tokens:
+                return []
+            end = num_tokens - (num_tokens - start) % hash_block_size
+            tokens = request.all_token_ids
+            if have == 0:
+                return [
+                    BlockHash(h) for h in block_hashes(none_hash, hash_block_size, tokens[:end])
+                ]
+            out = []
+            parent = request.block_hashes[-1]
+            while start < end:
+                parent = hash_block_tokens(
+                    none_hash, parent, tokens[start : start + hash_block_size]
+                )
+                out.append(BlockHash(parent))
+                start += hash_block_size
+            return out
+
+        return rust_block_hasher
+
+    factory.__vtl_rust_hasher__ = True
+    core_mod.get_request_block_hasher = factory
+    log.info("rust_sched: block hashing routed to vtl_sched (VTL_RUST_HASHER=1)")
 
 
 def _install_generation_hooks(scheduler_cls):
@@ -1588,7 +2100,7 @@ def _install_generation_hooks(scheduler_cls):
 @register_patch("rust_sched", default=False)
 def apply() -> None:
     m = modes()
-    if not (m["shadow"] or m["authority"]):
+    if not (m["shadow"] or m["authority"] or m["hasher"]):
         log.info("rust_sched: no mode selected, nothing installed")
         return
 
@@ -1597,6 +2109,16 @@ def apply() -> None:
     except BaseException as exc:
         reraise_fatal(exc)
         log.warning("rust_sched: vtl_sched extension not importable (%r); staying on vLLM", exc)
+        return
+
+    if m["hasher"]:
+        try:
+            _install_rust_hasher()
+        except BaseException as exc:
+            reraise_fatal(exc)
+            log.exception("rust_sched: rust block hasher not installed; keeping stock")
+
+    if not (m["shadow"] or m["authority"]):
         return
 
     import vllm.v1.core.sched.scheduler as sched_mod
@@ -1685,6 +2207,8 @@ def _self_check() -> None:
         "VTL_RUST_SCHED_UFO", "VTL_RUST_SCHED_UFO_SHADOW",
         "VTL_RUST_SCHED_TABLE", "VTL_RUST_SCHED_TABLE_SHADOW",
         "VTL_RUST_SCHED_SPEC", "VTL_SCHED_TIMING",
+        "VTL_RUST_SCHED_R8", "VTL_RUST_SCHED_R8_SHADOW", "VTL_RUST_HASHER",
+        "VTL_SHM_IPC", "VTL_SHM_IPC_RAW", "VTL_NSTEP",
     )}
     try:
         for k in saved:
@@ -1693,6 +2217,7 @@ def _self_check() -> None:
             "shadow": False, "strict": False, "authority": False,
             "full": False, "radix": False, "ufo": False, "ufo_shadow": False,
             "table": False, "table_shadow": False, "spec": False, "timing": False,
+            "r8": False, "r8_shadow": False, "hasher": False, "nstep": False,
         }, modes()
         assert env_on("VTL_RUST_SCHED") is False
         for truthy in ("1", "true", "YES", " on "):
@@ -1727,6 +2252,38 @@ def _self_check() -> None:
         # VTL_SCHED_TIMING is orthogonal: log-only, no dependency on any of the above.
         os.environ["VTL_SCHED_TIMING"] = "1"
         assert modes()["timing"] is True
+
+        # R8 needs UFO *and* the raw shm wire format -- building bytes the output thread
+        # would have to unpack again is strictly worse than building objects.
+        os.environ["VTL_RUST_SCHED_FULL"] = "1"
+        os.environ["VTL_RUST_SCHED_UFO"] = "1"
+        os.environ["VTL_RUST_SCHED_R8"] = "1"
+        assert modes()["r8"] is False, "R8 must not arm without the shm raw wire format"
+        os.environ["VTL_SHM_IPC"] = "1"
+        assert modes()["r8"] is False, "...nor with shm but msgpack records"
+        os.environ["VTL_SHM_IPC_RAW"] = "1"
+        assert modes()["r8"] is True
+        assert modes()["r8_shadow"] is False
+        os.environ["VTL_RUST_SCHED_R8_SHADOW"] = "1"
+        assert modes()["r8_shadow"] is True
+        os.environ["VTL_RUST_SCHED_UFO"] = "0"
+        assert modes()["r8"] is False and modes()["r8_shadow"] is False, (
+            "R8 IS update_step plus a pack; it cannot arm without UFO"
+        )
+        os.environ["VTL_RUST_SCHED_UFO"] = "1"
+
+        # The N-step commit lives inside the Rust schedule loop, so it needs FULL.
+        os.environ["VTL_NSTEP"] = "1"
+        assert modes()["nstep"] is True
+        os.environ["VTL_RUST_SCHED_FULL"] = "0"
+        assert modes()["nstep"] is False
+        os.environ["VTL_RUST_SCHED_FULL"] = "1"
+
+        # The hasher is independent: it needs only the extension, not the scheduler.
+        assert modes()["hasher"] is False
+        os.environ["VTL_RUST_HASHER"] = "1"
+        os.environ["VTL_RUST_SCHED_FULL"] = "0"
+        assert modes()["hasher"] is True and modes()["full"] is False
     finally:
         for k, v in saved.items():
             if v is None:
@@ -1800,6 +2357,126 @@ def _self_check() -> None:
     else:  # pragma: no cover
         raise AssertionError("connector path must refuse loudly")
     log.setLevel(logging.NOTSET)
+
+    # ---- C1a: the N-step burst gate + the num_computed_tokens arithmetic -------------
+    class SO:
+        def __init__(self, **kw):
+            self.scheduled_new_reqs = []
+            self.preempted_req_ids = set()
+            self.scheduled_spec_decode_tokens = {}
+            self.scheduled_encoder_inputs = {}
+            self.has_structured_output_requests = False
+            self.new_block_ids_to_zero = None
+            self.num_scheduled_tokens = {"a": 1, "b": 1}
+            self.__dict__.update(kw)
+
+    assert burst_blocked(SO(), False, True, 8) is None
+    for kw in (
+        {"scheduled_new_reqs": [object()]},
+        {"preempted_req_ids": {"a"}},
+        {"scheduled_spec_decode_tokens": {"a": [7]}},
+        {"scheduled_encoder_inputs": {"a": [0]}},
+        {"has_structured_output_requests": True},
+        {"new_block_ids_to_zero": [3]},
+        {"num_scheduled_tokens": {}},
+        {"num_scheduled_tokens": {"a": 1, "b": 2}},   # a chunked prefill in the batch
+        {"num_scheduled_tokens": dict.fromkeys("abcdefghi", 1)},  # 9 > cap
+    ):
+        assert burst_blocked(SO(**kw), False, True, 8) is not None, kw
+    # The waiting queue only blocks when the TTFT guard is on.
+    assert burst_blocked(SO(), True, True, 8) == "waiting queue is not empty"
+    assert burst_blocked(SO(), True, False, 8) is None
+
+    class SP:
+        def __init__(self, **kw):
+            self.temperature = 0.0
+            self.logprobs = None
+            self.prompt_logprobs = None
+            self.min_tokens = 0
+            self.bad_words = None
+            self.allowed_token_ids = None
+            self.logit_bias = None
+            self.presence_penalty = 0.0
+            self.frequency_penalty = 0.0
+            self.repetition_penalty = 1.0
+            self.__dict__.update(kw)
+
+    class REQ:
+        def __init__(self, **kw):
+            self.sampling_params = SP()
+            self.pooling_params = None
+            self.resumable = False
+            self.use_structured_output = False
+            self.num_output_placeholders = 1
+            self.num_prompt_tokens = 100
+            self.max_tokens = 200
+            self.num_tokens = 200
+            self.num_computed_tokens = 200
+            self.__dict__.update(kw)
+
+    # The align gate, at block_size 16 / N 4: offsets 0..12 fit, 13..15 do not.
+    fits = [c for c in range(16) if burst_request_blocked(REQ(), c, 4, 16, 32768) is None]
+    assert fits == list(range(13)), fits
+    assert len(fits) == 13, "13/16 coverage at N=4 is the number the plan sizes against"
+    assert [c for c in range(16)
+            if burst_request_blocked(REQ(), c, 8, 16, 32768) is None] == list(range(9))
+    assert burst_request_blocked(REQ(), 0, 17, 16, 32768) is not None, "N > block_size"
+
+    # ...and every non-greedy disqualifier, one at a time (offset 0 = align gate open).
+    assert burst_request_blocked(REQ(), 0, 4, 16, 32768) is None
+    for kw in (
+        {"sampling_params": None},
+        {"pooling_params": object()},
+        {"resumable": True},
+        {"use_structured_output": True},
+        {"sampling_params": SP(temperature=0.7)},
+        {"sampling_params": SP(logprobs=5)},
+        {"sampling_params": SP(prompt_logprobs=1)},
+        {"sampling_params": SP(min_tokens=8)},
+        {"sampling_params": SP(bad_words=["x"])},
+        {"sampling_params": SP(allowed_token_ids=[1])},
+        {"sampling_params": SP(logit_bias={1: 2.0})},
+        {"sampling_params": SP(presence_penalty=0.5)},
+        {"sampling_params": SP(frequency_penalty=0.5)},
+        {"sampling_params": SP(repetition_penalty=1.1)},
+        # max_tokens caps the burst: 99 + 4 > min(32768, 100 + 2)
+        {"max_tokens": 2, "num_prompt_tokens": 100},
+    ):
+        assert burst_request_blocked(REQ(**kw), 99 if "max_tokens" in kw else 0,
+                                     4, 16, 32768) is not None, kw
+    # ...and max_model_len does the same.
+    assert burst_request_blocked(REQ(max_tokens=1 << 20), 32766, 4, 16, 32768) is not None
+
+    # commit -> uncommit is exactly symmetric on both counters, and `is_prefill_chunk` is
+    # computed BEFORE the placeholder bump (the ordering `_update_after_schedule` uses).
+    r = REQ(num_tokens=100, num_computed_tokens=101, num_output_placeholders=2)
+    burst_commit(r, 3)
+    assert (r.num_computed_tokens, r.num_output_placeholders) == (104, 5), vars(r)
+    assert r.is_prefill_chunk is False, "104 < 100 + 2 is false, and the bump comes after"
+    burst_uncommit(r, 3)
+    assert (r.num_computed_tokens, r.num_output_placeholders) == (101, 2)
+    # THE PREFIX-CACHE INVARIANT. `AsyncScheduler._update_request_with_output` caches
+    # `num_computed - num_output_placeholders` blocks; on a plain decode step that comes
+    # out at `num_tokens - 1` (every token but the one just generated, whose position has
+    # no KV yet). A burst must land on the same value whether it ran to completion or
+    # stopped early -- that equality IS the guard against fingerprinting KV that was
+    # never computed.
+    for kept in (4, 2, 1):
+        # Post-_update_after_schedule steady state: T=100, C=101, P=2.
+        r = REQ(num_tokens=100, num_computed_tokens=101, num_output_placeholders=2)
+        burst_commit(r, 3)                          # committed N=4
+        assert (r.num_computed_tokens, r.num_output_placeholders) == (104, 5)
+        r.num_tokens += kept                        # `_update_request_with_output` appends
+        burst_uncommit(r, 4 - kept)                 # ...then the reconcile
+        r.num_output_placeholders -= kept           # ...then AsyncScheduler's subtraction
+        assert r.num_output_placeholders >= 0, kept
+        assert (
+            r.num_computed_tokens - r.num_output_placeholders == r.num_tokens - 1
+        ), (kept, vars(r))
+    # Saturating, never negative, on an accounting skew.
+    r = REQ(num_computed_tokens=1, num_output_placeholders=1)
+    burst_uncommit(r, 1000)
+    assert (r.num_computed_tokens, r.num_output_placeholders) == (0, 0)
 
     # reraise_fatal: a crate panic (BaseException, not Exception) is swallowed by the
     # guards; interpreter signals still get through.

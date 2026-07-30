@@ -497,8 +497,12 @@ impl ScheduleCore {
 }
 
 /// `_update_after_schedule`'s per-request arithmetic, both scheduler layers.
+///
+/// `pub(crate)` so the N-step burst commit ([`crate::manager::Manager::table_burst`]) can
+/// apply the SAME function for its extra tokens instead of a second copy that could drift
+/// on the placeholder-bump ordering (`is_prefill_chunk` is computed BEFORE the bump).
 #[inline]
-fn advance(e: &mut SchedReq, num_new_tokens: usize, num_sampled_tokens_per_step: usize) {
+pub(crate) fn advance(e: &mut SchedReq, num_new_tokens: usize, num_sampled_tokens_per_step: usize) {
     e.num_computed_tokens += num_new_tokens;
     e.is_prefill_chunk = e.num_computed_tokens < e.num_tokens + e.num_output_placeholders;
     if !e.is_prefill_chunk {

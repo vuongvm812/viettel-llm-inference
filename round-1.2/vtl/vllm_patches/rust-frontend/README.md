@@ -31,8 +31,19 @@ frontend binary. They carry our frontend optimizations so a clean checkout (wher
 Applied idempotently **per patch**: the stage skips a patch iff its *reverse* dry-run applies
 (i.e. it is already in the checkout) and applies the rest, so a locally-modified checkout that
 carries some of them still gets the others. The stage then asserts one marker per independent
-group (`sonic_rs` in `validated_json.rs`, `src/engine-core-client/src/shm_ipc.rs` exists) and
-fails the build if either is missing.
+group (`sonic_rs` in `validated_json.rs`, `src/engine-core-client/src/shm_ipc.rs` exists,
+`per_token_stream_enabled` in `decoded.rs`) and fails the build if any is missing.
+
+## `per_token_stream.patch`
+- `src/text/src/output/decoded.rs` — emit one `TextDelta` per decoded TOKEN instead of one
+  per engine record. Stock concatenates every token in a record into a single delta, which
+  under the N-step decode burst (`VTL_NSTEP`) means N tokens in one SSE chunk — and a
+  chunk-counting ITL metric (`bench/replay.py:99`) would then report TPOT N times worse than
+  reality. Inert on a non-burst boot: a one-token record takes the identical stock path.
+  Refuses a record carrying logprobs (they are decoded once for the whole record). Gated on
+  `VTL_STREAM_PER_TOKEN` (default on; `=0` restores stock), same shape as
+  `http_trace_toggle.patch`. Its three unit tests are run by `Dockerfile.vllm-fork`
+  (`cargo test --release -p vllm-text --lib`).
 
 ## `shm_ipc.patch`
 - `Cargo.toml` / `src/engine-core-client/Cargo.toml` — add the `iceoryx2` (pinned **0.9.3**)

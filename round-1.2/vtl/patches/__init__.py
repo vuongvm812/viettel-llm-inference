@@ -49,6 +49,12 @@ _MODULES: tuple[str, ...] = (
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
     "decode_fastpath",  # V2 runner: skip the dead metadata build on repeat pure-decode steps,
                         # + pooled pinned staging instead of pin_memory-per-step
+    # AFTER decode_fastpath: nstep reuses its `_fa_write` helper and its builder
+    # classification rather than copying either, and its readiness probe reads
+    # decode_fastpath's `_C.builders`. The two wrap DISJOINT seams -- decode_fastpath owns
+    # prepare_inputs / prepare_attn, nstep owns execute_model / sample_tokens / capture_model
+    # -- so neither stacks on the other and the order is about imports, not wrappers.
+    "nstep_decode",     # N decode iterations per engine step (armed by rust_sched's commit)
     "conv_align_fused",  # registers vllm_cuda::conv_align_fused; the call site is in the fork
     "shortconv_mega",    # registers vllm_cuda::shortconv_decode_mega + its persistent scratch
     "shm_ipc",          # iceoryx2 shm data plane for the frontend<->EngineCore hop (VTL_SHM_IPC=1)

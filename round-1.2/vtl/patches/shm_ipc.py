@@ -154,6 +154,13 @@ def output_service(input_address: str) -> str:
 # silently dropped rather than falling back to msgpack. ``apply()`` diffs these against the
 # live structs and forces raw off on any drift -- fail closed. Set by ``apply()``.
 _RAW_ENABLED = True
+# Set by apply() once the output thread has actually been replaced AND the raw layout is
+# live. `rust_sched.py`'s R8 path reads it and refuses to emit bytes onto the output queue
+# if it is False -- stock's `process_output_sockets` would do `outputs.engine_index = ...`
+# on a `bytes` and take EngineCore down. Fail closed: the env gates alone are not proof
+# that this module installed (VTL_ENABLE_SHM_IPC=0 disables the registry entry while
+# VTL_SHM_IPC=1 is still set).
+RAW_OUTPUT_PATH = False
 KNOWN_OUTPUT_FIELDS = frozenset(
     {
         "request_id",
@@ -300,6 +307,62 @@ def raw_pack_into(buffer, outputs, plan=None) -> int:
     return at
 
 
+def raw_unpack(record):
+    """Inverse of ``raw_pack_into``: rebuild ``EngineCoreOutputs`` from a TAG_RAW record.
+
+    R8 (``VTL_RUST_SCHED_R8``) has Rust emit these bytes directly, so the EngineCore no
+    longer holds the objects at all. The shm publish takes the bytes as they are -- but the
+    ZMQ arm still needs real objects, and the shm->ZMQ demotion is a PERMANENT one-way latch
+    whose *tripping* batch must still be delivered. Decoding here removes that race
+    entirely: whichever transport wins, the same record is what gets sent.
+
+    Cold path by construction (it runs at most once per boot, on the demotion), so clarity
+    beats speed. Raises on any malformed record -- the caller treats that as "drop shm".
+    """
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
+
+    mv = memoryview(record)
+    if bytes(mv[0:1]) != TAG_RAW:
+        raise ValueError(f"not a raw record: tag {bytes(mv[0:1])!r}")
+    version, _reserved, engine_index, timestamp, n_out, n_fin = _RAW_HEADER.unpack_from(mv, 1)
+    if version != RAW_VERSION:
+        raise ValueError(f"raw record version {version} != {RAW_VERSION}")
+    at = 1 + _RAW_HEADER.size
+    outputs = []
+    for _ in range(n_out):
+        id_len, n_tok, n_nans, flags, finish, _r, stop = _RAW_OUTPUT_HEAD.unpack_from(mv, at)
+        at += _RAW_OUTPUT_HEAD.size
+        request_id = bytes(mv[at : at + id_len]).decode()
+        at += id_len
+        token_ids = list(struct.unpack_from(f"<{n_tok}I", mv, at)) if n_tok else []
+        at += 4 * n_tok
+        outputs.append(
+            EngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=token_ids,
+                finish_reason=(
+                    FinishReason(finish) if flags & FLAG_FINISH_REASON else None
+                ),
+                stop_reason=stop if flags & FLAG_STOP_TOKEN else None,
+                num_nans_in_logits=n_nans,
+            )
+        )
+    finished = set()
+    for _ in range(n_fin):
+        (id_len,) = _U32.unpack_from(mv, at)
+        at += 4
+        finished.add(bytes(mv[at : at + id_len]).decode())
+        at += id_len
+    if at != len(record):
+        raise ValueError(f"raw record has {len(record) - at} trailing bytes")
+    return EngineCoreOutputs(
+        engine_index=engine_index,
+        outputs=outputs,
+        timestamp=timestamp,
+        finished_requests=finished or None,
+    )
+
+
 # ------------------------------------------------------------------------------------------
 # iceoryx2 plumbing
 # ------------------------------------------------------------------------------------------
@@ -381,6 +444,13 @@ class _OutputPublisher:
         if size:
             src = payload if isinstance(payload, bytes) else _address(payload)
             ctypes.memmove(sample.payload_ptr + 1, src, size)
+        return self._send(sample)
+
+    def publish_record(self, record) -> bool:
+        """Publish an ALREADY-FRAMED record (R8: Rust packed it, tag byte included)."""
+        size = len(record)
+        sample = self._publisher.loan_slice_uninit(size)
+        ctypes.memmove(sample.payload_ptr, record, size)
         return self._send(sample)
 
     def publish_raw(self, outputs) -> bool:
@@ -530,6 +600,28 @@ def _process_output_sockets(self, output_paths, coord_output_path, engine_index)
                 break
             assert not isinstance(output, bytes)
             client_index, outputs = output
+            if type(outputs) is bytes:
+                # R8: the scheduler handed us a finished TAG_RAW record instead of objects
+                # (rust_sched.py's `_install_r8`). Publish the bytes as they are; the
+                # engine_index and timestamp are already baked in by the packer.
+                if shm is not None and client_index == 0 and len(sockets) == 1:
+                    try:
+                        if shm.publish_record(outputs):
+                            shm_delivered = True
+                            continue
+                    except Exception:
+                        log.exception("vtl shm_ipc: R8 publish failed, ZMQ from here on")
+                        shm = None
+                    if shm is not None and shm_delivered:
+                        log.warning(
+                            "vtl shm_ipc: output publish undelivered after a live stream, "
+                            "falling back to ZMQ for good"
+                        )
+                        shm = None
+                # ZMQ arm: msgpack needs real objects back. Decoding costs one cold call
+                # per boot (the demotion latch below makes it the last shm attempt), and
+                # it is what lets the TRIPPING batch still be delivered.
+                outputs = raw_unpack(outputs)
             outputs.engine_index = engine_index
 
             if client_index == -1:
@@ -623,9 +715,10 @@ def apply() -> None:
     EngineCoreProc.process_output_sockets = mark_patched(
         _process_output_sockets, EngineCoreProc.process_output_sockets
     )
+    global RAW_OUTPUT_PATH
+    RAW_OUTPUT_PATH = bool(_env_flag("VTL_SHM_IPC_RAW") and _RAW_ENABLED)
     log.info(
-        "vtl: shm_ipc installed (iceoryx2 data plane, raw=%s)",
-        _env_flag("VTL_SHM_IPC_RAW") and _RAW_ENABLED,
+        "vtl: shm_ipc installed (iceoryx2 data plane, raw=%s)", RAW_OUTPUT_PATH
     )
 
 
@@ -755,6 +848,36 @@ def _self_check() -> None:
     unicode_case = _Outs(outputs=[_Out("req-é", [1])])
     assert len(_pack(unicode_case)) == raw_size(unicode_case)
     assert "req-é".encode() in _pack(unicode_case)
+
+    # --- R8 round trip (pack -> unpack) ----------------------------------------------------
+    # raw_unpack needs the real msgspec structs; off-box `make check` has no vLLM, so the
+    # round trip runs only where the import lands (the image, and `make test-kernel`).
+    try:
+        from vllm.v1.engine import EngineCoreOutputs  # noqa: F401
+    except Exception:
+        print("shm_ipc: raw_unpack round trip skipped (no vLLM in this interpreter)")
+    else:
+        for case in (plain, finished, unicode_case):
+            back = raw_unpack(_pack(case))
+            assert back.engine_index == case.engine_index
+            assert back.timestamp == case.timestamp
+            assert len(back.outputs) == len(case.outputs)
+            for got, want in zip(back.outputs, case.outputs):
+                assert got.request_id == want.request_id
+                assert got.new_token_ids == list(want.new_token_ids)
+                assert (got.finish_reason is None) == (want.finish_reason is None)
+                assert got.stop_reason == want.stop_reason
+                assert got.num_nans_in_logits == want.num_nans_in_logits
+            assert (back.finished_requests or set()) == set(case.finished_requests or ())
+        # A truncated / mistagged record must raise, not decode into garbage.
+        good = _pack(plain)
+        for bad in (good[:-1], good + b"\x00", b"M" + good[1:]):
+            try:
+                raw_unpack(bad)
+            except (ValueError, struct.error):
+                pass
+            else:
+                raise AssertionError(f"raw_unpack accepted a malformed record: {bad.hex()}")
 
     # --- schema drift gate ----------------------------------------------------------------
     class _StructOut:
