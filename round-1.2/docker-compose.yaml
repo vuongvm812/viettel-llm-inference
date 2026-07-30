@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:b8a2c4b573fc31275bbf149c021c113cca2905467d57832b01e99594fe4a6485 # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:8fedb2373b886278d2897978afb8640fbe3041f23eb19f419e48237524e24328 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -72,6 +72,12 @@ services:
       - --disable-log-stats
       - --uvicorn-log-level=warning
 
+      # NOTE (2026-07-30, decided against for now): the closed-loop trace sim puts 17% of
+      # decoded tokens at batch 3/5/6, which pad to the next captured size and fall out of
+      # graph-mode bursts/in-graph sampling. Adding 3/5/6 here (and to
+      # nstep_decode.BURST_SIZES) lifts graph coverage 82%->99% -- but stock FULL graphs at
+      # those sizes have never been validated on the H200 and get no boot shadow, so the
+      # swap waits for a run that can afford to fail. 16/32 kept for the same reason.
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
     ports:
       - "8000:8000"

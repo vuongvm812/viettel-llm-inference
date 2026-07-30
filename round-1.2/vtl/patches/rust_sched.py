@@ -947,14 +947,13 @@ class TableState:
       7. every dirty transition, so a speculation kicked before it cannot be consumed after
     """
 
-    __slots__ = ("dirty", "gen", "armed", "off", "steps")
+    __slots__ = ("dirty", "gen", "armed", "off")
 
     def __init__(self):
         self.dirty = True
         self.gen = 0
         self.armed = False  # a kick is outstanding and not yet consumed
         self.off = False    # permanent, process-lifetime fallback to the marshalled path
-        self.steps = 0
 
     def bump(self) -> None:
         self.gen += 1
@@ -2456,15 +2455,6 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 # full resync, and the only place `dirty` clears.
                 tbl.dirty = False
                 tbl.armed = False
-        if tbl is not None:
-            tbl.steps += 1
-            if SPEC and tbl.steps % 2000 == 0:
-                hits, misses, rollbacks, disabled = kv._rust.spec_stats()
-                log.info(
-                    "rust_sched: speculation over %d steps -- hits=%d misses=%d "
-                    "rollbacks=%d disabled=%s",
-                    tbl.steps, hits, misses, rollbacks, disabled,
-                )
         if TIMING:
             t_rust = ns()
             timers.add("rust", t_rust - t_marshal)

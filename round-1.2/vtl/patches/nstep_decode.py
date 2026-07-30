@@ -102,7 +102,11 @@ log = logging.getLogger("vllm.vtl.nstep")
 
 # Decode cudagraph sizes worth a burst graph, and therefore the largest batch a burst is
 # ever committed for. Beyond 8 concurrent generations the trace does not go (the scored
-# replay peaks at 8), and each extra size is another captured graph at boot.
+# replay peaks at 8), and each extra size is another captured graph at boot. The trace sim
+# says 17% of tokens decode at batch 3/5/6; adding those sizes HERE AND to compose's
+# cudagraph_capture_sizes would lift graph coverage 82%->99%, but stock FULL graphs at
+# never-before-captured sizes carry unvalidated-path risk and wait for a run that can
+# afford to fail (see the compose comment).
 BURST_SIZES = (1, 2, 4, 8)
 MAX_BURST_REQS = BURST_SIZES[-1]
 
@@ -133,11 +137,11 @@ class _Burst:
     __slots__ = (
         "armed", "ready", "key", "n", "mode", "runner", "graphs",
         "accum", "tok", "step", "num_sampled", "num_rejected", "desc", "pending",
-        "bursts", "iters", "graph_bursts", "steps", "advance", "bump", "idx_map",
+        "advance", "bump", "idx_map",
         "max_seq_len",
         # in-graph ladder (VTL_NSTEP_FOLD_T1 / VTL_NSTEP_UNROLL / VTL_SAMPLE_IN_GRAPH)
         "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs",
-        "ones", "zeros", "pending1", "unroll_bursts", "fold_bursts", "g1_steps",
+        "ones", "zeros", "pending1",
     )
 
     def __init__(self) -> None:
@@ -159,10 +163,6 @@ class _Burst:
         self.num_rejected = None # [max_num_reqs] int32, filled with -(N-1)
         self.desc = None         # the FULL descriptor the last step replayed
         self.pending = 0         # burst factor committed for the step being executed
-        self.bursts = 0
-        self.iters = 0
-        self.graph_bursts = 0    # bursts that rode the captured graph (rest ran eager)
-        self.steps = 0           # every sample_tokens call, burst or not
         # --- the in-graph ladder ---
         self.fold = False        # capture the token-1 prologue (VTL_NSTEP_FOLD_T1)
         self.unroll = False      # capture prologue + N-1 bodies as ONE graph
@@ -172,9 +172,6 @@ class _Burst:
         self.ones = None         # [max_num_reqs] int32 filled with 1  (num_sampled, N=1)
         self.zeros = None        # [max_num_reqs] int32 filled with 0  (num_rejected, N=1)
         self.pending1 = False    # in-graph N=1 sampling committed for this step
-        self.unroll_bursts = 0
-        self.fold_bursts = 0
-        self.g1_steps = 0
 
     def disable(self, why: str) -> None:
         """Permanent, process-lifetime fallback to one token per step."""
@@ -686,16 +683,11 @@ def _run_burst(runner, b: _Burst, n: int, ib, hidden):
         if whole is not None and whole[1] == b.desc and whole[2] == n:
             # ONE replay for the whole burst: prologue, N-1 bodies, accumulator tail.
             whole[0].replay()
-            b.bursts += 1
-            b.iters += n
-            b.graph_bursts += 1
-            b.unroll_bursts += 1
             return _burst_output(b, num_reqs, n, SamplerOutput)
 
     pro = b.pro_graphs.get(num_reqs) if folded else None
     if pro is not None and pro[1] == b.desc:
         pro[0].replay()
-        b.fold_bursts += 1
     else:
         # Token 1 from the hidden states the stock forward already produced, host-launched.
         torch.argmax(
@@ -706,7 +698,6 @@ def _run_burst(runner, b: _Burst, n: int, ib, hidden):
         graph = entry[0]
         for _ in range(n - 1):
             graph.replay()
-        b.graph_bursts += 1
     else:
         forward = lambda: runner.cudagraph_manager.run_fullgraph(b.desc)  # noqa: E731
         for j in range(1, n):
@@ -717,8 +708,6 @@ def _run_burst(runner, b: _Burst, n: int, ib, hidden):
     # itself, in-graph, and returned above.)
     b.accum[:num_reqs, n - 1].copy_(b.tok[:num_reqs])
 
-    b.bursts += 1
-    b.iters += n
     return _burst_output(b, num_reqs, n, SamplerOutput)
 
 
@@ -743,7 +732,6 @@ def _sample_one_in_graph(runner, b: _Burst, ib, hidden):
     if not _hidden_is_persistent(runner, hidden, rows):
         return None
     entry[0].replay()
-    b.g1_steps += 1
     return SamplerOutput(
         # CLONED for the same reason the burst's accumulator is: `AsyncOutput` copies it on
         # a second stream and the copy outlives this call.
@@ -861,16 +849,6 @@ def _patch_runner(b: _Burst) -> None:
             one = b.pending1
             b.pending = 0
             b.pending1 = False
-            b.steps += 1
-            if b.steps % 2000 == 0:
-                log.info(
-                    "vtl: nstep engagement -- %d bursts (%d graph / %d eager, "
-                    "%d unrolled / %d folded), %d tokens over %d steps, "
-                    "%d in-graph N=1 samples (mode=%s)",
-                    b.bursts, b.graph_bursts, b.bursts - b.graph_bursts,
-                    b.unroll_bursts, b.fold_bursts, b.iters, b.steps,
-                    b.g1_steps, b.mode,
-                )
             state = self.execute_model_state
             # `grammar_output is not None` cannot happen on a committed burst or a committed
             # in-graph sample (the gate refuses structured output), but a bare argmax would
@@ -1105,17 +1083,16 @@ def _self_check() -> None:
     # most expensive place to find out.
     for name in ("advance", "bump", "idx_map", "max_seq_len", "accum", "tok", "step",
                  "num_sampled", "num_rejected", "desc", "pending", "graphs", "runner",
-                 "armed", "ready", "key", "n", "mode", "bursts", "iters",
-                 "graph_bursts", "steps",
+                 "armed", "ready", "key", "n", "mode",
                  "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs",
-                 "ones", "zeros", "pending1", "unroll_bursts", "fold_bursts", "g1_steps"):
+                 "ones", "zeros", "pending1"):
         setattr(BURST, name, getattr(BURST, name))
     assert set(_Burst.__slots__) == {
         "armed", "ready", "key", "n", "mode", "runner", "graphs", "accum", "tok", "step",
-        "num_sampled", "num_rejected", "desc", "pending", "bursts", "iters",
-        "graph_bursts", "steps", "advance", "bump", "idx_map", "max_seq_len",
+        "num_sampled", "num_rejected", "desc", "pending",
+        "advance", "bump", "idx_map", "max_seq_len",
         "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs", "ones", "zeros",
-        "pending1", "unroll_bursts", "fold_bursts", "g1_steps",
+        "pending1",
     }, "the slot list above and __slots__ must not drift"
 
     # The in-graph ladder demotes ONE rung at a time, and `fold` takes `unroll` with it
