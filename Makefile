@@ -39,7 +39,7 @@ VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
 # success. `make verify` is the check: the "fusion replaced N patterns" count drops back to its
 # pre-hoist value instead of covering the conv layers.
 VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
-VLLM_FORK_TAG ?= v0.25.0-tree@sha256:6c0f6a0649585d398cd20ff3f85e683b7db7643d0861ef745ce09dd40b3fad51
+VLLM_FORK_TAG ?= v0.25.0-tree@sha256:fdc061e37425840f0c2384c7ed165d221258a82a1cb2a8576ca42ad032f3619f
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
