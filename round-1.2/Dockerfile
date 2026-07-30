@@ -44,6 +44,10 @@ ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.0
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS vtl-sched-builder
 ARG VTL_SCHED_RUST_TOOLCHAIN=1.83
 ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:${PATH}
+# Pin the ISA to baseline x86-64 explicitly: the wheel is served on the judge's H200 host,
+# not this builder, so no -native; the pin just keeps a toolchain-default drift from ever
+# emitting newer ISA. amd64 stage only -- local (arm64) cargo test is unaffected.
+ENV RUSTFLAGS="-C target-cpu=x86-64"
 # The toolchain install mirrors Dockerfile.vllm-fork's rust-builder (same rustup one-liner, same
 # -o Dir::Etc::sourceparts=-). Best-effort as a whole: any step of it failing is a network fact.
 RUN mkdir -p /wheels; \
