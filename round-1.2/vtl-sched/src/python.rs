@@ -455,9 +455,24 @@ impl KvManager {
     /// Same return contract as `update_step_pack`: `None` for the record means "not
     /// packable", and on that arm NOTHING is appended to the store, because Python is about
     /// to materialize the whole step back onto the stock path.
+    ///
+    /// `fold_cache` (R9, default `false`): when the step packs, also run each slot's
+    /// `cache_blocks` INSIDE this call instead of `rust_sched.py` doing it one FFI
+    /// crossing per request afterwards. See [`Manager::fold_cache_blocks`]; `false`
+    /// reproduces every existing caller byte-for-byte (no store append either way is
+    /// unaffected, since that is gated on `packed`, not on this flag).
+    ///
+    /// `publish` (Batch 3, default `false`): when the step packs AND the crate's output
+    /// channel is open ([`KvManager::out_open`]), publish the record straight from the
+    /// packer's buffer into the loaned shm sample INSIDE this same locked call -- no
+    /// `Vec<u8>` copy, no `PyBytes`, no output-queue hop to the Python shm thread. On a
+    /// delivered publish the returned record is `None` (nothing left to queue) and
+    /// `published` is `true`; on anything else (not packed, no channel open, or the
+    /// publish itself reported 0 receivers) behaviour is EXACTLY as `publish=false`:
+    /// the caller gets the bytes back and must route them the way it always did.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (sampled, rows, counts, slots, max_model_len, engine_index,
-                        timestamp, finished))]
+                        timestamp, finished, fold_cache=false, publish=false))]
     fn update_step_pack_np(
         &self,
         py: Python<'_>,
@@ -469,7 +484,9 @@ impl KvManager {
         engine_index: u32,
         timestamp: f64,
         finished: Vec<String>,
-    ) -> PyResult<(Vec<(u32, u8, i64)>, Option<Py<PyBytes>>)> {
+        fold_cache: bool,
+        publish: bool,
+    ) -> PyResult<(Vec<(u32, u8, i64)>, Option<Py<PyBytes>>, bool)> {
         let n = slots.len();
         if rows.len() != n || counts.len() != n {
             return Err(PyValueError::new_err(format!(
@@ -497,7 +514,7 @@ impl KvManager {
             flat.extend_from_slice(&arr[row * ncols..row * ncols + cnt]);
         }
         let shared = self.shared.clone();
-        let (verdicts, record) = py
+        let (verdicts, record, published) = py
             .allow_threads(move || {
                 let mut sh = lock_shared(&shared);
                 sh.invalidate();
@@ -509,23 +526,115 @@ impl KvManager {
                     engine_index,
                     timestamp,
                     &finished,
+                    fold_cache,
                 )?;
                 let out: Vec<(u32, u8, i64)> = verdicts
                     .iter()
                     .map(|v| (v.num_accepted, v.status, v.stop_reason))
                     .collect();
+                if packed && publish {
+                    #[cfg(feature = "shm")]
+                    let delivered = match &sh.out {
+                        Some(ch) => ch.publish_record(sh.manager.raw.finish()?),
+                        None => false,
+                    };
+                    #[cfg(not(feature = "shm"))]
+                    let delivered = false;
+                    if delivered {
+                        return Ok::<_, String>((out, None, true));
+                    }
+                }
                 let rec = if packed {
                     Some(sh.manager.raw.finish()?.to_vec())
                 } else {
                     None
                 };
-                Ok::<_, String>((out, rec))
+                Ok::<_, String>((out, rec, false))
             })
             .map_err(err)?;
         Ok((
             verdicts,
             record.map(|r| PyBytes::new_bound(py, &r).unbind()),
+            published,
         ))
+    }
+
+    // ---- Batch 3: crate-owned iceoryx2 output publisher -------------------
+
+    /// Open `vtl/out/<seed>` for this boot's `input_address`. `false` on any failure
+    /// (iceoryx2 refused the pairing, or the wheel was built without the `shm` cargo
+    /// feature) -- the caller's fail-open ladder then builds its own publisher exactly as
+    /// it did before this port. Idempotent: a channel already open for THIS process is left
+    /// alone. `MAX_PUBLISHERS = 1` is baked into the service config on both halves (see
+    /// `out.rs`'s module doc), so once this returns `true` Python must not also construct
+    /// an `_OutputPublisher` -- ownership is exclusive, not shared.
+    #[cfg(feature = "shm")]
+    fn out_open(&self, input_address: &str) -> bool {
+        let mut sh = self.w();
+        if sh.out.is_some() {
+            return true;
+        }
+        match crate::out::OutChannel::open(input_address) {
+            Ok(ch) => {
+                sh.out = Some(ch);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(not(feature = "shm"))]
+    fn out_open(&self, _input_address: &str) -> bool {
+        false
+    }
+
+    /// `true` once `out_open` has succeeded. Read by `rust_sched.py`'s inline-publish
+    /// ordering guard and by `shm_ipc.py` to decide whether a Python `_OutputPublisher` is
+    /// needed at all.
+    #[cfg(feature = "shm")]
+    fn out_is_open(&self) -> bool {
+        self.r().out.is_some()
+    }
+
+    #[cfg(not(feature = "shm"))]
+    fn out_is_open(&self) -> bool {
+        false
+    }
+
+    /// Publish `tag + payload` through the crate's channel (mirrors
+    /// `_OutputPublisher.publish`): the fallback arms in `shm_ipc.py` (msgpack-encoded
+    /// objects, the TAG_DEAD sentinel) call this instead of the iceoryx2 Python bindings,
+    /// now that ownership of the channel has moved into the crate. `false` = no channel
+    /// open, or undelivered (no subscriber / a full buffer) -- the caller's existing ZMQ
+    /// fallback and permanent demotion latch take over exactly as before this port.
+    #[cfg(feature = "shm")]
+    fn out_publish(&self, tag: u8, payload: &Bound<'_, PyBytes>) -> bool {
+        let sh = self.r();
+        match &sh.out {
+            Some(ch) => ch.publish(tag, payload.as_bytes()),
+            None => false,
+        }
+    }
+
+    #[cfg(not(feature = "shm"))]
+    fn out_publish(&self, _tag: u8, _payload: &Bound<'_, PyBytes>) -> bool {
+        false
+    }
+
+    /// Publish an ALREADY-FRAMED record (mirrors `_OutputPublisher.publish_record`): the
+    /// tag byte is whatever the caller's packer wrote at offset 0, copied verbatim.
+    #[cfg(feature = "shm")]
+    fn out_publish_record(&self, record: &Bound<'_, PyBytes>) -> bool {
+        let sh = self.r();
+        match &sh.out {
+            Some(ch) => ch.publish_record(record.as_bytes()),
+            None => false,
+        }
+    }
+
+    #[cfg(not(feature = "shm"))]
+    fn out_publish_record(&self, _record: &Bound<'_, PyBytes>) -> bool {
+        false
     }
 
     // ---- R6b: the resident request table ----------------------------------
@@ -748,6 +857,14 @@ impl KvManager {
     /// Number of blocks currently held by `slot` in `group` — cheap parity probe.
     fn num_blocks(&self, slot: u32, group: usize) -> usize {
         self.w().manager.group_blocks(slot, group).len()
+    }
+
+    /// R9: count of `update_step_pack_np(fold_cache=true)` slots the fold could not apply
+    /// `cache_blocks` to (no resident table entry, or a non-RUNNING one). Should stay 0
+    /// for the lifetime of a correct boot; `rust_sched.py`'s R9 disable latch polls this
+    /// rather than trusting the fold's silence.
+    fn cache_fold_skips(&self) -> u64 {
+        self.r().manager.cache_fold_skips
     }
 
     fn take_prefix_cache_stats<'py>(

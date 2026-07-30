@@ -11,5 +11,8 @@ classifiers = ["Programming Language :: Rust"]
 
 [tool.maturin]
 module-name = "vtl_sched"
-features = ["python", "pyo3/extension-module"]
+# Batch 3: "shm" pulls in the crate-owned iceoryx2 output publisher (src/out.rs). The
+# Dockerfile's plain `cargo test --release` (default features) stays iceoryx2-free either
+# way -- this list only governs the wheel maturin actually ships.
+features = ["python", "shm", "pyo3/extension-module"]
 strip = true

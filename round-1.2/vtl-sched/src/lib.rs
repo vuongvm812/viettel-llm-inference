@@ -16,6 +16,12 @@ pub mod hash;
 /// in it (`Block`, the index snapshots) is one callers must not be able to forge.
 pub(crate) mod journal;
 pub mod manager;
+/// Batch 3: the iceoryx2 output publisher, moved into the crate so the finished R8 record
+/// never has to cross back into Python before it reaches shm. The module itself compiles
+/// under default features (it is where `seed()` and its golden test live -- shared with
+/// `shm_ipc.py::GOLDEN_SEED`); everything that actually touches iceoryx2 is behind the
+/// `shm` cargo feature so default `cargo test` stays dependency-free.
+pub mod out;
 pub mod radix;
 pub mod sched;
 pub mod single_type;

@@ -137,6 +137,20 @@ def modes() -> dict:
         and env_on("VTL_SHM_IPC")
         and env_on("VTL_SHM_IPC_RAW")
     )
+    # Port-2: Rust owns the per-slot token list, counters and block-hash chain. Rides on
+    # R8 (it IS `update_step_pack`, driven off the sampler's numpy array) and on the Rust
+    # hasher -- with two hash implementations live, one would own the prompt blocks and
+    # the other the decode blocks, and a divergence between them is a silent prefix-cache
+    # key-space fork, not an exception. Refuses the two OTHER shadow arms outright: both
+    # keep Python's `append_output_token_ids` authoritative, and the store has already
+    # appended the same tokens by then, so the pair would double-count every token.
+    tokstore = (
+        r8
+        and not env_on("VTL_RUST_SCHED_R8_SHADOW")
+        and not env_on("VTL_RUST_SCHED_UFO_SHADOW")
+        and env_on("VTL_RUST_HASHER")
+        and env_on("VTL_RUST_SCHED_TOKSTORE")
+    )
     return {
         "shadow": env_on("VTL_RUST_SCHED_SHADOW"),
         "strict": env_on("VTL_RUST_SCHED_SHADOW_STRICT"),
@@ -163,32 +177,19 @@ def modes() -> dict:
         # C1a: N-step decode burst commitment. Needs the full Rust loop (the commit
         # extends the resident table in the same place the schedule decisions land).
         "nstep": full and env_on("VTL_NSTEP"),
-        # Port-2: Rust owns the per-slot token list, counters and block-hash chain.
-        #
-        # Rides on R8 (it IS `update_step_pack`, driven off the sampler's numpy array) and on
-        # the Rust hasher -- with two hash implementations live, one would own the prompt
-        # blocks and the other the decode blocks, and a divergence between them is a silent
-        # prefix-cache key-space fork, not an exception.
-        #
-        # ...and refuses the two OTHER shadow arms outright: both keep Python's
-        # `append_output_token_ids` authoritative, and the store has already appended the
-        # same tokens by then, so the pair would double-count every token. Those arms are
-        # diagnostics; the token store simply is not available while one is on.
-        "tokstore": (
-            r8
-            and not env_on("VTL_RUST_SCHED_R8_SHADOW")
-            and not env_on("VTL_RUST_SCHED_UFO_SHADOW")
-            and env_on("VTL_RUST_HASHER")
-            and env_on("VTL_RUST_SCHED_TOKSTORE")
-        ),
-        "tokstore_shadow": (
-            r8
-            and not env_on("VTL_RUST_SCHED_R8_SHADOW")
-            and not env_on("VTL_RUST_SCHED_UFO_SHADOW")
-            and env_on("VTL_RUST_HASHER")
-            and env_on("VTL_RUST_SCHED_TOKSTORE")
-            and env_on("VTL_RUST_SCHED_TOKSTORE_SHADOW")
-        ),
+        "tokstore": tokstore,
+        "tokstore_shadow": tokstore and env_on("VTL_RUST_SCHED_TOKSTORE_SHADOW"),
+        # R9: collapse decide()/r8_apply's per-request Python loops into the single
+        # update_step_pack_np crossing (+ the crate-side cache_blocks fold). Needs the
+        # token store live -- the residue loop's counter writes and the fold's
+        # `num_computed - num_output_placeholders` math both assume Rust already owns the
+        # per-slot bookkeeping tokstore provides. `r9_shadow` is deliberately NOT gated on
+        # `r9` here (same pattern as `ufo_shadow`): it is a pre-flight soak diagnostic --
+        # exercise and diff the batch-cache derivation with the old loop still
+        # authoritative -- runnable before `VTL_RUST_SCHED_R9` is ever flipped on. The
+        # installer combines them (`R9.live = r9 and not r9_shadow`).
+        "r9": tokstore and env_on("VTL_RUST_SCHED_R9"),
+        "r9_shadow": env_on("VTL_RUST_SCHED_R9_SHADOW"),
     }
 
 
@@ -322,6 +323,22 @@ class RustMirror:
         # slots whose stop params are interned (UFO); discarded on drop so a recycled
         # slot re-registers. Owned here because drop() is the one recycling point.
         self._stops: set[int] = set()
+        # slots whose burst eligibility is interned (commit_burst's `_burst_gate`):
+        # value is the cached `lim`, or -1 for a permanently ineligible request.
+        # Discarded on drop for the same reason as `_stops`.
+        self._burst_lim: dict[int, int] = {}
+        # R9: slots proven packable (the 6 `decide()` clauses all passed at least once).
+        # Monotonic within a slot's lifetime -- see `decide()`'s docstring on why the
+        # `prefill_stats` one-shot latch makes that safe -- and discarded on drop like
+        # `_stops`/`_burst_lim` so a recycled slot re-proves itself.
+        self._pack_ok: set[int] = set()
+        # R9: the previous step's batch derivation, `(req_id_to_index, slots, rows,
+        # requests)`, keyed by IDENTITY of the first element. `req_id_to_index` is the
+        # SAME dict object across repeat decode steps (hotpath_microopt.patch), so an
+        # identity hit means "the exact same requests, same order" without walking them.
+        # `None` when nothing is cached; invalidated (see call sites) rather than trusted
+        # across anything that could change the request set or its facade state.
+        self._batch_cache = None
 
     def slot(self, request) -> int:
         rid = request.request_id
@@ -348,6 +365,12 @@ class RustMirror:
         if slot is not None:
             self._pushed.pop(slot, None)
             self._stops.discard(slot)
+            self._burst_lim.pop(slot, None)
+            self._pack_ok.discard(slot)
+            # A freed slot may have been part of the cached batch; the cheapest correct
+            # thing is to drop the whole cache rather than reason about which requests
+            # it still names correctly.
+            self._batch_cache = None
             self.rust.forget(request_id)
 
 
@@ -711,6 +734,20 @@ def _install_authority(base, mirror_modes):
                 raise RuntimeError(f"VTL_RUST_SCHED=1 but config unsupported: {reason}")
             self._rust = vtl_sched.KvManager(cfg)
             self._mirror = RustMirror(self._rust)
+            # Batch 3: hand the crate's KvManager to shm_ipc's output thread, which is the
+            # one place that actually knows this boot's `input_address` (`self.addresses`
+            # lives on EngineCoreProc, not here). shm_ipc calls `out_open` itself, lazily,
+            # once it starts -- registering here just makes the handle reachable. Cheap and
+            # harmless if the gate ends up off: an unread registration is a no-op.
+            if env_on("VTL_SHM_IPC_RUST_PUB"):
+                try:
+                    from vtl.patches import shm_ipc
+
+                    shm_ipc.register_rust_kv(self._rust)
+                except Exception:
+                    log.exception(
+                        "rust_sched: could not register the rust kv handle with shm_ipc"
+                    )
             # R6b/R6c state. Always constructed (cheap); the gates decide who reads it.
             self._vtl_table = TableState()
             self._empty = RustBlocks(tuple([] for _ in range(self._rust.num_groups)))
@@ -876,6 +913,9 @@ def _install_authority(base, mirror_modes):
 
         def reset_prefix_cache(self):
             self._vtl_table.resync("reset_prefix_cache")
+            # R9: a whole-pool event invalidates whatever the batch cache assumed about
+            # cached block state (folded `cache_blocks` calls included).
+            self._mirror._batch_cache = None
             return self._rust.reset_prefix_cache()
 
         def get_num_common_prefix_blocks(self, running_request_id):
@@ -1155,6 +1195,65 @@ def burst_request_blocked(request, computed_before: int, n: int, block_size: int
     return burst_sampler_blocked(request, computed_before, n, max_model_len)
 
 
+def _burst_immutable_blocked(request) -> str | None:
+    """The request-immutable subset of ``burst_sampler_blocked``'s clauses -- everything
+    sourced from ``sampling_params``/``resumable``/``use_structured_output``, none of
+    which change after admission. Split out so ``_burst_gate`` can intern it once per
+    slot instead of re-evaluating it every step. Excludes the placeholder count and the
+    length-cap arithmetic, both of which move every step.
+    """
+    sp = request.sampling_params
+    if sp is None or request.pooling_params is not None:
+        return "not a generation request"
+    if getattr(request, "resumable", False) or request.use_structured_output:
+        return "resumable or structured-output request"
+    if sp.temperature != 0.0:
+        return "not greedy"
+    if sp.logprobs is not None or sp.prompt_logprobs is not None:
+        return "logprobs requested"
+    if getattr(sp, "min_tokens", 0):
+        return "min_tokens masking is not applied by the burst argmax"
+    if sp.bad_words or sp.allowed_token_ids or sp.logit_bias:
+        return "logit-modifying sampling params"
+    if sp.presence_penalty or sp.frequency_penalty or sp.repetition_penalty != 1.0:
+        return "penalties"
+    return None
+
+
+def _burst_gate(mirror, slot: int, request, computed_before: int, n: int,
+                max_model_len: int, block_size: int | None = None) -> str | None:
+    """``burst_request_blocked``/``burst_sampler_blocked``, with the immutable clauses
+    interned per slot in ``mirror._burst_lim`` (RustMirror-owned, popped on ``drop()``
+    so a recycled slot re-evaluates). First sight of a slot pays the full
+    ``_burst_immutable_blocked`` check once and caches ``lim = min(max_model_len,
+    num_prompt_tokens + max_tokens)``, or ``-1`` if permanently ineligible. Every later
+    step only re-checks what a step can actually change: the align gate (when
+    ``block_size`` is given), the placeholder count, and the length-cap arithmetic
+    against the cached ``lim``.
+
+    ``block_size is None`` skips the align gate -- the N=1 in-graph path doesn't need
+    it (one token crosses no block boundary; see ``burst_sampler_blocked``'s
+    docstring).
+    """
+    lim = mirror._burst_lim.get(slot)
+    if lim is None:
+        reason = _burst_immutable_blocked(request)
+        if reason is not None:
+            mirror._burst_lim[slot] = -1
+            return reason
+        max_tokens = getattr(request, "max_tokens", None) or 0
+        lim = mirror._burst_lim[slot] = min(max_model_len, request.num_prompt_tokens + max_tokens)
+    elif lim < 0:
+        return "ineligible request (interned)"
+    if block_size is not None and computed_before % block_size + n > block_size:
+        return "burst would cross a block boundary"
+    if request.num_output_placeholders < 0:
+        return "negative placeholder count"
+    if computed_before + n > lim:
+        return "burst would run past max_tokens / max_model_len"
+    return None
+
+
 def burst_commit(request, delta: int) -> None:
     """Advance one request by the ``delta`` extra tokens the burst will compute.
 
@@ -1206,6 +1305,22 @@ def pack_req(slot: int, request) -> tuple:
         bool(getattr(request, "is_prefill_chunk", False)),
         bool(request.skip_reading_prefix_cache),
     )
+
+
+def r9_batch_diff(cached_slots: list, cached_rows: list, gathered_counts: list,
+                   fresh_slots: list, fresh_rows: list, fresh_counts: list) -> str | None:
+    """R9_SHADOW: what ``mirror._batch_cache`` PREDICTS this step against what the full
+    per-request loop actually built, compared BEFORE the FFI fires so a divergence is
+    caught before ``fold_cache`` could ever act on it. Returns the mismatching field's
+    name (used as the once-per-boot-per-kind log key) or ``None``. Pure -- self-checked.
+    """
+    if cached_slots != fresh_slots:
+        return "slots"
+    if cached_rows != fresh_rows:
+        return "rows"
+    if gathered_counts != fresh_counts:
+        return "counts"
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -1264,6 +1379,124 @@ class _TokState:
 
 
 TOK = _TokState()
+
+
+class _R9State:
+    """R9 process state -- same shape as ``_TokState``/``nstep_decode.BURST``: one engine
+    core per process, so a module global is the whole lifetime story.
+
+    ``live`` gates taking the collapsed FFI-plus-residue path (fold_cache=True included);
+    ``shadow`` gates running the batch-cache derivation as a diagnostic ALONGSIDE the old
+    loop, which stays authoritative. Both are resolved once at install time from the env
+    gates, then only ever move towards ``False`` -- ``disable()`` is the sole mutator
+    after that, mirroring ``TOK.disable``'s boot-lifetime latch.
+    """
+
+    __slots__ = ("live", "shadow", "checks", "warned_kinds")
+
+    def __init__(self) -> None:
+        self.live = False
+        self.shadow = False
+        self.checks = 0
+        self.warned_kinds: set = set()
+
+    def disable(self, why: str) -> None:
+        if self.live or self.shadow:
+            log.error("rust_sched: R9 disabled for this boot -- %s", why)
+        self.live = False
+        self.shadow = False
+
+    def warn_once(self, kind: str, msg: str, *args) -> None:
+        """One ERROR per mismatch KIND per boot -- a soak that finds the same divergence
+        every step must not flood the log the way an unbounded one would."""
+        if kind not in self.warned_kinds:
+            self.warned_kinds.add(kind)
+            log.error(msg, *args)
+
+
+R9 = _R9State()
+
+
+def _pack_ok_clauses(request) -> bool:
+    """The 6-clause check the R8 record has no slot for: a second client index, a
+    resumable session's re-enqueue, encoder-cache frees, trace headers, prefill stats or
+    lifecycle events. ``decide()`` interns a ``True`` result per slot in
+    ``RustMirror._pack_ok`` instead of re-running this every step -- see that field's
+    docstring for why the one mutable member (``prefill_stats``, a one-shot latch) is
+    still safe to cache forever once cleared. Pure -- self-checked.
+    """
+    return (
+        request.client_index == 0
+        and not request.resumable
+        and not request.has_encoder_inputs
+        and request.trace_headers is None
+        and request.prefill_stats is None
+        and not request.events
+    )
+
+
+def _r9_cache_hit_counts(cache, r2i, sampled_counts):
+    """R9's fast-hit guard, factored out of ``decide()`` so it is unit-testable without a
+    live crate: an identity check plus a cheap numpy gather plus a zero-count guard.
+
+    ``cache`` is ``mirror._batch_cache`` (``(r2i, slots, rows, requests)`` or ``None``);
+    ``r2i`` is THIS step's ``model_runner_output.req_id_to_index``; ``sampled_counts`` is
+    the sampler's per-row count array (``LazySampled.counts``). Returns the gathered
+    per-cached-row counts as a plain list on a usable hit, or ``None`` on any miss --
+    no cache, an identity mismatch, or a prefill chunk (a zero anywhere in the gather)
+    changing which rows belong in the batch this step. Pure -- self-checked.
+    """
+    if cache is None or cache[0] is not r2i:
+        return None
+    _, _slots, rows, _requests = cache
+    counts = sampled_counts[rows]
+    if bool((counts == 0).any()):
+        return None
+    return counts.tolist()
+
+
+def _r9_maybe_check_fold_skips(rust) -> None:
+    """R9: ``cache_fold_skips()`` is the loud version of ``table_with``'s silent skip.
+    Cheap to call every step, but every-4096 is cheaper still, and the hazard -- if it
+    exists at all -- does not need step-granularity detection."""
+    R9.checks += 1
+    if R9.checks & 0xFFF:
+        return
+    try:
+        skips = rust.cache_fold_skips()
+    except BaseException as exc:
+        reraise_fatal(exc)
+        return
+    if skips:
+        R9.disable(f"cache_fold_skips={skips} (table_with silent-skip hazard fired)")
+
+
+def _r9_shadow_check(mirror, model_runner_output, sampled, slots, rows, counts) -> None:
+    """``VTL_RUST_SCHED_R9_SHADOW``: diff the cache's prediction for THIS step against
+    what the (still-authoritative) full per-request loop just built, BEFORE the real FFI
+    call -- see ``r9_batch_diff``. Any mismatch disables R9 for the boot; the old loop
+    never stops being authoritative in shadow mode, so a mismatch costs a log line, not
+    correctness.
+    """
+    cache = mirror._batch_cache
+    if cache is None or cache[0] is not model_runner_output.req_id_to_index:
+        return
+    _, c_slots, c_rows, _c_requests = cache
+    try:
+        gathered = sampled.counts[c_rows].tolist()
+        kind = r9_batch_diff(c_slots, c_rows, gathered, slots, rows, counts)
+    except BaseException as exc:
+        reraise_fatal(exc)
+        kind = "diff-raised"
+    if kind is None:
+        return
+    R9.warn_once(
+        kind,
+        "rust_sched: R9 shadow divergence in %s -- cached(slots=%r rows=%r) "
+        "fresh(slots=%r rows=%r counts=%r)",
+        kind, c_slots, c_rows, slots, rows, counts,
+    )
+    R9.disable(f"shadow divergence in {kind}")
 
 
 class _Row:
@@ -1552,6 +1785,75 @@ def _install_async_output() -> None:
     AsyncOutput.get_output = mark_patched(get_output, original, patch="rust_sched_tokstore")
 
 
+def _install_async_output_event_ring() -> None:
+    """One-liner 5d: ``AsyncOutput.__init__`` allocates a fresh ``torch.cuda.Event``
+    every decode step just to sleep-wait on it once in ``get_output``; a small
+    pre-created ring removes that allocation from the hot path.
+
+    Verbatim copy of the stock body (``vllm/v1/worker/gpu/async_utils.py:13-47``,
+    reference only -- never edited) except the event line, implemented as a monkeypatch
+    so it needs no fork patch or rebuild. Correctness: ``AsyncModelRunnerOutput`` overlaps
+    at most ``max_concurrent_batches`` (2) steps' copies at once; the ring is 4 slots, so
+    reusing slot ``i`` again is always at least 2 calls after the one before it recorded
+    -- by then that earlier copy has long since been synchronized on. Reusing an event can
+    only make a `.synchronize()` wait a little longer for a copy that was already
+    in-flight; it can never return before the copy it is meant to guard finishes. Fail
+    open: any exception at install time (no CUDA available, a vLLM signature change)
+    leaves the stock per-call ``torch.cuda.Event`` in place.
+    """
+    try:
+        import torch
+
+        from vllm.v1.worker.gpu import async_utils
+
+        AsyncOutput = async_utils.AsyncOutput
+        if already_patched(AsyncOutput, "__init__", patch="rust_sched_event_ring"):
+            return
+        original_init = AsyncOutput.__init__
+
+        ring = [torch.cuda.Event(blocking=True) for _ in range(4)]
+        counter = [0]
+
+        def __init__(self, model_runner_output, sampler_output, num_sampled_tokens,
+                     main_stream, copy_stream):
+            self.model_runner_output = model_runner_output
+            self.sampler_output = sampler_output
+            self.num_sampled_tokens = num_sampled_tokens
+            # The only change from stock: a ring slot instead of a fresh allocation.
+            self.copy_event = ring[counter[0] % len(ring)]
+            counter[0] += 1
+
+            with async_utils.stream(copy_stream, main_stream):
+                copy_stream.wait_stream(main_stream)
+                self.sampled_token_ids = async_utils.async_copy_to_np(
+                    sampler_output.sampled_token_ids
+                )
+                self.logprobs_tensors = None
+                if sampler_output.logprobs_tensors is not None:
+                    self.logprobs_tensors = (
+                        sampler_output.logprobs_tensors.to_cpu_nonblocking()
+                    )
+                self.num_nans = None
+                if sampler_output.num_nans is not None:
+                    self.num_nans = async_utils.async_copy_to_np(sampler_output.num_nans)
+                self.num_sampled_tokens_np = async_utils.async_copy_to_np(num_sampled_tokens)
+                self.prompt_logprobs_dict = {
+                    k: v.to_cpu_nonblocking() if v is not None else None
+                    for k, v in self.model_runner_output.prompt_logprobs_dict.items()
+                }
+                self.copy_event.record(copy_stream)
+
+        AsyncOutput.__init__ = mark_patched(
+            __init__, original_init, patch="rust_sched_event_ring"
+        )
+        log.info("rust_sched: AsyncOutput event ring installed (4 pre-created events)")
+    except BaseException as exc:
+        reraise_fatal(exc)
+        log.exception(
+            "rust_sched: AsyncOutput event ring not installed; stock per-call event"
+        )
+
+
 def _install_update_from_output(scheduler_cls, m: dict):
     """R6a -- one Rust call per step for the whole batch's stop decision.
 
@@ -1586,6 +1888,16 @@ def _install_update_from_output(scheduler_cls, m: dict):
     TOK.shadow = m["tokstore_shadow"]
     TOK.live = STORE and not TOK.shadow
 
+    # R9: the collapsed FFI + residue loop. `R9.live` decides whether decide() folds
+    # `cache_blocks` in and whether `update_from_output` uses the residue loop instead of
+    # `r8_apply`; `R9.shadow` keeps the old loop authoritative but still exercises the
+    # batch-cache derivation (and diffs it) as a soak-testable diagnostic -- see
+    # `r9_batch_diff`. Both live on the module singleton, not a closure cell, because
+    # `R9.disable()` must be reachable from inside `decide()`'s per-step checks and stay
+    # disabled for the rest of the boot, same contract as `TOK.disable`.
+    R9.live = m["r9"] and not m["r9_shadow"]
+    R9.shadow = m["r9_shadow"]
+
     # R8 emits `bytes` onto the output queue, which ONLY `shm_ipc`'s replacement output
     # thread understands -- stock's would do `outputs.engine_index = ...` on a bytes and
     # take EngineCore down. The env gates are not proof that module installed
@@ -1611,6 +1923,39 @@ def _install_update_from_output(scheduler_cls, m: dict):
                     )
                 _r8[0] = ok
         return _r8[0]
+
+    # Batch 3: inline-publish ordering guard. `shm_ipc.PUB` holds two single-writer
+    # counters -- `enqueued` bumped here (the engine thread) whenever a step's output goes
+    # to the queue, `published` bumped by the output thread after each queue item is
+    # actually sent. Publishing straight from the crate is only safe when the two agree
+    # (no backlog): otherwise an inline publish could overtake an item still in flight
+    # through the queue and reorder the wire stream. Resolved EAGERLY (unlike `r8_live`,
+    # which waits on `shm_ipc.apply()`'s state) because `PUB` is a plain module singleton
+    # that exists the moment the module imports -- the two counters must start from the
+    # same step or their gap never closes.
+    _pub_mod = None
+    if env_on("VTL_SHM_IPC_RUST_PUB"):
+        try:
+            from vtl.patches import shm_ipc as _pub_mod
+        except Exception:
+            log.exception("rust_sched: shm_ipc not importable; VTL_SHM_IPC_RUST_PUB inert")
+            _pub_mod = None
+
+    def bump_enqueued() -> None:
+        if _pub_mod is not None:
+            _pub_mod.PUB.enqueued += 1
+
+    def out_publish_ready(rust) -> bool:
+        if _pub_mod is None:
+            return False
+        try:
+            if not rust.out_is_open():
+                return False
+        except BaseException as exc:
+            reraise_fatal(exc)
+            return False
+        return _pub_mod.PUB.enqueued == _pub_mod.PUB.published
+
     wrapped_ufo = scheduler_cls.update_from_output
     wrapped_urwo = scheduler_cls._update_request_with_output
     monotonic = time.monotonic
@@ -1722,10 +2067,49 @@ def _install_update_from_output(scheduler_cls, m: dict):
         store, and no token id is ever turned into a Python int. ``lazy`` goes False the
         moment anything in the batch cannot ride that path, and the tail then materializes
         the step back onto the object path before it hands over.
+
+        R9 (needs the token store): ``mirror._batch_cache`` remembers the last step's
+        ``(slots, rows, requests)`` keyed on IDENTITY of ``req_id_to_index`` (the
+        hotpath_microopt fork patch keeps that dict the SAME OBJECT across repeat decode
+        steps). A hit skips the whole per-request loop below -- one numpy gather off the
+        sampler's own count array stands in for it -- and folds each slot's ``cache_blocks``
+        into the crossing (``fold_cache=True``) instead of a per-request FFI afterwards.
         """
         rust, mirror = kv._rust, kv._mirror
         sampled = model_runner_output.sampled_token_ids
         lazy = TOK.live and pack and isinstance(sampled, LazySampled)
+
+        if R9.live and lazy:
+            cache = mirror._batch_cache
+            counts = _r9_cache_hit_counts(
+                cache, model_runner_output.req_id_to_index, sampled.counts
+            )
+            # `counts is None` covers every miss reason at once: no cache, an identity
+            # mismatch, or a prefill chunk (zero-count row) in an otherwise-identical
+            # batch -- fall through to the full loop rather than guess which row it was.
+            if counts is not None:
+                _, c_slots, c_rows, c_requests = cache
+                out, record, published = rust.update_step_pack_np(
+                    sampled.arr, c_rows, counts, c_slots, int(self.max_model_len),
+                    0, monotonic(), (), fold_cache=True, publish=out_publish_ready(rust),
+                )
+                self._vtl_r8_record = record
+                self._vtl_r8_published = published
+                _r9_maybe_check_fold_skips(rust)
+                if record is not None or published:
+                    self._vtl_r9_residue = list(zip(c_slots, c_requests, out))
+                    return {}
+                # Rust refused the record for a reason neither the identity nor the
+                # zero-count check anticipated (e.g. a slot lost its interned name). The
+                # verdicts are still real -- `wrapped_ufo`'s per-request fallback must see
+                # them, same contract as the miss path below -- but the cache itself is
+                # suspect, so drop it and re-derive from scratch.
+                mirror._batch_cache = None
+                return {
+                    r.request_id: (c, *v)
+                    for r, c, v in zip(c_requests, counts, out)
+                }
+
         slots: list[int] = []
         rows: list[int] = []
         counts: list[int] = []
@@ -1747,19 +2131,21 @@ def _install_update_from_output(scheduler_cls, m: dict):
                 self._vtl_ufo_clean = False
                 pack = False
                 continue
-            if pack and not (
-                request.client_index == 0
-                and not request.resumable
-                and not request.has_encoder_inputs
-                and request.trace_headers is None
-                and request.prefill_stats is None
-                and not request.events
-            ):
-                # The record has no slot for any of these: a second client index, a
-                # resumable session's re-enqueue, encoder-cache frees, trace headers,
-                # prefill stats or lifecycle events. Objects for the whole step instead.
-                pack = False
             slot = mirror.slot(request)
+            if pack:
+                # R9: the six clauses are all request-immutable once true (see
+                # `RustMirror._pack_ok`'s docstring on why `prefill_stats` -- the one
+                # mutable member -- is still safe to intern), so a proven-packable slot
+                # is a set lookup instead of six attribute reads every step.
+                if slot in mirror._pack_ok:
+                    pass
+                elif _pack_ok_clauses(request):
+                    mirror._pack_ok.add(slot)
+                else:
+                    # The record has no slot for any of these: a second client index, a
+                    # resumable session's re-enqueue, encoder-cache frees, trace headers,
+                    # prefill stats or lifecycle events. Objects for the whole step.
+                    pack = False
             # Python-side registry, same rationale as RustMirror._pushed: asking Rust
             # `has_stop_params` here was one FFI crossing per request per step to re-learn
             # a fact only this module changes. register() overwrites, so a lost entry
@@ -1788,12 +2174,29 @@ def _install_update_from_output(scheduler_cls, m: dict):
         if not slots:
             return None
         if lazy and pack:
-            out, record = rust.update_step_pack_np(
+            req_only = None
+            if R9.live or R9.shadow:
+                req_only = [r for _rid, _n, r in expect]
+                if R9.shadow:
+                    _r9_shadow_check(mirror, model_runner_output, sampled, slots, rows, counts)
+                mirror._batch_cache = (model_runner_output.req_id_to_index, slots, rows, req_only)
+            # Inline publish is scoped to the R9 residue path (below): only `r9_apply`
+            # checks `_vtl_r8_published` to skip the queue put, so attempting it while R9
+            # is off would strand the record (never queued, never published in the sense
+            # `r8_apply` understands). `and` short-circuits, so `out_publish_ready` (and
+            # the `shm_ipc` import it triggers) never runs on a non-R9 boot.
+            want_publish = R9.live and out_publish_ready(rust)
+            out, record, published = rust.update_step_pack_np(
                 sampled.arr, rows, counts, slots, int(self.max_model_len),
-                0, monotonic(), (),
+                0, monotonic(), (), fold_cache=R9.live, publish=want_publish,
             )
             self._vtl_r8_record = record
-            # `record is None` (Rust refused the pack) is NOT handled here on purpose:
+            self._vtl_r8_published = published
+            if R9.live:
+                _r9_maybe_check_fold_skips(rust)
+                if record is not None or published:
+                    self._vtl_r9_residue = list(zip(slots, req_only, out))
+            # `record is None and not published` (Rust refused the pack) is NOT handled here on purpose:
             # `update_from_output` then takes the `wrapped_ufo` arm, whose
             # `store_full_fallback` guard is strictly wider than anything this loop saw.
             # Rust appended nothing to the store on that arm, so Python owns the append.
@@ -1910,6 +2313,67 @@ def _install_update_from_output(scheduler_cls, m: dict):
             self.waiting.remove_requests(stopped_preempted)
         return {0: self._vtl_r8_record}
 
+    def r9_apply(self, residue):
+        """R9: the residue loop replacing ``r8_apply`` when ``decide()`` took the
+        collapsed FFI path (fast-hit OR the miss path's lazy branch, both set
+        ``self._vtl_r9_residue``).
+
+        ``residue`` is ``list[(slot, request, (num_accepted, status, stop_reason))]``,
+        built by ``decide()`` straight from arrays it already had -- no re-walk of
+        ``req_id_to_index``, no ``sampled[index]`` lookup, no
+        ``_update_request_with_output`` call. The four attribute writes are the facade
+        branch of ``_urwo_inner`` (the fold already ran ``cache_blocks``, so that
+        per-request FFI is gone too); the burst reconcile is ``reconcile_burst`` verbatim,
+        read off the verdict instead of re-derived by calling ``_update_request_with_output``;
+        the finished-request bookkeeping is ``r8_apply`` verbatim.
+        """
+        burst_n = self._vtl_burst_n
+        rust = self.kv_cache_manager._rust
+        stopped_running = None
+        stopped_preempted = None
+        for slot, request, (acc, status, stop_reason) in residue:
+            request.num_tokens += acc
+            request.num_tokens_with_spec += acc
+            request.num_output_tokens += acc
+            request.num_output_placeholders = max(0, request.num_output_placeholders - acc)
+            # `reconcile_burst`'s arithmetic, inlined: a burst that stopped short (or
+            # whose runner produced fewer tokens than committed) gives the surplus back
+            # to both the request and the resident table.
+            short = burst_n - acc
+            if short > 0:
+                burst_uncommit(request, short)
+                rust.table_burst([slot], -short)
+            if status == 0:
+                continue
+            status_before = request.status
+            request.status = _STATUS_FROM_CODE[status]
+            if stop_reason >= 0:
+                request.stop_reason = stop_reason
+            # `resumable` is refused by decide(), so _handle_stopped_request is the
+            # constant-True branch; call it anyway so a future resumable request cannot
+            # silently take a path that skips the streaming re-enqueue.
+            if self._handle_stopped_request(request):
+                self._free_request(request)
+            if status_before == RequestStatus.RUNNING:
+                if stopped_running is None:
+                    stopped_running = set()
+                stopped_running.add(request)
+            else:
+                if stopped_preempted is None:
+                    stopped_preempted = set()
+                stopped_preempted.add(request)
+        if stopped_running:
+            self.running = remove_all(self.running, stopped_running)
+        if stopped_preempted:
+            self.waiting.remove_requests(stopped_preempted)
+        # Batch 3: `decide()` already delivered the record straight from the crate --
+        # nothing left to queue. `EngineCoreProc._process_engine_step` does
+        # `for output in outputs.items() if outputs else ()`, so an EMPTY dict here means
+        # the step's output never reaches `output_queue.put_nowait` at all.
+        if self._vtl_r8_published:
+            return {}
+        return {0: self._vtl_r8_record}
+
     def maybe_kick(self, kv):
         """Arm the next step's speculation. Called once wrapped_ufo has returned, so every
         ``_free_request`` -> ``kv.free`` of this step has already landed in the Rust pool.
@@ -1951,6 +2415,8 @@ def _install_update_from_output(scheduler_cls, m: dict):
     def update_from_output(self, scheduler_output, model_runner_output):
         self._vtl_ufo = None
         self._vtl_r8_record = None
+        self._vtl_r8_published = False
+        self._vtl_r9_residue = None
         # C1a side channel: how many tokens THIS step's schedule committed to. Read once
         # per step (not per request) so the reconcile stays FIFO-correct under async
         # scheduling, where two steps are in flight and each has its own factor.
@@ -1977,6 +2443,13 @@ def _install_update_from_output(scheduler_cls, m: dict):
                 log.exception("rust_sched: UFO batch failed; this step uses check_stop")
                 self._vtl_ufo = None
                 self._vtl_r8_record = None
+                self._vtl_r8_published = False
+                self._vtl_r9_residue = None
+                # An exception mid-derivation may have left the cache half-built or
+                # pointed at requests this step is about to fall back on.
+                mirror = getattr(kv, "_mirror", None)
+                if mirror is not None:
+                    mirror._batch_cache = None
             if self._vtl_ufo is None:
                 self._vtl_ufo_clean = False
         elif sampled:
@@ -1984,8 +2457,14 @@ def _install_update_from_output(scheduler_cls, m: dict):
             # whole batch, so update_step applied no delta at all.
             self._vtl_ufo_clean = False
         try:
-            if self._vtl_r8_record is not None and not r8_shadow:
-                outputs = r8_apply(self, model_runner_output)
+            # `or self._vtl_r8_published`: Batch 3's inline-delivered case leaves the
+            # record itself `None` (nothing left to copy into a `PyBytes`), so the record
+            # alone no longer distinguishes "packed" from "refused" -- see `decide()`.
+            if (self._vtl_r8_record is not None or self._vtl_r8_published) and not r8_shadow:
+                if self._vtl_r9_residue is not None:
+                    outputs = r9_apply(self, self._vtl_r9_residue)
+                else:
+                    outputs = r8_apply(self, model_runner_output)
             else:
                 if TOK.live:
                     # THE COMPLETE GUARD. Stock's loop walks
@@ -2006,10 +2485,17 @@ def _install_update_from_output(scheduler_cls, m: dict):
         finally:
             self._vtl_ufo = None
             self._vtl_r8_record = None
+            self._vtl_r8_published = False
+            self._vtl_r9_residue = None
             self._vtl_burst_n = 1
             self._vtl_tok_shadow = None
         if spec:
             maybe_kick(self, kv)
+        if outputs:
+            # Batch 3 ordering guard: count every item this step hands to
+            # `EngineCoreProc._process_engine_step` for `output_queue.put_nowait` -- an
+            # inline-published step returns `{}` above and is correctly NOT counted here.
+            bump_enqueued()
         return outputs
 
     def r8_compare(self, outputs) -> None:
@@ -2145,6 +2631,8 @@ def _install_update_from_output(scheduler_cls, m: dict):
     scheduler_cls._vtl_ufo = None
     scheduler_cls._vtl_ufo_clean = True
     scheduler_cls._vtl_r8_record = None
+    scheduler_cls._vtl_r8_published = False
+    scheduler_cls._vtl_r9_residue = None
     scheduler_cls._vtl_burst_n = 1
     scheduler_cls._vtl_tok_shadow = None
     mark_patched(update_from_output, wrapped_ufo, patch="rust_sched_ufo")
@@ -2157,9 +2645,10 @@ def _install_update_from_output(scheduler_cls, m: dict):
             _install_async_output()
     log.info(
         "rust_sched: UFO batched stop decision active "
-        "(shadow=%s, kick=%s, r8=%s%s, tokstore=%s%s)",
+        "(shadow=%s, kick=%s, r8=%s%s, tokstore=%s%s, r9=%s%s)",
         shadow, spec, _r8[0], " SHADOW" if r8_shadow else "",
         STORE, " SHADOW" if TOK.shadow else "",
+        R9.live, " SHADOW" if R9.shadow else "",
     )
 
 
@@ -2180,6 +2669,12 @@ def _install_preempt_hook(scheduler_cls) -> None:
     def _preempt_request(self, request, *args, **kwargs):
         if facaded(request):
             tok_materialize(self.kv_cache_manager, request)
+        # R9: a preempted request may be part of the cached batch (or about to be
+        # re-admitted with a different slot); the cheapest correct thing is to drop the
+        # whole cache rather than reason about which rows it still names correctly.
+        mirror = getattr(self.kv_cache_manager, "_mirror", None)
+        if mirror is not None:
+            mirror._batch_cache = None
         return wrapped(self, request, *args, **kwargs)
 
     scheduler_cls._preempt_request = mark_patched(
@@ -2260,7 +2755,8 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         TWO COMMITS, ONE GATE. The burst needs the align gate and the queue-empty guard;
         in-graph N=1 sampling needs neither (one token crosses no block boundary and delays
         no admission), so a step the burst refuses can still commit the cheaper rung. The
-        shared predicates are ``burst_blocked_batch`` / ``burst_sampler_blocked``.
+        shared predicates are ``burst_blocked_batch`` / ``_burst_gate`` (the latter interns
+        ``burst_sampler_blocked``'s request-immutable clauses per slot; see its docstring).
 
         Silent no-op on every ineligible step. On ANY exception the burst is disabled for the
         boot and the step is a plain one-token step: nothing has been mutated at that point
@@ -2277,6 +2773,7 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 skip_note(self, batch_why)
                 return
             slots = [slot for slot, _ in decisions["scheduled_running"]]
+            mirror = kv._mirror
             # `- 1`: num_computed_tokens as it was BEFORE _update_after_schedule advanced it.
             if n >= 2:
                 why = None
@@ -2286,9 +2783,9 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     block_size = self.cache_config.block_size
                     for slot in slots:
                         request = by_slot[slot]
-                        why = burst_request_blocked(
-                            request, request.num_computed_tokens - 1, n,
-                            block_size, self.max_model_len,
+                        why = _burst_gate(
+                            mirror, slot, request, request.num_computed_tokens - 1, n,
+                            self.max_model_len, block_size,
                         )
                         if why is not None:
                             break
@@ -2297,6 +2794,12 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     for slot in slots:
                         burst_commit(by_slot[slot], delta)
                     kv._rust.table_burst(slots, delta)
+                    self._vtl_burst_commits = c = getattr(self, "_vtl_burst_commits", 0) + 1
+                    if c == 1 or not c & 0x1FFF:
+                        log.info(
+                            "rust_sched: nstep engaged -- %d bursts committed (n=%d, batch=%d)",
+                            c, n, len(slots),
+                        )
                     so.vtl_burst_n = n
                     return
                 skip_note(self, why)
@@ -2304,14 +2807,18 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 why = None
                 for slot in slots:
                     request = by_slot[slot]
-                    why = burst_sampler_blocked(
-                        request, request.num_computed_tokens - 1, 1, self.max_model_len
+                    why = _burst_gate(
+                        mirror, slot, request, request.num_computed_tokens - 1, 1,
+                        self.max_model_len,
                     )
                     if why is not None:
                         break
                 if why is None:
                     # No bookkeeping at all: one token is exactly what the step already
                     # committed to, so only the SAMPLING path changes.
+                    if not getattr(self, "_vtl_sample_in_graph_logged", False):
+                        self._vtl_sample_in_graph_logged = True
+                        log.info("rust_sched: in-graph sampling engaged")
                     so.vtl_sample_in_graph = True
                     return
                 skip_note(self, f"in-graph sampling: {why}")
@@ -2714,6 +3221,10 @@ def _install_generation_hooks(scheduler_cls):
 
 @register_patch("rust_sched", default=False)
 def apply() -> None:
+    # One-liner 5d: independent of every gate below (no vtl_sched extension needed, no
+    # scheduler surface touched) -- see `_install_async_output_event_ring`'s docstring.
+    _install_async_output_event_ring()
+
     m = modes()
     if not (m["shadow"] or m["authority"] or m["hasher"]):
         log.info("rust_sched: no mode selected, nothing installed")
@@ -2825,6 +3336,7 @@ def _self_check() -> None:
         "VTL_RUST_SCHED_R8", "VTL_RUST_SCHED_R8_SHADOW", "VTL_RUST_HASHER",
         "VTL_SHM_IPC", "VTL_SHM_IPC_RAW", "VTL_NSTEP",
         "VTL_RUST_SCHED_TOKSTORE", "VTL_RUST_SCHED_TOKSTORE_SHADOW",
+        "VTL_RUST_SCHED_R9", "VTL_RUST_SCHED_R9_SHADOW",
     )}
     try:
         for k in saved:
@@ -2835,6 +3347,7 @@ def _self_check() -> None:
             "table": False, "table_shadow": False, "spec": False, "timing": False,
             "r8": False, "r8_shadow": False, "hasher": False, "nstep": False,
             "tokstore": False, "tokstore_shadow": False,
+            "r9": False, "r9_shadow": False,
         }, modes()
         assert env_on("VTL_RUST_SCHED") is False
         for truthy in ("1", "true", "YES", " on "):
@@ -2919,9 +3432,28 @@ def _self_check() -> None:
             "the store IS update_step_pack; it cannot arm without R8"
         )
         os.environ["VTL_RUST_SCHED_R8"] = "1"
-        os.environ.pop("VTL_RUST_SCHED_TOKSTORE")
         os.environ.pop("VTL_RUST_SCHED_TOKSTORE_SHADOW")
+        assert modes()["tokstore"] is True
+
+        # R9 rides on the token store: the residue loop's counter writes and the fold's
+        # `num_computed - num_output_placeholders` math both assume Rust already owns the
+        # per-slot bookkeeping tokstore provides.
+        assert modes()["r9"] is False, "R9 needs VTL_RUST_SCHED_R9 too"
+        os.environ["VTL_RUST_SCHED_R9"] = "1"
+        assert modes()["r9"] is True
+        assert modes()["r9_shadow"] is False
+        # r9_shadow is a pre-flight soak diagnostic: it reads regardless of r9 itself, so
+        # it can be exercised before VTL_RUST_SCHED_R9 is ever flipped on.
+        os.environ["VTL_RUST_SCHED_R9_SHADOW"] = "1"
+        assert modes()["r9_shadow"] is True
+        os.environ.pop("VTL_RUST_SCHED_R9")
+        assert modes()["r9"] is False and modes()["r9_shadow"] is True
+        os.environ.pop("VTL_RUST_SCHED_R9_SHADOW")
+        os.environ.pop("VTL_RUST_SCHED_TOKSTORE")
         assert modes()["tokstore"] is False
+        os.environ["VTL_RUST_SCHED_R9"] = "1"
+        assert modes()["r9"] is False, "R9 cannot arm without the token store"
+        os.environ.pop("VTL_RUST_SCHED_R9")
 
         # The hasher is independent: it needs only the extension, not the scheduler.
         os.environ["VTL_RUST_SCHED_FULL"] = "0"
@@ -3142,6 +3674,127 @@ def _self_check() -> None:
     r = REQ(num_computed_tokens=1, num_output_placeholders=1)
     burst_uncommit(r, 1000)
     assert (r.num_computed_tokens, r.num_output_placeholders) == (0, 0)
+
+    # ---- C1b: commit_burst's per-slot eligibility intern (`_burst_gate`) --------------
+    class FakeRustForget:
+        def forget(self, request_id):
+            pass
+
+    mirror = RustMirror(FakeRustForget())
+    req = REQ(max_tokens=2)  # lim = min(32768, 100 + 2) = 102
+    # Miss: full evaluation, lim cached.
+    assert _burst_gate(mirror, 5, req, 0, 4, 32768, 16) is None
+    assert mirror._burst_lim[5] == 102
+    # Hit: the cached lim wins even if an immutable field is mutated afterwards -- a
+    # live scheduler never does this, the point is the intern no longer looks.
+    req.sampling_params = SP(temperature=0.7)
+    assert _burst_gate(mirror, 5, req, 0, 4, 32768, 16) is None
+    # ...but the genuinely dynamic clauses still run on every hit.
+    assert _burst_gate(mirror, 5, req, 13, 4, 32768, 16) is not None, "align gate"
+    req.num_output_placeholders = -1
+    assert _burst_gate(mirror, 5, req, 0, 4, 32768, 16) is not None, "placeholder count"
+    req.num_output_placeholders = 1
+    assert _burst_gate(mirror, 5, req, 99, 4, 32768, 16) is not None, "length cap (lim=102)"
+    assert _burst_gate(mirror, 5, req, 98, 4, 32768, 16) is None, "98 + 4 == 102 still fits"
+    # block_size=None (the N=1 in-graph path) skips the align gate on a hit too.
+    assert _burst_gate(mirror, 5, req, 13, 1, 32768) is None
+
+    # Miss on a permanently-ineligible request caches -1; every later hit short-circuits
+    # without re-running `_burst_immutable_blocked`.
+    bad = REQ(sampling_params=SP(temperature=0.7))
+    assert _burst_gate(mirror, 9, bad, 0, 4, 32768, 16) == "not greedy"
+    assert mirror._burst_lim[9] == -1
+    bad.sampling_params = SP()  # now "eligible" -- the intern must still refuse
+    assert _burst_gate(mirror, 9, bad, 0, 4, 32768, 16) == "ineligible request (interned)"
+
+    # drop() clears the intern so a recycled slot re-evaluates.
+    mirror._slots["r1"] = 9
+    mirror.drop("r1")
+    assert 9 not in mirror._burst_lim
+
+    # ---- R9: packability intern, the batch cache, and the fast-hit guard -------------
+
+    # `_pack_ok_clauses`: the prefill_stats one-shot latch is the only mutable member --
+    # refused while set, packable once vLLM's stock `take_prefill_stats()` clears it.
+    class PSReq:
+        def __init__(self, **kw):
+            self.client_index = 0
+            self.resumable = False
+            self.has_encoder_inputs = False
+            self.trace_headers = None
+            self.prefill_stats = object()  # non-None: a fresh request's live PrefillStats
+            self.events = []
+            self.__dict__.update(kw)
+
+    pr = PSReq()
+    assert _pack_ok_clauses(pr) is False, "prefill_stats is still set"
+    pslot = 40
+    if pslot in mirror._pack_ok:
+        pass
+    elif _pack_ok_clauses(pr):
+        mirror._pack_ok.add(pslot)
+    assert pslot not in mirror._pack_ok, "must not intern on a refusal"
+    pr.prefill_stats = None  # what stock `take_prefill_stats()` leaves behind
+    if pslot in mirror._pack_ok:
+        pass
+    elif _pack_ok_clauses(pr):
+        mirror._pack_ok.add(pslot)
+    assert pslot in mirror._pack_ok, "the latch cleared -- now interned"
+    # Mutating a request afterwards does not un-intern it: the whole point of the cache
+    # is to stop looking once a slot is proven.
+    pr.client_index = 7
+    assert pslot in mirror._pack_ok
+    for kw in (
+        {"client_index": 1}, {"resumable": True}, {"has_encoder_inputs": True},
+        {"trace_headers": object()}, {"prefill_stats": object()}, {"events": [1]},
+    ):
+        assert _pack_ok_clauses(PSReq(**kw)) is False, kw
+
+    # `mirror.drop()` discards the intern so a recycled slot re-proves itself.
+    mirror._slots["ps1"] = pslot
+    mirror.drop("ps1")
+    assert pslot not in mirror._pack_ok
+
+    # `_r9_cache_hit_counts`: identity, the numpy gather, and the zero-count guard.
+    import numpy as np
+
+    r2i = {"a": 0, "b": 1}
+    cache = (r2i, [11, 12], [0, 1], ["req-a", "req-b"])
+    counts = np.array([1, 1, 4], dtype=np.int64)  # index 2 belongs to some OTHER request
+    assert _r9_cache_hit_counts(cache, r2i, counts) == [1, 1]
+    assert _r9_cache_hit_counts(None, r2i, counts) is None
+    assert _r9_cache_hit_counts(cache, dict(r2i), counts) is None, (
+        "identity, not equality -- a freshly-built dict must miss even with equal contents"
+    )
+    zero = np.array([1, 0], dtype=np.int64)
+    assert _r9_cache_hit_counts(cache, r2i, zero) is None, (
+        "a zero anywhere forces the miss path -- a prefill chunk may have appeared"
+    )
+
+    # `RustMirror._batch_cache`: built by decide(), read on the next hit, and cleared by
+    # every path that could make it point at the wrong requests.
+    mirror._batch_cache = cache
+    assert mirror._batch_cache is cache
+    mirror._slots["cache-owner"] = 11
+    mirror.drop("cache-owner")
+    assert mirror._batch_cache is None, "drop() must invalidate the whole cache"
+
+    # `r9_batch_diff`: agreement is silent, and it names the FIRST field that disagrees.
+    assert r9_batch_diff([1, 2], [0, 1], [1, 1], [1, 2], [0, 1], [1, 1]) is None
+    assert r9_batch_diff([1, 2], [0, 1], [1, 1], [1, 9], [0, 1], [1, 1]) == "slots"
+    assert r9_batch_diff([1, 2], [0, 1], [1, 1], [1, 2], [0, 9], [1, 1]) == "rows"
+    assert r9_batch_diff([1, 2], [0, 1], [1, 1], [1, 2], [0, 1], [1, 9]) == "counts"
+
+    # `_R9State`: boot-lifetime disable, and warn_once's one-line-per-kind budget.
+    r9st = _R9State()
+    r9st.live = True
+    log.setLevel(logging.CRITICAL)
+    r9st.warn_once("slots", "first")
+    r9st.warn_once("slots", "second")  # suppressed -- already warned for this kind
+    assert r9st.warned_kinds == {"slots"}
+    r9st.disable("test")
+    log.setLevel(logging.NOTSET)
+    assert not r9st.live and not r9st.shadow
 
     # ---- Port-2: LazySampled / _Row / the facade / materialization --------------------
 

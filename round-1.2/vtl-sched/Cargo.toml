@@ -19,10 +19,18 @@ numpy = { version = "0.22", optional = true }
 smallvec = { version = "1", features = ["union"] }
 sha2 = "0.10"
 rustc-hash = "2"
+# Batch 3: engine-side output publisher. Pinned to the EXACT version of the iceoryx2 wheel
+# installed in round-1.2/Dockerfile and the rust-frontend's Cargo.toml -- the two halves
+# share a shm data segment layout and iceoryx2 makes no cross-minor-version promise.
+# Optional: default `cargo test` must not need it (no libpython either -- see `python` above).
+iceoryx2 = { version = "0.9.3", optional = true }
 
 [features]
 default = []
 python = ["dep:pyo3", "dep:numpy"]
+# Batch 3: crate-owned iceoryx2 output publisher (`src/out.rs`). Independent of `python` in
+# principle; the wheel maturin ships needs both (see pyproject.toml).
+shm = ["dep:iceoryx2"]
 
 [profile.release]
 opt-level = 3

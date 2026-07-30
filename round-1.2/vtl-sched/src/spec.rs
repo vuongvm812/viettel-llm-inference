@@ -56,6 +56,13 @@ pub struct Shared {
     pub manager: Manager,
     pub core: ScheduleCore,
     pub spec: SpecState,
+    /// Batch 3: the crate-owned output channel, opened by `KvManager::out_open`. Lives here
+    /// (rather than on `KvManager` directly) so `update_step_pack_np`'s `py.allow_threads`
+    /// closure -- which already holds this same lock for the pack -- can publish without a
+    /// second mutex acquisition. `None` until `out_open` succeeds; stays `None` forever
+    /// without the `shm` cargo feature.
+    #[cfg(feature = "shm")]
+    pub out: Option<crate::out::OutChannel>,
 }
 
 #[derive(Default)]
@@ -82,6 +89,8 @@ impl Shared {
             manager,
             core: ScheduleCore::new(),
             spec: SpecState::default(),
+            #[cfg(feature = "shm")]
+            out: None,
         }
     }
 

@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:8fedb2373b886278d2897978afb8640fbe3041f23eb19f419e48237524e24328 # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:2edebdf8d09d4b6db1037ca1b2cbd78940f412c1801c862a21069eac82a7dd92 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -151,6 +151,8 @@ services:
       # VTL_GIL_SWITCH_INTERVAL: "0" here to restore the interpreter default (the A/B control).
 
       VLLM_USE_RUST_FRONTEND: "1"
+      # Multi-turn inter-request gaps in the trace tail out past 30s; 60s still races a
+      # slow turn's connection reuse, so give it more headroom.
       VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "60"
       # Rust frontend (vllm-rs) tokio worker-thread count. Unset in code auto-sizes to the
       # CFS quota (≈3 on the judge's 3-core budget). Pinned here so it's tunable: lower to 2
@@ -355,6 +357,13 @@ services:
       VTL_ENABLE_SHM_IPC: 1
       VTL_SHM_IPC: 1
       VTL_SHM_IPC_RAW: 1
+      # Batch 3: the crate publishes the finished R8/R9 record straight into this channel
+      # from the engine thread, skipping the output_queue -> Python shm-thread GIL hop.
+      # MAX_PUBLISHERS=1 makes ownership exclusive; a failed `out_open` (or the wheel built
+      # without the `shm` cargo feature) falls back to the Python `_OutputPublisher` exactly
+      # as before this batch -- default-on is safe for the same reason every other rung here
+      # is. Revert: "0" = Python always owns the channel.
+      VTL_SHM_IPC_RUST_PUB: "1"
 
       # vtl_sched Rust scheduler core. Precedence in code (rust_sched.py apply()):
       # authority = RUST or FULL, and authority WINS -- with the flags below, the SHADOW and
@@ -462,6 +471,16 @@ services:
                                          # store is driven alongside and diffed per step
                                          # (hash chains + both counters). Soak arm; costs a
                                          # second hash pass per step. Revert: "0".
+      VTL_RUST_SCHED_R9: "1"             # R9: collapse decide()/r8_apply's per-request
+                                         # Python loops into one update_step_pack_np
+                                         # crossing (+ fold cache_blocks into it) plus a
+                                         # thin residue loop. Needs VTL_RUST_SCHED_TOKSTORE.
+                                         # Fail-open: R9.disable() on any inconsistency.
+                                         # Revert: "0" = r8_apply's per-request loop.
+      VTL_RUST_SCHED_R9_SHADOW: "0"      # 1 = the old loop stays authoritative; the batch
+                                         # cache is still built and diffed against it every
+                                         # step (pre-flight soak, independent of R9 itself).
+                                         # Revert: "0".
       VTL_STREAM_PER_TOKEN: "1"          # Rust frontend: one SSE chunk per TOKEN instead of
                                          # per engine record. MANDATORY with the burst -- a
                                          # chunk-counting ITL metric would otherwise score it

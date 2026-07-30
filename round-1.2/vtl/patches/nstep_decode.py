@@ -597,13 +597,12 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
 
         graph = capture(lambda: _burst_body(runner, b, rows, rows, forward), "burst body")
         if graph is None:
-            # Rung 3 is the floor of graph mode: without a body graph there is nothing to
-            # replay, so the whole boot goes eager.
-            log.error("vtl: nstep graph mode off at num_reqs=%d; eager for this boot", rows)
-            b.graphs.clear()
-            b.demote("fold", "the burst body graph did not capture")
-            b.mode = "eager"
-            return
+            # The body graph is the floor of graph mode for THIS size only -- skip it
+            # (fold/unroll below are the same iteration, so `continue` skips those rungs
+            # too) and let the other captured sizes still ride graph mode. Whole-boot
+            # demotion only happens below, after the loop, if NOTHING captured.
+            log.error("vtl: nstep body capture failed at num_reqs=%d; size skipped", rows)
+            continue
         b.graphs[rows] = (graph, desc)
         captured += 1
 
@@ -938,9 +937,19 @@ def _patch_runner(b: _Burst) -> None:
         from vllm.v1.worker.gpu.async_utils import AsyncOutput
 
         ib = state.input_batch
+        # Same idea as decode_fastpath's reused InputBatch: when the request set hasn't
+        # changed, `ib.req_ids` is often the SAME list object across steps, so an identity
+        # hit skips rebuilding this dict every burst emit. A miss (new object -- composition
+        # changed, or fastpath not engaged) just rebuilds it once, same as before.
+        if getattr(runner, "_vtl_r2i_ids", None) is ib.req_ids:
+            r2i = runner._vtl_r2i
+        else:
+            r2i = {req_id: i for i, req_id in enumerate(ib.req_ids)}
+            runner._vtl_r2i = r2i
+            runner._vtl_r2i_ids = ib.req_ids
         model_runner_output = ModelRunnerOutput(
             req_ids=ib.req_ids,
-            req_id_to_index={req_id: i for i, req_id in enumerate(ib.req_ids)},
+            req_id_to_index=r2i,
             sampled_token_ids=None,  # type: ignore[arg-type]
             prompt_logprobs_dict={},  # type: ignore[arg-type]
         )

@@ -135,6 +135,14 @@ pub struct Manager {
     pub common_prefix: Vec<usize>,
     /// Last `get_computed_blocks` result, per request slot.
     pub(crate) hit_len: FxHashMap<u32, usize>,
+
+    /// R9: steps where `update_step_pack_store`'s `fold_cache` found a slot with no
+    /// resident table entry (or a non-RUNNING one) and skipped its `cache_blocks` fold.
+    /// `table_with`'s silent skip (`:315`) is correct-by-construction for the paths that
+    /// use it today, but folding `cache_blocks` in leans on the SAME silence, so this
+    /// counter is the loud version: it should stay 0 for the lifetime of a correct boot,
+    /// and `rust_sched.py` polls it to trip the R9 disable latch if it ever isn't.
+    pub cache_fold_skips: u64,
 }
 
 impl Manager {
@@ -208,6 +216,7 @@ impl Manager {
             scratch_flat: Vec::with_capacity(256),
             common_prefix: Vec::with_capacity(n),
             hit_len: FxHashMap::default(),
+            cache_fold_skips: 0,
             cfg,
         })
     }
@@ -984,6 +993,11 @@ impl Manager {
     /// to the non-store path for identical inputs. On a refused slot (`status == u8::MAX`,
     /// which `pack_inner` reports as "not packed") NOTHING is appended: Python is about to
     /// materialize the whole step onto the stock path, and it owns the append from there.
+    ///
+    /// `fold_cache`: R9. When the step packed, additionally run each slot's `cache_blocks`
+    /// INSIDE this call (see [`Manager::fold_cache_blocks`]) instead of Python doing it one
+    /// FFI crossing per request afterwards. `false` reproduces today's behaviour exactly —
+    /// no store append, no fold either, is unaffected either way.
     #[allow(clippy::too_many_arguments)]
     pub fn update_step_pack_store(
         &mut self,
@@ -994,6 +1008,7 @@ impl Manager {
         engine_index: u32,
         timestamp: f64,
         finished: &[String],
+        fold_cache: bool,
     ) -> Result<(&[crate::update::Verdict], bool), String> {
         let n = slots.len();
         if counts.len() != n {
@@ -1049,6 +1064,9 @@ impl Manager {
                         let acc: SmallVec<[u32; 16]> =
                             self.stops.out.iter().map(|v| v.num_accepted).collect();
                         self.store_apply(slots, &cu, token_ids, &acc)?;
+                        if fold_cache {
+                            self.fold_cache_blocks(slots);
+                        }
                     }
                     Ok(packed)
                 })
@@ -1059,6 +1077,38 @@ impl Manager {
         self.tok_ntok = ntok;
         let packed = result?;
         Ok((&self.stops.out, packed))
+    }
+
+    /// R9: the per-request `cache_blocks` crossing folded into the packed step.
+    ///
+    /// Mirrors `AsyncScheduler._update_request_with_output`'s trailing call
+    /// (async_scheduler.py:71-74): `cache_blocks(num_computed_tokens -
+    /// num_output_placeholders)`, for every RUNNING slot this step accepted tokens for.
+    /// By the time this runs, [`Manager::update_step`] (called from `pack_inner`, above)
+    /// has already applied THIS step's placeholder decrement to the resident table
+    /// (`:764`), so `e.num_computed_tokens - e.num_output_placeholders` here is exactly
+    /// Python's post-decrement argument — no second read of Python state is needed.
+    ///
+    /// Every slot in `slots` has `status != u8::MAX` by construction (the caller only
+    /// reaches this when `pack_inner` returned `packed == true`, which itself requires
+    /// no refused slot), so that check is a documented invariant, not a live branch.
+    /// A slot with no resident entry, or a non-RUNNING one (freed / preempted this
+    /// step), is the `table_with` silent-skip hazard (`:315`) applied to a NEW caller —
+    /// `cache_fold_skips` counts it rather than skipping quietly, so a boot where it
+    /// ever fires is loud instead of a silent stale-cache accumulation.
+    fn fold_cache_blocks(&mut self, slots: &[u32]) {
+        for (i, &slot) in slots.iter().enumerate() {
+            if self.stops.out[i].status == u8::MAX {
+                continue;
+            }
+            match self.table_get(slot) {
+                Some(e) if e.status == STATUS_RUNNING => {
+                    let n = e.num_computed_tokens.saturating_sub(e.num_output_placeholders);
+                    self.cache_blocks(slot, n);
+                }
+                _ => self.cache_fold_skips += 1,
+            }
+        }
     }
 }
 
@@ -1361,7 +1411,7 @@ mod tests {
         let (mut m, slot) = store_mgr("req-a", 103);
         m.store_init(slot, &[], 103, 3).unwrap();
         let (verdicts, packed) = m
-            .update_step_pack_store(&[slot], &[2], &[5, 6], 1000, 0, 1.5, &[])
+            .update_step_pack_store(&[slot], &[2], &[5, 6], 1000, 0, 1.5, &[], false)
             .unwrap();
         assert!(packed);
         assert_eq!(verdicts[0].num_accepted, 2);
@@ -1372,11 +1422,185 @@ mod tests {
     }
 
     #[test]
+    fn record_is_identical_with_the_store_and_fold_cache_on() {
+        // R9: `fold_cache` must not perturb the record. It only adds an internal
+        // `cache_blocks` call after the verdicts and the store append -- neither of which
+        // the packer reads from -- so the bytes must match the `fold_cache=false` golden
+        // exactly. `slot` has no resident table entry here, which also exercises
+        // `cache_fold_skips` (see `cache_fold_skips_non_running_and_counts` for the
+        // non-skip half of that contract).
+        let mut plain = Manager::new(hybrid_cfg(64)).unwrap();
+        let a = plain.intern("req-a");
+        plain.stops.set(a, stop_params());
+        plain
+            .update_step_pack(&[a], &[0, 2], &[5, 6], &[3], &[103], 1000, 0, 1.5, &[])
+            .unwrap();
+        let want = plain.raw.finish().unwrap().to_vec();
+
+        let (mut m, slot) = store_mgr("req-a", 103);
+        m.store_init(slot, &[], 103, 3).unwrap();
+        let (verdicts, packed) = m
+            .update_step_pack_store(&[slot], &[2], &[5, 6], 1000, 0, 1.5, &[], true)
+            .unwrap();
+        assert!(packed);
+        assert_eq!(verdicts[0].num_accepted, 2);
+        assert_eq!(m.raw.finish().unwrap(), &want[..]);
+        assert_eq!(m.tokens.counts(slot), Some((105, 5)));
+        assert_eq!(
+            m.cache_fold_skips, 1,
+            "no resident table entry for this slot -- counted, not silent"
+        );
+    }
+
+    #[test]
+    fn cache_fold_matches_explicit_cache_blocks() {
+        // Same scenario driven two ways: `fold_cache=true` folds `cache_blocks` into the
+        // packed step; `fold_cache=false` plus an explicit call afterwards reproduces BY
+        // HAND what Python does today (`AsyncScheduler._update_request_with_output`'s
+        // trailing `cache_blocks(num_computed_tokens - num_output_placeholders)`,
+        // async_scheduler.py:71-74). Both must leave the pool in an IDENTICAL state --
+        // proven by a third, freshly-admitted request sharing the exact prefix seeing the
+        // exact same cache hit.
+        fn run(fold_cache: bool) -> (usize, usize) {
+            let mut m = Manager::new(hybrid_cfg(256)).unwrap();
+            m.store_arm(crate::hash::none_hash_from_seed("0"));
+            let hs = chain(4, 1);
+            let a = m.intern("a");
+            // Prompt: 48 tokens (3 full blocks), admitted and cached in one shot.
+            m.push_hashes(a, &packed(&hs[..3]), 48);
+            assert_eq!(m.get_computed_blocks(a, 48, 0, false), 0);
+            assert!(m
+                .allocate_slots(a, 48, 0, true, 0, 0, 48, STATUS_WAITING, false)
+                .unwrap());
+            m.store_init(a, &[], 48, 0).unwrap();
+            // Schedule-time allocation for the 16-token burst -- `num_request_tokens` is
+            // still 48 here (Python's `request.num_tokens` before the output arrives), so
+            // this allocates the 4th physical block WITHOUT caching it yet (matching
+            // `allocate_slots`'s own `min(total_computed + new, num_request_tokens)` clip).
+            assert!(m
+                .allocate_slots(a, 16, 0, false, 0, 48, 48, STATUS_RUNNING, true)
+                .unwrap());
+            // The decode-produced 4th block's hash, pushed the way `RustMirror.slot()`
+            // would once the block hasher has it -- BEFORE the FFI crossing that applies
+            // the tokens, exactly as `decide()` orders it.
+            m.push_hashes(a, &packed(&hs[3..]), 48);
+
+            // A resident table entry as it would read right after schedule() advanced it
+            // for a committed 16-token burst this step: computed already at 64 (48 prompt
+            // + 16 decode), placeholders still at 16 -- NOT yet decremented by this call.
+            m.table_set(
+                a,
+                SchedEntry {
+                    slot: a,
+                    num_tokens: 48,
+                    num_tokens_with_spec: 48,
+                    num_computed_tokens: 64,
+                    num_output_placeholders: 16,
+                    num_prompt_tokens: 48,
+                    max_tokens: 1000,
+                    status: STATUS_RUNNING,
+                    num_preemptions: 0,
+                    is_prefill_chunk: false,
+                    skip_reading_prefix_cache: false,
+                },
+            );
+            m.stops.set(
+                a,
+                crate::update::StopParams {
+                    min_tokens: 0,
+                    max_tokens: 1000,
+                    eos_token_id: Some(999_999),
+                    stop_token_ids: Default::default(),
+                },
+            );
+            let decode_tokens: Vec<i64> = (500..516).collect();
+            let (verdicts, packed_ok) = m
+                .update_step_pack_store(
+                    &[a], &[16], &decode_tokens, 100_000, 0, 0.0, &[], fold_cache,
+                )
+                .unwrap();
+            assert!(packed_ok);
+            assert_eq!(verdicts[0].num_accepted, 16, "no stop -- every token kept");
+            if !fold_cache {
+                // What Python's per-request trailing call does today: same subtraction,
+                // same argument, one FFI crossing later instead of inside this one.
+                let e = m.table_get(a).unwrap();
+                let n = e.num_computed_tokens - e.num_output_placeholders;
+                m.cache_blocks(a, n);
+            }
+
+            // A fresh, longer request sharing the exact 64-token prefix.
+            let hs5 = {
+                let mut v = hs.clone();
+                v.push([9; HASH_LEN]);
+                v
+            };
+            let c = m.intern("c");
+            m.push_hashes(c, &packed(&hs5), 80);
+            let hit = m.get_computed_blocks(c, 80, 0, false);
+            (hit, m.coord.pool.get_num_free_blocks())
+        }
+
+        let folded = run(true);
+        let explicit = run(false);
+        assert_eq!(folded, explicit, "fold_cache=true must match an explicit cache_blocks");
+        assert_eq!(folded.0, 64, "the decode-completed 4th block must be cache-visible");
+    }
+
+    #[test]
+    fn cache_fold_skips_non_running_and_counts() {
+        // `table_with`'s silent skip (`:315`) is correct-by-construction for its existing
+        // callers; folding `cache_blocks` in leans on the SAME silence, so this is the loud
+        // version -- `cache_fold_skips` must count every slot the fold could not apply to.
+        let (mut m, a) = store_mgr("req-a", 10);
+
+        // No resident table entry at all yet.
+        let (_, packed) = m
+            .update_step_pack_store(&[a], &[1], &[7], 1000, 0, 0.0, &[], true)
+            .unwrap();
+        assert!(packed);
+        assert_eq!(m.cache_fold_skips, 1);
+
+        // A resident entry that exists but is not RUNNING (e.g. preempted this step) is
+        // the same hazard: skip and count, never fold into a stale/wrong slot.
+        m.table_set(
+            a,
+            SchedEntry {
+                slot: a,
+                status: STATUS_PREEMPTED,
+                num_computed_tokens: 11,
+                num_output_placeholders: 0,
+                ..SchedEntry::default()
+            },
+        );
+        let (_, packed) = m
+            .update_step_pack_store(&[a], &[1], &[8], 1000, 0, 0.0, &[], true)
+            .unwrap();
+        assert!(packed);
+        assert_eq!(m.cache_fold_skips, 2);
+
+        // A genuinely RUNNING resident entry does NOT skip.
+        m.table_set(
+            a,
+            SchedEntry {
+                slot: a,
+                status: STATUS_RUNNING,
+                num_computed_tokens: 12,
+                num_output_placeholders: 0,
+                ..SchedEntry::default()
+            },
+        );
+        m.update_step_pack_store(&[a], &[1], &[9], 1000, 0, 0.0, &[], true)
+            .unwrap();
+        assert_eq!(m.cache_fold_skips, 2, "a RUNNING entry folds -- no new skip");
+    }
+
+    #[test]
     fn the_store_path_truncates_at_a_stop_everywhere() {
         let (mut m, slot) = store_mgr("req-a", 10);
         // EOS (2) is the second of three -> record, counters and store all keep 2.
         let (verdicts, packed) = m
-            .update_step_pack_store(&[slot], &[3], &[5, 2, 9], 1000, 0, 0.0, &[])
+            .update_step_pack_store(&[slot], &[3], &[5, 2, 9], 1000, 0, 0.0, &[], false)
             .unwrap();
         assert_eq!(verdicts[0].num_accepted, 2);
         assert!(packed);
@@ -1392,7 +1616,7 @@ mod tests {
         let b = m.intern("req-b");
         m.store_init(b, &[], 10, 0).unwrap(); // ...but no stop params
         let (verdicts, packed) = m
-            .update_step_pack_store(&[a, b], &[1, 1], &[7, 7], 1000, 0, 0.0, &[])
+            .update_step_pack_store(&[a, b], &[1, 1], &[7, 7], 1000, 0, 0.0, &[], false)
             .unwrap();
         assert_eq!(verdicts[1].status, u8::MAX);
         assert!(!packed);
@@ -1406,15 +1630,15 @@ mod tests {
         let b = m.intern("req-b");
         m.stops.set(b, stop_params());
         assert!(m
-            .update_step_pack_store(&[b], &[1], &[7], 1000, 0, 0.0, &[])
+            .update_step_pack_store(&[b], &[1], &[7], 1000, 0, 0.0, &[], false)
             .is_err());
         // Arity and flat-length mismatches are Errs, not panics or short records.
         let (mut m2, a2) = store_mgr("req-a", 10);
         assert!(m2
-            .update_step_pack_store(&[a2], &[1, 1], &[7], 1000, 0, 0.0, &[])
+            .update_step_pack_store(&[a2], &[1, 1], &[7], 1000, 0, 0.0, &[], false)
             .is_err());
         assert!(m2
-            .update_step_pack_store(&[a2], &[2], &[7], 1000, 0, 0.0, &[])
+            .update_step_pack_store(&[a2], &[2], &[7], 1000, 0, 0.0, &[], false)
             .is_err());
     }
 
@@ -1444,7 +1668,7 @@ mod tests {
         assert_eq!(m.num_hashes(slot), 1);
         m.store_init(slot, &[], 16, 0).unwrap();
         for tok in &all[16..] {
-            m.update_step_pack_store(&[slot], &[1], &[*tok], 100000, 0, 0.0, &[])
+            m.update_step_pack_store(&[slot], &[1], &[*tok], 100000, 0, 0.0, &[], false)
                 .unwrap();
         }
         assert_eq!(m.num_hashes(slot), 2, "one new full block");
@@ -1461,7 +1685,7 @@ mod tests {
         // authoritative `update_step_pack_store`: identical chain and identical counters.
         let (mut auth, a) = store_mgr("req-a", 16);
         for t in 200..216i64 {
-            auth.update_step_pack_store(&[a], &[1], &[t], 100000, 0, 0.0, &[])
+            auth.update_step_pack_store(&[a], &[1], &[t], 100000, 0, 0.0, &[], false)
                 .unwrap();
         }
         let (mut shadow, b) = store_mgr("req-a", 16);
@@ -1479,7 +1703,7 @@ mod tests {
     #[test]
     fn forget_clears_the_store_so_a_recycled_slot_starts_clean() {
         let (mut m, a) = store_mgr("req-a", 10);
-        m.update_step_pack_store(&[a], &[1], &[7], 1000, 0, 0.0, &[])
+        m.update_step_pack_store(&[a], &[1], &[7], 1000, 0, 0.0, &[], false)
             .unwrap();
         assert_eq!(m.tokens.counts(a), Some((11, 1)));
         m.forget("req-a");

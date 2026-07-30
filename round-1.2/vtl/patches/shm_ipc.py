@@ -102,6 +102,99 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in _TRUTHY
 
 
+# --- Batch 3: crate-owned output publisher --------------------------------------------
+#
+# ``VTL_SHM_IPC_RUST_PUB=1`` moves publisher OWNERSHIP for the engine -> frontend channel
+# into the Rust crate: ``rust_sched.py``'s R9 residue path publishes the finished R8 record
+# straight from ``update_step_pack_np`` on the engine thread, skipping the
+# ``output_queue.put_nowait`` -> this module's output thread -> iceoryx2 hop entirely for
+# the common case. ``MAX_PUBLISHERS = 1`` (below) means a crate publisher and a Python
+# ``_OutputPublisher`` can never coexist, so ``_process_output_sockets`` builds one or the
+# other, never both -- see its ``try``/``except`` at the top.
+
+
+class _RustKvHandle:
+    """One-slot registry: `rust_sched.py` calls `register_rust_kv` once its crate
+    `KvManager` exists (it has no way to learn `input_address` itself -- that lives on
+    `EngineCoreProc`, not the KV manager); `_process_output_sockets` -- which DOES know the
+    address -- reads it back to open the channel. A list, not a bare module global, only
+    because a late `register_rust_kv` call (patch install order is not guaranteed) must
+    still be visible without needing a `global` statement at the call site.
+    """
+
+    __slots__ = ("kv",)
+
+    def __init__(self) -> None:
+        self.kv = None
+
+
+_RUST_KV = _RustKvHandle()
+
+
+def register_rust_kv(kv) -> None:
+    """Cross-module handshake counterpart to `_RUST_KV` -- see its docstring."""
+    _RUST_KV.kv = kv
+
+
+class _PubCounters:
+    """Inline-publish ordering guard: two SINGLE-WRITER counters, so neither needs a lock
+    under the GIL (a lone `+= 1` on an int attribute is one atomic-enough read + write from
+    the writer's own thread; only the OTHER thread's reads race it, and a stale read just
+    delays the gate closing/opening by at most one step). ``enqueued`` is bumped by the
+    engine thread (`rust_sched.py::update_from_output`) once per step whose output actually
+    reaches `output_queue`; ``published`` is bumped here, by the output thread, once per
+    queue item this thread finishes sending. `rust_sched.py`'s `decide()` only asks the
+    crate to publish inline when the two agree -- otherwise an inline publish could
+    overtake an item still in flight through the queue and reorder the wire stream.
+    """
+
+    __slots__ = ("enqueued", "published")
+
+    def __init__(self) -> None:
+        self.enqueued = 0
+        self.published = 0
+
+
+PUB = _PubCounters()
+
+
+class _RustOutputAdapter:
+    """Same method shape as `_OutputPublisher`, backed by the crate's `out_publish` /
+    `out_publish_record` FFIs instead of the iceoryx2 Python bindings, so
+    `_process_output_sockets`'s body -- the demotion latch, the TAG_DEAD send, the R8 bytes
+    arm -- is textually unchanged whichever one is live. Constructed only after
+    `kv.out_open()` has succeeded (``MAX_PUBLISHERS = 1`` makes the two mutually exclusive
+    by construction -- see this module's header).
+    """
+
+    __slots__ = ("_kv",)
+
+    def __init__(self, kv) -> None:
+        self._kv = kv
+
+    def publish(self, tag: bytes, payload) -> bool:
+        if not isinstance(payload, (bytes, bytearray)):
+            payload = bytes(payload)
+        return self._kv.out_publish(tag[0], bytes(payload))
+
+    def publish_record(self, record) -> bool:
+        if not isinstance(record, bytes):
+            record = bytes(record)
+        return self._kv.out_publish_record(record)
+
+    def publish_raw(self, outputs) -> bool:
+        """No crate FFI packs `outputs` straight into a loaned shm sample the way Python's
+        `_OutputPublisher.publish_raw` does -- this is the object-fallback arm (R8 did NOT
+        apply this step), so one extra `bytearray` copy here is not on the fast path this
+        port exists to shorten. `raw_pack_into` writes ITS OWN tag byte at offset 0 (same
+        framing `publish_record` expects, NOT `publish`'s "tag + payload" -- a second tag
+        byte here would corrupt the record with a duplicate leading byte)."""
+        buf = bytearray(raw_size(outputs))
+        written = raw_pack_into(buf, outputs)
+        assert written == len(buf), (written, len(buf))
+        return self._kv.out_publish_record(bytes(buf))
+
+
 def _seed(input_address: str) -> str:
     """Per-boot service-name seed both processes derive independently.
 
@@ -565,7 +658,18 @@ def _process_output_sockets(self, output_paths, coord_output_path, engine_index)
     shm_buffer = bytearray()  # reused across publishes, like upstream's reuse_buffers
     use_raw = False
     try:
-        shm = _OutputPublisher(self.addresses.inputs[0])
+        # Batch 3: MAX_PUBLISHERS=1 means the crate publisher and `_OutputPublisher` are
+        # mutually exclusive -- try the crate first (it may already be registered from a
+        # prior boot's stale reference, hence `out_open`'s own idempotence), and build the
+        # Python one only if that is not live. `_RUST_KV.kv` is `None` whenever
+        # `rust_sched.py` never registered (gate off, shadow-only mode, or authority mode
+        # never installed) -- same fail-open shape as everything else in this module.
+        rust_kv = _RUST_KV.kv if _env_flag("VTL_SHM_IPC_RUST_PUB") else None
+        if rust_kv is not None and rust_kv.out_open(self.addresses.inputs[0]):
+            shm = _RustOutputAdapter(rust_kv)
+            log.info("vtl shm_ipc: output channel owned by the rust crate (VTL_SHM_IPC_RUST_PUB)")
+        else:
+            shm = _OutputPublisher(self.addresses.inputs[0])
         use_raw = _env_flag("VTL_SHM_IPC_RAW") and _RAW_ENABLED
     except Exception:
         log.exception("vtl shm_ipc: output channel setup failed, staying on ZMQ")
@@ -608,6 +712,7 @@ def _process_output_sockets(self, output_paths, coord_output_path, engine_index)
                     try:
                         if shm.publish_record(outputs):
                             shm_delivered = True
+                            PUB.published += 1
                             continue
                     except Exception:
                         log.exception("vtl shm_ipc: R8 publish failed, ZMQ from here on")
@@ -651,6 +756,7 @@ def _process_output_sockets(self, output_paths, coord_output_path, engine_index)
                         sent = len(buffers) == 1 and shm.publish(TAG_MSGPACK, buffers[0])
                     if sent:
                         shm_delivered = True
+                        PUB.published += 1
                         continue
                 except Exception:
                     log.exception("vtl shm_ipc: publish failed, ZMQ from here on")
@@ -675,6 +781,10 @@ def _process_output_sockets(self, output_paths, coord_output_path, engine_index)
                 pending.appendleft((tracker, ref, buffer))
             elif len(reuse_buffers) < max_reuse_bufs:
                 reuse_buffers.append(buffer)
+            # Batch 3 ordering guard: this is the ZMQ fallback for the same client_index==0
+            # stream `PUB.enqueued` counts (the coord (-1) branch above returns before this
+            # point and is deliberately not counted -- `rust_sched.py` never enqueues those).
+            PUB.published += 1
 
 
 @register_patch("shm_ipc", default=False)
@@ -878,6 +988,60 @@ def _self_check() -> None:
                 pass
             else:
                 raise AssertionError(f"raw_unpack accepted a malformed record: {bad.hex()}")
+
+    # --- Batch 3: crate-owned publisher plumbing (fakes only, no live iceoryx2) -----------
+    class _FakeKv:
+        """Duck-types the three crate FFIs `_RustOutputAdapter` calls, with a `deliver`
+        knob so both the delivered and undelivered arms are exercised."""
+
+        def __init__(self, deliver=True):
+            self.deliver = deliver
+            self.opened = None
+            self.publishes: list = []
+
+        def out_open(self, input_address):
+            self.opened = input_address
+            return True
+
+        def out_publish(self, tag, payload):
+            self.publishes.append((tag, bytes(payload)))
+            return self.deliver
+
+        def out_publish_record(self, record):
+            self.publishes.append((None, bytes(record)))
+            return self.deliver
+
+    adapter = _RustOutputAdapter(_FakeKv())
+    assert adapter.publish(TAG_MSGPACK, b"\x90")
+    assert adapter._kv.publishes == [(TAG_MSGPACK[0], b"\x90")]
+    assert adapter.publish_record(b"Rhello")
+    assert adapter._kv.publishes[-1] == (None, b"Rhello")
+
+    undelivered = _RustOutputAdapter(_FakeKv(deliver=False))
+    assert not undelivered.publish_record(b"Rgone")
+
+    outs = _Outs(engine_index=0, timestamp=0.0, outputs=[_Out("req-1a", [5])])
+    raw_adapter = _RustOutputAdapter(_FakeKv())
+    assert raw_adapter.publish_raw(outs)
+    # `publish_record` framing (no separate tag arg): the packed bytes already start with
+    # TAG_RAW at offset 0, so a second tag byte must NOT be prepended -- see the docstring.
+    assert raw_adapter._kv.publishes[-1] == (None, _pack(outs))
+
+    # `register_rust_kv` / `_RUST_KV`: last write wins, visible without a `global` at the
+    # reader (mirrors the cross-module handshake `_process_output_sockets` relies on).
+    assert _RUST_KV.kv is None
+    sentinel = object()
+    register_rust_kv(sentinel)
+    assert _RUST_KV.kv is sentinel
+    register_rust_kv(None)  # leave the module state clean for any test run after this one
+
+    # `_PubCounters`: the ordering guard's whole contract is this equality check.
+    pc = _PubCounters()
+    assert pc.enqueued == pc.published == 0
+    pc.enqueued += 1
+    assert pc.enqueued != pc.published
+    pc.published += 1
+    assert pc.enqueued == pc.published
 
     # --- schema drift gate ----------------------------------------------------------------
     class _StructOut:

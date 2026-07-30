@@ -1235,6 +1235,117 @@ def test_update_step_refuses_unregistered_and_malformed_batches():
     assert not kv.has_stop_params(reused)
 
 
+# ------------------------------------------------------------------------------------
+# R9 tier -- update_step_pack_np driven straight from Python, and fold_cache.
+# ------------------------------------------------------------------------------------
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - vtl_sched's own `python` feature needs numpy too
+    np = None
+
+requires_numpy = pytest.mark.skipif(np is None, reason="numpy not importable")
+
+
+@requires_crate
+@requires_numpy
+def test_update_step_pack_np_matches_update_step_pack():
+    """The numpy crossing must be a faithful stand-in for the flat-list one: same
+    verdicts, same record, for the same tokens taken off a 2D array instead of a
+    flattened + cu_lens-indexed buffer."""
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+    kv_np = vtl_sched.KvManager(rust_config(num_blocks=256))
+    kv.store_arm(vtl_sched.none_hash_from_seed("0"))
+    kv_np.store_arm(vtl_sched.none_hash_from_seed("0"))
+
+    names = ["r0", "r1", "r2"]
+    toks = [[5], [6, 7, 2], [8, 9]]  # r1's EOS(2) trims at index 2
+    n_toks = [10, 10, 10]
+    slots, cu, flat = [], [0], []
+    for name, t, n in zip(names, toks, n_toks):
+        for kv_ in (kv, kv_np):
+            s = kv_.intern(name)
+            kv_.set_stop_params(s, 0, 1000, 2, [])
+            kv_.store_init(s, [], n, 0)
+        slots.append(kv_np.lookup(name))
+        flat.extend(t)
+        cu.append(len(flat))
+    counts = [len(t) for t in toks]
+
+    v_pack, rec_pack = kv.update_step_pack(
+        [kv.lookup(n) for n in names], cu, flat, [0] * len(names), n_toks, 4096, 0, 1.5, []
+    )
+    rows = list(range(len(names)))
+    arr = np.zeros((len(names), max(counts)), dtype=np.int64)
+    for row, t in zip(rows, toks):
+        arr[row, : len(t)] = t
+    v_np, rec_np, published = kv_np.update_step_pack_np(arr, rows, counts, slots, 4096, 0, 1.5, ())
+    assert [tuple(v) for v in v_np] == [tuple(v) for v in v_pack]
+    assert rec_np == rec_pack
+    assert published is False, "publish defaults off -- nothing should have been delivered"
+
+
+@requires_crate
+@requires_numpy
+def test_update_step_pack_np_refuses_a_noncontiguous_array():
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+    kv.store_arm(vtl_sched.none_hash_from_seed("0"))
+    slot = kv.intern("r")
+    kv.set_stop_params(slot, 0, 1000, 2, [])
+    kv.store_init(slot, [], 10, 0)
+    arr = np.zeros((4, 8), dtype=np.int64)
+    arr[0, :2] = [5, 6]
+    noncontig = arr[:, ::2]  # a view, not C-contiguous
+    with pytest.raises(Exception):
+        kv.update_step_pack_np(noncontig, [0], [2], [slot], 4096, 0, 0.0, ())
+
+
+@requires_crate
+@requires_numpy
+def test_update_step_pack_np_fold_cache_defaults_off():
+    """`fold_cache` must default to `False`: every caller written before R9 existed
+    (this file's other tests included) must keep behaving exactly as it did without
+    passing the new keyword."""
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+    kv.store_arm(vtl_sched.none_hash_from_seed("0"))
+    slot = kv.intern("r")
+    kv.set_stop_params(slot, 0, 1000, 2, [])
+    kv.store_init(slot, [], 10, 0)
+    arr = np.array([[5, 6, 7, 8]], dtype=np.int64)
+    verdicts, record, published = kv.update_step_pack_np(arr, [0], [4], [slot], 4096, 0, 0.0, ())
+    assert record is not None
+    assert published is False, "publish defaults off -- nothing should have been delivered"
+    assert kv.cache_fold_skips() == 0, "fold_cache defaulted off -- the fold never ran"
+
+
+@requires_crate
+@requires_numpy
+def test_update_step_pack_np_fold_cache_is_idempotent_with_an_explicit_call():
+    """A folded step, then an explicit `cache_blocks` call with the SAME argument the
+    fold would have used, must change nothing further: the fold already did exactly
+    that much work. (The rigorous cache-content proof, with real block allocation, is
+    the crate's own `cache_fold_matches_explicit_cache_blocks` golden test; this is the
+    FFI-surface smoke test -- the keyword plumbs through and the pool is left stable.)
+    """
+    kv = vtl_sched.KvManager(rust_config(num_blocks=256))
+    kv.store_arm(vtl_sched.none_hash_from_seed("0"))
+    slot = kv.intern("r")
+    kv.set_stop_params(slot, 0, 1000, 2, [])
+    kv.store_init(slot, [], 16, 0)
+    kv.table_set(slot, (slot, 16, 16, 16, 0, 16, 1000, 1, 0, False, False))
+    arr = np.array([[100, 101, 102, 103]], dtype=np.int64)
+    verdicts, record, published = kv.update_step_pack_np(
+        arr, [0], [4], [slot], 4096, 0, 0.0, (), fold_cache=True
+    )
+    assert record is not None
+    assert published is False, "publish defaults off -- nothing should have been delivered"
+    assert kv.cache_fold_skips() == 0
+    after_fold = kv.num_free_blocks
+    e = kv.table_entry(slot)
+    kv.cache_blocks(slot, e[3] - e[4])  # the same math the fold just ran internally
+    assert kv.num_free_blocks == after_fold, "an explicit call after the fold is a no-op"
+
+
 # ---------------------------------------------------------------------------
 # tier 5 -- R6b/R6c: the resident request table and the speculative precompute
 # ---------------------------------------------------------------------------
