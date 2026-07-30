@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:5e0769a2d07c8d90fb56617e7d0ae10b8ac9d8aeddd51fa243df4190763fc8e3 # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:b8a2c4b573fc31275bbf149c021c113cca2905467d57832b01e99594fe4a6485 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
