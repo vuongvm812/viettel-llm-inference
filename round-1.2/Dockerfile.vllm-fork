@@ -57,8 +57,12 @@ ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:${PATH}
 # curl/ca-certificates for rustup; unzip for the protoc release below; git to fetch the
 # Rust workspace source. -o Dir::Etc::sourceparts=- skips the CUDA / deadsnakes repos in
 # sources.list.d (intermittently mid-sync) — these packages are in the base Ubuntu repos.
+# libssl-dev: the per-crate `cargo test -p ...` invocations below re-resolve features for
+# that one package, so they lose the bin's native-tls-vendored and openssl-sys falls back
+# to pkg-config; the system dev package satisfies it. Test binaries only — the shipped
+# vllm-rs still links the vendored OpenSSL from the `--features native-tls-vendored` build.
 RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
-    && apt-get install -y --no-install-recommends build-essential perl pkg-config curl ca-certificates unzip git \
+    && apt-get install -y --no-install-recommends build-essential perl pkg-config libssl-dev curl ca-certificates unzip git \
     && rm -rf /var/lib/apt/lists/*
 
 # vllm-server's gRPC build script needs protoc. The proto uses proto3 `optional`,
