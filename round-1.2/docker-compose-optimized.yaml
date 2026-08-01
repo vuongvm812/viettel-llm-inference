@@ -15,3 +15,10 @@ services:
     # localtest overlay is also stacked its `build:` takes over and this is just the tag
     # the built image gets.)
     image: unseenablefuture/awesome-badger:dev
+    # environment:
+      # Percent of L2 a context may reserve for persisting accesses -- the driver-side knob
+      # behind cudaLimitPersistingL2CacheSize, and the only one that works under MPS. Paired
+      # with VTL_L2_PERSIST=1 (vtl/patches/l2_persist.py); pointless unless that patch's boot
+      # probe reports a nonzero maxPersistingL2CacheSize, which CUDA documents as always 0
+      # under MIG. Harmless when ignored.
+      # CUDA_DEVICE_DEFAULT_PERSISTING_L2_CACHE_PERCENTAGE_LIMIT: "25"

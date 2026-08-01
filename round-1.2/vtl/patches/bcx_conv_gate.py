@@ -31,7 +31,7 @@ import logging
 
 from vtl.registry import register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl.bcx_conv_gate")
 
 _OP = "bcx_conv_gate_quant"
 _SUPPORTED_OP = "bcx_conv_gate_supported"

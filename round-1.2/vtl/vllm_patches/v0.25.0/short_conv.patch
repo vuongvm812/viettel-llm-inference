@@ -10,13 +10,13 @@
  import torch
  
  from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
-@@ -28,8 +31,168 @@
+@@ -28,8 +31,259 @@
  from vllm.v1.attention.backend import AttentionMetadata
  from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
  from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 +from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
- 
- 
++
++
 +def _vtl_flag(name: str) -> bool:
 +    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 +
@@ -34,6 +34,15 @@
 +# round-1.2/vtl/csrc/bcx_conv_gate_quant.cu. Inert unless _VTL_MUL_QUANT is also on (it writes
 +# into that staging buffer). See round-1.2/vtl/patches/bcx_conv_gate.py.
 +_VTL_BCX_CONV_GATE = _vtl_flag("VTL_ENABLE_BCX_CONV_GATE")
++
++# vtl: the whole decode block -- per-token fp8 quant, in_proj W4A8, conv+gate+quant, out_proj
++# W4A8 -- in ONE launch (round-1.2/vtl/csrc/shortconv_decode_mega.cu). Default ON; the runtime
++# gates below (armed scratch + a co-residency budget measured on the real kernel + M <= 8 +
++# decode-only + the plain int4 weight view) do the actual deciding, and any miss keeps the
++# existing four-op chain untouched. `VTL_SHORTCONV_MEGA=0` is the one-line revert.
++_VTL_MEGA = os.environ.get("VTL_SHORTCONV_MEGA", "1").strip().lower() not in {
++    "0", "false", "no", "off", ""
++}
 +
 +# The CUTLASS W4A8 kernel supports exactly one group size and rejects anything else in
 +# can_implement(), so this cannot drift from round-1.2/vtl/patches/quant_w4a8.py:GROUP_SIZE
@@ -137,6 +146,88 @@
 +    return ok
 +
 +
++def _vtl_mega_decode(layer, hidden_states, output) -> bool:
++    """Fused short-conv decode megakernel. True = done, False = run the stock chain.
++
++    WHY IT SITS IN ``forward`` AND NOT ``forward_cuda``: the megakernel starts at the
++    activation that feeds ``in_proj``, and ``in_proj`` was hoisted OUT of the custom op by
++    this very patch (see ``forward`` below). ``forward_cuda`` only ever sees ``BCx``, i.e.
++    everything the kernel's first two phases exist to produce. LFM2's ``operator_norm`` runs
++    one level further up (lfm2.py), so ``hidden_states`` here is already normalized and the
++    kernel is invoked with ``norm_weight=None`` -- its phase 1 then does only the per-token
++    fp8 quant, which is exactly what ``quant_w4a8.apply`` would have done.
++
++    CAPTURE-TIME STATIC, WHICH IS WHY THE M<=8 BOUND IS SAFE. Every condition below is a
++    Python branch over ``attn_metadata`` scalars. Under FULL cudagraph the graph is captured
++    once per batch descriptor and replayed without re-entering Python, and under PIECEWISE
++    the same is true per ``BatchDescriptor(num_tokens=...)`` -- so whichever arm is taken at
++    capture is frozen into that graph. Capture sizes 16 and 32 therefore bake the STOCK
++    chain, capture sizes 1/2/4/8 bake the megakernel, and no replay can ever cross over. (If
++    this ever stopped holding, the kernel's own ``TORCH_CHECK`` on M would fail loudly rather
++    than read past the scratch.)
++    """
++    if not _VTL_MEGA:
++        return False
++    try:
++        from vtl.patches.shortconv_mega import arm, mega_state
++    except Exception:
++        return False
++
++    forward_context = get_forward_context()
++    attn_metadata_raw = forward_context.attn_metadata
++    if attn_metadata_raw is None or not isinstance(attn_metadata_raw, dict):
++        return False
++    attn_metadata = attn_metadata_raw.get(layer.prefix)
++    if not isinstance(attn_metadata, ShortConvAttentionMetadata):
++        return False
++    m = attn_metadata.num_decode_tokens
++    if attn_metadata.num_prefills > 0 or m <= 0 or m != hidden_states.shape[0]:
++        return False
++
++    in_wq = getattr(layer.in_proj, "_vtl_mega_wq", None)
++    out_wq = getattr(layer.out_proj, "_vtl_mega_wq", None)
++    if in_wq is None or out_wq is None:
++        return False
++
++    conv_weights = layer.conv.weight.view(
++        layer.conv.weight.size(0), layer.conv.weight.size(2)
++    )
++    conv_state = (
++        layer.kv_cache[0]
++        if is_conv_state_dim_first()
++        else layer.kv_cache[0].transpose(-1, -2)
++    )
++    dim = conv_weights.shape[0]
++    if not torch.ops.vllm_cuda.shortconv_decode_mega_supported(
++        dim, conv_weights.shape[1], conv_state.shape[2], m
++    ):
++        return False
++    state = arm(dim, hidden_states.device)
++    if state is None:
++        return False
++
++    # Past this point the kernel rotates the conv ring buffer, so there is no falling back:
++    # re-running the stock chain afterwards would double-advance the state. Let it raise.
++    torch.ops.vllm_cuda.shortconv_decode_mega(
++        output[:m],
++        hidden_states[:m],
++        None,  # already normalized by operator_norm (lfm2.py)
++        0.0,
++        in_wq,
++        layer.in_proj._vtl_mega_gs,
++        conv_weights,
++        layer.conv.bias,
++        conv_state,
++        attn_metadata.state_indices_tensor_d,
++        NULL_BLOCK_ID,
++        out_wq,
++        layer.out_proj._vtl_mega_gs,
++        state["scratch"],
++        state["grid"],
++    )
++    return True
+ 
+ 
 +def _vtl_out_proj_quantized(out_proj, y_fp8, y_scale, out_dtype):
 +    """out_proj GEMM over an already-quantized activation.
 +
@@ -179,7 +270,7 @@
  # --8<-- [start:short_conv]
  @CustomOp.register("short_conv")
  class ShortConv(MambaBase, CustomOp):
-@@ -88,7 +251,7 @@
+@@ -92,7 +346,7 @@
  
      def forward_native(
          self,
@@ -188,7 +279,7 @@
          output: torch.Tensor,
      ):
          # Reference torch causal conv1d; runs on all CPU platforms. AMX kernels
-@@ -106,7 +269,6 @@
+@@ -110,7 +364,6 @@
              attn_metadata = attn_metadata_raw[self.prefix]
              assert isinstance(attn_metadata, ShortConvAttentionMetadata)
  
@@ -196,7 +287,7 @@
          B, C, x = BCx.chunk(3, dim=-1)
  
          # (dim, kernel_size) — same reshape as forward_cuda
-@@ -118,7 +280,7 @@
+@@ -122,7 +375,7 @@
              # Profile run — output value doesn't matter
              Bx = (B * x).contiguous()
              output_tensor, _ = self.out_proj(C * Bx)
@@ -205,7 +296,7 @@
              return
  
          conv_state = (
-@@ -185,15 +347,34 @@
+@@ -189,15 +442,38 @@
          hidden_states: torch.Tensor,
          output: torch.Tensor,
      ):
@@ -227,6 +318,10 @@
 +        # out_proj deliberately stays INSIDE the op: the fused mul_quant / bcx_conv_gate_quant
 +        # path feeds it an already-quantized activation by hand (_vtl_out_proj_quantized), which
 +        # is not something a fusion pass could express anyway.
++        # vtl P2: the whole decode block in one launch when every gate says yes. Ahead of
++        # in_proj because the kernel subsumes it. Fail-closed -> the chain below.
++        if _vtl_mega_decode(self, hidden_states, output):
++            return
 +        BCx, _ = self.in_proj(hidden_states)
          torch.ops.vllm.short_conv(
 -            hidden_states,
@@ -242,7 +337,7 @@
          output: torch.Tensor,
      ):
          forward_context = get_forward_context()
-@@ -218,8 +399,6 @@
+@@ -222,8 +498,6 @@
              has_initial_states_p = attn_metadata.has_initial_states_p
              query_start_loc_p = attn_metadata.query_start_loc_p
  
@@ -251,7 +346,7 @@
          B, C, x = BCx.chunk(3, dim=-1)
  
          conv_weights = self.conv.weight.view(
-@@ -260,6 +439,59 @@
+@@ -265,6 +539,59 @@
          )
          conv_output_list = []
  
@@ -303,7 +398,7 @@
 +                )
 +            except Exception:
 +                self.out_proj._vtl_mul_quant_ok = False  # stop retrying; no log-spam
-+                logging.getLogger("vtl").exception(
++                logging.getLogger("vllm.vtl.short_conv").exception(
 +                    "vtl: short-conv fp8 staging buffer alloc failed; using stock"
 +                )
 +                use_fused = use_conv_gate = False
@@ -311,7 +406,7 @@
          if has_prefill:
              Bx_p = (B_p * x_p).transpose(0, 1)
              Bx = causal_conv1d_fn(
-@@ -274,21 +506,61 @@
+@@ -279,21 +606,61 @@
                  query_start_loc=query_start_loc_p,
              ).transpose(0, 1)[:num_prefill_tokens]
  
@@ -385,7 +480,7 @@
  
          # Merge prefill and decode outputs before passing to gated MLP
          hidden_states = torch.vstack(conv_output_list)
-@@ -317,20 +589,23 @@
+@@ -325,20 +692,23 @@
  
  
  def short_conv(

@@ -32,6 +32,20 @@
 //                                                 Triton causal_conv1d_update on that half of the
 //                                                 batch. `_supported` is the shape predicate the
 //                                                 Python gate queries instead of re-hardcoding it.
+//   conv_align_fused / conv_align_supported    -- NEW ops, vllm_cuda only. The mamba "align"
+//                                                 pre-copy (state advance + conv-window block
+//                                                 migration) in one launch instead of the two
+//                                                 Triton kernels preprocess_state runs every
+//                                                 step. Called from the fork patch
+//                                                 mamba_align_precopy.patch.
+//   shortconv_decode_mega / _supported /       -- NEW ops, vllm_cuda only. The WHOLE short-conv
+//     _grid / _scratch_bytes                      decode block (norm+quant -> in_proj W4A8 ->
+//                                                 conv+gate+quant -> out_proj W4A8) in one
+//                                                 launch, with a hand-rolled device-wide
+//                                                 barrier between phases. `_grid` reports this
+//                                                 build's real co-residency budget, which the
+//                                                 barrier's safety depends on and which Python
+//                                                 cannot compute.
 
 #include <torch/extension.h>
 #include <torch/library.h>
@@ -62,6 +76,36 @@ void bcx_conv_gate_quant(torch::Tensor& y_fp8, torch::Tensor& y_scale, torch::Te
                          std::optional<torch::Tensor> const& scale_ub);
 
 bool bcx_conv_gate_supported(int64_t dim, int64_t width, int64_t state_len);
+
+void conv_align_fused(torch::Tensor& state_idx, torch::Tensor& num_accepted,
+                      torch::Tensor const& idx_mapping,
+                      torch::Tensor const& num_computed_tokens,
+                      torch::Tensor const& query_start_loc,
+                      torch::Tensor const& block_table_ptrs, int64_t block_table_stride_req,
+                      torch::Tensor const& state_base_addrs,
+                      torch::Tensor const& state_block_strides,
+                      torch::Tensor const& state_elem_sizes,
+                      torch::Tensor const& state_inner_sizes,
+                      torch::Tensor const& state_conv_widths,
+                      torch::Tensor const& state_group_indices, int64_t num_reqs,
+                      int64_t mamba_block_size);
+
+bool conv_align_supported(bool dim_first, bool all_conv, int64_t num_states);
+
+void shortconv_decode_mega(torch::Tensor& out, torch::Tensor const& x,
+                           std::optional<torch::Tensor> const& norm_weight, double epsilon,
+                           torch::Tensor const& in_wq, torch::Tensor const& in_gs,
+                           torch::Tensor const& conv_weight,
+                           std::optional<torch::Tensor> const& conv_bias,
+                           torch::Tensor& conv_state, torch::Tensor const& state_indices,
+                           int64_t null_block_id, torch::Tensor const& out_wq,
+                           torch::Tensor const& out_gs, torch::Tensor& scratch,
+                           int64_t num_blocks);
+
+bool shortconv_decode_mega_supported(int64_t dim, int64_t width, int64_t state_len,
+                                     int64_t max_tokens);
+int64_t shortconv_decode_mega_grid(int64_t dim);
+int64_t shortconv_decode_mega_scratch_bytes(int64_t dim);
 }  // namespace vtl
 
 TORCH_LIBRARY(vllm_cuda, m) {
@@ -82,10 +126,33 @@ TORCH_LIBRARY(vllm_cuda, m) {
       "bcx_conv_gate_quant(Tensor! y_fp8, Tensor! y_scale, Tensor! conv_state, "
       "Tensor bcx, Tensor conv_weight, Tensor? conv_bias, Tensor state_indices, "
       "int null_block_id, Tensor? scale_ub) -> ()");
-  // Shape predicate: no tensor arguments, so it cannot be dispatched by device key -- register
-  // the implementation right here as a catch-all instead of in the CUDA block below.
+  m.def(
+      "conv_align_fused(Tensor! state_idx, Tensor! num_accepted, Tensor idx_mapping, "
+      "Tensor num_computed_tokens, Tensor query_start_loc, Tensor block_table_ptrs, "
+      "int block_table_stride_req, Tensor state_base_addrs, Tensor state_block_strides, "
+      "Tensor state_elem_sizes, Tensor state_inner_sizes, Tensor state_conv_widths, "
+      "Tensor state_group_indices, int num_reqs, int mamba_block_size) -> ()");
+  m.def(
+      "shortconv_decode_mega(Tensor! out, Tensor x, Tensor? norm_weight, float epsilon, "
+      "Tensor in_wq, Tensor in_gs, Tensor conv_weight, Tensor? conv_bias, "
+      "Tensor! conv_state, Tensor state_indices, int null_block_id, Tensor out_wq, "
+      "Tensor out_gs, Tensor! scratch, int num_blocks) -> ()");
+  // Shape/capacity predicates: no tensor arguments, so they cannot be dispatched by device
+  // key -- register the implementations right here as catch-alls instead of in the CUDA block
+  // below. `shortconv_decode_mega_grid` queries this build's real occupancy, which is why the
+  // Python gate cannot compute it itself.
   m.def("bcx_conv_gate_supported(int dim, int width, int state_len) -> bool",
         TORCH_FN(vtl::bcx_conv_gate_supported));
+  m.def("conv_align_supported(bool dim_first, bool all_conv, int num_states) -> bool",
+        TORCH_FN(vtl::conv_align_supported));
+  m.def(
+      "shortconv_decode_mega_supported(int dim, int width, int state_len, int max_tokens) "
+      "-> bool",
+      TORCH_FN(vtl::shortconv_decode_mega_supported));
+  m.def("shortconv_decode_mega_grid(int dim) -> int",
+        TORCH_FN(vtl::shortconv_decode_mega_grid));
+  m.def("shortconv_decode_mega_scratch_bytes(int dim) -> int",
+        TORCH_FN(vtl::shortconv_decode_mega_scratch_bytes));
 }
 
 TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
@@ -96,6 +163,8 @@ TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
          TORCH_FN(vtl::silu_and_mul_dynamic_per_token_quant));
   m.impl("mul_dynamic_per_token_quant", TORCH_FN(vtl::mul_dynamic_per_token_quant));
   m.impl("bcx_conv_gate_quant", TORCH_FN(vtl::bcx_conv_gate_quant));
+  m.impl("conv_align_fused", TORCH_FN(vtl::conv_align_fused));
+  m.impl("shortconv_decode_mega", TORCH_FN(vtl::shortconv_decode_mega));
 }
 
 // Overrides of vLLM's own _C ops (schemas defined by vllm._C_stable_libtorch, imported first).

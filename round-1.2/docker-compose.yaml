@@ -13,7 +13,7 @@ name: viettel-llm-optimized
 
 services:
   model:
-    image: unseenablefuture/awesome-badger@sha256:aa427bc0d0ec92ef8e46d97ddfefe0a2193dbd064326baf308e55a092d7d2a2c # submission: re-pin by @sha256:<new digest>
+    image: unseenablefuture/awesome-badger@sha256:2edebdf8d09d4b6db1037ca1b2cbd78940f412c1801c862a21069eac82a7dd92 # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
     entrypoint:
       - python3 #Don't change this to vllm-server
@@ -32,6 +32,8 @@ services:
       - --max-model-len=32768
       - --gpu-memory-utilization=0.90
       - --tensor-parallel-size=1
+      - --distributed-executor-backend=mp
+      # - --attention-backend=FLASHINFER
 
       # Intra-conversation prefix reuse is the biggest win now (turn N reuses turns 0..N-1).
       # LFM2 is a hybrid (short-conv state + attn KV): mamba_cache_mode MUST be `align` --
@@ -70,12 +72,26 @@ services:
       - --disable-log-stats
       - --uvicorn-log-level=warning
 
+      # NOTE (2026-07-30, decided against for now): the closed-loop trace sim puts 17% of
+      # decoded tokens at batch 3/5/6, which pad to the next captured size and fall out of
+      # graph-mode bursts/in-graph sampling. Adding 3/5/6 here (and to
+      # nstep_decode.BURST_SIZES) lifts graph coverage 82%->99% -- but stock FULL graphs at
+      # those sizes have never been validated on the H200 and get no boot shadow, so the
+      # swap waits for a run that can afford to fail. 16/32 kept for the same reason.
       - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
     ports:
       - "8000:8000"
     environment:
       VLLM_PLUGINS: vtl
       VLLM_LOGGING_LEVEL: WARNING             # INFO does per-request log work on the hot path
+      # Level for the `vllm.vtl` logger subtree ONLY, which vtl/plugin.py gives its own handler.
+      # It has to be separate: vtl loggers are children of `vllm`, so they would otherwise
+      # inherit the WARNING above and every vtl INFO line would vanish -- which is exactly what
+      # used to happen, and it took `make verify`'s seven greps with it (plugin loaded, w4a8
+      # registered, layers quantized, lm_head outcome, the cutlass sm_count readout).
+      # INFO is safe on the hot path here because vtl logs at load, not per request. WARNING to
+      # quiet it; DEBUG adds nothing today.
+      VTL_LOG_LEVEL: INFO
       # Pin the axum/tower/hyper HTTP stack to WARN independent of the app default above, so
       # the per-request tower_http TraceLayer span stays disabled even if you raise
       # VLLM_LOGGING_LEVEL to INFO/DEBUG to debug the app. Per-target directives only (no
@@ -114,8 +130,7 @@ services:
       VTL_V2_FORCE_CUTLASS_FP8: "1"      # force fp8 layers off Marlin (its stable-ABI aten::empty
                                          #   crashes under V2's dynamic-shape graph) onto CUTLASS.
                                          #   Only matters under V2; "0" reverts. See quant_fp8.py.
-      # VTL_V2_FUSED_CONV_ALIGN reserved for the on-box fused conv+align kernel (Part B Target 1);
-      # inert until that .cu is built and parity-checked -- stock precopy runs meanwhile.
+      # VTL_V2_FUSED_CONV_ALIGN now lands for real in the hotpath batch block below.
 
       # vLLM only pins torch's CPU thread count in set_multiprocessing_worker_envs(), which the
       # MULTIPROC executor calls. At --tensor-parallel-size=1 we get UniProcExecutor, which
@@ -124,7 +139,10 @@ services:
       # libgomp would busy-spin after every parallel region. PASSIVE stops the spin-wait.
       OMP_NUM_THREADS: "3"
       MKL_NUM_THREADS: "3"
-      OMP_WAIT_POLICY: "ACTIVE"
+      OMP_WAIT_POLICY: "PASSIVE"             # was ACTIVE, contradicting the comment above:
+                                             # on 3 cores a spinning libgomp worker steals a
+                                             # third of the host budget from the decode loop.
+                                             # Revert: "ACTIVE".
 
       # CPython hands the GIL to a waiting thread only after sys.getswitchinterval() -- 5ms by
       # default, longer than a whole decode step. The engine-core main loop is tight pure
@@ -133,6 +151,8 @@ services:
       # VTL_GIL_SWITCH_INTERVAL: "0" here to restore the interpreter default (the A/B control).
 
       VLLM_USE_RUST_FRONTEND: "1"
+      # Multi-turn inter-request gaps in the trace tail out past 30s; 60s still races a
+      # slow turn's connection reuse, so give it more headroom.
       VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "60"
       # Rust frontend (vllm-rs) tokio worker-thread count. Unset in code auto-sizes to the
       # CFS quota (≈3 on the judge's 3-core budget). Pinned here so it's tunable: lower to 2
@@ -147,8 +167,12 @@ services:
       # dispatch handoff also collapses onto the tokio LIFO slot instead of waking a second
       # thread per token. Sweep 1<->2 if TTFT regresses (one zmq thread means a large msgpack
       # decode blocks request submission).
-      VLLM_RS_ZMQ_WORKER_THREADS: "3"
-      VLLM_RS_REQUEST_WORKER_THREADS: "3"
+      # Pinned to 2 (2026-07-29): JUDGE-SWEPT, not hypothesized. Full submissions at 1/2/3
+      # scored 71.5 / 72.5 / 72.1 -- so 1 starves submission (one blocked worker delays a
+      # request enough to show in score) and 3 pays contention on the 3-core budget. 2 is a
+      # measured optimum; do not re-derive it from theory. Revert ladder: 3 (the old value).
+      VLLM_RS_ZMQ_WORKER_THREADS: "2"
+      VLLM_RS_REQUEST_WORKER_THREADS: "2"
       # Drop the per-request axum TraceLayer span (latency A/B). Unset = layer ON (default);
       # 1 removes it, which is what we ship. Set to 0 to restore it and measure the delta.
       # Trade-off: loses rejected-request log visibility (logs are already WARN-pinned anyway).
@@ -222,6 +246,253 @@ services:
       # Interpolated so `make sweep-schedule` can drive it from the host env with no file edit.
       # Unset resolves to empty, i.e. the kernel heuristic -- what submissions ship.
       VTL_W4A8_SCHEDULE: ""
+
+      # ---- round-1.2 hot-path batch (docs/round-1.2-hotpath-batch-plan.md). ALL ENABLED by
+      # decision, 2026-07-29. INERT UNTIL THE IMAGE CARRIES THIS CODE: three of the six items
+      # are new CUDA / new fork patches, so `make vllm-fork PUSH=1` -> re-pin the digest above
+      # -> `make build` must run first, or these envs land on an image that has never heard of
+      # them (harmless, but they buy nothing). Every runtime gate fails CLOSED to the stock
+      # path -- a missing op, a wrong layout or too little occupancy disarms the feature at
+      # boot, it does not crash. If TPOT/TTFT regresses, bisect by flipping these to 0 ONE AT
+      # A TIME (bench/ab_summary.py); they are independent.
+      VTL_ENABLE_DECODE_FASTPATH: "1"    # skip the metadata build that FULL cudagraph discards
+                                         #   on repeat pure-decode steps. Revert: "0".
+      VTL_DECODE_FASTPATH_SHADOW: "0"    # DEBUG ARM: run both paths and diff the persistent
+                                         #   buffers every step. Doubles the host work; "1" only
+                                         #   to investigate a suspected divergence.
+      VTL_UVA_POOL: "1"                  # pooled pinned staging instead of pin_memory() (i.e. a
+                                         #   cudaHostAlloc) twice per step. Revert: "0".
+      VTL_RUST_SCHED_UFO: "1"            # batch update_from_output's stop decision into one Rust
+                                         #   call. Needs VTL_RUST_SCHED_FULL. Revert: "0".
+      VTL_RUST_SCHED_UFO_SHADOW: "0"     # keep python's check_stop authoritative, log Rust
+                                         #   disagreement. Soak arm; "1" costs both paths.
+      VTL_V2_FUSED_CONV_ALIGN: "1"       # mamba align pre-copy: 1 launch instead of 2 (state
+                                         #   advance + conv window migration). Revert: "0".
+      VTL_ENABLE_CONV_ALIGN_FUSED: "1"   # registers the op the line above calls. Revert: "0".
+      VTL_SHORTCONV_MEGA: "1"            # the WHOLE short-conv decode block in one launch
+                                         #   (quant -> in_proj W4A8 -> conv+gate -> out_proj).
+                                         #   Only fires at <=8 decode tokens, decode-only, and
+                                         #   only when the kernel's measured co-residency covers
+                                         #   its device barrier. Revert: "0".
+      VTL_ENABLE_SHORTCONV_MEGA: "1"     # registers the op + its persistent scratch and the
+                                         #   megakernel's own int4 weight view (~84 MB; the
+                                         #   CUTLASS-packed weights are not readable by hand).
+                                         #   Revert: "0" -- also frees that memory.
+      VTL_WARMUP_CONCURRENCY: "8"        # warm cudagraph capture sizes 2/4/8 by replaying the
+                                         #   baked trace slice concurrently after line 0 (which
+                                         #   stays serial, to seed the shared prefix unraced).
+                                         #   Revert to the sequential prime: "1".
+
+      # ---- opt/round12-5ws knobs. ALL ENABLED (2026-07-28, by decision) on the strongest
+      # un-benchmarked hypothesis per feature. NONE of these has cleared a 3-boot A/B on the
+      # slice yet, and a regression here cannot be attributed to one flag -- if TPOT/TTFT
+      # moves the wrong way, bisect by flipping these back to 0 / "" one at a time
+      # (bench/ab_summary.py). Every value is a literal; each line is a one-line revert.
+      # NOTE: inert until the image carries the round12-5ws code -- rebuild (make vllm-fork
+      # PUSH=1 -> re-pin -> make build) and re-pin the digest above, or these envs hit an
+      # image that has never heard of them.
+
+      # v2 CUTLASS W4A8 schedules (vtl._C_w4a8: Stream-K / cluster / small-tile arms).
+      # EMPTY = feature off, stock kernel everywhere. Either one bare name or a per-shape map
+      # "n<out>k<in>=<name>;...;*=<name>". Legal names: 128x16_1x1x1_sk 128x32_1x1x1_sk
+      # 128x16_1x1x1_sk_nd 128x32_1x1x1_sk_nd 128x16_1x1x1_splitk4 128x32_1x1x1_splitk4
+      # 128x16_1x1x1_s4 128x16_1x1x1_s8 128x16_2x1x1 128x8_1x1x1 64x16_1x1x1_pp 64x32_1x1x1_pp.
+      # Only fires at M <= MTHRESH. Driven by `make sweep-schedule V2=1`.
+      # ENABLED with the primary hypothesis: Stream-K on every decode GEMM (the stock choice
+      # at these shapes is 128x16_1x1x1 with no k-split; w2 runs 16 CTAs x 64 k-iters on
+      # 16 SMs). Swap the map for the sweep winner once `make sweep-schedule V2=1` has run.
+      # NOT the _sk_nd variant: nondeterministic reduction is a sweep arm only, because it makes
+      # results non-reproducible run-to-run and a flake then looks like a regression.
+      # VTL_W4A8_SCHEDULE_V2: "*=128x16_1x1x1_sk"
+      VTL_W4A8_SCHEDULE_V2: "n3072k2048=128x16_1x1x1_sk"
+      VTL_W4A8_V2_MTHRESH: "16"              # decode band upper bound; 0 = control arm
+                                             # (always forward to the stock kernel).
+                                             # 16, not 32, at sm_count=16: TileN=16, so
+                                             # M 17-32 = 2 token tiles -> qkv 48 CTAs = 3
+                                             # EVEN waves (sk = pure overhead); the ragged
+                                             # 1.5-wave case sk exists for is M<=16 only.
+                                             # Revert: "32".
+
+      # Prefill band, M in (MTHRESH, PREFILL_MAX]. This is the ONLY place cluster multicast of
+      # the WEIGHTS and raster order do anything: CUTLASS multicasts operand A (the weights,
+      # after swap+transpose) along the cluster's N dim, and that dim tiles TOKENS -- so at
+      # decode's single token tile no cluster shape can share a weight byte, while at M~512 with
+      # TileN=128 there are four tiles and a ClusterN=2 pair shares an 8 KB int4 tile per
+      # k-iteration. Raster order matters for the same reason and is probably the larger half:
+      # CUTLASS's heuristic picks AlongM here, which reuses the ACTIVATION (~2 KB) and re-reads
+      # every weight tile, where AlongN reuses the weights. Both *_pf arms force AlongN.
+      #
+      # ENABLED on the strongest hypothesis (cluster + AlongN), like the rest of this block.
+      # UNMEASURED: this is a TTFT play and the ERS gradient values 1 ms TPOT at ~23x 1 ms TTFT,
+      # so it is ranked below the decode arms. `make sweep-schedule PREFILL=1` settles it.
+      # Revert = set MAX back to "0" (band closed, stock heuristic, exactly as before).
+      #
+      # MAX bounds the band: above 1024 tokens the stock heuristic runs, because these arms are
+      # shaped for a few hundred tokens and a 4k prompt is a different problem. The LOWER bound
+      # is not a knob -- the op refuses to run a ClusterN=2 arm below 129 tokens (it needs two
+      # 128-wide token tiles, and CUTLASS would otherwise pad the grid and burn half the slice
+      # on discarded output) and falls back to stock there. That matters with chunked prefill
+      # on: a 33-128 token chunk is normal traffic and must not fault.
+      # Legal names: 128x128_1x2x1_pf (cluster + AlongN) 128x128_1x1x1_pf (AlongN + swizzle).
+      VTL_W4A8_SCHEDULE_V2_PREFILL: "128x128_1x2x1_pf"
+      VTL_W4A8_V2_PREFILL_MAX: "1024"
+
+      # Overrides the SM count CUTLASS schedules against. EMPTY = query the device, which is
+      # what upstream does. Set this ONLY if the boot line "vtl: w4a8 v2 armed -- cutlass
+      # sm_count=N" reports the physical H200's 132 rather than the slice's ~16: every
+      # persistent grid and every Stream-K split is sized from that number, so a wrong one
+      # silently mis-schedules every GEMM. One-line fix, no rebuild.
+      VTL_W4A8_SM_COUNT: ""
+
+      # Read-only go/no-go for a cooperative-grid decode megakernel: cooperative-launch support,
+      # the co-resident block ceiling, and whether MPS is on (the one thing CUDA documents as
+      # incompatible with cooperative launch -- stream capture into a CUDA graph is fine). Two
+      # device-attribute queries at load; launches nothing, allocates nothing. Reports "GO" or
+      # "NO-GO" on the boot line. 0 to silence.
+      VTL_ENABLE_MEGAKERNEL_PROBE: 1
+
+      # iceoryx2 shm data plane frontend<->EngineCore (ZMQ stays for handshake/death/fallback).
+      # BOTH the registry gate and the master switch must be 1 to activate; RAW additionally
+      # switches the per-step output record to the fixed zero-copy layout.
+      VTL_ENABLE_SHM_IPC: 1
+      VTL_SHM_IPC: 1
+      VTL_SHM_IPC_RAW: 1
+      # Batch 3: the crate publishes the finished R8/R9 record straight into this channel
+      # from the engine thread, skipping the output_queue -> Python shm-thread GIL hop.
+      # MAX_PUBLISHERS=1 makes ownership exclusive; a failed `out_open` (or the wheel built
+      # without the `shm` cargo feature) falls back to the Python `_OutputPublisher` exactly
+      # as before this batch -- default-on is safe for the same reason every other rung here
+      # is. Revert: "0" = Python always owns the channel.
+      VTL_SHM_IPC_RUST_PUB: "1"
+
+      # vtl_sched Rust scheduler core. Precedence in code (rust_sched.py apply()):
+      # authority = RUST or FULL, and authority WINS -- with the flags below, the SHADOW and
+      # STRICT lines are inert (shadow only installs when authority is off; strict only
+      # matters inside shadow). They are left at 1 so that flipping RUST+FULL to 0 falls
+      # straight back to the shadow soak instead of all-Python. FULL = schedule() runs in
+      # Rust too (SJF folded in); RADIX = radix prefix index instead of flat (parity-asserted,
+      # either is valid -- this is an implementation selector, not an additive feature).
+      # Revert ladder: FULL->0 (keep Rust manager, Python schedule()) -> RUST->0 (shadow soak)
+      # -> ENABLE->0 (all-Python, provably stock-vtl).
+      VTL_ENABLE_RUST_SCHED: 1
+      VTL_RUST_SCHED_SHADOW: 1
+      VTL_RUST_SCHED: 1
+      VTL_RUST_SCHED_FULL: 1
+      VTL_RUST_SCHED_SHADOW_STRICT: 1
+      VTL_RUST_SCHED_RADIX: 1
+
+      # R7 zero-overhead extensions on top of FULL+UFO. TABLE = Rust-resident request table
+      # (schedule_resident, no per-step pack_req marshalling; any bail/UFO-fallback step
+      # resyncs via the marshalled path). SPEC = speculative precompute: after each
+      # update_from_output a parked background thread (vtl-sched-spec, condvar, no spin)
+      # pre-runs the next schedule() GIL-free against the real manager under an exact-undo
+      # journal; consumed only if nothing invalidated (generation counter + Rust-side
+      # rollback-on-any-mutation), else rolled back bit-identically and computed inline.
+      # Revert ladder: SPEC->0 (table only) -> TABLE->0 (exact previously-shipped R6a path).
+      # TABLE_SHADOW=1 (diagnostic) compares table vs pack_req per step, marshalled stays
+      # authoritative. TIMING=1 (diagnostic) logs schedule-phase p50/p95 every 500 steps.
+      VTL_RUST_SCHED_TABLE: 1
+      VTL_RUST_SCHED_TABLE_SHADOW: 0
+      VTL_RUST_SCHED_SPEC: 1
+      VTL_SCHED_TIMING: 0
+
+      # ---- 2026-07-30 batch: hotpath micro-opts (A), R8 output collapse (B), N-step
+      # decode burst (C). ALL ON, none A/B'd on the slice yet -- bisect by flipping one
+      # line at a time (each carries its own one-line revert).
+      #
+      # INERT UNTIL THE FORK IMAGE IS REBUILT: VTL_HOTPATH_MICROOPT (edits two installed
+      # .py files) and VTL_STREAM_PER_TOKEN (edits the vllm-rs frontend source) ride in
+      # fork patches, so they do nothing until `make vllm-fork PUSH=1` -> re-pin the
+      # digest above -> `make build`. Everything else is plugin/Rust-wheel code and is
+      # live on a plain `make build`.
+      VTL_HOTPATH_MICROOPT: "1"          # Item A: 5 per-step host micro-opts in
+                                         # model_runner.py + core.py, all behind this one
+                                         # in-file env read. Revert: "0" = stock control
+                                         # flow, byte for byte. (fork patch)
+      VTL_RUST_SCHED_R8: "1"             # Item B: Rust packs the shm output record and the
+                                         # EngineCoreOutput build is skipped. Needs UFO +
+                                         # SHM_IPC + SHM_IPC_RAW (modes() enforces).
+                                         # Revert: "0" = python builds the objects.
+      VTL_RUST_SCHED_R8_SHADOW: "0"      # 1 = build BOTH and byte-compare per step, python
+                                         # authoritative. Soak arm; costs a full pack per
+                                         # step. Revert: "0".
+      VTL_RUST_HASHER: "1"               # Item B3: block hashing via vtl_sched (sha256 over
+                                         # pickle in Rust). Request.block_hashes stays the
+                                         # source of truth. Revert: "0" = stock hasher.
+      VTL_ENABLE_NSTEP_DECODE: "1"       # Item C runner half: N decode iterations per engine
+                                         # step. Revert: "0" = one token per step, and the
+                                         # scheduler then never commits a burst either.
+      VTL_NSTEP: "1"                     # Item C scheduler half: commit the burst at schedule
+                                         # time. Revert: "0" = never burst (runner idle).
+      VTL_NSTEP_N: "4"                   # Burst width. 4 because the align gate covers 13/16
+                                         # of decode steps at N=4 vs 9/16 at N=8 and chunk
+                                         # burstiness (ITL p95) grows with N. Sweep 2/4/8.
+      VTL_NSTEP_MODE: "graph"            # Ladder: graph -> eager -> off. A capture failure at
+                                         # boot logs once and drops to eager on its own.
+                                         # Revert: "eager".
+      VTL_NSTEP_QUEUE_EMPTY_ONLY: "1"    # TTFT guard: no burst while a request is waiting, so
+                                         # admission is never delayed by N-1 iterations.
+                                         # Revert: "0" = burst regardless (a sweep arm).
+
+      # ---- 2026-07-30 follow-up: in-graph work (Port 1) + the Rust token store (Port 2).
+      # ALL ON, none A/B'd on the slice yet. The three NSTEP/SAMPLE knobs below are a
+      # LADDER: each is captured separately at boot and each failure demotes to the rung
+      # under it, logging once. INERT until a capture succeeds on the H200 -- and all three
+      # are inert outright under VTL_NSTEP_MODE=eager, since every one of them IS a capture.
+      VTL_NSTEP_FOLD_T1: "1"             # Fold token 1's compute_logits+argmax into the
+                                         # burst capture (reads the persistent
+                                         # cudagraph_manager.hidden_states buffer), so the
+                                         # graph arm host-launches no logits at all. Also
+                                         # the graph VTL_SAMPLE_IN_GRAPH reuses -- turning
+                                         # this off turns that off too.
+                                         # Revert: "0" = host-launched token 1.
+      VTL_NSTEP_UNROLL: "1"              # Capture prologue + N-1 bodies + the accumulator
+                                         # store as ONE graph per burst size: the whole
+                                         # burst becomes a single replay(). +1 graph per
+                                         # size (4), same memory pool. Needs FOLD_T1.
+                                         # Revert: "0" = N replays of the per-iteration
+                                         # graph (the previously shipped behaviour).
+      VTL_SAMPLE_IN_GRAPH: "1"           # The rung that pays even if bursts stay dormant:
+                                         # on a plain greedy 1-token decode step the
+                                         # scheduler commits vtl_sample_in_graph and
+                                         # sample_tokens replays the prologue graph instead
+                                         # of calling the V2 sampler. No align gate and no
+                                         # queue-empty gate (one token crosses no block
+                                         # boundary and delays no admission). Needs FOLD_T1.
+                                         # Revert: "0" = stock sampler every step.
+      VTL_RUST_SCHED_TOKSTORE: "1"       # Port 2: Rust owns each slot's output tokens,
+                                         # counters and block-hash chain. Deletes the two
+                                         # tolist()s in AsyncOutput.get_output, decide()'s
+                                         # per-request token loop, the append_output_token_ids
+                                         # extend and the per-step Python hasher call.
+                                         # Needs R8 + VTL_RUST_HASHER (modes() enforces).
+                                         # Revert: "0" = Python owns the token lists.
+      VTL_RUST_SCHED_TOKSTORE_SHADOW: "0"  # 1 = Python stays authoritative and the Rust
+                                         # store is driven alongside and diffed per step
+                                         # (hash chains + both counters). Soak arm; costs a
+                                         # second hash pass per step. Revert: "0".
+      VTL_RUST_SCHED_R9: "1"             # R9: collapse decide()/r8_apply's per-request
+                                         # Python loops into one update_step_pack_np
+                                         # crossing (+ fold cache_blocks into it) plus a
+                                         # thin residue loop. Needs VTL_RUST_SCHED_TOKSTORE.
+                                         # Fail-open: R9.disable() on any inconsistency.
+                                         # Revert: "0" = r8_apply's per-request loop.
+      VTL_RUST_SCHED_R9_SHADOW: "0"      # 1 = the old loop stays authoritative; the batch
+                                         # cache is still built and diffed against it every
+                                         # step (pre-flight soak, independent of R9 itself).
+                                         # Revert: "0".
+      VTL_STREAM_PER_TOKEN: "1"          # Rust frontend: one SSE chunk per TOKEN instead of
+                                         # per engine record. MANDATORY with the burst -- a
+                                         # chunk-counting ITL metric would otherwise score it
+                                         # N x worse. Revert: "0". (fork patch)
+
+      # L2 persisting-cache window over the largest packed weight (w13). The boot probe runs
+      # regardless (read-only, logs cudaDevAttrMaxPersistingL2CacheSize -- expected 0: the CUDA
+      # docs say the L2 set-aside is disabled under MIG, which is exactly what the probe checks).
+      # The window itself is opt-in and a no-op while the probe reads 0.
+      VTL_L2_PERSIST: 1
+      VTL_L2_PERSIST_BYTES: "25165824"       # 24 MiB set-aside request, clamped to the device max
+      VTL_L2_HIT_RATIO: "0.6"                # fraction of window lines marked persisting
 
       # Both default OFF in code -- these two ARE load-bearing overrides.
       VTL_ENABLE_MUL_QUANT: 1                # fused conv-gate mul+fp8-quant; also gives out_proj a

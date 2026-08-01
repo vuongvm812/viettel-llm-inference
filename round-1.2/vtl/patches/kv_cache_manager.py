@@ -31,7 +31,7 @@ import logging
 
 from vtl.registry import register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl.kv_cache_manager")
 
 _HUGE = 1 << 60  # un-plannable request: pushed to the back / treated as unlimited free
 _DEFAULT_BLOCK_SIZE = 16  # only a fallback if the manager exposes no block_size

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "vtl-sched"
+version = "0.1.0"
+description = "Rust KV-cache block metadata / prefix cache / scheduler core for the vtl vLLM plugin"
+requires-python = ">=3.9"
+classifiers = ["Programming Language :: Rust"]
+
+[tool.maturin]
+module-name = "vtl_sched"
+# Batch 3: "shm" pulls in the crate-owned iceoryx2 output publisher (src/out.rs). The
+# Dockerfile's plain `cargo test --release` (default features) stays iceoryx2-free either
+# way -- this list only governs the wheel maturin actually ships.
+features = ["python", "shm", "pyo3/extension-module"]
+strip = true

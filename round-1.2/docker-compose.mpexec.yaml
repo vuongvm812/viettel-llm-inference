@@ -1,0 +1,40 @@
+# A/B ARM, NOT SUBMITTED: multiproc executor at TP=1.
+#
+# Usage: docker compose -f docker-compose.yaml -f docker-compose.mpexec.yaml up
+#
+# Why: under the default uniproc executor the ENTIRE model-runner host prep
+# (_update_states + _prepare_inputs + attn metadata + cudagraph dispatch) runs inline on
+# the EngineCore busy-loop thread, serialized with schedule() and update_from_output —
+# the ~3.4ms host block that IS the TPOT (TPOT ~= max(host, gpu)). The mp backend moves
+# it into a worker process (FutureWrapper rpc + WorkerAsyncOutputCopy thread), a genuine
+# second CPU thread of overlap. Cost: one IPC hop per step and a third busy process on
+# the 3-vCPU box contending with the shm_ipc + tokio threads — which is why this is an
+# experiment arm, not the default.
+#
+# Adopt only on a >=0.22ms TPOT win at 3 boots/arm (ab_summary.py noise floor), TTFT and
+# ERS not regressed. If it wins, it supersedes the scheduler-side overlap work.
+#
+# Compose replaces the `command` sequence wholesale, so the full list is duplicated from
+# docker-compose.yaml with ONE addition (--distributed-executor-backend=mp). Keep in sync.
+services:
+  model:
+    command:
+      - -O3
+      - --model=/model
+      - --served-model-name=LFM2.5-1.2B-Instruct
+      - --host=0.0.0.0
+      - --port=8000
+      - --max-model-len=32768
+      - --gpu-memory-utilization=0.90
+      - --tensor-parallel-size=1
+      - --distributed-executor-backend=mp
+      - --enable-prefix-caching
+      - --mamba_cache_mode=align
+      - --enable-chunked-prefill
+      - --max-num-seqs=70
+      - --max-num-batched-tokens=8192
+      - --quantization=vtl_w4a8
+      - --kv-cache-dtype=fp8_e4m3
+      - --disable-log-stats
+      - --uvicorn-log-level=warning
+      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'

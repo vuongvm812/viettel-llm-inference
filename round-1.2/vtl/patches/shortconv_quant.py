@@ -44,7 +44,7 @@ import logging
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
-log = logging.getLogger("vtl")
+log = logging.getLogger("vllm.vtl.shortconv_quant")
 
 
 def _rebuild_projections(self, *, merged_cls, row_cls, quant_config) -> bool:

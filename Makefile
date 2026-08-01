@@ -39,7 +39,7 @@ VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
 # success. `make verify` is the check: the "fusion replaced N patterns" count drops back to its
 # pre-hoist value instead of covering the conv layers.
 VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
-VLLM_FORK_TAG ?= v0.25.0-tree@sha256:45ee1a65d96e9e65c54296273629e7a1ac6824dbe69611e104bb7073c799f91e
+VLLM_FORK_TAG ?= v0.25.0-tree@sha256:fdc061e37425840f0c2384c7ed165d221258a82a1cb2a8576ca42ad032f3619f
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
@@ -75,7 +75,7 @@ IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: check stats build up down warm push bench sweep-schedule profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap
+.PHONY: check stats build up down warm push bench sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -87,9 +87,15 @@ check:
 	done
 	$(IN) python3 bench/trace_stats.py --self-check
 	$(IN) python3 bench/metrics.py
+	$(IN) python3 bench/sweep_report.py --selfcheck
 	$(IN) python3 bench/eval_quality.py --self-check
 	$(IN) python3 bench/profile_trace.py --self-check
-	$(IN) [ -f bench/build_trace_round2.py ] && PYTHONPATH=. python3 bench/build_trace_round2.py --self-check || true
+	@# if-form, not `[ -f x ] && cmd || true`: that swallows the script's OWN failure as well as
+	@# its absence, i.e. a broken self-check reports green. Absent = fine, present = must pass.
+	$(IN) if [ -f bench/build_trace_round2.py ]; then PYTHONPATH=. python3 bench/build_trace_round2.py --self-check; fi
+	@# Formula half runs anywhere; the live-allocator half needs CUDA and skips off-box
+	@# (it runs for real under `make test-kernel`, which pytest-globs bench/test_*.py).
+	$(IN) if [ -f bench/test_kv_alignment.py ]; then python3 bench/test_kv_alignment.py; fi
 	$(IN) python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
 
 # No compose, no server, no model: the kernel tests just need the image and a GPU.
@@ -280,19 +286,90 @@ bench:
 ## full 132-SM Hopper and the judge's MIG 1g.18gb slice has ~19, so its choice is an open
 ## question, not a settled one. This is the one already-exposed W4A8 tunable never swept.
 ## `heuristic` is the sentinel for "unset", the baseline every other row must beat -- a literal
-## empty word cannot survive make -> shell word splitting. The three named tiles are what the
-## heuristic picks for our shapes (M<=32 decode, 8192-token prefill).
-SCHEDULES ?= heuristic 128x16_1x1x1 128x32_1x1x1 128x256_1x1x1
-sweep-schedule:
+## empty word cannot survive make -> shell word splitting. All ten stock tiles are swept, not
+## just the three the heuristic picks for our shapes: the point is that its M/N/K-only rule was
+## tuned on hardware this box is not.
+##
+##   make sweep-schedule                    # heuristic + all 10 stock tiles, 3 boots each
+##   make sweep-schedule BOOTS=5            # add BOOTS, not reps -- the floor is boot-to-boot
+##   make sweep-schedule V2=1               # + the vtl._C_w4a8 Stream-K/cluster/pingpong arms
+##   make sweep-schedule MICRO=1            # microbench every arm FIRST, then boot (see below)
+##   make sweep-schedule SCHEDULES=128x16_1x1x1   # one arm, no baseline
+##
+## COMPILE COST: either schedule env changes the kernel selected for every W4A8 GEMM, which
+## invalidates the AOT/inductor caches baked into /opt/vtl/cache -- the FIRST boot of each arm
+## pays that compile, mostly in TTFT. That is why 3 boots is the default and why sweep_report.py
+## reads the noise floor off the baseline arm's own boot spread instead of a constant.
+##
+## ENV CONTRACT: a stock name goes to VTL_W4A8_SCHEDULE (vtl/patches/quant_w4a8.py). Anything
+## else -- *_sk, *_pp, 128x8_1x1x1, cluster variants beyond the stock ten -- is a v2 schedule
+## from the vtl._C_w4a8 extension and goes to VTL_W4A8_SCHEDULE_V2 instead, with
+## VTL_W4A8_SCHEDULE left EMPTY so exactly one knob steers the kernel. This target only sets the
+## envs; it does not require the v2 extension to exist (an image without it ignores the var and
+## the arm reads as a duplicate baseline -- which is itself the check that the .so is loaded).
+##
+## docker-compose.yaml pins VTL_W4A8_SCHEDULE as a literal (the submission artifact takes no
+## ${VAR}) and a compose literal beats the host env, so each arm is driven by a throwaway
+## overlay instead. Exporting the var on the host, as this target used to, does nothing.
+STOCK_SCHEDULES := 256x128_1x1x1 256x64_1x1x1 256x32_1x1x1 256x16_1x1x1 128x256_2x1x1 \
+                   128x256_1x1x1 128x128_1x1x1 128x64_1x1x1 128x32_1x1x1 128x16_1x1x1
+## WS2's planned v2 instantiations. Opt-in (V2=1): they need the sm_90a vtl._C_w4a8 build, and
+## sweeping them against an image that lacks it just burns boots.
+V2_SCHEDULES ?= 128x16_1x1x1_sk 128x32_1x1x1_sk 128x16_2x1x1 128x8_1x1x1 \
+                64x16_1x1x1_pp 64x32_1x1x1_pp \
+                128x16_1x1x1_sk_nd 128x32_1x1x1_sk_nd \
+                128x16_1x1x1_splitk4 128x32_1x1x1_splitk4 \
+                128x16_1x1x1_s4 128x16_1x1x1_s8
+## Prefill-band arms. NOT in the default sweep: they select a different env knob
+## (VTL_W4A8_SCHEDULE_V2_PREFILL) and only fire when VTL_W4A8_V2_PREFILL_MAX is non-zero, so
+## sweeping them alongside the decode arms would silently measure the baseline. Sweep with
+## `make sweep-schedule PREFILL=1`, which sets both.
+V2_PREFILL_SCHEDULES ?= 128x128_1x2x1_pf 128x128_1x1x1_pf
+SCHEDULES ?= heuristic $(STOCK_SCHEDULES) $(if $(V2),$(V2_SCHEDULES)) \
+             $(if $(PREFILL),$(V2_PREFILL_SCHEDULES))
+BOOTS ?= 3
+# Named for the knob it sweeps, NOT /tmp/vtl-sched.yaml -- that reads like the vtl-sched Rust
+# crate (WS4), which has nothing to do with W4A8 tiles.
+SWEEP_OVERLAY := /tmp/vtl-w4a8-sweep.yaml
+# Upper bound of the prefill band while sweeping a *_pf arm. Only applied to those arms: left at
+# 0 the band cannot fire at all, which is what keeps every other arm a clean decode measurement.
+PREFILL_MAX ?= 1024
+# One line, duplicated in the micro target rather than abstracted: stock name -> $$s, heuristic
+# -> neither, a *_pf name -> $$pf (a different env knob), anything else -> $$v2.
+SWEEP_CLASSIFY = s=""; v2=""; pf=""; pfmax=0; \
+	  case " $(STOCK_SCHEDULES) " in *" $$name "*) s="$$name";; \
+	  *) case "$$name" in heuristic) ;; \
+	     *_pf) pf="$$name"; pfmax=$(PREFILL_MAX);; \
+	     *) v2="$$name";; esac;; esac
+sweep-schedule: $(if $(MICRO),sweep-schedule-micro)
 	@for name in $(SCHEDULES); do \
-	  case "$$name" in heuristic) s="";; *) s="$$name";; esac; \
-	  echo "=== VTL_W4A8_SCHEDULE=$${s:-<heuristic>}"; \
-	  ( cd $(ROUND) && VTL_W4A8_SCHEDULE="$$s" $(DC) up -d --force-recreate --wait \
-	    && VTL_W4A8_SCHEDULE="$$s" python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
-	         --out bench-sched-$$name.json \
-	    ; rc=$$?; VTL_W4A8_SCHEDULE="$$s" $(DC) down; exit $$rc ) || exit 1; \
+	  $(SWEEP_CLASSIFY); \
+	  printf 'services:\n  model:\n    environment:\n      VTL_W4A8_SCHEDULE: "%s"\n      VTL_W4A8_SCHEDULE_V2: "%s"\n      VTL_W4A8_SCHEDULE_V2_PREFILL: "%s"\n      VTL_W4A8_V2_PREFILL_MAX: "%s"\n' \
+	    "$$s" "$$v2" "$$pf" "$$pfmax" > $(SWEEP_OVERLAY); \
+	  b=0; while [ $$b -lt $(BOOTS) ]; do b=$$((b+1)); \
+	    echo "=== $$name boot $$b/$(BOOTS) (VTL_W4A8_SCHEDULE='$$s' VTL_W4A8_SCHEDULE_V2='$$v2' PREFILL='$$pf'/$$pfmax)"; \
+	    ( cd $(ROUND) && $(DC) -f $(SWEEP_OVERLAY) up -d --force-recreate --wait \
+	      && python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	           --out bench-sched-$$name-b$$b.json \
+	      ; rc=$$?; $(DC) -f $(SWEEP_OVERLAY) down; exit $$rc ) || exit 1; \
+	  done; \
 	done
-	@echo "compare: $(ROUND)/bench-sched-*.json (heuristic is the baseline)"
+	@echo "verdict: cd $(ROUND) && python3 bench/sweep_report.py bench-sched-*.json"
+	@echo "  (compare.py prints one column per BOOT and cannot group arms -- use sweep_report)"
+
+## Kernel-level filter to run BEFORE committing $(BOOTS) boots x $(words $(SCHEDULES)) arms of
+## trace replay to the box. Same microbench `make bench-kernel` runs (bench/test_*.py print
+## CUDA-event tables), once per schedule: minutes instead of hours, and an arm that already
+## loses at the kernel does not deserve a boot. No compose and no replay -- a microbench needs
+## neither -- so this is also the only way to sweep on a GPU box with no model weights.
+sweep-schedule-micro: build
+	@for name in $(SCHEDULES); do \
+	  $(SWEEP_CLASSIFY); \
+	  echo "=== micro $$name (VTL_W4A8_SCHEDULE='$$s' VTL_W4A8_SCHEDULE_V2='$$v2' PREFILL='$$pf'/$$pfmax)"; \
+	  $(KRUN) "export VTL_W4A8_SCHEDULE='$$s' VTL_W4A8_SCHEDULE_V2='$$v2' \
+	    VTL_W4A8_SCHEDULE_V2_PREFILL='$$pf' VTL_W4A8_V2_PREFILL_MAX='$$pfmax'; \
+	    for t in /bench/test_*.py; do echo \"--- \$$t\"; python3 \$$t || exit 1; done" || exit 1; \
+	done
 
 ## Phase-0 profiler (needs the H200). Boots with vLLM's torch profiler enabled, drives a small
 ## closed-loop replay, and prints a ranked GPU-kernel cost table. See docs/plans/.
