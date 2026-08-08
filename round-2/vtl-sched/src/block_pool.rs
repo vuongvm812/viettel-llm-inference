@@ -737,7 +737,11 @@ impl BlockPool {
     /// touch and decrements it on free and simply tolerates the drift (`is_null` keeps
     /// it out of the free queue either way); a drifting counter on this side would trip
     /// `free_blocks`' double-free assert in debug and wrap in release, so both paths
-    /// skip it and its counter stays honestly at 0.
+    /// skip it and its counter stays honestly at 0. The one reader that can observe the
+    /// difference is `get_num_common_prefix_blocks` (single_type.rs), whose ref-count
+    /// scan now always breaks at a leading null instead of coincidentally continuing
+    /// when Python's drifted count equals num_reqs -- the conservative answer, and moot
+    /// on lean boots, which skip that call entirely.
     pub fn touch(&mut self, blocks: &[u32]) -> Result<(), String> {
         for &id in blocks {
             let b = self.arena.get(id);

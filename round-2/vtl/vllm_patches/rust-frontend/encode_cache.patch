@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..9a84634
 --- /dev/null
 +++ b/src/text/src/encode_cache.rs
-@@ -0,0 +1,408 @@
+@@ -0,0 +1,418 @@
 +//! vtl: prefix -> token-ids cache for chat prompts (`VTL_FRONTEND_ENCODE_CACHE`).
 +//!
 +//! WHY. 350 of the 420 graded-trace requests are strict *extensions* of an earlier request
@@ -202,22 +202,32 @@ index 0000000..9a84634
 +        let mut out = ids;
 +        out.extend_from_slice(&encode(&text[split..])?);
 +
-+        {
++        let entry = Entry {
++            prefix: text[..split].to_string(),
++            ids: out[..prefix_len].to_vec(),
++        };
++        // Both ~17 KB allocations above happen OUTSIDE the lock, and an eviction's
++        // ~12 MB drop below it -- the critical section is a hash insert.
++        let evicted = {
 +            let mut entries = self.lock();
-+            if entries.len() >= MAX_ENTRIES && !entries.contains_key(&key) {
-+                entries.clear();
-+            }
-+            entries.insert(
-+                key,
-+                Entry {
-+                    prefix: text[..split].to_string(),
-+                    ids: out[..prefix_len].to_vec(),
-+                },
-+            );
-+        }
++            let full = entries.len() >= MAX_ENTRIES && !entries.contains_key(&key);
++            let old = full.then(|| std::mem::take(&mut *entries));
++            entries.insert(key, entry);
++            old
++        };
++        drop(evicted);
 +
 +        if self.should_verify() {
-+            let stock = encode(text)?;
++            let stock = match encode(text) {
++                Ok(stock) => stock,
++                Err(e) => {
++                    // Hand the claim back: leaking it would leave `verify_ok` short of
++                    // its target forever, silently pinning every later request to the
++                    // 2x encode-and-compare path.
++                    self.verify_left.fetch_add(1, Ordering::Relaxed);
++                    return Err(e);
++                }
++            };
 +            if stock != out {
 +                self.killed.store(true, Ordering::Relaxed);
 +                warn!(

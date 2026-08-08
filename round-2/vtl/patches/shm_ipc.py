@@ -628,9 +628,10 @@ class RawTokens(Sequence):
         return iter(self._list())
 
     def copy(self):
-        # A FRESH list every call, not `self._list()`: `Request.__init__` extends the
-        # result in place as `_all_token_ids`.
-        return self._arr.tolist()
+        # A FRESH list every call, not `self._list()` itself: `Request.__init__` extends
+        # the result in place as `_all_token_ids`. Copying the cached list beats a second
+        # C-level `tolist` when `__reduce__` (the mp pickle) also fires for this request.
+        return list(self._list())
 
     def __reduce__(self):
         return (list, (self._list(),))
@@ -731,7 +732,14 @@ def _run_input_thread(engine, input_address: str, engine_index: int, ready: thre
                     if request_type == EngineCoreRequestType.ADD:
                         req = add_request_decoder.decode(data_frames)
                         if raw_ids is not None:
-                            req.prompt_token_ids = RawTokens(raw_ids)
+                            # A resumable session's prompt list gets `.extend`ed in place
+                            # by the scheduler (`_update_request_as_session`), which the
+                            # read-only facade cannot satisfy -- give those a real list.
+                            req.prompt_token_ids = (
+                                raw_ids.tolist()
+                                if getattr(req, "resumable", False)
+                                else RawTokens(raw_ids)
+                            )
                         try:
                             request = engine.preprocess_add_request(req)
                         except Exception:

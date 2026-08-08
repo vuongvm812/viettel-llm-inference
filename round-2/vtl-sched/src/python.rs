@@ -25,6 +25,7 @@
 //! worker only holds it between a `kick` and the following `take_speculative`.
 //! The numpy buffers stay OUTSIDE the mutex — they are GIL-protected, as before.
 
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
@@ -934,8 +935,12 @@ pub struct Scheduler {
     /// stays a thin, backward-compatible handle.
     params: Option<Params>,
     /// Built on the first `*_arena` call. `None` on a dict-path boot, so a plugin that
-    /// never asks for the arena pays nothing.
-    arena: Option<Arena>,
+    /// never asks for the arena pays nothing. Interior-mutable so the `*_arena` entry
+    /// points can take `&self`: a `&mut self` pymethod is an EXCLUSIVE pyclass borrow
+    /// held across the GIL-released scheduling window, which would turn any concurrent
+    /// `Scheduler` call into `RuntimeError: Already borrowed`. The RefCell borrow here is
+    /// scoped to the GIL-held marshalling only.
+    arena: RefCell<Option<Arena>>,
 }
 
 impl Arena {
@@ -963,12 +968,18 @@ impl Arena {
             grew = true;
         }
         let bound = self.bufs[idx].bind(py);
-        // SAFETY: the buffer is owned by this Scheduler and only ever handed to Python as a
-        // read-only `[:n]` view; the GIL is held for the duration of the write.
+        // SAFETY: the buffer is owned by this Scheduler; Python only reads `[:n]` slices
+        // of it (nothing on the Python side writes it), and the GIL is held for the
+        // duration of this write.
         let dst = unsafe { bound.as_slice_mut()? };
-        for (d, v) in dst.iter_mut().zip(vals) {
+        let mut written = 0usize;
+        for (d, v) in dst[..n].iter_mut().zip(vals) {
             *d = v;
+            written += 1;
         }
+        // Python trusts `dst[..n]` blindly -- a short iterator would leave stale entries
+        // it reads as real decisions.
+        debug_assert_eq!(written, n, "arena buffer {idx}: iterator yielded {written} of {n}");
         Ok(grew)
     }
 }
@@ -998,12 +1009,13 @@ impl Scheduler {
     /// Marshal `d` into the arena. Counts are ELEMENT counts of the flat buffers, not
     /// tuple counts, so Python's strided views need no arity constant.
     fn write_arena<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         d: &Decisions,
         check: bool,
     ) -> PyResult<ArenaCounts<'py>> {
-        let arena = self.arena.get_or_insert_with(Arena::new);
+        let mut slot = self.arena.borrow_mut();
+        let arena = slot.get_or_insert_with(Arena::new);
         let n_run = d.scheduled_running.len() * 2;
         let n_adm = d.scheduled_admitted.len() * 3;
         let mut grew = arena.fill(
@@ -1180,7 +1192,7 @@ impl Scheduler {
     fn new() -> Self {
         Scheduler {
             params: None,
-            arena: None,
+            arena: RefCell::new(None),
         }
     }
 
@@ -1237,8 +1249,9 @@ impl Scheduler {
 
     /// The persistent decision buffers, in count-tuple order. Python reads them once and
     /// again whenever a `*_arena` call reports `grew`.
-    fn arena_buffers(&mut self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
-        let arena = self.arena.get_or_insert_with(Arena::new);
+    fn arena_buffers(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+        let mut slot = self.arena.borrow_mut();
+        let arena = slot.get_or_insert_with(Arena::new);
         while arena.bufs.len() < ARENA_BUFS {
             arena
                 .bufs
@@ -1254,7 +1267,7 @@ impl Scheduler {
     /// [`Self::schedule`] writing into the arena instead of building a PyDict.
     #[pyo3(signature = (kv, running, waiting, check=false))]
     fn schedule_arena<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         kv: &KvManager,
         running: Vec<ReqTuple>,
@@ -1271,7 +1284,7 @@ impl Scheduler {
     /// [`Self::schedule_resident`] writing into the arena.
     #[pyo3(signature = (kv, running_slots, waiting, check=false))]
     fn schedule_resident_arena<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         kv: &KvManager,
         running_slots: Vec<u32>,
@@ -1288,7 +1301,7 @@ impl Scheduler {
     /// speculation, call the resident path".
     #[pyo3(signature = (kv, generation, running_slots, check=false))]
     fn take_speculative_arena<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         kv: &KvManager,
         generation: u64,

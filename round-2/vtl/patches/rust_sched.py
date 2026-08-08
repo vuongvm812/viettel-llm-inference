@@ -336,6 +336,16 @@ def ring_blocked(scheduler) -> str | None:
         # The fast path must PEEK at the pending frees; `get_freed_mm_hashes()` drains and
         # would drop them on a step that then refuses the reuse.
         return "encoder cache manager exposes no peekable `freed` list"
+    # The ring replays `scheduled_cached_reqs` verbatim, so every CachedRequestData field
+    # that is per-step-fresh in stock (`new_token_ids` under PP, `num_output_tokens` under
+    # iteration-details logging) must be provably dead -- exactly `lean_blocked`'s
+    # predicate, whether or not LEAN itself is enabled. The identity check in `ring_reuse`
+    # additionally leans on `schedule_supported` refusing KV connectors: without a
+    # connector, `_free_request` always `del self.requests[...]` at finish, which is what
+    # makes registry identity authoritative for slot recycling.
+    why = lean_blocked(scheduler)
+    if why:
+        return why
     return None
 
 
@@ -3601,6 +3611,9 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     and not scheduler_output.finished_req_ids
                     and not scheduler_output.preempted_req_ids
                     and total == len(sched_slots)
+                    # An empty batch is not worth caching, and reusing one would bump
+                    # `sched_step_seq` where stock gates on `total > 0`.
+                    and total > 0
                 )
                 else None
             )
