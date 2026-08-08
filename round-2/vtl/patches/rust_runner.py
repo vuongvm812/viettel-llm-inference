@@ -60,6 +60,8 @@ Phase 3 / ``max_concurrent_batches`` = 1), not relaxing this gate.
 
 ``VTL_RUST_RUNNER``: "0" off, "1" on.
 ``VTL_RUST_RUNNER_STEPS``: burst launches per FFI call (M4 ceiling).
+``VTL_RUST_RUNNER_REQUIRE``: "1" makes a refusal a BOOT FAILURE instead of a silent
+degrade -- see ``_State.refuse``.
 """
 
 from __future__ import annotations
@@ -77,6 +79,16 @@ def mode() -> str:
     """"off" | "on"."""
     raw = os.environ.get("VTL_RUST_RUNNER", "1").strip().lower()
     return "on" if raw in _TRUTHY else "off"
+
+
+def require() -> bool:
+    """``VTL_RUST_RUNNER_REQUIRE``: turn a refusal into a raise. Mirrors
+    ``VTL_RUST_SCHED_REQUIRE`` (rust_sched.refuse) and exists for the same reason: a runner
+    that quietly never armed looks, in every latency number, exactly like a runner that ran
+    and did not help, so an A/B arm that measures the stock path while looking fine is the
+    failure this flag makes impossible. Default OFF -- in the submission, serving-but-slower
+    beats not serving."""
+    return os.environ.get("VTL_RUST_RUNNER_REQUIRE", "").strip().lower() in _TRUTHY
 
 
 def max_steps() -> int:
@@ -133,7 +145,13 @@ class _State:
         self.engaged = 0        # launches taken this boot, for the once-in-a-while log
 
     def refuse(self, why: str) -> None:
-        """Permanent stand-down for the boot. Never raises -- the caller keeps the stock path."""
+        """Permanent stand-down for the boot.
+
+        Raises only under ``VTL_RUST_RUNNER_REQUIRE`` (see ``require``); otherwise never
+        raises -- the caller keeps the stock path. The latch is dropped and the crate-side
+        runner disarmed BEFORE the raise, so even the raising arm leaves consistent state
+        if something upstream swallows it.
+        """
         if self.live:
             log.error("vtl: rust runner disabled for this boot -- %s", why)
         else:
@@ -147,6 +165,10 @@ class _State:
                 self.runner.disarm()
             except Exception:  # pragma: no cover - a disarm that throws must not propagate
                 log.exception("vtl: rust runner disarm failed")
+        if require():
+            raise RuntimeError(
+                f"VTL_RUST_RUNNER_REQUIRE=1 but the Rust runner cannot run: {why}"
+            )
 
     def take_step(self) -> "_Stash | None":
         """Pop the stash. Always popped, launch or no launch: a stash names a SCHEDULED
@@ -422,6 +444,34 @@ def _self_check() -> None:
             os.environ.pop("VTL_RUST_RUNNER", None)
         else:
             os.environ["VTL_RUST_RUNNER"] = saved
+
+    saved_r = os.environ.get("VTL_RUST_RUNNER_REQUIRE")
+    try:
+        os.environ.pop("VTL_RUST_RUNNER_REQUIRE", None)
+        assert require() is False, "the submission must degrade, not fail"
+        for raw, want in (("1", True), ("on", True), ("0", False), ("", False)):
+            os.environ["VTL_RUST_RUNNER_REQUIRE"] = raw
+            assert require() is want, raw
+        # ...and then a refusal is a raise, not a latch. The latch still drops first, so
+        # a caller that swallows the raise cannot be left with a live-but-broken runner.
+        os.environ["VTL_RUST_RUNNER_REQUIRE"] = "1"
+        s = _State()
+        s.live = True
+        logging.disable(logging.CRITICAL)
+        try:
+            s.refuse("required")
+        except RuntimeError as exc:
+            assert "VTL_RUST_RUNNER_REQUIRE" in str(exc), exc
+        else:
+            raise AssertionError("REQUIRE must not degrade quietly")
+        finally:
+            logging.disable(logging.NOTSET)
+        assert not s.live and s.why == "required"
+    finally:
+        if saved_r is None:
+            os.environ.pop("VTL_RUST_RUNNER_REQUIRE", None)
+        else:
+            os.environ["VTL_RUST_RUNNER_REQUIRE"] = saved_r
 
     saved_n = os.environ.get("VTL_RUST_RUNNER_STEPS")
     try:

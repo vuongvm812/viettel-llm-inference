@@ -1013,6 +1013,18 @@ def _patch_runner(b: _Burst) -> None:
             except Exception:
                 log.exception("vtl: nstep burst setup failed; one token per step")
                 b.armed = False
+            # VTL_RUST_RUNNER_REQUIRE, checked HERE: every guard above swallows on purpose
+            # (a runner that cannot arm must not cost the boot), so the loud arm has to sit
+            # outside all of them. An unimportable module raises on its own, which is the
+            # same answer.
+            if _flag("VTL_RUST_RUNNER_REQUIRE", "0"):
+                from vtl.patches import rust_runner
+
+                if not rust_runner.STATE.live:
+                    raise RuntimeError(
+                        "VTL_RUST_RUNNER_REQUIRE=1 but the Rust runner is not armed: "
+                        f"{rust_runner.STATE.why}"
+                    )
             return size
 
         return capture_model
