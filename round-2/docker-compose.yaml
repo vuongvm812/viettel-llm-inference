@@ -4,28 +4,29 @@ name: viettel-llm-optimized
 # mounts -- the judge host provides the model at /model and scrapes :8000.
 #
 # ============================ FILL IN BEFORE SUBMITTING ============================
-# This round ships MODEL-AGNOSTIC: nothing below assumes a particular architecture.
-# Three things must be set once the model is known, and `make verify` checks each:
+# CURRENTLY PINNED TO LFM2.5-1.2B-Instruct -- the round-1.2 model -- so this branch can be
+# booted and measured against a real model. The CODE stays model-agnostic (decode_fastpath
+# classifies dense and hybrid alike); only the three serve literals below are model-specific,
+# and each must be revisited when round-2's actual model is announced:
 #
-#   1. --served-model-name       currently the placeholder `round2-model`. It must match
+#   1. --served-model-name       `LFM2.5-1.2B-Instruct`. Must match
 #                                bench/build_trace_round2.py's --model-name and the "model"
 #                                field of data/input/trace-round2.jsonl, or every replayed
 #                                request 404s.
 #   2. --max-model-len           must equal the model's native context (config.json
-#                                max_position_embeddings). A tighter cap truncates the
-#                                judge's long-context probe -> flagged as cheating.
-#   3. --quantization            vtl_w4a8 is kept from the previous round but is NOT
-#                                validated against this architecture. Run
-#                                bench/eval_quality.py before trusting it; revert to
-#                                vtl_fp8 (or drop the flag) if agreement is poor.
+#                                max_position_embeddings). 32768 is LFM2.5's. A tighter cap
+#                                truncates the judge's long-context probe -> cheating flag.
+#   3. --quantization            vtl_w4a8, carried from round-1.2 where it WAS validated
+#                                against this architecture. Re-run bench/eval_quality.py if
+#                                the model changes; revert to vtl_fp8 if agreement is poor.
+#   4. --mamba_cache_mode=align  REQUIRED by LFM2.5 (hybrid: 10 short-conv + 6 GQA). DELETE
+#                                the line if the final model is dense -- passing it to a
+#                                model without mamba caching fails at startup. See the
+#                                comment at the flag itself.
 #
 # NO SHELL-VARIABLE INTERPOLATION ANYWHERE IN THIS FILE (no dollar-brace anything). It is
 # submitted as-is and an unset variable is a boot failure, i.e. score 0. Literals only.
 # Check with:  grep -F '$''{' docker-compose.yaml   # must print nothing
-#
-# ARCHITECTURE-SPECIFIC SERVE FLAGS (e.g. --mamba_cache_mode for a hybrid SSM model) are
-# deliberately absent: passing one a model does not implement raises at startup. Add only
-# what the chosen model actually needs.
 # ==================================================================================
 #
 # Workload (regenerate stats with `python bench/trace_stats.py`):
@@ -46,7 +47,14 @@ services:
     command:
       - -O3
       - --model=/model #Don't change this to vllm-server
-      - --served-model-name=round2-model #Don't change this to vllm-server -- PLACEHOLDER, see header
+      # TWO names, deliberately. `--served-model-name` is nargs="+" (arg_utils.py:223) and
+      # the FIRST is what responses report, so the server answers to its real name while
+      # `round2-model` stays a live alias -- which is what data/input/trace-round2.jsonl
+      # still puts in `body.model`. Without the alias every replayed request 404s.
+      # Drop `round2-model` once the trace is regenerated with the real name.
+      - --served-model-name #Don't change this to vllm-server -- see header
+      - LFM2.5-1.2B-Instruct
+      - round2-model
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
 
@@ -72,12 +80,18 @@ services:
 
       # Intra-conversation prefix reuse is the biggest win (turn N reuses turns 0..N-1).
       #
-      # IF THE CHOSEN MODEL IS A HYBRID (SSM/conv state alongside attention KV) it will also
-      # need `--mamba_cache_mode=align`. Left out because passing it to a model that does not
-      # implement it is a startup failure, and `align` is also what vtl-sched's config
-      # validation requires (src/config.rs) -- so a hybrid round must add it back or the Rust
-      # scheduler refuses to engage.
+      # `--mamba_cache_mode=align` is REQUIRED by the model pinned above: LFM2.5 is a hybrid
+      # (10 short-conv layers alongside 6 GQA), and `align` is what vtl-sched's config
+      # validation demands for any Mamba-kind group (src/config.rs:73) AND what
+      # decode_fastpath's mamba branch demands (decode_fastpath.py:198). Without it the Rust
+      # scheduler refuses to engage and the fast path stays off.
+      #
+      # IF THE SUBMITTED MODEL TURNS OUT TO BE DENSE, DELETE THIS LINE: passing it to a model
+      # that does not implement mamba caching is a startup failure. Nothing else needs to
+      # change for a dense model -- `_classify` accepts an empty mamba builder list and the
+      # crate only demands `align` for Mamba-kind groups.
       - --enable-prefix-caching
+      - --mamba_cache_mode=align
       - --enable-chunked-prefill
       - --max-num-seqs=70 # peak concurrency ~6 in the trace; a small cap shrinks the cudagraph
                           # capture set + VRAM and leaves OOM headroom. Sweep with bench/replay.py.
