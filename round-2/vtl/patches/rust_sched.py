@@ -2157,14 +2157,18 @@ def _install_update_from_output(scheduler_cls, m: dict):
         if done.exit == "unpacked":
             # Should-never-happen: the crate refuses the pre-flight rather than reach here.
             # The failed launch appended NOTHING to the token store (`store_apply` runs
-            # only on a packed step) but did advance the resident table, so drop that
-            # launch from the residue, force a table resync, and let `burst_uncommit` give
-            # its tokens back -- the same reconcile a stopped burst uses.
+            # only on a packed step) but the WORKER did advance -- `postprocess_sampled`
+            # consumed all `ran * n` tokens, including the unpacked launch's. The two sides
+            # cannot be re-aligned after the fact (re-running `decide()` would double-append
+            # the packed launches), so retire every slot in the batch as length-capped:
+            # the client gets the tokens the store actually holds, and no request ever
+            # generates again from worker/scheduler-divergent state. `ran` already counts
+            # the unpacked launch, so `base` -- the packed launches' tokens -- is already
+            # right and the residue accepts exactly those.
             log.error("rust_sched: the runner could not pack launch %d; standing down", ran)
             stand_down = "a launch did not pack"
             self._vtl_ufo_clean = False
-            verdicts = [(0, 0, -1)] * len(stash.slots)
-            base = max(0, base - n)
+            verdicts = [(0, 2, -1)] * len(stash.slots)  # 2 = FINISHED_LENGTH_CAPPED
         self._vtl_r9_residue = [
             (slot, req, (base + acc, status, stop))
             for slot, req, (acc, status, stop) in zip(stash.slots, stash.reqs, verdicts)

@@ -2081,9 +2081,10 @@ impl Runner {
                 if !packed {
                     // The pre-flight above says this cannot happen, so it is reported
                     // rather than absorbed: the launch DID run and advanced the resident
-                    // table, but `store_apply` never appended its tokens. The caller drops
-                    // this launch from the residue, resyncs the table and gives the tokens
-                    // back through the burst reconcile.
+                    // table, but `store_apply` never appended its tokens. The caller
+                    // retires the whole batch (the worker consumed this launch's tokens,
+                    // the store did not, and the two cannot be re-aligned after the fact)
+                    // and stands the runner down for the boot.
                     exit = LoopExit::Unpacked;
                     break;
                 }
@@ -2134,7 +2135,9 @@ pub enum LoopExit {
     /// appended to the store even though the graph produced them. The pre-flight makes this
     /// unreachable; it is a variant rather than an error because by the time it is known
     /// the launch has happened, and a caller that treated it as "nothing ran" would
-    /// double-count the launches before it.
+    /// double-count the launches before it. The caller must not let the affected slots
+    /// generate again (worker and store now disagree on their length) -- rust_sched
+    /// retires the batch and stands the runner down.
     Unpacked,
 }
 

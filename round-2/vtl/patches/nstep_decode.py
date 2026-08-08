@@ -872,6 +872,12 @@ def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
     # table row and CLAMPS itself to one launch when this shape has no continuation graph,
     # which is strictly better than refusing the whole step (the surplus is reconciled).
 
+    # Rows `num_reqs..pad` keep whatever an earlier (wider) step left in them, and the
+    # captured `compute_slot_mappings` grid does read them -- but `prepare_inputs` pads
+    # `query_start_loc[num_reqs + 1:]` with the real token count (input_batch.py:137), so
+    # each padded row's token loop is `range(t, t)` and its stale `idx_map` value is a
+    # loaded-but-dead operand; the kernel's sentinel program then PAD_SLOT_IDs the token
+    # gap. Same argument the Python arm's padded replay rests on.
     b.idx_map[:num_reqs].copy_(ib.idx_mapping, non_blocking=True)
     b.rows.fill_(num_reqs)
     # No `b.step.zero_()`: the unroll graph does it in-graph, and the continuation graphs
