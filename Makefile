@@ -3,16 +3,23 @@
 # repos at the root so they are not duplicated per round.
 #
 #   round-1.1/  frozen Qwen3.5-2B baseline (phase-1)
-#   round-1.2/  LFM2.5-1.2B refactor       (phase-2, default)
+#   round-1.2/  LFM2.5-1.2B refactor       (phase-2)
+#   round-2/    model-agnostic workspace   (phase-3, default; no model baked in)
 #
 # Pick the round with ROUND=... on any target:
-#   make up                      # round-1.2 (default)
-#   make up ROUND=round-1.1      # the baseline
-#   make test-kernel ROUND=round-1.2
-ROUND ?= round-1.2
+#   make up                      # round-2 (default)
+#   make up ROUND=round-1.2      # the LFM2.5 phase-2 stack
+#   make test-kernel ROUND=round-1.1
+ROUND ?= round-2
 ifeq ($(wildcard $(ROUND)/.),)
-$(error ROUND '$(ROUND)' not found -- use ROUND=round-1.1 or ROUND=round-1.2)
+$(error ROUND '$(ROUND)' not found -- use ROUND=round-1.1, round-1.2 or round-2)
 endif
+
+# Per-round overrides, included BEFORE every default below so a plain `?=` cannot clobber them.
+# This is how a round pins its OWN forked-vLLM digest: the fork is built from that round's
+# vtl/vllm_patches/, so two rounds with different patch sets cannot share one VLLM_FORK_TAG.
+# Optional -- a round without a round.mk just takes the defaults.
+-include $(ROUND)/round.mk
 
 IMAGE ?= unseenablefuture/awesome-badger
 TAG ?= dev
@@ -63,7 +70,7 @@ PGO_TARGET_CPU ?= native
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
 IN := cd $(ROUND) &&
-TRACE := data/input/trace-round2.jsonl
+TRACE ?= data/input/trace-round2.jsonl
 # docker-compose.yaml is the SUBMISSION artifact and the single source of truth for every
 # serve flag and env var; the three overlays only carry their differences (dev image tag,
 # local build+mount, judge-box resource caps). Order matters -- later -f wins.
@@ -75,7 +82,20 @@ IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: check stats build up down warm push bench sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap
+.PHONY: check stats build up down warm push bench sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show
+
+## Host-level latency tuning for the DEV/BENCH box. NOT part of any submission -- the judge
+## runs `docker compose up` on their host and none of these knobs are reachable from a
+## compose file. The point is measurement quality: unlocked GPU clocks make two identical
+## arms differ by more than the effect being measured. Round-independent, so no ROUND=.
+## ALWAYS run host-tune-reset when you are done -- a box left with clocks locked lies about
+## power and thermals for whoever uses it next.
+host-tune:
+	sudo scripts/host-tune.sh apply
+host-tune-reset:
+	sudo scripts/host-tune.sh reset
+host-tune-show:
+	@scripts/host-tune.sh show
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -85,6 +105,11 @@ check:
 	  case "$$f" in */__init__.py) continue;; esac; \
 	  echo "-- $$f"; PYTHONPATH=. python3 "$$f" || exit 1; \
 	done
+	@# grep-guarded: older rounds' healthcheck has no --selfcheck flag.
+	$(IN) if grep -q selfcheck vtl/warmup_healthcheck.py; then python3 vtl/warmup_healthcheck.py --selfcheck; fi
+	@# NVRTC harness (round-2+). The pure half only -- cache keys, gating, arg packing.
+	@# The compile+numerics half is bench/test_nvrtc.py under `make test-kernel` (needs a GPU).
+	$(IN) if [ -f vtl/nvrtc.py ]; then PYTHONPATH=. python3 bench/test_nvrtc.py --self-check; fi
 	$(IN) python3 bench/trace_stats.py --self-check
 	$(IN) python3 bench/metrics.py
 	$(IN) python3 bench/sweep_report.py --selfcheck
@@ -197,6 +222,20 @@ verify:
 	@grep -q "channelwise fp8 unavailable" /tmp/vtl-verify.log \
 	  && echo "WARN channelwise fp8 fell back to stock per-tensor" \
 	  || echo "OK   channelwise fp8 active"
+	@# The Rust scheduler covers exactly two KV cache-spec kinds (full attention, mamba) and
+	@# REFUSES anything else -- sliding-window, chunked-local, cross-attention -- by logging one
+	@# line and handing back to stock vLLM. That is the right default for serving and the worst
+	@# possible default for measurement: a whole scheduler not running is indistinguishable, in
+	@# every latency number, from one that ran and did not help. So name it here. Set
+	@# VTL_RUST_SCHED_REQUIRE=1 to turn the refusal into a boot failure instead.
+	@if grep -q "rust_sched: NOT ENGAGED" /tmp/vtl-verify.log; then \
+	   echo "WARN rust scheduler NOT ENGAGED: $$(sed -n 's/.*rust_sched: NOT ENGAGED -- //p' /tmp/vtl-verify.log | tail -1)"; \
+	   echo "     you are measuring the stock scheduler. VTL_RUST_SCHED_REQUIRE=1 makes this fatal."; \
+	 elif grep -qE "rust_sched: (SHADOW|AUTHORITY) mode active" /tmp/vtl-verify.log; then \
+	   echo "OK   rust scheduler engaged: $$(grep -oE 'rust_sched: (SHADOW|AUTHORITY) mode active \([^)]*\)' /tmp/vtl-verify.log | tail -1)"; \
+	 else \
+	   echo "WARN rust scheduler state unknown -- no mode selected, or logging below INFO"; \
+	 fi
 	@# The jemalloc apt step deliberately cannot fail the build (a failed build scores zero,
 	@# glibc malloc only scores worse), so the check it used to do at build time lives here:
 	@# a missing lib makes the loader print this once per process. WARN, not FAIL -- it serves.

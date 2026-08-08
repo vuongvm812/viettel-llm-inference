@@ -1,0 +1,27 @@
+# Resource-cap overlay -- EXPERIMENT ONLY, never submit.
+#
+# Reproduces the judge box's budget (3 cores, 8 GB) so we can answer one question:
+# does vLLM get slower when we take CPU away? If p50 is flat from 3 cores down to
+# 1, nothing was using the extra cores and CPU pinning / NUMA / Rust are all moot.
+#
+# Usage:
+#   COMPOSE="docker compose -f docker-compose.yaml \
+#                           -f docker-compose-optimized.yaml \
+#                           -f docker-compose.localtest.yaml \
+#                           -f docker-compose.cpucap.yaml"
+#   VTL_CPUS=3 $COMPOSE up -d --wait
+#
+# `cpus` is a CFS quota (3 cores' worth of time, any cores), not an affinity mask.
+# That is what the judge's cgroup does. Use `cpuset: "0-2"` instead only if you are
+# specifically testing pinning.
+services:
+  model:
+    cpus: ${VTL_CPUS:-3}
+    mem_limit: 8g
+    # Equal to mem_limit => swap disabled. Without this the container silently
+    # thrashes to disk instead of OOMing, and the benchmark measures the swap.
+    memswap_limit: 8g
+    # /dev/shm is tmpfs and its pages are charged against mem_limit above. The 2g in
+    # the base compose is a cap, not a reservation, but a leak there eats a quarter
+    # of the budget. TP=1 needs almost none of it.
+    shm_size: "1g"

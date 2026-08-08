@@ -1,0 +1,11 @@
+{
+  "workload": "vLLM multi-turn (shared prefix + growing context, output length pinned)",
+  "num_conversations": 70,
+  "user_turns_per_conversation": 6,
+  "total_requests": 420,
+  "shared_system_prefix_tokens": 1000,
+  "per_conversation_prefix_tokens": 1000,
+  "new_user_tokens_per_turn": 150,
+  "output_tokens_per_turn_pinned": 300,
+  "arrival": "Poisson, seed 42"
+}

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vtl"
+version = "0.1.0"
+description = "Viettel vLLM patch overlay"
+requires-python = ">=3.10"
+# vLLM is provided by the base image. Depending on it here would try to
+# reinstall/downgrade it at plugin install time.
+dependencies = []
+
+# The entire integration surface with vLLM. Without a .dist-info (i.e. without a
+# real install, not a bind-mount) this entry point does not exist and register()
+# is never called.
+[project.entry-points."vllm.general_plugins"]
+vtl = "vtl.plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["vtl*"]
+
+# NVRTC kernel sources ship as DATA, not compiled into vtl._C. That is the whole point:
+# they are read at model load and compiled for the shape actually in use, and editing one
+# is a container restart rather than a full nvcc rebuild (see vtl/nvrtc.py).
+# Without this stanza the wheel silently omits them and every NVRTC kernel degrades to AOT.
+[tool.setuptools.package-data]
+vtl = ["kernels/*.cu", "kernels/*.cuh"]

@@ -1,0 +1,41 @@
+[package]
+name = "vtl-sched"
+version = "0.1.0"
+edition = "2021"
+description = "Logic-preserving Rust port of vLLM v0.25.0 KV-cache block metadata, prefix caching and scheduler core"
+license = "Apache-2.0"
+
+[lib]
+name = "vtl_sched"
+# cdylib for the Python extension, rlib so `cargo test` can link the unit tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# PyO3/numpy are OPTIONAL: the ported logic must be testable with `cargo test` in an image
+# that has no libpython to link against — the Dockerfile builder stage does exactly that
+# before it lets the wheel out. maturin turns the `python` feature on via pyproject.toml.
+pyo3 = { version = "0.22", features = ["macros"], optional = true }
+numpy = { version = "0.22", optional = true }
+smallvec = { version = "1", features = ["union"] }
+sha2 = "0.10"
+rustc-hash = "2"
+# Batch 3: engine-side output publisher. Pinned to the EXACT version of the iceoryx2 wheel
+# installed in round-2/Dockerfile and the rust-frontend's Cargo.toml -- the two halves
+# share a shm data segment layout and iceoryx2 makes no cross-minor-version promise.
+# Optional: default `cargo test` must not need it (no libpython either -- see `python` above).
+iceoryx2 = { version = "0.9.3", optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:numpy"]
+# Batch 3: crate-owned iceoryx2 output publisher (`src/out.rs`). Independent of `python` in
+# principle; the wheel maturin ships needs both (see pyproject.toml).
+shm = ["dep:iceoryx2"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# An integer wrap in the block accounting must be a catchable panic, not silently
+# corrupted state that the engine keeps serving from. Costs ~nothing at this scale.
+overflow-checks = true

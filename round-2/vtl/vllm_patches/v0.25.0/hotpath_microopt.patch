@@ -1,0 +1,305 @@
+Item A -- accidental-overhead micro-opts on the per-decode-step host path.
+
+Five edits across two installed files, each individually below the ~0.5 ms A/B noise
+floor and therefore landed as a batch on mechanism, not on a measurement:
+
+  model_runner.py
+    1. `sampler.apply_staged_writes()` folded into the existing `if
+       scheduler_output.scheduled_new_reqs:` guard. `Sampler.add_request` is the only
+       writer into the sampler's staged state and runs only inside that loop, so on a
+       decode step the call was 14 `copy_to_uva()` whole-array copies (plus a torch
+       slice alloc each) over state nobody staged.
+    2. `build_slot_mappings_by_layer` skipped iff `cg_mode == FULL and speculator is
+       None`. `run_fullgraph` is a bare `graph.replay()` -- it never enters
+       `set_forward_context`, so nothing reads the per-layer dict on that arm.
+       PIECEWISE / mixed / eager steps still build it (attention.py:761 consumes it),
+       hence a PER-STEP guard.
+    3. `req_id_to_index` cached on the runner, keyed by `input_batch.req_ids` LIST
+       OBJECT IDENTITY. The decode fast path reuses one InputBatch and never mutates
+       req_ids; any new or reordered batch allocates a fresh list, so `is` is an exact
+       "same batch" test.
+    4. The full-`max_num_reqs` `np.minimum` into `req_states.num_computed_prefill_tokens`
+       deleted; the single read site recomputes it batch-sized off the gather it already
+       performs. CAVEAT, deliberate: the array is left STALE for out-of-batch slots.
+       Verified safe -- the only other toucher is `RequestState.add_request`
+       (states.py:109), which writes each slot on admission, and the only reader is the
+       site that now recomputes.
+
+  core.py
+    5. The three per-step `@contextmanager` entries in `step_with_batch_queue` replaced
+       by inline `try/except` + `dump_engine_exception(...)` + re-raise (identical
+       diagnostics, and the two regions stay SEPARATE so the first still cannot catch
+       `future.result()`), with `log_iteration_details` skipped outright when
+       `enable_logging_iteration_details` is off -- checked once at __init__ into
+       `_vtl_log_iters`.
+
+Kill switch: `VTL_HOTPATH_MICROOPT=0` restores stock control flow byte for byte -- every
+edit is an `if _VTL_MICROOPT:` with the untouched stock statement in the `else` arm.
+Same in-file-env-read convention as mamba_align_precopy.patch. Compose ships "1".
+
+Touches no file any other v0.25.0 patch touches (api_server, mamba_hybrid,
+rejection_sampler, sampler), so hunks cannot collide.
+
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -19,6 +19,7 @@
+ 
+ import functools
+ import gc
++import os
+ import time
+ from copy import deepcopy
+ from typing import Any, NamedTuple
+@@ -115,9 +116,28 @@
+ from vllm.v1.worker.utils import KVBlockZeroer
+ 
+ logger = init_logger(__name__)
++
++
++# vtl: accidental-overhead micro-opts on the per-decode-step host path. Read ONCE at import
++# so the hot path pays a global load, not an environ lookup. `VTL_HOTPATH_MICROOPT=0`
++# restores stock control flow byte for byte -- every use below is a plain `if _VTL_MICROOPT`
++# with the stock statement in the `else` arm. See
++# round-2/vtl/vllm_patches/v0.25.0/hotpath_microopt.patch for the rationale of each.
++_VTL_MICROOPT = os.environ.get("VTL_HOTPATH_MICROOPT", "1").strip().lower() not in (
++    "0",
++    "false",
++    "no",
++    "off",
++    "",
++)
+ 
+ 
+ class GPUModelRunner(LoRAModelRunnerMixin):
++    # vtl: `req_id_to_index` cache (see sample_tokens). Class-level defaults so the
++    # attribute always exists without touching __init__.
++    _vtl_r2i_ids: list[str] | None = None
++    _vtl_r2i: dict[str, int] | None = None
++
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
+         self.model_config = vllm_config.model_config
+@@ -807,7 +827,15 @@
+         if scheduler_output.scheduled_new_reqs:
+             self.req_states.apply_staged_writes()
+             self.model_state.apply_staged_writes()
+-        if self.sampler is not None:
++            # vtl: folded into the `scheduled_new_reqs` guard. `Sampler.add_request` above
++            # is the ONLY writer into the sampler's staged state, and it is reached only
++            # from this loop -- min_tokens / penalties / logit bias are all applied
++            # in-kernel or on GPU and stage nothing mid-request. Unguarded this costs 14
++            # `copy_to_uva()` whole-array copies (+ a torch slice alloc each) per DECODE
++            # step, where nothing was staged.
++            if _VTL_MICROOPT and self.sampler is not None:
++                self.sampler.apply_staged_writes()
++        if not _VTL_MICROOPT and self.sampler is not None:
+             self.sampler.apply_staged_writes()
+ 
+     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+@@ -825,11 +853,19 @@
+                 )
+ 
+         # Update CPU num_computed_prefill_tokens.
+-        np.minimum(
+-            self.req_states.num_computed_tokens_np,
+-            self.req_states.prefill_len.np,
+-            out=self.req_states.num_computed_prefill_tokens,
+-        )
++        # vtl: the stock call is a full max_num_reqs-wide (70-element) np.minimum whose
++        # result is read at exactly ONE site -- `prepare_inputs` gathers
++        # `[idx_mapping_np]` out of it (see :915 below). At batch 1-8 that is ~62 wasted
++        # lanes plus the ufunc dispatch; the gather site recomputes it batch-sized from
++        # the same two arrays instead. The array is left STALE for out-of-batch slots,
++        # which is safe because `RequestState.add_request` (states.py:109) writes each
++        # slot's own value on admission and no other reader exists.
++        if not _VTL_MICROOPT:
++            np.minimum(
++                self.req_states.num_computed_tokens_np,
++                self.req_states.prefill_len.np,
++                out=self.req_states.num_computed_prefill_tokens,
++            )
+ 
+         # Zero GPU memory for freshly allocated cache blocks to prevent
+         # stale NaN/data from corrupting attention or SSM computation.
+@@ -911,8 +947,18 @@
+         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
+         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
+         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
+-        computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens
+-        num_computed_prefill_tokens_np = computed_prefill_tokens_np[idx_mapping_np]
++        if _VTL_MICROOPT:
++            # vtl: batch-sized `min(num_computed, prefill_len)` in place of the
++            # full-array np.minimum that `update_requests` used to precompute. Reuses the
++            # `[idx_mapping_np]` gather that this site performed anyway, so the whole
++            # optimization is "do the min on 8 elements instead of 70". Slots are NOT
++            # dense, so this must gather, never slice `[:num_reqs]`.
++            num_computed_prefill_tokens_np = np.minimum(
++                self.req_states.num_computed_tokens_np[idx_mapping_np], prefill_len_np
++            )
++        else:
++            computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens
++            num_computed_prefill_tokens_np = computed_prefill_tokens_np[idx_mapping_np]
+         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
+ 
+         # Get prefill tokens if any.
+@@ -1213,9 +1259,19 @@
+         slot_mappings_by_layer = None
+         if not (dummy_run and skip_attn_for_dummy_run):
+             assert slot_mappings is not None
+-            slot_mappings_by_layer = build_slot_mappings_by_layer(
+-                slot_mappings, self.kv_cache_config
+-            )
++            # vtl: on a FULL-cudagraph step with no speculator the per-layer dict is DEAD.
++            # `run_fullgraph` is a bare `graphs[desc].replay()` -- it never enters
++            # `set_forward_context`, so nothing reads `slot_mapping`; and the only other
++            # consumer, `speculator.propose`, does not exist. PIECEWISE / mixed / eager
++            # steps DO consume it (attention.py:761), so the guard is per-step, not per-boot.
++            if not (
++                _VTL_MICROOPT
++                and batch_desc.cg_mode == CUDAGraphMode.FULL
++                and self.speculator is None
++            ):
++                slot_mappings_by_layer = build_slot_mappings_by_layer(
++                    slot_mappings, self.kv_cache_config
++                )
+             assert block_tables is not None
+             attn_metadata = self.model_state.prepare_attn(
+                 input_batch,
+@@ -1411,13 +1467,32 @@
+             self.req_states.num_computed_tokens.gpu,
+             self.req_states.prompt_len.np,
+         )
++
++        # vtl: the dict is rebuilt from scratch every step, but on a repeat decode step
++        # `input_batch.req_ids` is the very same LIST OBJECT (the fast path reuses one
++        # InputBatch and never mutates req_ids), so the dict is identical too. Key the
++        # cache on that list's identity: a new or reordered batch always allocates a fresh
++        # list, which makes `is` an exact "same batch" test at zero comparison cost. The
++        # dict outlives the step by reference (like req_ids itself already does), and the
++        # predicate guarantees the contents match, so the aliasing is inert.
++        if _VTL_MICROOPT:
++            if input_batch.req_ids is not self._vtl_r2i_ids:
++                self._vtl_r2i_ids = input_batch.req_ids
++                self._vtl_r2i = {
++                    req_id: i for i, req_id in enumerate(input_batch.req_ids)
++                }
++            req_id_to_index = self._vtl_r2i
++        else:
++            req_id_to_index = {
++                req_id: i for i, req_id in enumerate(input_batch.req_ids)
++            }
+ 
+         # Prepare the model runner output.
+         model_runner_output = ModelRunnerOutput(
+             req_ids=input_batch.req_ids,
+             # NOTE(woosuk): req_id_to_index is unused in this model runner.
+             # Only for compatibility with the existing model runner and scheduler.
+-            req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
++            req_id_to_index=req_id_to_index,
+             sampled_token_ids=None,  # type: ignore
+             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+         )
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -89,6 +89,16 @@
+ logger = init_logger(__name__)
+ 
+ HANDSHAKE_TIMEOUT_MINS = 5
++
++# vtl: see round-2/vtl/vllm_patches/v0.25.0/hotpath_microopt.patch.
++# `VTL_HOTPATH_MICROOPT=0` restores stock control flow exactly.
++_VTL_MICROOPT = os.environ.get("VTL_HOTPATH_MICROOPT", "1").strip().lower() not in (
++    "0",
++    "false",
++    "no",
++    "off",
++    "",
++)
+ 
+ _R = TypeVar("_R")  # Return type for collective_rpc
+ 
+@@ -222,6 +232,11 @@
+             self.step if self.batch_queue is None else self.step_with_batch_queue
+         )
+         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
++
++        # vtl: hoisted out of the per-step `log_iteration_details` contextmanager.
++        self._vtl_log_iters = bool(
++            vllm_config.observability_config.enable_logging_iteration_details
++        )
+ 
+         self.aborts_queue = queue.Queue[list[str]]()
+ 
+@@ -545,10 +560,25 @@
+         deferred_scheduler_output = None
+         if self.scheduler.has_requests():
+             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+-            with self.log_error_detail(scheduler_output):
+-                exec_future = self.model_executor.execute_model(
+-                    scheduler_output, non_block=True
+-                )
++            if _VTL_MICROOPT:
++                # vtl: inlined `log_error_detail`. Entering the @contextmanager allocates a
++                # generator + a _GeneratorContextManager per step; the body below is the
++                # generator's own try/except verbatim, so the diagnostics dump is preserved
++                # exactly (including catching Exception, not BaseException).
++                try:
++                    exec_future = self.model_executor.execute_model(
++                        scheduler_output, non_block=True
++                    )
++                except Exception as err:
++                    dump_engine_exception(
++                        self.vllm_config, scheduler_output, self.scheduler.make_stats()
++                    )
++                    raise err
++            else:
++                with self.log_error_detail(scheduler_output):
++                    exec_future = self.model_executor.execute_model(
++                        scheduler_output, non_block=True
++                    )
+             if self.is_ec_consumer:
+                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
+ 
+@@ -588,16 +618,32 @@
+ 
+         # Block until the next result is available.
+         future, scheduler_output, exec_model_fut = batch_queue.pop()
+-        with (
+-            self.log_error_detail(scheduler_output),
+-            self.log_iteration_details(scheduler_output),
+-        ):
+-            model_output = future.result()
+-            if model_output is None:
+-                # None from sample_tokens() implies that the original execute_model()
+-                # call failed - raise that exception.
+-                exec_model_fut.result()
+-                raise RuntimeError("unexpected error")
++        if _VTL_MICROOPT and not self._vtl_log_iters:
++            # vtl: two more per-step contextmanager allocations. `log_iteration_details` is
++            # a no-op when `enable_logging_iteration_details` is off (checked once, at
++            # __init__, into `_vtl_log_iters`), so only `log_error_detail`'s try/except
++            # survives -- inlined here, semantics unchanged.
++            try:
++                model_output = future.result()
++                if model_output is None:
++                    exec_model_fut.result()
++                    raise RuntimeError("unexpected error")
++            except Exception as err:
++                dump_engine_exception(
++                    self.vllm_config, scheduler_output, self.scheduler.make_stats()
++                )
++                raise err
++        else:
++            with (
++                self.log_error_detail(scheduler_output),
++                self.log_iteration_details(scheduler_output),
++            ):
++                model_output = future.result()
++                if model_output is None:
++                    # None from sample_tokens() implies that the original execute_model()
++                    # call failed - raise that exception.
++                    exec_model_fut.result()
++                    raise RuntimeError("unexpected error")
+ 
+         # Before processing the model output, process any aborts that happened
+         # during the model execution.

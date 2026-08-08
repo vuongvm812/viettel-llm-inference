@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       workdir:
-        description: 'Round directory (e.g. round-1.2)'
+        description: 'Round directory (e.g. round-2)'
         required: true
-        default: 'round-1.2'
+        default: 'round-2'
         type: string
       image_digest:
         description: 'Image digest (sha256:...)'

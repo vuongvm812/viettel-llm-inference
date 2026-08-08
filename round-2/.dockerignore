@@ -1,0 +1,20 @@
+# Deny-all, then allow exactly what the image needs. The model is bind-mounted at
+# /model by the judge, never baked in -- keeping hf-model/ (5.9 GB) out of the
+# build context matters.
+*
+!pyproject.toml
+!setup.py
+!README.md
+!vtl/
+!docker/cache/
+# Warm-up trace slice (bind-mounted + head -n during build; parents must be re-included too).
+!data
+!data/input
+!data/input/trace-round1.jsonl
+# PGO training corpus + replayer for the fork's rust-builder stage (VLLM_RS_PGO=1).
+!data/input/trace-round2.jsonl
+!bench
+!bench/*
+# WS4 Rust scheduler crate (built in its own stage; only the wheel reaches the image).
+!vtl-sched
+!vtl-sched/**

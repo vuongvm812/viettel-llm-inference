@@ -1,0 +1,27 @@
+# NVRTC kernel dev loop. NOT part of the submission -- an overlay, like localtest/cpucap.
+#
+#   docker compose -f docker-compose.yaml -f docker-compose-optimized.yaml \
+#                  -f docker-compose.localtest.yaml -f docker-compose.nvrtc-dev.yaml up -d
+#   $EDITOR vtl/kernels/rms_norm_quant.cu
+#   docker compose ... restart model          # ~15 s, no rebuild
+#
+# WHY THIS WORKS. vtl/kernels/*.cu are package DATA read at model load, not sources compiled
+# into vtl._C. Mounting the host directory over them means an edit is picked up by the next
+# boot. Editing vtl/csrc/*.cu instead costs a full `pip install /src` with nvcc across four
+# SM arches -- roughly 20 minutes -- because those really are compiled into the .so.
+#
+# The cache is mounted too, and that matters in both directions: cubins survive restarts
+# (so an unchanged kernel does not recompile), and a changed kernel gets a different cache
+# key, so there is no stale-cubin trap. Harvest it into the image with `make warm`.
+services:
+  model:
+    volumes:
+      - ./vtl/kernels:/kernels:ro
+      - ./docker/cache/nvrtc:/opt/vtl/cache/nvrtc
+    environment:
+      VTL_NVRTC: "1"
+      VTL_NVRTC_SRC: /kernels
+      # INFO so the per-kernel "specialized for (-DHIDDEN=...)" line and any NVRTC warning
+      # (register spills especially) are visible -- a silent fallback to the AOT kernel is
+      # otherwise indistinguishable from a working JIT.
+      VTL_LOG_LEVEL: INFO

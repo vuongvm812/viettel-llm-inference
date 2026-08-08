@@ -1,0 +1,95 @@
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -184,6 +184,16 @@
+         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
+ 
++        # vtl: one launch instead of two. The pair below exists to compute six scalars per
++        # request and hand them to a copy that fast-exits on 15 of every 16 decode steps;
++        # the two scratch arrays it writes have no other consumer, so the fused kernel keeps
++        # src_col/token_bias in shared memory and skips them. Same arithmetic, ported in
++        # vtl/csrc/conv_align_fused.cu. Fail-closed: layout, op or env miss -> stock pair.
++        if self._vtl_try_conv_align_fused(
++            input_batch, ctx, mamba_spec, num_reqs, num_computed_tokens
++        ):
++            return
++
+         # The state-advance + pre-copy kernels run every step; they fast-exit per
+         # request when src_col < 0 or src_col == dst_col, so no copy happens on
+         # steps that don't cross a block boundary. (Skipping the launch entirely
+@@ -212,6 +222,75 @@
+             input_batch.idx_mapping,
+         )
+ 
++    # vtl: None = not yet decided, False = refused for the life of the process.
++    _vtl_conv_align_ok = None
++
++    def _vtl_conv_align_eligible(self, ctx) -> bool:
++        """One-time gate for the fused align kernel. Anything unexpected -> stock.
++
++        The kernel only implements the SD conv branch of ``_copy_mamba_state_block``
++        (contiguous window migration), which is LFM2.5's layout and its only state type.
++        A temporal/SSM state or the DS layout needs a different address mode, so they are
++        REFUSED here rather than silently mis-copied.
++        """
++        import os
++
++        raw = os.environ.get("VTL_V2_FUSED_CONV_ALIGN", "1").strip().lower()
++        if raw in ("0", "false", "no", "off", ""):
++            return False
++        if not ctx.is_initialized:
++            return False  # asked again next step, once the metadata exists
++        if not hasattr(torch.ops.vllm_cuda, "conv_align_fused"):
++            return False
++        from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
++
++        all_conv = bool((ctx.state_conv_widths > 0).all().item())
++        return bool(
++            torch.ops.vllm_cuda.conv_align_supported(
++                is_conv_state_dim_first(), all_conv, ctx.state_conv_widths.numel()
++            )
++        )
++
++    def _vtl_try_conv_align_fused(
++        self, input_batch, ctx, mamba_spec, num_reqs, num_computed_tokens
++    ) -> bool:
++        if self._vtl_conv_align_ok is False:
++            return False
++        if self._vtl_conv_align_ok is None:
++            try:
++                self._vtl_conv_align_ok = self._vtl_conv_align_eligible(ctx)
++            except Exception:
++                self._vtl_conv_align_ok = False
++            if not self._vtl_conv_align_ok:
++                # Undecided (ctx not initialized yet) stays undecided; a hard refusal is
++                # sticky. `is_initialized` is the only retryable condition.
++                if ctx.is_initialized:
++                    self._vtl_conv_align_ok = False
++                else:
++                    self._vtl_conv_align_ok = None
++                return False
++        # Past this point a failure must NOT fall back: the kernel advances state_idx in
++        # place, so re-running the stock pair afterwards would advance it twice. Let it
++        # raise instead -- silently wrong recurrent state is worse than a crash.
++        torch.ops.vllm_cuda.conv_align_fused(
++            self._mamba_state_idx_gpu,
++            self.num_accepted_tokens_gpu,
++            input_batch.idx_mapping,
++            num_computed_tokens,
++            input_batch.query_start_loc,
++            ctx.block_table_ptrs,
++            int(ctx.block_table_stride_req),
++            ctx.state_base_addrs,
++            ctx.state_block_strides,
++            ctx.state_elem_sizes,
++            ctx.state_inner_sizes,
++            ctx.state_conv_widths,
++            ctx.state_group_indices,
++            num_reqs,
++            mamba_spec.block_size,
++        )
++        return True
++
+     def prepare_attn(
+         self,
+         input_batch: InputBatch,

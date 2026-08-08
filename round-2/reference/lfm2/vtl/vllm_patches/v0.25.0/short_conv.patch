@@ -1,0 +1,510 @@
+--- a/vllm/model_executor/layers/mamba/short_conv.py
++++ b/vllm/model_executor/layers/mamba/short_conv.py
+@@ -2,6 +2,9 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import logging
++import os
++
+ import torch
+ 
+ from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
+@@ -28,8 +31,259 @@
+ from vllm.v1.attention.backend import AttentionMetadata
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+ from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++
++def _vtl_flag(name: str) -> bool:
++    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
++
++
++# vtl Phase-3: fused conv-gate `y = C*Bx` + fp8 quant + out_proj, opt-in and fail-closed.
++# Also enables the shared per-layer fp8 STAGING BUFFER: out_proj is a single GEMM over the merged
++# decode|prefill tensor, so feeding it pre-quantized used to require a decode-only batch. Instead
++# both halves now write their fp8 rows into one `[num_actual_tokens, dim]` buffer and out_proj
++# consumes it whole -- which covers prefill-only and mixed batches too, and drops the bf16
++# `torch.vstack`. See round-1.2/vtl/patches/mul_quant.py and round-1.2/vtl/csrc/mul_quant.cu.
++_VTL_MUL_QUANT = _vtl_flag("VTL_ENABLE_MUL_QUANT")
++
++# vtl: replace the decode half of that path -- `(B_d*x_d).contiguous()`, the Triton
++# `causal_conv1d_update`, and the gate+quant -- with the single fused kernel in
++# round-1.2/vtl/csrc/bcx_conv_gate_quant.cu. Inert unless _VTL_MUL_QUANT is also on (it writes
++# into that staging buffer). See round-1.2/vtl/patches/bcx_conv_gate.py.
++_VTL_BCX_CONV_GATE = _vtl_flag("VTL_ENABLE_BCX_CONV_GATE")
++
++# vtl: the whole decode block -- per-token fp8 quant, in_proj W4A8, conv+gate+quant, out_proj
++# W4A8 -- in ONE launch (round-1.2/vtl/csrc/shortconv_decode_mega.cu). Default ON; the runtime
++# gates below (armed scratch + a co-residency budget measured on the real kernel + M <= 8 +
++# decode-only + the plain int4 weight view) do the actual deciding, and any miss keeps the
++# existing four-op chain untouched. `VTL_SHORTCONV_MEGA=0` is the one-line revert.
++_VTL_MEGA = os.environ.get("VTL_SHORTCONV_MEGA", "1").strip().lower() not in {
++    "0", "false", "no", "off", ""
++}
++
++# The CUTLASS W4A8 kernel supports exactly one group size and rejects anything else in
++# can_implement(), so this cannot drift from round-1.2/vtl/patches/quant_w4a8.py:GROUP_SIZE
++# without the layer failing to build in the first place. Hardcoded rather than imported to
++# keep this file free of vtl imports.
++_VTL_W4A8_GROUP_SIZE = 128
++
++
++def _vtl_w4a8_out_proj(out_proj) -> bool:
++    """True if ``out_proj`` was quantized to int4 by round-1.2/vtl/patches/quant_w4a8.py.
++
++    Keys on the SAME single flag that quant_w4a8's own ``apply()`` keys on, deliberately, rather
++    than duck-typing the three packed attributes. Two predicates that mean "is this layer int4"
++    are two predicates that can disagree: the attributes appear one assignment before the flag
++    is set, and in that window a duck-typing check here would call cutlass_w4a8_mm against a
++    half-installed layer -- wrong numerics, not slow numerics. quant_w4a8 sets the flag last and
++    only inside its try, so the flag is true only when the layer is fully built.
++    """
++    return getattr(out_proj, "_vtl_w4a8_done", False)
++
++
++def _vtl_mul_quant_eligible(out_proj) -> bool:
++    """True if ``out_proj`` can take a pre-quantized fp8 activation for the fused gate path.
++
++    Cached per-layer. Requires the flag on, the fused op registered, no bias, not Marlin, and
++    TP=1 (RowParallelLinear's all-reduce is not replicated here), plus ``out_proj`` on one of
++    our two quantized paths -- both consume the SAME fp8 activation + per-token scale:
++
++      * vtl_w4a8: int4 ``weight_packed`` + group/channel scales -> ops.cutlass_w4a8_mm
++      * vtl_fp8:  column-major fp8 ``weight`` + per-channel ``weight_scale`` -> cutlass_scaled_mm
++
++    Any miss -> stock path, so this never changes numerics outside the configs it checks for.
++    """
++    cached = getattr(out_proj, "_vtl_mul_quant_ok", None)
++    if cached is not None:
++        return cached
++    ok = False
++    try:
++        from vllm.distributed import get_tensor_model_parallel_world_size
++
++        weight = getattr(out_proj, "weight", None)
++        quantized = _vtl_w4a8_out_proj(out_proj) or (
++            weight is not None
++            and weight.dtype == torch.float8_e4m3fn
++            and getattr(out_proj, "weight_scale", None) is not None
++        )
++        ok = (
++            _VTL_MUL_QUANT
++            and hasattr(torch.ops, "vllm_cuda")
++            and hasattr(torch.ops.vllm_cuda, "mul_dynamic_per_token_quant")
++            and quantized
++            and getattr(out_proj, "bias", None) is None
++            and not getattr(getattr(out_proj, "quant_method", None), "use_marlin", False)
++            and get_tensor_model_parallel_world_size() == 1
++        )
++    except Exception:
++        ok = False
++    out_proj._vtl_mul_quant_ok = ok
++    return ok
++
++
++def _vtl_conv_gate_eligible(layer, conv_weights, conv_state, state_indices, bcx) -> bool:
++    """True if the fused short-conv DECODE kernel can serve this layer.
++
++    Cached per-layer. On top of the flag and the op being registered, the shape predicate itself
++    lives in C++ (``bcx_conv_gate_supported``) so the vector width and block-size caps are not
++    re-hardcoded here. The kernel is specialised to conv width 3 / state_len 2 -- LFM2.5's
++    ``conv_L_cache = 3`` with the ``conv_kernel - 1`` state allocation -- and rejects anything else,
++    in which case the caller keeps the stock ``causal_conv1d_update``.
++    """
++    cached = getattr(layer, "_vtl_conv_gate_ok", None)
++    if cached is not None:
++        return cached
++    ok = False
++    try:
++        ok = (
++            _VTL_BCX_CONV_GATE
++            and hasattr(torch.ops, "vllm_cuda")
++            and hasattr(torch.ops.vllm_cuda, "bcx_conv_gate_quant")
++            and hasattr(torch.ops.vllm_cuda, "bcx_conv_gate_supported")
++            and bcx.dtype in (torch.bfloat16, torch.float16)
++            # The kernel reads B/C/x straight out of the merged in_proj output.
++            and bcx.dim() == 2
++            and bcx.stride(1) == 1
++            and bcx.shape[1] == 3 * conv_weights.shape[0]
++            # Same dtype for state and weights: stock does `x.to(conv_state.dtype)`, we don't.
++            and conv_state.dtype == bcx.dtype
++            and conv_weights.dtype == bcx.dtype
++            and conv_weights.stride(1) == 1
++            and conv_state.dim() == 3
++            and conv_state.shape[1] == conv_weights.shape[0]
++            and state_indices is not None
++            and state_indices.dtype == torch.int32
++            and torch.ops.vllm_cuda.bcx_conv_gate_supported(
++                conv_weights.shape[0], conv_weights.shape[1], conv_state.shape[2]
++            )
++        )
++    except Exception:
++        ok = False
++    layer._vtl_conv_gate_ok = ok
++    return ok
++
++
++def _vtl_mega_decode(layer, hidden_states, output) -> bool:
++    """Fused short-conv decode megakernel. True = done, False = run the stock chain.
++
++    WHY IT SITS IN ``forward`` AND NOT ``forward_cuda``: the megakernel starts at the
++    activation that feeds ``in_proj``, and ``in_proj`` was hoisted OUT of the custom op by
++    this very patch (see ``forward`` below). ``forward_cuda`` only ever sees ``BCx``, i.e.
++    everything the kernel's first two phases exist to produce. LFM2's ``operator_norm`` runs
++    one level further up (lfm2.py), so ``hidden_states`` here is already normalized and the
++    kernel is invoked with ``norm_weight=None`` -- its phase 1 then does only the per-token
++    fp8 quant, which is exactly what ``quant_w4a8.apply`` would have done.
++
++    CAPTURE-TIME STATIC, WHICH IS WHY THE M<=8 BOUND IS SAFE. Every condition below is a
++    Python branch over ``attn_metadata`` scalars. Under FULL cudagraph the graph is captured
++    once per batch descriptor and replayed without re-entering Python, and under PIECEWISE
++    the same is true per ``BatchDescriptor(num_tokens=...)`` -- so whichever arm is taken at
++    capture is frozen into that graph. Capture sizes 16 and 32 therefore bake the STOCK
++    chain, capture sizes 1/2/4/8 bake the megakernel, and no replay can ever cross over. (If
++    this ever stopped holding, the kernel's own ``TORCH_CHECK`` on M would fail loudly rather
++    than read past the scratch.)
++    """
++    if not _VTL_MEGA:
++        return False
++    try:
++        from vtl.patches.shortconv_mega import arm, mega_state
++    except Exception:
++        return False
++
++    forward_context = get_forward_context()
++    attn_metadata_raw = forward_context.attn_metadata
++    if attn_metadata_raw is None or not isinstance(attn_metadata_raw, dict):
++        return False
++    attn_metadata = attn_metadata_raw.get(layer.prefix)
++    if not isinstance(attn_metadata, ShortConvAttentionMetadata):
++        return False
++    m = attn_metadata.num_decode_tokens
++    if attn_metadata.num_prefills > 0 or m <= 0 or m != hidden_states.shape[0]:
++        return False
++
++    in_wq = getattr(layer.in_proj, "_vtl_mega_wq", None)
++    out_wq = getattr(layer.out_proj, "_vtl_mega_wq", None)
++    if in_wq is None or out_wq is None:
++        return False
++
++    conv_weights = layer.conv.weight.view(
++        layer.conv.weight.size(0), layer.conv.weight.size(2)
++    )
++    conv_state = (
++        layer.kv_cache[0]
++        if is_conv_state_dim_first()
++        else layer.kv_cache[0].transpose(-1, -2)
++    )
++    dim = conv_weights.shape[0]
++    if not torch.ops.vllm_cuda.shortconv_decode_mega_supported(
++        dim, conv_weights.shape[1], conv_state.shape[2], m
++    ):
++        return False
++    state = arm(dim, hidden_states.device)
++    if state is None:
++        return False
++
++    # Past this point the kernel rotates the conv ring buffer, so there is no falling back:
++    # re-running the stock chain afterwards would double-advance the state. Let it raise.
++    torch.ops.vllm_cuda.shortconv_decode_mega(
++        output[:m],
++        hidden_states[:m],
++        None,  # already normalized by operator_norm (lfm2.py)
++        0.0,
++        in_wq,
++        layer.in_proj._vtl_mega_gs,
++        conv_weights,
++        layer.conv.bias,
++        conv_state,
++        attn_metadata.state_indices_tensor_d,
++        NULL_BLOCK_ID,
++        out_wq,
++        layer.out_proj._vtl_mega_gs,
++        state["scratch"],
++        state["grid"],
++    )
++    return True
+ 
+ 
++def _vtl_out_proj_quantized(out_proj, y_fp8, y_scale, out_dtype):
++    """out_proj GEMM over an already-quantized activation.
++
++    This is the ONE place the fused short-conv path reaches the GEMM: the whole ShortConv
++    forward runs inside an opaque custom op, so no FX fusion pass can rewrite it and the call
++    is made by hand. Both arms take the same pre-quantized fp8 activation + per-token scale
++    that mul_quant/bcx_conv_gate just produced, so nothing upstream cares which one runs.
++    Preconditions (no padding at dim=2048, no bias, TP=1) come from _vtl_mul_quant_eligible.
++    """
++    from vllm import _custom_ops as ops
++
++    if _vtl_w4a8_out_proj(out_proj):
++        # int4 weights: group scales are consumed in the GEMM mainloop, the per-channel fp32
++        # residual and our per-token activation scale in the epilogue. Always emits bf16.
++        return ops.cutlass_w4a8_mm(
++            a=y_fp8,
++            b_q=out_proj.weight_packed,
++            b_group_scales=out_proj.weight_group_scale,
++            b_group_size=_VTL_W4A8_GROUP_SIZE,
++            a_token_scales=y_scale,
++            b_channel_scales=out_proj.weight_chan_scale,
++            # Read off the LAYER, never from os.environ. quant_w4a8.schedule() is the single
++            # process-wide read of VTL_W4A8_SCHEDULE and stamps the validated result here, so a
++            # sweep cannot apply to the other GEMMs but silently miss these ten conv out_projs.
++            maybe_schedule=getattr(out_proj, "_vtl_w4a8_schedule", None),
++        ).to(out_dtype)
++
++    # fp8 weights: column-major [K, N], weight_scale per-channel [N, 1] -- exactly what the
++    # stock Fp8 apply_weights passes to cutlass_scaled_mm.
++    return ops.cutlass_scaled_mm(
++        y_fp8,
++        out_proj.weight,
++        scale_a=y_scale,
++        scale_b=out_proj.weight_scale,
++        out_dtype=out_dtype,
++        bias=None,
++    )
++
++
+ # --8<-- [start:short_conv]
+ @CustomOp.register("short_conv")
+ class ShortConv(MambaBase, CustomOp):
+@@ -92,7 +346,7 @@
+ 
+     def forward_native(
+         self,
+-        hidden_states: torch.Tensor,
++        BCx: torch.Tensor,
+         output: torch.Tensor,
+     ):
+         # Reference torch causal conv1d; runs on all CPU platforms. AMX kernels
+@@ -110,7 +364,6 @@
+             attn_metadata = attn_metadata_raw[self.prefix]
+             assert isinstance(attn_metadata, ShortConvAttentionMetadata)
+ 
+-        BCx, _ = self.in_proj(hidden_states)
+         B, C, x = BCx.chunk(3, dim=-1)
+ 
+         # (dim, kernel_size) — same reshape as forward_cuda
+@@ -122,7 +375,7 @@
+             # Profile run — output value doesn't matter
+             Bx = (B * x).contiguous()
+             output_tensor, _ = self.out_proj(C * Bx)
+-            output[: hidden_states.shape[0]] = output_tensor
++            output[: BCx.shape[0]] = output_tensor  # vtl: BCx has the same token count
+             return
+ 
+         conv_state = (
+@@ -189,15 +442,38 @@
+         hidden_states: torch.Tensor,
+         output: torch.Tensor,
+     ):
++        # vtl: in_proj is applied HERE, outside the custom op, and the op takes BCx.
++        #
++        # `torch.ops.vllm.short_conv` is opaque to every FX pass (direct_register_custom_op
++        # below), so while in_proj lived inside it, RMSNormQuantFusionPass could not see the
++        # QuantFP8 that in_proj's quantized path emits -- `operator_norm` sits OUTSIDE the op
++        # (lfm2.py) and the quant sat inside. Result: the 6 attention layers fused their
++        # norm+quant into our rms_norm_quant CUDA kernel and the 10 short-conv layers did not,
++        # each materializing a bf16 [T, dim] norm output and reading it straight back.
++        # ~671 MB of avoidable prefill traffic at T=8192.
++        #
++        # Hoisting is only half the fix: the norm output also needs to have exactly ONE consumer,
++        # or pm.register_replacement refuses the match. See the companion lfm2.patch, which stops
++        # `output = torch.empty_like(hidden_states)` from being the second one. Either patch
++        # alone is inert.
++        #
++        # out_proj deliberately stays INSIDE the op: the fused mul_quant / bcx_conv_gate_quant
++        # path feeds it an already-quantized activation by hand (_vtl_out_proj_quantized), which
++        # is not something a fusion pass could express anyway.
++        # vtl P2: the whole decode block in one launch when every gate says yes. Ahead of
++        # in_proj because the kernel subsumes it. Fail-closed -> the chain below.
++        if _vtl_mega_decode(self, hidden_states, output):
++            return
++        BCx, _ = self.in_proj(hidden_states)
+         torch.ops.vllm.short_conv(
+-            hidden_states,
++            BCx,
+             output,
+             self.prefix,
+         )
+ 
+     def forward_cuda(
+         self,
+-        hidden_states: torch.Tensor,
++        BCx: torch.Tensor,
+         output: torch.Tensor,
+     ):
+         forward_context = get_forward_context()
+@@ -222,8 +498,6 @@
+             has_initial_states_p = attn_metadata.has_initial_states_p
+             query_start_loc_p = attn_metadata.query_start_loc_p
+ 
+-        BCx, _ = self.in_proj(hidden_states)
+-
+         B, C, x = BCx.chunk(3, dim=-1)
+ 
+         conv_weights = self.conv.weight.view(
+@@ -265,6 +539,59 @@
+         )
+         conv_output_list = []
+ 
++        # vtl tree-spec P5 seam: during tree verify every draft node arrives as a "decode"
++        # token and causal_conv1d_update would advance the PERSISTENT conv_state for rejected
++        # drafts too. When the runner activates staging (_VTL_CONV_STAGE set), we stage each
++        # node's Bx and update a SCRATCH clone instead; the accepted path is committed
++        # post-sample (vtl.conv_commit). Inactive (None) -> byte-identical stock decode.
++        # ON-BOX: scratch layout, state_indices, and cudagraph capture of the staged path.
++        _vtl_stage = globals().get("_VTL_CONV_STAGE")
++
++        # vtl Phase-3 fused path (opt-in, fail-closed). Both halves quantize their own rows into
++        # one shared fp8 staging buffer, so the single out_proj GEMM can consume the whole merged
++        # decode|prefill tensor pre-quantized -- decode-only, prefill-only and mixed batches alike,
++        # with no bf16 `torch.vstack` in between. Skipped entirely while tree-spec staging is
++        # active, to avoid interacting with the deferred conv-state commit.
++        # ON-BOX: validate under cudagraph capture. On miss/failure -> stock path below.
++        use_fused = (
++            _vtl_stage is None
++            and _VTL_MUL_QUANT
++            and _vtl_mul_quant_eligible(self.out_proj)
++        )
++        # The fused decode kernel additionally replaces `(B_d*x_d).contiguous()` and the Triton
++        # causal_conv1d_update; it writes its rows of the same staging buffer.
++        use_conv_gate = (
++            use_fused
++            and has_decode
++            and _vtl_conv_gate_eligible(
++                self, conv_weights, conv_state, state_indices_tensor_d, BCx
++            )
++        )
++        # FAIL-CLOSED SCOPE. Every precondition is validated by the two `_eligible` helpers above,
++        # before anything mutates conv_state -- and only the allocation below is retryable. Once
++        # `causal_conv1d_fn` or `bcx_conv_gate_quant` has advanced the ring buffer, falling back to
++        # the stock path would DOUBLE-APPLY that update, so a failure past this point must not be
++        # swallowed: silently wrong state is worse than a raised exception. Hence the try/except
++        # covers the alloc only.
++        y_fp8 = y_scale = None
++        if use_fused:
++            try:
++                dim = conv_weights.shape[0]
++                y_fp8 = torch.empty(
++                    (num_actual_tokens, dim),
++                    dtype=torch.float8_e4m3fn,
++                    device=BCx.device,
++                )
++                y_scale = torch.empty(
++                    (num_actual_tokens, 1), dtype=torch.float32, device=BCx.device
++                )
++            except Exception:
++                self.out_proj._vtl_mul_quant_ok = False  # stop retrying; no log-spam
++                logging.getLogger("vllm.vtl.short_conv").exception(
++                    "vtl: short-conv fp8 staging buffer alloc failed; using stock"
++                )
++                use_fused = use_conv_gate = False
++
+         if has_prefill:
+             Bx_p = (B_p * x_p).transpose(0, 1)
+             Bx = causal_conv1d_fn(
+@@ -279,21 +606,61 @@
+                 query_start_loc=query_start_loc_p,
+             ).transpose(0, 1)[:num_prefill_tokens]
+ 
+-            y = C_p * Bx
+-            conv_output_list.append(y)
++            if use_fused:
++                # `Bx` is already [T, dim] with row stride dim -- causal_conv1d_fn allocates with
++                # `empty_like` on the (dim, T) transposed view, and preserve_format keeps its
++                # strides, so the transpose back is contiguous. C_p is a chunk view with row
++                # stride 3*dim. Both are last-dim contiguous, which is all mul_quant needs; the
++                # `.contiguous()` is a no-op that only bites if a future vLLM changes that layout.
++                torch.ops.vllm_cuda.mul_dynamic_per_token_quant(
++                    y_fp8[num_decodes:], y_scale[num_decodes:], C_p, Bx.contiguous(), None
++                )
++            else:
++                y = C_p * Bx
++                conv_output_list.append(y)
+ 
+         if has_decode:
+-            Bx_d = (B_d * x_d).contiguous()
+-            Bx = causal_conv1d_update(
+-                Bx_d,
+-                conv_state,
+-                conv_weights,
+-                self.conv.bias,
+-                activation=None,
+-                conv_state_indices=state_indices_tensor_d,
++            if use_conv_gate:
++                # B*x -> conv1d + state rotation -> C* -> fp8 quant, in one launch.
++                torch.ops.vllm_cuda.bcx_conv_gate_quant(
++                    y_fp8[:num_decodes],
++                    y_scale[:num_decodes],
++                    conv_state,
++                    BCx[:num_decodes],
++                    conv_weights,
++                    self.conv.bias,
++                    state_indices_tensor_d,
++                    NULL_BLOCK_ID,
++                    None,
++                )
++            else:
++                Bx_d = (B_d * x_d).contiguous()
++                _conv_state_d = conv_state
++                if _vtl_stage is not None:
++                    _conv_state_d = _vtl_stage(
++                        id(self), Bx_d, conv_state, state_indices_tensor_d
++                    )
++                Bx = causal_conv1d_update(
++                    Bx_d,
++                    _conv_state_d,
++                    conv_weights,
++                    self.conv.bias,
++                    activation=None,
++                    conv_state_indices=state_indices_tensor_d,
++                )
++                if use_fused:
++                    torch.ops.vllm_cuda.mul_dynamic_per_token_quant(
++                        y_fp8[:num_decodes], y_scale[:num_decodes], C_d, Bx, None
++                    )
++                else:
++                    y = C_d * Bx
++                    conv_output_list.insert(0, y)
++
++        if use_fused:
++            output[:num_actual_tokens] = _vtl_out_proj_quantized(
++                self.out_proj, y_fp8, y_scale, BCx.dtype
+             )
+-            y = C_d * Bx
+-            conv_output_list.insert(0, y)
++            return
+ 
+         # Merge prefill and decode outputs before passing to gated MLP
+         hidden_states = torch.vstack(conv_output_list)
+@@ -325,20 +692,23 @@
+ 
+ 
+ def short_conv(
+-    hidden_states: torch.Tensor,
++    BCx: torch.Tensor,
+     output: torch.Tensor,
+     layer_name: str,
+ ) -> None:
++    # vtl: takes the in_proj OUTPUT, not hidden_states -- in_proj is applied by
++    # ShortConv.forward so the fusion pass can reach its activation quant. `mutates_args` and
++    # the fake impl are unchanged: the op still only writes `output`.
+     forward_context: ForwardContext = get_forward_context()
+     self = forward_context.no_compile_layers[layer_name]
+     if not current_platform.is_cpu():
+-        self.forward_cuda(hidden_states=hidden_states, output=output)
++        self.forward_cuda(BCx=BCx, output=output)
+     else:
+-        self.forward_native(hidden_states=hidden_states, output=output)
++        self.forward_native(BCx=BCx, output=output)
+ 
+ 
+ def short_conv_fake(
+-    hidden_states: torch.Tensor,
++    BCx: torch.Tensor,
+     output: torch.Tensor,
+     layer_name: str,
+ ) -> None:
