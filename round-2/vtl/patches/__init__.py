@@ -41,8 +41,14 @@ _MODULES: tuple[str, ...] = (
     # (VTL_RUST_SCHED_FULL supersedes its schedule() wrapper, folding the same SJF key
     # into the Rust loop). Off unless VTL_ENABLE_RUST_SCHED=1 *and* a mode flag is set.
     "rust_sched",
-    "msgspec_stream",   # dict+msgspec SSE for simple chat streams (serving-path TPOT)
-    "msgspec_json",     # msgspec request-body decode + non-streaming JSON response encode
+    # NOTE: no HTTP-layer patches here. The Rust frontend owns the socket
+    # (api_server_rust_frontend.patch routes the entrypoint into
+    # run_multi_api_server unconditionally), so starlette/FastAPI/OpenAIServing*
+    # objects are never constructed in this process. `msgspec_stream` and
+    # `msgspec_json` used to sit here and patched exactly those -- dead weight
+    # once the Python api_server stopped starting. Per-token SSE now comes from
+    # vtl/vllm_patches/rust-frontend/per_token_stream.patch (VTL_STREAM_PER_TOKEN)
+    # and body decode from encode_cache.patch. Anything HTTP-shaped belongs there.
     "greedy_sampler",   # argmax fast path for plain greedy steps (per-step TPOT)
     "step0_eos_ban",    # mask EOS out of each request's FIRST sampled token. Guards a real
                         # failure mode of int4 lm_head: argmax picks the EOS token at step 0

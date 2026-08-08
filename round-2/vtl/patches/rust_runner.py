@@ -22,7 +22,7 @@ loras)`` tuple is dispatched through both vLLM's manager and the Rust table, and
 disagreement refuses the arm. That check is the whole reason it is safe to have a second
 dispatcher at all.
 
-``VTL_RUST_RUNNER``: "0" off, "1" on, "check" = shadow (both paths run and are diffed).
+``VTL_RUST_RUNNER``: "0" off, "1" on.
 """
 
 from __future__ import annotations
@@ -36,10 +36,8 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 def mode() -> str:
-    """"off" | "on" | "check"."""
+    """"off" | "on"."""
     raw = os.environ.get("VTL_RUST_RUNNER", "1").strip().lower()
-    if raw == "check":
-        return "check"
     return "on" if raw in _TRUTHY else "off"
 
 
@@ -55,14 +53,12 @@ def max_steps() -> int:
 class _State:
     """Module-global, like ``BURST`` and ``decode_fastpath._C``: one runner per process."""
 
-    __slots__ = ("runner", "live", "why", "shadow", "diverged")
+    __slots__ = ("runner", "live", "why")
 
     def __init__(self) -> None:
         self.runner = None      # the vtl_sched.Runner, once armed
         self.live = False       # may run_step() be called?
         self.why = "not armed"  # the one reason, logged once
-        self.shadow = False     # VTL_RUST_RUNNER=check
-        self.diverged = 0
 
     def refuse(self, why: str) -> None:
         """Permanent stand-down for the boot. Never raises -- the caller keeps the stock path."""
@@ -205,7 +201,6 @@ def export(runner, b) -> None:
     if want == "off":
         STATE.refuse("VTL_RUST_RUNNER=0")
         return
-    STATE.shadow = want == "check"
 
     try:
         import vtl_sched
@@ -301,8 +296,8 @@ def _self_check() -> None:
     """No torch, no vLLM, no crate: the env parsing and the refusal latch."""
     saved = os.environ.get("VTL_RUST_RUNNER")
     try:
-        for raw, want in (("1", "on"), ("0", "off"), ("check", "check"),
-                          ("CHECK", "check"), ("yes", "on"), ("nonsense", "off")):
+        for raw, want in (("1", "on"), ("0", "off"), ("check", "off"),
+                          ("yes", "on"), ("nonsense", "off")):
             os.environ["VTL_RUST_RUNNER"] = raw
             assert mode() == want, (raw, mode(), want)
         os.environ.pop("VTL_RUST_RUNNER", None)

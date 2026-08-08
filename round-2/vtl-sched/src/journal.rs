@@ -59,7 +59,6 @@ pub enum Undo {
     /// Whatever the prefix-cache index mapped `key` to (representation included).
     Index(HashKey, IndexSnapshot),
     CachedByBlock(u32, Option<SmallVec<[HashKey; 2]>>),
-    EvictedLen(usize),
 
     // ---- single_type (per KV cache group) ---------------------------------
     ReqBlocksLen(u32, u32, usize),
@@ -112,7 +111,6 @@ impl Journal {
                         m.coord.pool.cached_by_block.remove(&id);
                     }
                 },
-                Undo::EvictedLen(n) => m.coord.pool.evicted_this_step.truncate(n),
 
                 Undo::ReqBlocksLen(g, req, n) => {
                     if let Some(v) = m.coord.managers[g as usize].req_to_blocks.get_mut(&req) {

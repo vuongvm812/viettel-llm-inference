@@ -7,29 +7,19 @@ loop. This module is the only thing that wires it into a live engine.
 Gates (all default OFF, all independent except where noted)::
 
     VTL_ENABLE_RUST_SCHED=1        install this patch at all (registry gate)
-    VTL_RUST_SCHED_SHADOW=1        run Rust ALONGSIDE Python every call and compare
-    VTL_RUST_SCHED_SHADOW_STRICT=1 make a shadow mismatch raise (TESTS ONLY). In serving
-                                   the outer guard catches the AssertionError and simply
-                                   disables the mirror, so strict buys nothing there --
-                                   it exists so a pytest driving the manager directly
-                                   fails on the first divergence instead of counting.
     VTL_RUST_SCHED=1               make Rust AUTHORITATIVE for the KVCacheManager surface
     VTL_RUST_SCHED_FULL=1          also run the Rust schedule() loop (implies VTL_RUST_SCHED)
     VTL_RUST_SCHED_RADIX=1         use the radix index instead of the flat hash map
                                    (same answers; see vtl-sched/src/radix.rs)
     VTL_RUST_SCHED_UFO=1           R6a: batch the per-step stop decision of
                                    update_from_output into ONE Rust call (needs _FULL)
-    VTL_RUST_SCHED_UFO_SHADOW=1    keep Python's check_stop authoritative and only log
-                                   where the Rust verdict disagrees
     VTL_RUST_SCHED_TABLE=1         R6b: schedule from the Rust-RESIDENT request table
                                    instead of re-marshalling every running request each
                                    step (needs _FULL *and* _UFO -- the per-step token
                                    deltas ride on update_step)
-    VTL_RUST_SCHED_TABLE_SHADOW=1  keep the marshalled path authoritative and only log
-                                   where the resident table disagrees with pack_req
     VTL_RUST_SCHED_SPEC=1          R6c: precompute the next step on the Rust worker
                                    thread between update_from_output and schedule
-                                   (needs _TABLE; mutually exclusive with _TABLE_SHADOW)
+                                   (needs _TABLE)
     VTL_SCHED_TIMING=1             log-only p50/p95 of the schedule() phases. Independent
                                    of every other gate.
     VTL_RUST_SCHED_TOKSTORE=1      Port-2: Rust owns each slot's output tokens, counters and
@@ -37,15 +27,14 @@ Gates (all default OFF, all independent except where noted)::
                                    sampled ids cross as numpy, Python's ``Request`` degrades
                                    to three int counters, and the rare paths that need the
                                    real lists materialize them back from the crate.
-    VTL_RUST_SCHED_TOKSTORE_SHADOW=1  keep Python authoritative and only drive + diff the
-                                   Rust store (hash chains + both counters) per step.
 
-Why shadow first: this replaces the most correctness-critical component in the engine,
-and a hybrid layout (full-attention groups alongside mamba groups with
-``mamba_cache_mode=align``) has per-kind rules that fail SILENTLY when wrong -- a mamba
-state cached at the wrong boundary produces wrong tokens, not an exception. Shadow mode
-runs Python as the authority and only logs divergence, so a soak proves parity before any
-flag flips.
+This replaces the most correctness-critical component in the engine, and a hybrid layout
+(full-attention groups alongside mamba groups with ``mamba_cache_mode=align``) has
+per-kind rules that fail SILENTLY when wrong -- a mamba state cached at the wrong boundary
+produces wrong tokens, not an exception. Each rung above was therefore soaked against a
+Python-authoritative mirror before it was flipped on. Those mirrors are gone now that the
+parity work is done; ``bench/`` and the crate's own tests are what guard the port. Every
+gate still fails CLOSED -- a refusal degrades to the Python scheduler rather than raising.
 
 Composition with the existing patches:
   * ``vtl/patches/kv_cache_manager.py`` rebinds ``sched_mod.KVCacheManager`` to a subclass
@@ -81,7 +70,6 @@ from __future__ import annotations
 
 import logging
 import os
-import struct
 
 from vtl.registry import already_patched, mark_patched, register_patch
 
@@ -92,10 +80,6 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # RequestStatus values the Rust core needs (vllm/v1/request.py).
 _ST_WAITING, _ST_RUNNING, _ST_PREEMPTED = 0, 1, 2
-
-# R8 shadow only: the record's f64 timestamp sits at byte 9 (tag + version + u16 reserved
-# + u32 engine_index). Layout owner is vtl/patches/shm_ipc.py.
-_RAW_TS = struct.Struct("<d")
 
 
 def env_on(name: str) -> bool:
@@ -164,7 +148,6 @@ def modes() -> dict:
     # R6b rides on R6a: the resident table's per-step token delta is applied by
     # `update_step`, so without UFO the table would go stale on the very first decode.
     table = ufo and env_on("VTL_RUST_SCHED_TABLE")
-    table_shadow = table and env_on("VTL_RUST_SCHED_TABLE_SHADOW")
     r8 = (
         ufo
         and env_on("VTL_RUST_SCHED_R8")
@@ -175,36 +158,25 @@ def modes() -> dict:
     # R8 (it IS `update_step_pack`, driven off the sampler's numpy array) and on the Rust
     # hasher -- with two hash implementations live, one would own the prompt blocks and
     # the other the decode blocks, and a divergence between them is a silent prefix-cache
-    # key-space fork, not an exception. Refuses the two OTHER shadow arms outright: both
-    # keep Python's `append_output_token_ids` authoritative, and the store has already
-    # appended the same tokens by then, so the pair would double-count every token.
+    # key-space fork, not an exception.
     tokstore = (
         r8
-        and not env_on("VTL_RUST_SCHED_R8_SHADOW")
-        and not env_on("VTL_RUST_SCHED_UFO_SHADOW")
         and env_on("VTL_RUST_HASHER")
         and env_on("VTL_RUST_SCHED_TOKSTORE")
     )
     return {
-        "shadow": env_on("VTL_RUST_SCHED_SHADOW"),
-        "strict": env_on("VTL_RUST_SCHED_SHADOW_STRICT"),
         "authority": env_on("VTL_RUST_SCHED") or full,
         "full": full,
         "radix": env_on("VTL_RUST_SCHED_RADIX"),
         "ufo": ufo,
-        "ufo_shadow": env_on("VTL_RUST_SCHED_UFO_SHADOW"),
         "table": table,
-        "table_shadow": table_shadow,
-        # Shadow keeps the MARSHALLED call authoritative, and that call is what resyncs
-        # the table -- so the resident fast path (and therefore speculation, which can
-        # only be consumed by it) must stay off while shadowing.
-        "spec": table and not table_shadow and env_on("VTL_RUST_SCHED_SPEC"),
+        # Speculation can only be consumed by the resident fast path, so it rides on it.
+        "spec": table and env_on("VTL_RUST_SCHED_SPEC"),
         "timing": env_on("VTL_SCHED_TIMING"),
         # R8 rides on UFO (it IS update_step, plus the pack) and on the shm raw record
         # being the live wire format -- there is no point building bytes the output
-        # thread would have to decode again. Shadow keeps python authoritative.
+        # thread would have to decode again.
         "r8": r8,
-        "r8_shadow": r8 and env_on("VTL_RUST_SCHED_R8_SHADOW"),
         # B3: block hashing in Rust. Independent of everything above -- it only needs the
         # extension importable, so it stays armable with the scheduler flags off.
         "hasher": env_on("VTL_RUST_HASHER"),
@@ -212,18 +184,12 @@ def modes() -> dict:
         # extends the resident table in the same place the schedule decisions land).
         "nstep": full and env_on("VTL_NSTEP"),
         "tokstore": tokstore,
-        "tokstore_shadow": tokstore and env_on("VTL_RUST_SCHED_TOKSTORE_SHADOW"),
         # R9: collapse decide()/r8_apply's per-request Python loops into the single
         # update_step_pack_np crossing (+ the crate-side cache_blocks fold). Needs the
         # token store live -- the residue loop's counter writes and the fold's
         # `num_computed - num_output_placeholders` math both assume Rust already owns the
-        # per-slot bookkeeping tokstore provides. `r9_shadow` is deliberately NOT gated on
-        # `r9` here (same pattern as `ufo_shadow`): it is a pre-flight soak diagnostic --
-        # exercise and diff the batch-cache derivation with the old loop still
-        # authoritative -- runnable before `VTL_RUST_SCHED_R9` is ever flipped on. The
-        # installer combines them (`R9.live = r9 and not r9_shadow`).
+        # per-slot bookkeeping tokstore provides.
         "r9": tokstore and env_on("VTL_RUST_SCHED_R9"),
-        "r9_shadow": env_on("VTL_RUST_SCHED_R9_SHADOW"),
         # Phase A: stop producing decision payload no consumer on THIS boot reads
         # (`num_common_prefix_blocks` in the crate, the four dead `CachedRequestData`
         # fields in Python). Rides on the full loop -- it is that loop's apply block.
@@ -589,7 +555,7 @@ class RustMirror:
     creation, upstream of the KV manager), so the authoritative path never re-hashes in
     Rust -- it just receives the bytes. That removes any chance of a hash divergence in
     serving while keeping the ported hasher (``vtl_sched.block_hashes``) available and
-    parity-tested in ``bench/test_rust_sched_parity.py``.
+    covered by the crate's own tests.
     """
 
     def __init__(self, rust):
@@ -679,243 +645,6 @@ def status_code(request) -> int:
         raise NotImplementedError(
             f"rust_sched: unported RequestStatus {request.status!s}"
         ) from None
-
-
-# --------------------------------------------------------------------------
-# shadow mode
-# --------------------------------------------------------------------------
-
-
-class ShadowState:
-    """Mismatch bookkeeping. Monotonic counter, bounded logging, never raises in serving."""
-
-    LOG_BUDGET = 20
-
-    def __init__(self, strict: bool):
-        self.strict = strict
-        self.mismatches = 0
-        self.calls = 0
-
-    def check(self, what: str, py, rs, ctx: str = "") -> None:
-        self.calls += 1
-        if py == rs:
-            return
-        self.mismatches += 1
-        if self.mismatches <= self.LOG_BUDGET:
-            log.error(
-                "rust_sched SHADOW MISMATCH #%d in %s: python=%r rust=%r %s",
-                self.mismatches,
-                what,
-                py,
-                rs,
-                ctx,
-            )
-        elif self.mismatches == self.LOG_BUDGET + 1:
-            log.error("rust_sched: further shadow mismatches suppressed")
-        if self.strict:
-            raise AssertionError(
-                f"rust_sched shadow mismatch in {what}: python={py!r} rust={rs!r} {ctx}"
-            )
-
-
-def _install_shadow(base, mirror_modes):
-    """Subclass the currently-bound KVCacheManager and mirror every call into Rust."""
-    import vtl_sched
-
-    class VtlShadowKVCacheManager(base):
-        __vtl_rust_shadow__ = True
-
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._rust = None
-            self._shadow = ShadowState(mirror_modes["strict"])
-            if kv_transfer_configured():
-                refuse("a KV connector is configured")
-                return
-            cfg, reason = build_config(self, mirror_modes["radix"])
-            if reason is not None:
-                refuse(reason)
-                return
-            try:
-                self._rust = vtl_sched.KvManager(cfg)
-            except BaseException as exc:
-                reraise_fatal(exc)
-                refuse(f"crate rejected config: {exc!r}")
-                return
-            self._mirror = RustMirror(self._rust)
-            log.info(
-                "rust_sched: SHADOW mode active (%d groups, %d blocks, strict=%s)",
-                self._rust.num_groups,
-                cfg["num_blocks"],
-                mirror_modes["strict"],
-            )
-
-        # --- mirrored calls -------------------------------------------------
-
-        def new_step_starts(self):
-            super().new_step_starts()
-            if self._rust is not None:
-                self._rust.new_step_starts()
-
-        def get_computed_blocks(self, request):
-            blocks, num = super().get_computed_blocks(request)
-            if self._rust is not None:
-                try:
-                    slot = self._mirror.slot(request)
-                    rnum = self._rust.get_computed_blocks(
-                        slot,
-                        int(request.num_tokens),
-                        int(request.num_preemptions),
-                        bool(request.skip_reading_prefix_cache),
-                    )
-                    self._shadow.check(
-                        "get_computed_blocks.num_tokens", num, rnum, request.request_id
-                    )
-                    py_ids = blocks.get_block_ids()
-                    for g in range(self._rust.num_groups):
-                        n = self._rust.pending_hit_into_buffer(g)
-                        rs = self._rust.buffer(g)[:n].tolist()
-                        self._shadow.check(
-                            f"get_computed_blocks.blocks[{g}]",
-                            list(py_ids[g]),
-                            rs,
-                            request.request_id,
-                        )
-                except BaseException as exc:
-                    self._disable("get_computed_blocks", exc)
-            return blocks, num
-
-        def allocate_slots(self, request, num_new_tokens, *args, **kwargs):
-            result = super().allocate_slots(request, num_new_tokens, *args, **kwargs)
-            if self._rust is not None:
-                try:
-                    self._mirror_allocate(request, num_new_tokens, result, args, kwargs)
-                except BaseException as exc:
-                    self._disable("allocate_slots", exc)
-            return result
-
-        def _mirror_allocate(self, request, num_new_tokens, result, args, kwargs):
-            num_new_computed = kwargs.get("num_new_computed_tokens", 0)
-            if args:
-                num_new_computed = args[0]
-            new_computed_blocks = kwargs.get("new_computed_blocks")
-            if len(args) > 1:
-                new_computed_blocks = args[1]
-            lookahead = kwargs.get("num_lookahead_tokens", 0)
-            if len(args) > 2:
-                lookahead = args[2]
-            slot = self._mirror.slot(request)
-            ok = self._rust.allocate_slots(
-                slot,
-                int(num_new_tokens),
-                int(num_new_computed),
-                new_computed_blocks is not None,
-                int(lookahead),
-                int(request.num_computed_tokens),
-                int(request.num_tokens),
-                status_code(request),
-                bool(kwargs.get("has_scheduled_reqs", True)),
-            )
-            self._shadow.check(
-                "allocate_slots.fits", result is not None, ok, request.request_id
-            )
-            if result is None or not ok:
-                return
-            py_ids = result.get_block_ids()
-            for g in range(self._rust.num_groups):
-                n = self._rust.new_blocks_into_buffer(g)
-                self._shadow.check(
-                    f"allocate_slots.new_blocks[{g}]",
-                    list(py_ids[g]),
-                    self._rust.buffer(g)[:n].tolist(),
-                    request.request_id,
-                )
-            # Eviction order is not directly observable from Python, but it fully
-            # determines which block IDs come back next, so ID parity over a long trace
-            # IS eviction parity. Free-block counts catch accounting drift immediately.
-            self._shadow.check(
-                "free_blocks",
-                self.block_pool.get_num_free_blocks(),
-                self._rust.num_free_blocks,
-                request.request_id,
-            )
-
-        def cache_blocks(self, request, num_computed_tokens):
-            super().cache_blocks(request, num_computed_tokens)
-            if self._rust is not None:
-                try:
-                    slot = self._mirror.slot(request)
-                    self._rust.cache_blocks(slot, int(num_computed_tokens))
-                except BaseException as exc:
-                    self._disable("cache_blocks", exc)
-
-        def free(self, request):
-            super().free(request)
-            if self._rust is not None:
-                try:
-                    slot = self._mirror.slot(request)
-                    self._rust.free(slot)
-                    self._shadow.check(
-                        "free.free_blocks",
-                        self.block_pool.get_num_free_blocks(),
-                        self._rust.num_free_blocks,
-                        request.request_id,
-                    )
-                    self._mirror.drop(request.request_id)
-                except BaseException as exc:
-                    self._disable("free", exc)
-
-        def get_num_common_prefix_blocks(self, running_request_id):
-            out = super().get_num_common_prefix_blocks(running_request_id)
-            if self._rust is not None:
-                try:
-                    slot = self._rust.lookup(running_request_id)
-                    if slot is not None:
-                        self._shadow.check(
-                            "num_common_prefix_blocks",
-                            list(out),
-                            list(self._rust.num_common_prefix_blocks(slot)),
-                            running_request_id,
-                        )
-                except BaseException as exc:
-                    self._disable("common-prefix", exc)
-            return out
-
-        def reset_prefix_cache(self):
-            out = super().reset_prefix_cache()
-            if self._rust is not None:
-                try:
-                    self._shadow.check(
-                        "reset_prefix_cache", out, self._rust.reset_prefix_cache()
-                    )
-                except BaseException as exc:
-                    self._disable("reset_prefix_cache", exc)
-            return out
-
-        def evict_blocks(self, block_ids):
-            super().evict_blocks(block_ids)
-            if self._rust is not None:
-                try:
-                    self._rust.evict_blocks([int(b) for b in block_ids])
-                    self._shadow.check(
-                        "evict_blocks.free_blocks",
-                        self.block_pool.get_num_free_blocks(),
-                        self._rust.num_free_blocks,
-                    )
-                except BaseException as exc:
-                    self._disable("evict_blocks", exc)
-
-        def _disable(self, where: str, exc: BaseException) -> None:
-            """Drop the mirror. Never lets a crate panic reach EngineCore."""
-            reraise_fatal(exc)
-            log.exception("rust_sched: shadow %s failed; mirror disabled", where)
-            self._rust = None
-
-        @property
-        def rust_shadow_mismatches(self) -> int:
-            return self._shadow.mismatches
-
-    return VtlShadowKVCacheManager
 
 
 # --------------------------------------------------------------------------
@@ -1305,22 +1034,6 @@ class TableState:
             )
 
 
-# pack_req field order, for shadow-mode divergence reports.
-_REQ_FIELDS = (
-    "slot",
-    "num_tokens",
-    "num_tokens_with_spec",
-    "num_computed_tokens",
-    "num_output_placeholders",
-    "num_prompt_tokens",
-    "max_tokens",
-    "status",
-    "num_preemptions",
-    "is_prefill_chunk",
-    "skip_reading_prefix_cache",
-)
-
-
 class PhaseTimers:
     """VTL_SCHED_TIMING: p50/p95 of the three schedule() phases plus the step gap.
 
@@ -1596,22 +1309,6 @@ def pack_req(slot: int, request) -> tuple:
     )
 
 
-def r9_batch_diff(cached_slots: list, cached_rows: list, gathered_counts: list,
-                   fresh_slots: list, fresh_rows: list, fresh_counts: list) -> str | None:
-    """R9_SHADOW: what ``mirror._batch_cache`` PREDICTS this step against what the full
-    per-request loop actually built, compared BEFORE the FFI fires so a divergence is
-    caught before ``fold_cache`` could ever act on it. Returns the mismatching field's
-    name (used as the once-per-boot-per-kind log key) or ``None``. Pure -- self-checked.
-    """
-    if cached_slots != fresh_slots:
-        return "slots"
-    if cached_rows != fresh_rows:
-        return "rows"
-    if gathered_counts != fresh_counts:
-        return "counts"
-    return None
-
-
 # --------------------------------------------------------------------------
 # Port-2 -- the Rust-owned token store: the Python half
 # --------------------------------------------------------------------------
@@ -1644,12 +1341,11 @@ class _TokState:
     """Port-2 process state. One engine core per process, so a module global is the whole
     lifetime story -- same shape as ``nstep_decode.BURST``."""
 
-    __slots__ = ("live", "shadow", "armed", "hash_block_size", "facaded",
+    __slots__ = ("live", "armed", "hash_block_size", "facaded",
                  "materialized", "divergences", "warned")
 
     def __init__(self) -> None:
         self.live = False          # numpy fast path + facade installation
-        self.shadow = False        # python authoritative, store driven and compared
         self.armed = False         # NONE_HASH handed to the crate
         self.hash_block_size = 0
         self.facaded = 0
@@ -1661,10 +1357,9 @@ class _TokState:
         """Permanent, boot-lifetime fallback. Requests already facaded keep working: the
         per-request writer branch keys off the FACADE, not off this flag, and the next step
         that cannot take the numpy path materializes them back onto the stock path."""
-        if self.live or self.shadow:
+        if self.live:
             log.error("rust_sched: token store disabled for this boot -- %s", why)
         self.live = False
-        self.shadow = False
 
 
 TOK = _TokState()
@@ -1674,26 +1369,23 @@ class _R9State:
     """R9 process state -- same shape as ``_TokState``/``nstep_decode.BURST``: one engine
     core per process, so a module global is the whole lifetime story.
 
-    ``live`` gates taking the collapsed FFI-plus-residue path (fold_cache=True included);
-    ``shadow`` gates running the batch-cache derivation as a diagnostic ALONGSIDE the old
-    loop, which stays authoritative. Both are resolved once at install time from the env
-    gates, then only ever move towards ``False`` -- ``disable()`` is the sole mutator
-    after that, mirroring ``TOK.disable``'s boot-lifetime latch.
+    ``live`` gates taking the collapsed FFI-plus-residue path (fold_cache=True included).
+    It is resolved once at install time from the env gates, then only ever moves towards
+    ``False`` -- ``disable()`` is the sole mutator after that, mirroring ``TOK.disable``'s
+    boot-lifetime latch.
     """
 
-    __slots__ = ("live", "shadow", "checks", "warned_kinds")
+    __slots__ = ("live", "checks", "warned_kinds")
 
     def __init__(self) -> None:
         self.live = False
-        self.shadow = False
         self.checks = 0
         self.warned_kinds: set = set()
 
     def disable(self, why: str) -> None:
-        if self.live or self.shadow:
+        if self.live:
             log.error("rust_sched: R9 disabled for this boot -- %s", why)
         self.live = False
-        self.shadow = False
 
     def warn_once(self, kind: str, msg: str, *args) -> None:
         """One ERROR per mismatch KIND per boot -- a soak that finds the same divergence
@@ -1758,34 +1450,6 @@ def _r9_maybe_check_fold_skips(rust) -> None:
         return
     if skips:
         R9.disable(f"cache_fold_skips={skips} (table_with silent-skip hazard fired)")
-
-
-def _r9_shadow_check(mirror, model_runner_output, sampled, slots, rows, counts) -> None:
-    """``VTL_RUST_SCHED_R9_SHADOW``: diff the cache's prediction for THIS step against
-    what the (still-authoritative) full per-request loop just built, BEFORE the real FFI
-    call -- see ``r9_batch_diff``. Any mismatch disables R9 for the boot; the old loop
-    never stops being authoritative in shadow mode, so a mismatch costs a log line, not
-    correctness.
-    """
-    cache = mirror._batch_cache
-    if cache is None or cache[0] is not model_runner_output.req_id_to_index:
-        return
-    _, c_slots, c_rows, _c_requests = cache
-    try:
-        gathered = sampled.counts[c_rows].tolist()
-        kind = r9_batch_diff(c_slots, c_rows, gathered, slots, rows, counts)
-    except BaseException as exc:
-        reraise_fatal(exc)
-        kind = "diff-raised"
-    if kind is None:
-        return
-    R9.warn_once(
-        kind,
-        "rust_sched: R9 shadow divergence in %s -- cached(slots=%r rows=%r) "
-        "fresh(slots=%r rows=%r counts=%r)",
-        kind, c_slots, c_rows, slots, rows, counts,
-    )
-    R9.disable(f"shadow divergence in {kind}")
 
 
 class _Row:
@@ -2042,7 +1706,7 @@ def tok_arm(kv) -> bool:
     kv._rust.store_arm(bytes(kv_cache_utils.NONE_HASH))
     TOK.hash_block_size = hbs
     TOK.armed = True
-    log.info("rust_sched: token store armed (hash_block_size=%d, shadow=%s)", hbs, TOK.shadow)
+    log.info("rust_sched: token store armed (hash_block_size=%d)", hbs)
     return True
 
 
@@ -2173,24 +1837,18 @@ def _install_update_from_output(scheduler_cls, m: dict):
     from vllm.v1.core.sched.utils import remove_all
     from vllm.v1.request import RequestStatus
 
-    shadow = m["ufo_shadow"]
     spec = m["spec"]
-    r8_shadow = m["r8_shadow"]
-    # Port-2. STORE gates the crate-side bookkeeping (both arms); TOK.live gates the numpy
-    # fast path and the facade, and is the flag that a failure turns off for the boot.
+    # Port-2. STORE gates the crate-side bookkeeping; TOK.live gates the numpy fast path
+    # and the facade, and is the flag that a failure turns off for the boot.
     STORE = m["tokstore"]
-    TOK.shadow = m["tokstore_shadow"]
-    TOK.live = STORE and not TOK.shadow
+    TOK.live = STORE
 
     # R9: the collapsed FFI + residue loop. `R9.live` decides whether decide() folds
     # `cache_blocks` in and whether `update_from_output` uses the residue loop instead of
-    # `r8_apply`; `R9.shadow` keeps the old loop authoritative but still exercises the
-    # batch-cache derivation (and diffs it) as a soak-testable diagnostic -- see
-    # `r9_batch_diff`. Both live on the module singleton, not a closure cell, because
+    # `r8_apply`. It lives on the module singleton, not a closure cell, because
     # `R9.disable()` must be reachable from inside `decide()`'s per-step checks and stay
     # disabled for the rest of the boot, same contract as `TOK.disable`.
-    R9.live = m["r9"] and not m["r9_shadow"]
-    R9.shadow = m["r9_shadow"]
+    R9.live = m["r9"]
 
     # R8 emits `bytes` onto the output queue, which ONLY `shm_ipc`'s replacement output
     # thread understands -- stock's would do `outputs.engine_index = ...` on a bytes and
@@ -2462,8 +2120,6 @@ def _install_update_from_output(scheduler_cls, m: dict):
                     and not store_take_over(kv, request, slot):
                 # This request's tokens stay in Python, so the whole step does: the numpy
                 # crossing reads its counters off the store and there would be no entry.
-                # (`_vtl_tok_on`, not `facaded()`: the SHADOW arm installs no facade, and
-                # re-seeding the store every step would mask the drift it exists to catch.)
                 lazy = False
             slots.append(slot)
             rows.append(index)
@@ -2477,10 +2133,8 @@ def _install_update_from_output(scheduler_cls, m: dict):
             return None
         if lazy and pack:
             req_only = None
-            if R9.live or R9.shadow:
+            if R9.live:
                 req_only = [r for _rid, _n, r in expect]
-                if R9.shadow:
-                    _r9_shadow_check(mirror, model_runner_output, sampled, slots, rows, counts)
                 mirror._batch_cache = (model_runner_output.req_id_to_index, slots, rows, req_only)
             # Inline publish is scoped to the R9 residue path (below): only `r9_apply`
             # checks `_vtl_r8_published` to skip the queue put, so attempting it while R9
@@ -2526,46 +2180,7 @@ def _install_update_from_output(scheduler_cls, m: dict):
             self._vtl_r8_record = record
         else:
             out = rust.update_step(slots, cu, toks, n_out, n_tok, int(self.max_model_len))
-        if TOK.shadow:
-            self._vtl_tok_shadow = (slots, cu, toks, [v[0] for v in out], expect)
         return {rid: (n, *v) for (rid, n, _r), v in zip(expect, out)}
-
-    def store_compare(self, kv) -> None:
-        """VTL_RUST_SCHED_TOKSTORE_SHADOW: Python stays authoritative, Rust is checked.
-
-        Runs AFTER stock's ``append_output_token_ids`` (so the request holds this step's
-        tokens and hashes), drives the store with the SAME accepted counts, and diffs the
-        two hash chains and both counters per request.
-
-        Deliberately NOT a record byte-compare: running both pack arms in one step would
-        apply every verdict twice. Record byte-identity is proved instead by the crate's
-        ``record_is_identical_with_the_store`` golden test, which is exhaustive and free.
-        """
-        state = self._vtl_tok_shadow
-        self._vtl_tok_shadow = None
-        if state is None:
-            return
-        slots, cu, toks, accepted, batch = state
-        try:
-            kv._rust.store_apply(slots, cu, toks, accepted)
-            for slot, (rid, _n, request) in zip(slots, batch):
-                want = (int(request.num_tokens), int(request.num_output_tokens))
-                got = kv._rust.store_counts(slot)
-                if got != want:
-                    TOK.divergences += 1
-                    log.error("rust_sched: token store COUNTER divergence on %s -- "
-                              "python=%r rust=%r", rid, want, got)
-                py_hashes = b"".join(request.block_hashes)
-                rs_hashes = kv._rust.slot_hashes(slot)
-                if rs_hashes != py_hashes:
-                    TOK.divergences += 1
-                    log.error("rust_sched: token store HASH CHAIN divergence on %s -- "
-                              "python=%d hashes, rust=%d hashes", rid,
-                              len(py_hashes) // 32, len(rs_hashes or b"") // 32)
-        except BaseException as exc:
-            reraise_fatal(exc)
-            log.exception("rust_sched: token store shadow comparison failed")
-            TOK.disable("shadow comparison raised")
 
     def r8_apply(self, model_runner_output):
         """``update_from_output``'s per-request bookkeeping, WITHOUT the output assembly.
@@ -2762,7 +2377,7 @@ def _install_update_from_output(scheduler_cls, m: dict):
             # `or self._vtl_r8_published`: Batch 3's inline-delivered case leaves the
             # record itself `None` (nothing left to copy into a `PyBytes`), so the record
             # alone no longer distinguishes "packed" from "refused" -- see `decide()`.
-            if (self._vtl_r8_record is not None or self._vtl_r8_published) and not r8_shadow:
+            if self._vtl_r8_record is not None or self._vtl_r8_published:
                 if self._vtl_r9_residue is not None:
                     outputs = r9_apply(self, self._vtl_r9_residue)
                 else:
@@ -2780,17 +2395,12 @@ def _install_update_from_output(scheduler_cls, m: dict):
                         self, kv, scheduler_output, model_runner_output
                     )
                 outputs = wrapped_ufo(self, scheduler_output, model_runner_output)
-                if self._vtl_r8_record is not None:
-                    r8_compare(self, outputs)
-            if TOK.shadow and self._vtl_tok_shadow is not None:
-                store_compare(self, kv)
         finally:
             self._vtl_ufo = None
             self._vtl_r8_record = None
             self._vtl_r8_published = False
             self._vtl_r9_residue = None
             self._vtl_burst_n = 1
-            self._vtl_tok_shadow = None
         if spec:
             maybe_kick(self, kv)
         if outputs:
@@ -2799,40 +2409,6 @@ def _install_update_from_output(scheduler_cls, m: dict):
             # inline-published step returns `{}` above and is correctly NOT counted here.
             bump_enqueued()
         return outputs
-
-    def r8_compare(self, outputs) -> None:
-        """VTL_RUST_SCHED_R8_SHADOW: Python stays authoritative, Rust's bytes are checked.
-
-        Packs the objects stock just built with the SAME layout the frontend decodes and
-        diffs the two byte strings. A mismatch is the only signal that matters -- if these
-        agree over a full replay, flipping the authority arm on cannot change the wire.
-        """
-        rust_bytes = self._vtl_r8_record
-        try:
-            from vtl.patches.shm_ipc import raw_packable, raw_pack_into, raw_size
-
-            eco = outputs.get(0) if outputs else None
-            if eco is None or len(outputs) != 1:
-                log.error("rust_sched: R8 shadow -- python produced %d client batches, "
-                          "rust produced 1", len(outputs or ()))
-                return
-            # Rust stamps its own timestamp; copy python's in so the diff is about the
-            # payload, not about which side called monotonic() first.
-            eco.engine_index = 0
-            eco.timestamp = _RAW_TS.unpack_from(rust_bytes, 9)[0]
-            if not raw_packable(eco):
-                log.error("rust_sched: R8 shadow -- rust packed a batch python refuses")
-                return
-            buf = bytearray(raw_size(eco))
-            raw_pack_into(buf, eco)
-            if bytes(buf) != rust_bytes:
-                log.error(
-                    "rust_sched: R8 shadow BYTE DIVERGENCE\n  python=%s\n  rust  =%s",
-                    buf.hex(), rust_bytes.hex(),
-                )
-        except BaseException as exc:
-            reraise_fatal(exc)
-            log.exception("rust_sched: R8 shadow comparison failed")
 
     def reconcile_burst(self, request, kept: int) -> None:
         """Hand back the tokens a committed burst did not produce. See ``burst_uncommit``.
@@ -2877,29 +2453,6 @@ def _install_update_from_output(scheduler_cls, m: dict):
             return wrapped_urwo(self, request, new_token_ids)
         _, num_keep, status, stop_reason = answer
 
-        if shadow:
-            kept, stopped = wrapped_urwo(self, request, new_token_ids)
-            want = status != 0
-            if stopped != want or len(kept) != num_keep:
-                log.error(
-                    "rust_sched: UFO shadow divergence on %s -- python (%d kept, stopped=%s) "
-                    "vs rust (%d kept, status=%d)",
-                    request.request_id, len(kept), stopped, num_keep, status,
-                )
-            elif want:
-                # stop_reason is compared too: EOS-also-in-stop_token_ids is the one
-                # branch where status matches but the precedence choice shows only here.
-                rust_reason = stop_reason if stop_reason >= 0 else None
-                if (request.status is not _STATUS_FROM_CODE[status]
-                        or request.stop_reason != rust_reason):
-                    log.error(
-                        "rust_sched: UFO shadow status divergence on %s -- python "
-                        "(%s, reason=%s) vs rust (%s, reason=%s)",
-                        request.request_id, request.status, request.stop_reason,
-                        _STATUS_FROM_CODE[status], rust_reason,
-                    )
-            return kept, stopped
-
         if facaded(request):
             # Port-2: the tokens and the hash chain are already in Rust (appended by
             # `update_step_pack_np` for exactly `num_keep`), so the whole writer is two
@@ -2934,7 +2487,6 @@ def _install_update_from_output(scheduler_cls, m: dict):
     scheduler_cls._vtl_r8_published = False
     scheduler_cls._vtl_r9_residue = None
     scheduler_cls._vtl_burst_n = 1
-    scheduler_cls._vtl_tok_shadow = None
     mark_patched(update_from_output, wrapped_ufo, patch="rust_sched_ufo")
     mark_patched(_update_request_with_output, wrapped_urwo, patch="rust_sched_ufo")
     scheduler_cls.update_from_output = update_from_output
@@ -2945,10 +2497,8 @@ def _install_update_from_output(scheduler_cls, m: dict):
             _install_async_output()
     log.info(
         "rust_sched: UFO batched stop decision active "
-        "(shadow=%s, kick=%s, r8=%s%s, tokstore=%s%s, r9=%s%s)",
-        shadow, spec, _r8[0], " SHADOW" if r8_shadow else "",
-        STORE, " SHADOW" if TOK.shadow else "",
-        R9.live, " SHADOW" if R9.shadow else "",
+        "(kick=%s, r8=%s, tokstore=%s, r9=%s)",
+        spec, _r8[0], STORE, R9.live,
     )
 
 
@@ -3004,8 +2554,8 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     # Gates resolved ONCE, into closure cells. An off gate then costs one LOAD_DEREF and a
     # not-taken branch per step, which is why the timing arm below is inline rather than a
     # second copy of this 180-line function.
-    TABLE, TABLE_SHADOW, SPEC = m["table"], m["table_shadow"], m["spec"]
-    RESIDENT = TABLE and not TABLE_SHADOW
+    TABLE, SPEC = m["table"], m["spec"]
+    RESIDENT = TABLE
     TIMING = m["timing"]
     # Phase A. Resolved to its final value at first schedule (`lean_blocked` needs the
     # live scheduler), then constant: the crate is told once via `set_params`.
@@ -3026,7 +2576,6 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     ring_i = 0
     ns = time.monotonic_ns
     timers = PhaseTimers() if TIMING else None
-    table_shadow_state = ShadowState(strict=False) if TABLE_SHADOW else None
 
     # C1a. `nstep_decode` is the runner half; it publishes readiness and executes the
     # burst. Importing it here (not at module import) keeps rust_sched loadable when the
@@ -3042,25 +2591,6 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     NSTEP_QUEUE_EMPTY_ONLY = os.environ.get(
         "VTL_NSTEP_QUEUE_EMPTY_ONLY", "1"
     ).strip().lower() in _TRUTHY
-
-    def shadow_table(kv, running, by_slot):
-        """Log where the resident table disagrees with this step's ``pack_req`` tuples.
-
-        Called only from the marshalled arm, and only in TABLE_SHADOW mode: ``table_entry``
-        is non-invalidating and therefore reads THROUGH a pending speculation, but
-        ``modes()`` forces SPEC off whenever TABLE_SHADOW is on, so none can be pending.
-        """
-        for us in running:
-            them = kv._rust.table_entry(us[0])
-            if them == us:
-                table_shadow_state.calls += 1
-                continue
-            rid = by_slot[us[0]].request_id
-            if them is None:
-                table_shadow_state.check("table_entry", "present", "missing", rid)
-                continue
-            for name, mine, theirs in zip(_REQ_FIELDS, us, them):
-                table_shadow_state.check(f"table.{name}", mine, theirs, rid)
 
     def skip_note(self, why: str) -> None:
         """First-reason-only logging: names each new reason once, then stays quiet."""
@@ -3224,8 +2754,8 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             )
             log.info(
                 "rust_sched: FULL schedule() loop active "
-                "(sjf=%s, table=%s, table_shadow=%s, spec=%s, timing=%s)",
-                sjf_enabled, TABLE, TABLE_SHADOW, SPEC, TIMING,
+                "(sjf=%s, table=%s, spec=%s, timing=%s)",
+                sjf_enabled, TABLE, SPEC, TIMING,
             )
 
         if TIMING:
@@ -3316,11 +2846,6 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             if decisions is None and counts is None:
                 running = [pack_req(s, by_slot[s]) for s in running_slots]
         if decisions is None and counts is None:
-            if TABLE_SHADOW and tbl is not None and not tbl.dirty:
-                try:
-                    shadow_table(kv, running, by_slot)
-                except BaseException as exc:
-                    tbl.fail("table shadow", exc)
             if ARENA:
                 counts = core.schedule_arena(
                     kv._rust, running, waiting, arena_check_left > 0
@@ -3773,7 +3298,7 @@ def apply() -> None:
     _install_async_output_event_ring()
 
     m = modes()
-    if not (m["shadow"] or m["authority"] or m["hasher"]):
+    if not (m["authority"] or m["hasher"]):
         log.info("rust_sched: no mode selected, nothing installed")
         return
 
@@ -3794,15 +3319,13 @@ def apply() -> None:
             reraise_fatal(exc)
             log.exception("rust_sched: rust block hasher not installed; keeping stock")
 
-    if not (m["shadow"] or m["authority"]):
+    if not m["authority"]:
         return
 
     import vllm.v1.core.sched.scheduler as sched_mod
 
     base = sched_mod.KVCacheManager
-    if getattr(base, "__vtl_rust_shadow__", False) or getattr(
-        base, "__vtl_rust_authority__", False
-    ):
+    if getattr(base, "__vtl_rust_authority__", False):
         return  # idempotent
 
     if getattr(base, "__vtl_subclass__", False):
@@ -3810,12 +3333,8 @@ def apply() -> None:
     else:
         log.info("rust_sched: vtl kv_cache_manager patch is not installed; subclassing stock")
 
-    if m["authority"]:
-        sched_mod.KVCacheManager = _install_authority(base, m)
-        log.info("rust_sched: installed AUTHORITY manager (VTL_RUST_SCHED=1)")
-    else:
-        sched_mod.KVCacheManager = _install_shadow(base, m)
-        log.info("rust_sched: installed SHADOW manager (VTL_RUST_SCHED_SHADOW=1)")
+    sched_mod.KVCacheManager = _install_authority(base, m)
+    log.info("rust_sched: installed AUTHORITY manager (VTL_RUST_SCHED=1)")
 
     if m["authority"]:
         # Newer vLLM defaults scheduler_reserve_full_isl=True; its stock schedule()
@@ -3856,8 +3375,8 @@ def apply() -> None:
         _install_full_schedule(Scheduler, sjf, m)
         Scheduler.schedule.__vtl_rust_full__ = True
         log.info(
-            "rust_sched: resolved R6b/R6c mode -- table=%s table_shadow=%s spec=%s timing=%s",
-            m["table"], m["table_shadow"], m["spec"], m["timing"],
+            "rust_sched: resolved R6b/R6c mode -- table=%s spec=%s timing=%s",
+            m["table"], m["spec"], m["timing"],
         )
 
         if m["ufo"] and not already_patched(
@@ -3878,15 +3397,14 @@ def apply() -> None:
 
 def _self_check() -> None:
     saved = {k: os.environ.get(k) for k in (
-        "VTL_RUST_SCHED", "VTL_RUST_SCHED_SHADOW", "VTL_RUST_SCHED_FULL",
-        "VTL_RUST_SCHED_SHADOW_STRICT", "VTL_RUST_SCHED_RADIX",
-        "VTL_RUST_SCHED_UFO", "VTL_RUST_SCHED_UFO_SHADOW",
-        "VTL_RUST_SCHED_TABLE", "VTL_RUST_SCHED_TABLE_SHADOW",
+        "VTL_RUST_SCHED", "VTL_RUST_SCHED_FULL", "VTL_RUST_SCHED_RADIX",
+        "VTL_RUST_SCHED_UFO",
+        "VTL_RUST_SCHED_TABLE",
         "VTL_RUST_SCHED_SPEC", "VTL_SCHED_TIMING",
-        "VTL_RUST_SCHED_R8", "VTL_RUST_SCHED_R8_SHADOW", "VTL_RUST_HASHER",
+        "VTL_RUST_SCHED_R8", "VTL_RUST_HASHER",
         "VTL_SHM_IPC", "VTL_SHM_IPC_RAW", "VTL_NSTEP",
-        "VTL_RUST_SCHED_TOKSTORE", "VTL_RUST_SCHED_TOKSTORE_SHADOW",
-        "VTL_RUST_SCHED_R9", "VTL_RUST_SCHED_R9_SHADOW",
+        "VTL_RUST_SCHED_TOKSTORE",
+        "VTL_RUST_SCHED_R9",
         "VTL_RUST_SCHED_LEAN", "VTL_SCHED_LEAN_CHECK",
         "VTL_SCHED_DECISIONS_ARENA", "VTL_SCHED_SO_RING",
     )}
@@ -3894,12 +3412,12 @@ def _self_check() -> None:
         for k in saved:
             os.environ.pop(k, None)
         assert modes() == {
-            "shadow": False, "strict": False, "authority": False,
-            "full": False, "radix": False, "ufo": False, "ufo_shadow": False,
-            "table": False, "table_shadow": False, "spec": False, "timing": False,
-            "r8": False, "r8_shadow": False, "hasher": False, "nstep": False,
-            "tokstore": False, "tokstore_shadow": False,
-            "r9": False, "r9_shadow": False,
+            "authority": False,
+            "full": False, "radix": False, "ufo": False,
+            "table": False, "spec": False, "timing": False,
+            "r8": False, "hasher": False, "nstep": False,
+            "tokstore": False,
+            "r9": False,
             "lean": False, "lean_check": False,
             "arena": False, "arena_check": False, "so_ring": False,
         }, modes()
@@ -3916,15 +3434,10 @@ def _self_check() -> None:
         # UFO needs the full loop: it reads the Rust manager's slot interning.
         os.environ["VTL_RUST_SCHED_UFO"] = "1"
         assert modes()["ufo"] is True
-        # The R6b/R6c ladder: TABLE needs UFO, SPEC needs TABLE, and TABLE_SHADOW keeps
-        # the marshalled path authoritative so it must switch SPEC off.
+        # The R6b/R6c ladder: TABLE needs UFO, SPEC needs TABLE.
         os.environ["VTL_RUST_SCHED_TABLE"] = "1"
         os.environ["VTL_RUST_SCHED_SPEC"] = "1"
         assert modes()["table"] is True and modes()["spec"] is True
-        os.environ["VTL_RUST_SCHED_TABLE_SHADOW"] = "1"
-        assert modes()["table_shadow"] is True
-        assert modes()["spec"] is False, "shadow keeps the marshalled path authoritative"
-        os.environ.pop("VTL_RUST_SCHED_TABLE_SHADOW")
         os.environ["VTL_RUST_SCHED_UFO"] = "0"
         assert modes()["table"] is False and modes()["spec"] is False, (
             "TABLE must not arm without UFO -- update_step applies its token delta"
@@ -3947,11 +3460,8 @@ def _self_check() -> None:
         assert modes()["r8"] is False, "...nor with shm but msgpack records"
         os.environ["VTL_SHM_IPC_RAW"] = "1"
         assert modes()["r8"] is True
-        assert modes()["r8_shadow"] is False
-        os.environ["VTL_RUST_SCHED_R8_SHADOW"] = "1"
-        assert modes()["r8_shadow"] is True
         os.environ["VTL_RUST_SCHED_UFO"] = "0"
-        assert modes()["r8"] is False and modes()["r8_shadow"] is False, (
+        assert modes()["r8"] is False, (
             "R8 IS update_step plus a pack; it cannot arm without UFO"
         )
         os.environ["VTL_RUST_SCHED_UFO"] = "1"
@@ -3992,27 +3502,15 @@ def _self_check() -> None:
         # Port-2 rides on R8 *and* the Rust hasher: two live hash implementations would
         # each own half the chain, and a divergence between them is silent.
         os.environ["VTL_RUST_SCHED_TOKSTORE"] = "1"
-        assert modes()["r8_shadow"] is True
-        assert modes()["tokstore"] is False, "the R8 shadow arm would double-count tokens"
-        os.environ["VTL_RUST_SCHED_R8_SHADOW"] = "0"
         assert modes()["r8"] is True
         assert modes()["tokstore"] is False, "no token store without the Rust hasher"
         os.environ["VTL_RUST_HASHER"] = "1"
         assert modes()["tokstore"] is True
-        assert modes()["tokstore_shadow"] is False
-        os.environ["VTL_RUST_SCHED_TOKSTORE_SHADOW"] = "1"
-        assert modes()["tokstore_shadow"] is True
-        os.environ["VTL_RUST_SCHED_UFO_SHADOW"] = "1"
-        assert modes()["tokstore"] is False and modes()["tokstore_shadow"] is False, (
-            "the UFO shadow arm keeps python's append authoritative -> double count"
-        )
-        os.environ["VTL_RUST_SCHED_UFO_SHADOW"] = "0"
         os.environ["VTL_RUST_SCHED_R8"] = "0"
-        assert modes()["tokstore"] is False and modes()["tokstore_shadow"] is False, (
+        assert modes()["tokstore"] is False, (
             "the store IS update_step_pack; it cannot arm without R8"
         )
         os.environ["VTL_RUST_SCHED_R8"] = "1"
-        os.environ.pop("VTL_RUST_SCHED_TOKSTORE_SHADOW")
         assert modes()["tokstore"] is True
 
         # R9 rides on the token store: the residue loop's counter writes and the fold's
@@ -4021,14 +3519,7 @@ def _self_check() -> None:
         assert modes()["r9"] is False, "R9 needs VTL_RUST_SCHED_R9 too"
         os.environ["VTL_RUST_SCHED_R9"] = "1"
         assert modes()["r9"] is True
-        assert modes()["r9_shadow"] is False
-        # r9_shadow is a pre-flight soak diagnostic: it reads regardless of r9 itself, so
-        # it can be exercised before VTL_RUST_SCHED_R9 is ever flipped on.
-        os.environ["VTL_RUST_SCHED_R9_SHADOW"] = "1"
-        assert modes()["r9_shadow"] is True
         os.environ.pop("VTL_RUST_SCHED_R9")
-        assert modes()["r9"] is False and modes()["r9_shadow"] is True
-        os.environ.pop("VTL_RUST_SCHED_R9_SHADOW")
         os.environ.pop("VTL_RUST_SCHED_TOKSTORE")
         assert modes()["tokstore"] is False
         os.environ["VTL_RUST_SCHED_R9"] = "1"
@@ -4057,21 +3548,9 @@ def _self_check() -> None:
     assert spec_signature(Spec(16, "a")) != spec_signature(Spec(16, "b"))
     assert spec_signature(Spec(16, "a")) != spec_signature(Spec(32, "a"))
 
-    # ShadowState: counts, never raises unless strict. (The mismatch path logs at ERROR
-    # by design; mute it here so `make check` output stays clean.)
+    # (Muted below: several failure paths log at ERROR by design, and `make check`
+    # output should stay clean.)
     log.setLevel(logging.CRITICAL)
-    st = ShadowState(strict=False)
-    st.check("x", 1, 1)
-    assert st.mismatches == 0
-    st.check("x", 1, 2, "ctx")
-    assert st.mismatches == 1
-    strict = ShadowState(strict=True)
-    try:
-        strict.check("y", [1], [2])
-    except AssertionError as exc:
-        assert "rust_sched shadow mismatch" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("strict shadow mode must raise")
 
     # TableState: born dirty (nothing is resident yet); resync bumps the generation AND
     # disarms, so a speculation kicked before it can never be consumed after; fail() is
@@ -4517,12 +3996,6 @@ def _self_check() -> None:
     mirror.drop("cache-owner")
     assert mirror._batch_cache is None, "drop() must invalidate the whole cache"
 
-    # `r9_batch_diff`: agreement is silent, and it names the FIRST field that disagrees.
-    assert r9_batch_diff([1, 2], [0, 1], [1, 1], [1, 2], [0, 1], [1, 1]) is None
-    assert r9_batch_diff([1, 2], [0, 1], [1, 1], [1, 9], [0, 1], [1, 1]) == "slots"
-    assert r9_batch_diff([1, 2], [0, 1], [1, 1], [1, 2], [0, 9], [1, 1]) == "rows"
-    assert r9_batch_diff([1, 2], [0, 1], [1, 1], [1, 2], [0, 1], [1, 9]) == "counts"
-
     # `_R9State`: boot-lifetime disable, and warn_once's one-line-per-kind budget.
     r9st = _R9State()
     r9st.live = True
@@ -4532,7 +4005,7 @@ def _self_check() -> None:
     assert r9st.warned_kinds == {"slots"}
     r9st.disable("test")
     log.setLevel(logging.NOTSET)
-    assert not r9st.live and not r9st.shadow
+    assert not r9st.live
 
     # ---- Port-2: LazySampled / _Row / the facade / materialization --------------------
 
@@ -4713,16 +4186,16 @@ def _self_check() -> None:
     assert tok_store_init(nr2, exact, 3, 16) is True
     assert nr2.init == (3, [], 32, 0), "a block-aligned request seeds an empty tail"
 
-    # TOK.disable is permanent for the boot and closes both arms.
-    saved_tok = (TOK.live, TOK.shadow)
+    # TOK.disable is permanent for the boot.
+    saved_tok = TOK.live
     try:
-        TOK.live = TOK.shadow = True
+        TOK.live = True
         log.setLevel(logging.CRITICAL)
         TOK.disable("test")
         log.setLevel(logging.NOTSET)
-        assert not TOK.live and not TOK.shadow
+        assert not TOK.live
     finally:
-        TOK.live, TOK.shadow = saved_tok
+        TOK.live = saved_tok
 
     # reraise_fatal: a crate panic (BaseException, not Exception) is swallowed by the
     # guards; interpreter signals still get through.

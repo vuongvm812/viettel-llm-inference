@@ -58,8 +58,6 @@ the authority.
 | `kv_cache_manager` | on | adds `plan_request`/`free_blocks` signals to the KV manager |
 | `sched_policy` | on | cache-aware shortest-job-first reorder of the waiting queue |
 | `rust_sched` | **off** | the Rust scheduler core — see §1.4 |
-| `msgspec_stream` | on | msgspec SSE encoding for simple chat streams |
-| `msgspec_json` | on | msgspec request decode + non-streaming response encode |
 | `greedy_sampler` | on | argmax fast path for plain greedy steps |
 | `step0_eos_ban` | on | masks EOS out of each request's **first** sampled token |
 | `decode_fastpath` | on | V2 runner: skips the dead metadata build on repeat pure-decode steps |
@@ -176,11 +174,12 @@ in §1.2, `VTL_SKIP_EXT=1` (ignore `vtl._C`, run stock kernels — used by `make
 **V2 model runner** — `VLLM_USE_V2_MODEL_RUNNER`, `VTL_V2_GREEDY_FASTPATH`,
 `VTL_V2_GREEDY_ARGMAX_KERNEL`, `VTL_V2_FUSED_POSTPROCESS`, `VTL_V2_FORCE_CUTLASS_FP8`.
 
-**Rust scheduler** — `VTL_ENABLE_RUST_SCHED` plus a mode flag (`VTL_RUST_SCHED_SHADOW` /
-`VTL_RUST_SCHED` / `VTL_RUST_SCHED_FULL`); both are required. Sub-features:
+**Rust scheduler** — `VTL_ENABLE_RUST_SCHED` plus a mode flag (`VTL_RUST_SCHED` /
+`VTL_RUST_SCHED_FULL`); both are required. Sub-features:
 `_RADIX`, `_TABLE`, `_SPEC`, `_R8`, `_R9`, `_TOKSTORE`, `_UFO`, `VTL_RUST_HASHER`.
-Most have a `_SHADOW` twin that keeps Python authoritative and only logs divergence — that
-is the soak arm, and it costs both paths. Plus **`VTL_RUST_SCHED_REQUIRE`** (§1.4).
+Each rung used to carry a `_SHADOW` twin that kept Python authoritative and logged
+divergence; those soak arms were removed once the port was proved — `bench/` and the
+crate's own tests are the guard now. Plus **`VTL_RUST_SCHED_REQUIRE`** (§1.4).
 
 **N-step decode** — `VTL_ENABLE_NSTEP_DECODE`, `VTL_NSTEP`, `VTL_NSTEP_N`,
 `VTL_NSTEP_MODE`, `VTL_NSTEP_QUEUE_EMPTY_ONLY`, `VTL_NSTEP_FOLD_T1`, `VTL_NSTEP_UNROLL`,
@@ -366,8 +365,8 @@ there is nothing to compare against.
 ### 3.5 Check the Rust scheduler actually engages
 
 ```bash
-VTL_ENABLE_RUST_SCHED=1 VTL_RUST_SCHED_SHADOW=1 VTL_RUST_SCHED_REQUIRE=1 make up
-make verify   # want: rust_sched: SHADOW mode active (N groups, ...)
+VTL_ENABLE_RUST_SCHED=1 VTL_RUST_SCHED=1 VTL_RUST_SCHED_REQUIRE=1 make up
+make verify   # want: rust_sched: AUTHORITY mode active (N groups, ...)
 ```
 
 A dense model gives `1 groups` (unitary path). If it instead reports
@@ -530,7 +529,7 @@ does not exist there.
 
 **The real acceptance test for this workspace** — boot against a plain dense model that is
 nothing like the previous round's (e.g. `Qwen/Qwen3-0.6B`) and require both `make verify`
-green **and** `rust_sched: SHADOW mode active (1 groups, ...)`. That is the Rust port
+green **and** `rust_sched: AUTHORITY mode active (1 groups, ...)`. That is the Rust port
 engaging on a model it has never seen. Needs the GPU box.
 
 **Reference material** — `reference/lfm2/` holds the previous round's model-specific

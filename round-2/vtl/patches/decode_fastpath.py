@@ -48,11 +48,6 @@ actually advance -- ``num_computed_tokens_np`` and the numpy backing of
 contents are identical, so the aliasing is inert. ``execute_model_state`` is a single slot
 consumed by ``sample_tokens`` within the same step, so no two live InputBatches overlap.
 
-``VTL_DECODE_FASTPATH_SHADOW=1`` runs BOTH paths every eligible step (fast first, snapshot,
-then the stock original, then compare the persistent buffers) and logs divergence. The
-returned value is always the stock one, so shadow is safe in production -- it is just slow.
-Every write on both paths is idempotent, which is what makes running them back to back legal.
-
 --------------------------------------------------------------------------------------
 PART 2 -- ``VTL_UVA_POOL``: kill the two pin_memory-per-step allocations
 --------------------------------------------------------------------------------------
@@ -135,7 +130,7 @@ def has_new_blocks(so) -> bool:  # noqa: ANN001
 
 class _Cache:
     __slots__ = ("runner", "key", "ib", "seq_ub_np", "block_tables", "slot_mappings",
-                 "fast", "shadow", "builders", "refresh_bt", "snap", "hits", "misses")
+                 "fast", "builders", "refresh_bt", "hits", "misses")
 
     def __init__(self) -> None:
         self.builders = None
@@ -151,9 +146,7 @@ class _Cache:
         self.block_tables = None
         self.slot_mappings = None
         self.fast = False
-        self.shadow = False
         self.refresh_bt = True
-        self.snap = None
         # Builder classification survives reset(): it is a property of the loaded model, and
         # re-running it is the only thing that could log per step on an unsupported backend.
         self.builders = None if self.builders is not False else False
@@ -219,7 +212,7 @@ def _classify(runner):  # noqa: ANN001
                 return None  # populated on the builder's first real build(); retry
             fa.append((b, group_id))
     # An EMPTY mamba list is legal: a dense (attention-only) model has no SSM group, and
-    # every mamba consumer is a loop (`_fast_model_attn`, `_snapshot`) or an unpack
+    # every mamba consumer is a loop (`_fast_model_attn`) or an unpack
     # (`nstep_decode._burst_body`), so it no-ops. The mamba-specific refusals above all sit
     # inside the `state_indices_tensor_d` branch and are simply unreachable -- which is why
     # a dense model needs no `--mamba_cache_mode=align`. No FA builder is still fatal.
@@ -351,41 +344,6 @@ def _fast_model_attn(runner, c: _Cache) -> None:  # noqa: ANN001
         _mamba_write(b, c.block_tables[group_id], seq_lens, block_size, runner._vtl_gather_idx)
 
 
-# ---------------------------------------------------------------------------------------
-# Shadow: snapshot -> stock -> compare. Debug arm; compose ships it at 0.
-# ---------------------------------------------------------------------------------------
-
-
-def _snapshot(runner, c: _Cache) -> dict:  # noqa: ANN001
-    ib = c.ib
-    n = ib.num_reqs_after_padding
-    t = ib.num_tokens_after_padding
-    snap = {
-        "seq_lens": runner.input_buffers.seq_lens[:n].clone(),
-        "positions": runner.input_buffers.positions[:t].clone(),
-        "input_ids": runner.input_buffers.input_ids[:t].clone(),
-        "slot_mappings": None if c.slot_mappings is None else c.slot_mappings.clone(),
-    }
-    if c.builders:
-        fa, mamba = c.builders
-        for i, (b, _) in enumerate(fa):
-            snap[f"scheduler_metadata{i}"] = b.scheduler_metadata.clone()
-        for i, (b, _, _) in enumerate(mamba):
-            snap[f"state_indices{i}"] = b.state_indices_tensor_d[:n].clone()
-    return snap
-
-
-def _compare(where: str, snap: dict, truth: dict) -> None:
-    import torch
-
-    for k, v in snap.items():
-        w = truth.get(k)
-        if v is None or w is None:
-            continue
-        if not torch.equal(v, w):
-            log.error("vtl: decode_fastpath SHADOW divergence in %s/%s", where, k)
-
-
 def _install(cls, name: str, wrapper) -> None:  # noqa: ANN001
     if already_patched(cls, name, patch="decode_fastpath"):
         return
@@ -402,12 +360,10 @@ def _patch_runner() -> None:
     from vllm.v1.worker.gpu.model_states.default import DefaultModelState
     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
-    shadow = _flag("VTL_DECODE_FASTPATH_SHADOW", "0")
-
     def wrap_prepare_inputs(original):
         def prepare_inputs(self, scheduler_output, batch_desc):  # noqa: ANN001
             c = _C
-            c.fast = c.shadow = False
+            c.fast = False
             if _eligible(self, scheduler_output, batch_desc, c):
                 try:
                     ib = _fast_inputs(self, c)
@@ -417,15 +373,10 @@ def _patch_runner() -> None:
                 else:
                     c.fast = True
                     c.hits += 1
-                    if not shadow:
-                        return ib
-                    c.shadow = True
-                    c.snap = _snapshot(self, c)
+                    return ib
             c.misses += 1
             ib = original(self, scheduler_output, batch_desc)
             _recache(self, scheduler_output, batch_desc, ib, c)
-            if c.shadow:
-                _compare("prepare_inputs", c.snap, _snapshot(self, c))
             return ib
 
         return prepare_inputs
@@ -434,14 +385,9 @@ def _patch_runner() -> None:
         def prepare_attn(self, input_batch):  # noqa: ANN001
             c = _C
             if c.fast:
-                out = _fast_attn(self, c, c.refresh_bt)
-                if not c.shadow:
-                    return out
-                snap = _snapshot(self, c)
+                return _fast_attn(self, c, c.refresh_bt)
             bt, sm = original(self, input_batch)
             c.block_tables, c.slot_mappings = bt, sm
-            if c.fast and c.shadow:
-                _compare("prepare_attn", snap, _snapshot(self, c))
             return bt, sm
 
         return prepare_attn
@@ -458,17 +404,12 @@ def _patch_runner() -> None:
                     log.exception("vtl: decode_fastpath model prepare_attn failed; reverting")
                     c.reset()
                 else:
-                    if not c.shadow:
-                        # Discarded by execute_model under FULL. Empty, not the stale dict:
-                        # an unexpected consumer must fail loudly, never read last step's
-                        # max_seq_len as if it were this step's.
-                        return {}
-                    snap = _snapshot(runner, c)
-            out = original(self, input_batch, cudagraph_mode, block_tables, slot_mappings,
-                           attn_groups, kv_cache_config, for_capture)
-            if c.fast and c.shadow and not for_capture:
-                _compare("model_prepare_attn", snap, _snapshot(c.runner, c))
-            return out
+                    # Discarded by execute_model under FULL. Empty, not the stale dict:
+                    # an unexpected consumer must fail loudly, never read last step's
+                    # max_seq_len as if it were this step's.
+                    return {}
+            return original(self, input_batch, cudagraph_mode, block_tables, slot_mappings,
+                            attn_groups, kv_cache_config, for_capture)
 
         return prepare_attn
 
@@ -532,7 +473,7 @@ def _patch_runner() -> None:
     # seams -- dead on a dense model even with the builders classified.
     _install(MambaHybridModelState, "prepare_attn", wrap_model_prepare_attn)
     _install(DefaultModelState, "prepare_attn", wrap_model_prepare_attn)
-    log.info("vtl: decode_fastpath armed (shadow=%s)", shadow)
+    log.info("vtl: decode_fastpath armed")
 
 
 def _prime_fa_consts(runner, b, ib) -> None:  # noqa: ANN001

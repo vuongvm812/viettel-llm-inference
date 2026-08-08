@@ -464,8 +464,6 @@ pub struct BlockPool {
     scratch_ids: Vec<u32>,
     scratch_with_hash: Vec<u32>,
     scratch_without_hash: Vec<u32>,
-    /// Eviction victims recorded since the last drain (shadow-mode comparison).
-    pub evicted_this_step: Vec<u32>,
 }
 
 impl BlockPool {
@@ -497,7 +495,6 @@ impl BlockPool {
             scratch_ids: Vec::with_capacity(64),
             scratch_with_hash: Vec::with_capacity(64),
             scratch_without_hash: Vec::with_capacity(64),
-            evicted_this_step: Vec::new(),
         })
     }
 
@@ -724,10 +721,6 @@ impl BlockPool {
         if evicted == 0 {
             return false;
         }
-        if let Some(j) = self.arena.journal.as_mut() {
-            j.push(Undo::EvictedLen(self.evicted_this_step.len()));
-        }
-        self.evicted_this_step.push(block_id);
         true
     }
 
@@ -948,7 +941,6 @@ mod tests {
         p.get_new_blocks(p.get_num_free_blocks(), &mut all).unwrap();
         assert!(all.contains(&b));
         assert!(p.cached.get_one_block(&key).is_none());
-        assert!(p.evicted_this_step.contains(&b));
     }
 
     #[test]

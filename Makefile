@@ -231,8 +231,8 @@ verify:
 	@if grep -q "rust_sched: NOT ENGAGED" /tmp/vtl-verify.log; then \
 	   echo "WARN rust scheduler NOT ENGAGED: $$(sed -n 's/.*rust_sched: NOT ENGAGED -- //p' /tmp/vtl-verify.log | tail -1)"; \
 	   echo "     you are measuring the stock scheduler. VTL_RUST_SCHED_REQUIRE=1 makes this fatal."; \
-	 elif grep -qE "rust_sched: (SHADOW|AUTHORITY) mode active" /tmp/vtl-verify.log; then \
-	   echo "OK   rust scheduler engaged: $$(grep -oE 'rust_sched: (SHADOW|AUTHORITY) mode active \([^)]*\)' /tmp/vtl-verify.log | tail -1)"; \
+	 elif grep -q "rust_sched: AUTHORITY mode active" /tmp/vtl-verify.log; then \
+	   echo "OK   rust scheduler engaged: $$(grep -oE 'rust_sched: AUTHORITY mode active \([^)]*\)' /tmp/vtl-verify.log | tail -1)"; \
 	 else \
 	   echo "WARN rust scheduler state unknown -- no mode selected, or logging below INFO"; \
 	 fi

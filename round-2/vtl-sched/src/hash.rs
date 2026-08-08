@@ -210,8 +210,7 @@ pub fn hash_block_tokens(
 /// unset `PYTHONHASHSEED` -> 32 random bytes; set -> `sha256(seed_string)`.
 ///
 /// The random branch is intentionally NOT reproduced here: the live NONE_HASH is
-/// always passed in from Python so shadow/authority modes share vLLM's value
-/// whatever it is. This helper only covers the deterministic branch, for tests.
+/// always passed in from Python so the crate shares vLLM's value whatever it is. This helper only covers the deterministic branch, for tests.
 pub fn none_hash_from_seed(seed: &str) -> Digest32 {
     let mut p = Pickler::new(32 + seed.len());
     p.str(seed);

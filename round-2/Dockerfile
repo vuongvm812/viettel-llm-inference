@@ -259,8 +259,8 @@ RUN SO=$(python3 -c "import importlib.util as u; s = u.find_spec('vtl._C_w4a8');
     fi
 
 # WS4: the Rust scheduler core. Wheel only -- no toolchain lands in the served image.
-# Importing it has no effect until one of VTL_RUST_SCHED_SHADOW / VTL_RUST_SCHED /
-# VTL_RUST_SCHED_FULL is set AND VTL_ENABLE_RUST_SCHED=1 (see vtl/patches/rust_sched.py).
+# Importing it has no effect until VTL_RUST_SCHED or VTL_RUST_SCHED_FULL is set AND
+# VTL_ENABLE_RUST_SCHED=1 (see vtl/patches/rust_sched.py).
 # No wheel = the builder stage could not reach the network (see its header). That is a serving
 # no-op: rust_sched.py logs and disables itself when the module is absent. A wheel that IS here
 # and then fails to install or import is still fatal -- that one is our code.

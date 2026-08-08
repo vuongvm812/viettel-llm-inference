@@ -51,8 +51,8 @@ fn err(e: String) -> PyErr {
 /// and (optionally) the inline shm publish.
 ///
 /// Extracted verbatim from `update_step_pack_np`'s `allow_threads` body so the Rust model
-/// runner drives THE SAME code rather than a parallel implementation -- which is what lets
-/// `bench/test_rust_sched_parity.py` keep covering both paths. Callers must not hold the GIL.
+/// runner drives THE SAME code rather than a parallel implementation, so one set of tests
+/// covers both paths. Callers must not hold the GIL.
 #[allow(clippy::too_many_arguments)]
 fn step_pack_locked(
     shared: &Arc<Mutex<Shared>>,
@@ -458,11 +458,6 @@ impl KvManager {
             .map_err(err)
     }
 
-    /// `(num_tokens, num_output_tokens)` as the store holds them. The shadow arm's probe.
-    fn store_counts(&self, slot: u32) -> Option<(usize, usize)> {
-        self.r().manager.tokens.counts(slot)
-    }
-
     /// The slot's output tokens, as native Python ints (PyO3 converts `i64` -> `int`, so
     /// nothing numpy-shaped can reach a block-hash input or a `Request` token list).
     fn slot_tokens(&self, slot: u32) -> Option<Vec<i64>> {
@@ -481,22 +476,6 @@ impl KvManager {
     /// Release a slot from the store (materialization / permanent per-request fallback).
     fn store_forget(&self, slot: u32) {
         self.w().manager.tokens.forget(slot);
-    }
-
-    /// Shadow arm: append the accepted tokens and run the hash catch-up, with NO verdicts,
-    /// no table delta and no record. Python stays authoritative; the caller then compares
-    /// `store_counts` / `slot_hashes` against its own `Request`.
-    fn store_apply(
-        &self,
-        slots: Vec<u32>,
-        cu_lens: Vec<u32>,
-        token_ids: Vec<i64>,
-        accepted: Vec<u32>,
-    ) -> PyResult<()> {
-        self.w()
-            .manager
-            .store_apply(&slots, &cu_lens, &token_ids, &accepted)
-            .map_err(err)
     }
 
     /// Port-2: [`KvManager::update_step_pack`] driven straight off the sampler's numpy
@@ -681,17 +660,11 @@ impl KvManager {
         self.w().manager.table_clear(slot);
     }
 
-    /// One slot's entry in `pack_req` field order, for shadow-mode comparison.
+    /// FxHash over the entries at `slots`, in order.
     ///
-    /// NON-INVALIDATING on purpose, so a shadow build can probe it without killing every
-    /// speculation. The flip side: between a `kick` and its `take_speculative` this reads
-    /// the SPECULATIVE post-commit values. Call it outside that window.
-    fn table_entry(&self, slot: u32) -> Option<ReqTuple> {
-        self.r().manager.table_get(slot).map(pack)
-    }
-
-    /// FxHash over the entries at `slots`, in order. Same non-invalidating caveat as
-    /// [`KvManager::table_entry`].
+    /// NON-INVALIDATING on purpose, so a probe cannot kill a live speculation. The flip
+    /// side: between a `kick` and its `take_speculative` this reads the SPECULATIVE
+    /// post-commit values. Call it outside that window.
     fn table_fingerprint(&self, slots: Vec<u32>) -> u64 {
         self.r().manager.table_fingerprint(&slots)
     }
@@ -924,10 +897,6 @@ impl KvManager {
 
     fn num_common_prefix_blocks(&self, slot: u32) -> Vec<usize> {
         self.w().manager.get_num_common_prefix_blocks(slot).to_vec()
-    }
-
-    fn take_evicted(&self) -> Vec<u32> {
-        self.w().manager.take_evicted()
     }
 }
 

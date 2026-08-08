@@ -421,7 +421,6 @@ impl Manager {
             .collect();
         cbb.sort();
         cbb.hash(&mut h);
-        pool.evicted_this_step.hash(&mut h);
 
         for m in self.coord.managers.iter() {
             let mut rb: Vec<_> = m.req_to_blocks.iter().map(|(r, v)| (*r, v.clone())).collect();
@@ -723,11 +722,6 @@ impl Manager {
         self.coord.new_step_starts();
     }
 
-    /// Drain the eviction victims recorded since the last call (shadow-mode comparison).
-    pub fn take_evicted(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.coord.pool.evicted_this_step)
-    }
-
     /// R6a + R6b: one step's stop decisions AND the resident table's update-time delta.
     ///
     /// Mirrors `AsyncScheduler._update_request_with_output` (async_scheduler.py:52): the
@@ -952,8 +946,7 @@ impl Manager {
 
     /// Append this step's ACCEPTED tokens to the store and run the block-hash catch-up.
     ///
-    /// Shared by the authoritative numpy path and by the shadow arm, so the two cannot
-    /// drift. `accepted[i]` is `Verdict::num_accepted`, i.e. stop truncation already
+    /// Called by the authoritative numpy pack path. `accepted[i]` is `Verdict::num_accepted`, i.e. stop truncation already
     /// applied -- a token past a stop was never computed into KV and must not be hashed.
     pub fn store_apply(
         &mut self,
@@ -1680,24 +1673,25 @@ mod tests {
     }
 
     #[test]
-    fn store_apply_is_the_shadow_arm_and_agrees_with_the_authoritative_path() {
-        // Same tokens through `store_apply` (what the shadow arm calls) and through the
-        // authoritative `update_step_pack_store`: identical chain and identical counters.
+    fn store_apply_agrees_with_the_incremental_pack_path() {
+        // `store_apply` is the batch token-append `update_step_pack` calls internally.
+        // Driving 16 tokens through it in ONE call must land the same chain and the same
+        // counters as 16 incremental `update_step_pack_store` steps.
         let (mut auth, a) = store_mgr("req-a", 16);
         for t in 200..216i64 {
             auth.update_step_pack_store(&[a], &[1], &[t], 100000, 0, 0.0, &[], false)
                 .unwrap();
         }
-        let (mut shadow, b) = store_mgr("req-a", 16);
+        let (mut batch, b) = store_mgr("req-a", 16);
         let toks: Vec<i64> = (200..216).collect();
         let acc = vec![16u32];
-        shadow.store_apply(&[b], &[0, 16], &toks, &acc).unwrap();
-        assert_eq!(auth.slot_hashes(a), shadow.slot_hashes(b));
-        assert_eq!(auth.tokens.counts(a), shadow.tokens.counts(b));
-        assert_eq!(auth.slot_tokens(a), shadow.slot_tokens(b));
+        batch.store_apply(&[b], &[0, 16], &toks, &acc).unwrap();
+        assert_eq!(auth.slot_hashes(a), batch.slot_hashes(b));
+        assert_eq!(auth.tokens.counts(a), batch.tokens.counts(b));
+        assert_eq!(auth.slot_tokens(a), batch.slot_tokens(b));
         // Out-of-range accepted counts are refused rather than slicing past the batch.
-        assert!(shadow.store_apply(&[b], &[0, 1], &toks, &[2]).is_err());
-        assert!(shadow.store_apply(&[b], &[0, 1], &toks, &[1, 1]).is_err());
+        assert!(batch.store_apply(&[b], &[0, 1], &toks, &[2]).is_err());
+        assert!(batch.store_apply(&[b], &[0, 1], &toks, &[1, 1]).is_err());
     }
 
     #[test]

@@ -530,8 +530,8 @@ fn max_tokens_tail_drains_only_the_accepted_tokens() {
 /// `_preempt_request`'s three field writes, applied to the table.
 ///
 /// Not observable through the parity harness — a preempted request re-enters through the
-/// MARSHALLED waiting queue, which overwrites its entry wholesale — but `table_entry` is
-/// a shadow-mode probe and must not report a stale RUNNING request.
+/// MARSHALLED waiting queue, which overwrites its entry wholesale — but the table must
+/// never report a stale RUNNING request to anyone who reads it directly.
 #[test]
 fn preempted_slots_are_stamped_in_the_table() {
     // 12 usable blocks; each 64-token request holds 4 attention + 1 mamba block, and a

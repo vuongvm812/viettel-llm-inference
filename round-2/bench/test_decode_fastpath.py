@@ -8,7 +8,7 @@ Three tiers, because the three failure modes are independent:
     ``mamba_get_block_table_tensor`` + the ``_update_metadata_for_cudagraph_capture`` copy,
     which is the code it replaces, bit for bit;
   * the FA3 WRITE has no cheap oracle -- ``get_scheduler_metadata`` IS the reference -- so it
-    is covered by ``VTL_DECODE_FASTPATH_SHADOW=1`` against a live engine, not here.
+    is only exercised against a live engine, not here.
 
     pytest bench/test_decode_fastpath.py -q
     python bench/test_decode_fastpath.py     # predicate tier only, no pytest/GPU needed
