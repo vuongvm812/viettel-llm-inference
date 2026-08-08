@@ -1628,8 +1628,14 @@ impl Runner {
         crate::gpu::live::driver().err()
     }
 
-    /// Add one captured graph. `exec` is `torch.cuda.CUDAGraph.raw_cuda_graph_exec()`.
-    #[pyo3(signature = (num_tokens, num_reqs, uniform_token_count, num_active_loras, exec, full))]
+    /// Add one captured graph. `exec` is `torch.cuda.CUDAGraph.raw_cuda_graph_exec()` of the
+    /// WHOLE-BURST graph, `cont` of the continuation graph for launches 2..k (0 = none, so
+    /// this shape takes one launch per call).
+    ///
+    /// `cont` defaults so a plugin older than this wheel still registers the shapes it
+    /// knows about instead of failing the arm on an arity mismatch.
+    #[pyo3(signature = (num_tokens, num_reqs, uniform_token_count, num_active_loras, exec,
+                        full, cont = 0))]
     fn register_graph(
         &mut self,
         num_tokens: u32,
@@ -1638,6 +1644,7 @@ impl Runner {
         num_active_loras: u32,
         exec: u64,
         full: bool,
+        cont: u64,
     ) -> u32 {
         self.table.push_entry(crate::gpu::GraphEntry {
             num_tokens,
@@ -1645,6 +1652,7 @@ impl Runner {
             uniform_token_count,
             num_active_loras,
             exec,
+            cont,
             full,
         })
     }
@@ -1898,6 +1906,17 @@ impl Runner {
     /// LAST step only -- the intermediate ones are, by the exit rule above, all "nothing
     /// stopped", and materialising them would allocate per step for data nobody reads.
     ///
+    /// TWO EXEC CLASSES. Launch 1 replays the whole-burst graph, which begins with a
+    /// prologue over the hidden states the stock FULL replay left behind; launches 2..k
+    /// replay the CONTINUATION graph, which has no prologue and feeds off the last sampled
+    /// token instead. Relaunching the first exec would re-read hidden states nothing
+    /// refreshed in between and re-emit the token it already emitted, so a shape with no
+    /// continuation handle clamps itself to a single launch -- the caller learns how many
+    /// ran and reconciles the surplus it committed.
+    ///
+    /// Each launch fills the NEXT `width` accumulator columns (the continuation graph does
+    /// not reset the column counter), so launch i is gathered at column offset `i * width`.
+    ///
     /// WHY THE BATCH SHAPE IS FIXED FOR THE WHOLE CALL: the caller passes one
     /// `(num_reqs, num_tokens, uniform, loras)` and one slot/row/count layout. A step that
     /// would change any of them is precisely a step the scheduler has to re-plan, so it
@@ -1936,12 +1955,15 @@ impl Runner {
                 slots.len()
             )));
         }
-        let Some(exec) =
+        let Some((exec, cont)) =
             self.table
-                .launchable(num_reqs, num_tokens, uniform_token_count, num_active_loras)
+                .launchable_pair(num_reqs, num_tokens, uniform_token_count, num_active_loras)
         else {
             return Ok(None);
         };
+        // No continuation graph for this shape: one launch, and the caller reconciles.
+        let max_steps = if cont == 0 { 1 } else { max_steps };
+        let width = crate::gpu::burst_width(&counts).map_err(err)? as usize;
         let d = crate::gpu::live::driver().map_err(err)?;
         let pinned = self
             .pinned
@@ -1979,18 +2001,33 @@ impl Runner {
                     "accumulator is {bytes} bytes but the pinned buffer is {pinned_len}"
                 ));
             }
+            // The whole call's columns have to exist before the first launch: the graphs
+            // write `[i*width, (i+1)*width)` with no bound check of their own.
+            if max_steps as usize * width > out_cols {
+                return Err(format!(
+                    "{max_steps} launches of {width} tokens overrun the {out_cols}-column \
+                     accumulator"
+                ));
+            }
+            // PRE-FLIGHT, before anything is launched: a step that cannot pack would still
+            // have advanced the resident table and fed its tokens back into the input
+            // buffers, so "decline" has to be decided while declining is still free.
+            if !lock_shared(&shared).manager.runner_packable(&slots) {
+                return Ok(None);
+            }
 
             let mut records: Vec<Vec<u8>> = Vec::new();
             let mut last: Vec<(u32, u8, i64)> = Vec::new();
             let mut ran: u32 = 0;
             let mut exit = LoopExit::Budget;
 
-            for _ in 0..max_steps {
+            for i in 0..max_steps as usize {
                 // SAFETY / ordering: identical to run_step's, once per iteration. The next
                 // launch is enqueued on the same stream AFTER the previous event was
                 // synchronised, so no step overlaps its predecessor's D2H.
+                let this = if i == 0 { exec } else { cont };
                 crate::gpu::live::check("cuGraphLaunch", unsafe {
-                    (d.graph_launch)(exec as *mut std::os::raw::c_void, stream)
+                    (d.graph_launch)(this as *mut std::os::raw::c_void, stream)
                 })?;
                 crate::gpu::live::check("cuMemcpyDtoHAsync", unsafe {
                     (d.memcpy_dtoh_async)(
@@ -2010,8 +2047,17 @@ impl Runner {
                 let arr = unsafe {
                     std::slice::from_raw_parts(pinned_ptr as *const i64, out_rows * out_cols)
                 };
-                let flat =
-                    crate::update::gather_sampled(arr, out_rows, out_cols, &rows, &counts)?;
+                // Launch i's tokens live `i * width` columns in. Every row shares the
+                // offset (that is what `burst_width` enforces), so shifting the flat slice
+                // moves every row's window by exactly one launch -- no second index, and
+                // `gather_sampled`'s own bounds check tightens with the shift.
+                let flat = crate::update::gather_sampled(
+                    &arr[i * width..],
+                    out_rows,
+                    out_cols,
+                    &rows,
+                    &counts,
+                )?;
                 let (verdicts, rec, published) = step_pack_locked(
                     &shared,
                     &slots,
@@ -2025,24 +2071,35 @@ impl Runner {
                     publish,
                 )?;
                 ran += 1;
+                let packed = published || rec.is_some();
                 if let Some(r) = rec {
                     if !published {
                         records.push(r);
                     }
                 }
+                last = verdicts;
+                if !packed {
+                    // The pre-flight above says this cannot happen, so it is reported
+                    // rather than absorbed: the launch DID run and advanced the resident
+                    // table, but `store_apply` never appended its tokens. The caller drops
+                    // this launch from the residue, resyncs the table and gives the tokens
+                    // back through the burst reconcile.
+                    exit = LoopExit::Unpacked;
+                    break;
+                }
                 // A non-zero status is a finish. Stop BEFORE generating another token for a
                 // slot the scheduler still thinks is running.
-                let stopped = verdicts.iter().any(|(_, status, _)| *status != 0);
-                last = verdicts;
-                if stopped {
+                if last.iter().any(|(_, status, _)| *status != 0) {
                     exit = LoopExit::Stopped;
                     break;
                 }
             }
-            Ok((last, records, exit, ran))
+            Ok(Some((last, records, exit, ran)))
         });
 
-        let (verdicts, records, exit, ran) = outcome.map_err(err)?;
+        let Some((verdicts, records, exit, ran)) = outcome.map_err(err)? else {
+            return Ok(None);
+        };
         Ok(Some((
             verdicts,
             records
@@ -2073,6 +2130,12 @@ pub enum LoopExit {
     /// A request finished (any non-zero verdict status). The scheduler must be told before
     /// another token is generated for a slot that is done.
     Stopped,
+    /// The last launch ran but its step could not be PACKED, so its tokens were never
+    /// appended to the store even though the graph produced them. The pre-flight makes this
+    /// unreachable; it is a variant rather than an error because by the time it is known
+    /// the launch has happened, and a caller that treated it as "nothing ran" would
+    /// double-count the launches before it.
+    Unpacked,
 }
 
 #[cfg(feature = "cuda")]
@@ -2081,6 +2144,7 @@ impl LoopExit {
         match self {
             LoopExit::Budget => "budget",
             LoopExit::Stopped => "stopped",
+            LoopExit::Unpacked => "unpacked",
         }
     }
 }

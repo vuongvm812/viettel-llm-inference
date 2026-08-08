@@ -1260,6 +1260,31 @@ def _burst_gate(mirror, slot: int, request, computed_before: int, n: int,
     return None
 
 
+def burst_steps(computed_before: int, n: int, block_size: int, lim: int,
+                ceiling: int) -> int:
+    """How many back-to-back bursts of ``n`` this request can take. Pure -- self-checked.
+
+    The Rust runner takes several burst launches in one call, and the reason the align gate
+    exists does not change when they are back-to-back: the mamba ``state_indices_tensor_d``
+    and the block tables are baked into the captured graphs and re-derived by nothing, so
+    the WHOLE span has to stay inside the KV block the first launch started in. ``lim`` is
+    the ``min(max_model_len, num_prompt_tokens + max_tokens)`` cap ``_burst_gate`` interned
+    for the slot, so a multi-burst step cannot run past ``max_tokens`` either.
+
+    Never returns 0: this is only ever asked about a request whose SINGLE-burst gate
+    already passed, and the two answers agree by construction -- ``(block_size -
+    computed_before % block_size) // n >= 1`` IS ``computed_before % block_size + n <=
+    block_size``.
+    """
+    if ceiling < 2 or lim < 0:
+        return 1
+    return max(1, min(
+        ceiling,
+        (block_size - computed_before % block_size) // n,
+        (lim - computed_before) // n,
+    ))
+
+
 def burst_commit(request, delta: int) -> None:
     """Advance one request by the ``delta`` extra tokens the burst will compute.
 
@@ -2054,8 +2079,10 @@ def _install_update_from_output(scheduler_cls, m: dict):
             and step_packable_here(self, scheduler_output)
         )
 
-    def runner_stash(self, kv, scheduler_output, by_slot, slots, n, steps) -> bool:
-        """Promise the Rust runner this step, or ``False``. Called from ``commit_burst``.
+    def runner_stash(self, kv, scheduler_output, by_slot, slots, n, steps) -> int:
+        """Promise the Rust runner this step. Returns the burst launches GRANTED (0 = none,
+        so the step is committed for one burst the worker replays itself). Called from
+        ``commit_burst``.
 
         WHAT THE PROMISE IS: "if you launch, ``step_pack_locked`` will pack, and the
         residue will be applied by ``r9_apply``". So every predicate ``decide()``'s lazy R9
@@ -2075,20 +2102,27 @@ def _install_update_from_output(scheduler_cls, m: dict):
         """
         state = runner_mod.STATE
         if not state.live or state.step is not None or state.done is not None:
-            return False
+            return 0
         if not (R9.live and TOK.live and r8_live()):
-            return False
+            return 0
         if not step_packable_here(self, scheduler_output):
-            return False
+            return 0
         mirror = kv._mirror
         reqs = []
         for slot in slots:
             if slot not in mirror._stops or slot not in mirror._pack_ok:
-                return False
+                return 0
             request = by_slot[slot]
             if not facaded(request):
-                return False
+                return 0
             reqs.append(request)
+        publish = out_publish_ready(kv._rust)
+        if steps > 1 and not publish:
+            # `update_from_output` hands back ONE record per engine index, so the second
+            # launch's record would have nowhere to go. With the inline publish live each
+            # launch delivers its own and there is nothing left to return -- which is why
+            # k > 1 is gated on it instead of on a queue of records.
+            steps = 1
         state.step = runner_mod._Stash(
             # From the SLOT order, so the launch site's `key == tuple(ib.req_ids)` check
             # doubles as the proof that slots[i] is the slot of batch row i.
@@ -2099,9 +2133,9 @@ def _install_update_from_output(scheduler_cls, m: dict):
             steps=steps,
             max_model_len=int(self.max_model_len),
             fold=True,               # == R9.live, checked above
-            publish=out_publish_ready(kv._rust),
+            publish=publish,
         )
-        return True
+        return steps
 
     def runner_consume(self, done) -> None:
         """Turn the runner's ``_Done`` into exactly the state ``r9_apply`` reads.
@@ -2117,6 +2151,9 @@ def _install_update_from_output(scheduler_cls, m: dict):
         # one accepted the full width; only the last one's verdicts can be short.
         base = (ran - 1) * n
         verdicts = done.verdicts
+        # Deferred to the end of the function: `refuse` RAISES under
+        # VTL_RUST_RUNNER_REQUIRE, and the state below has to be applied first either way.
+        stand_down = None
         if done.exit == "unpacked":
             # Should-never-happen: the crate refuses the pre-flight rather than reach here.
             # The failed launch appended NOTHING to the token store (`store_apply` runs
@@ -2124,7 +2161,7 @@ def _install_update_from_output(scheduler_cls, m: dict):
             # launch from the residue, force a table resync, and let `burst_uncommit` give
             # its tokens back -- the same reconcile a stopped burst uses.
             log.error("rust_sched: the runner could not pack launch %d; standing down", ran)
-            runner_mod.STATE.refuse("a launch did not pack")
+            stand_down = "a launch did not pack"
             self._vtl_ufo_clean = False
             verdicts = [(0, 0, -1)] * len(stash.slots)
             base = max(0, base - n)
@@ -2147,7 +2184,9 @@ def _install_update_from_output(scheduler_cls, m: dict):
                 "rust_sched: the runner returned %d unpublished records for one step; "
                 "%d cannot be delivered", len(records), len(records) - 1,
             )
-            runner_mod.STATE.refuse("multi-record step without the inline publish")
+            stand_down = "multi-record step without the inline publish"
+        if stand_down is not None:
+            runner_mod.STATE.refuse(stand_down)
 
     def decide(self, kv, scheduler_output, model_runner_output, pack: bool):
         """Build the flat batch and take the single crossing. None = nothing portable.
@@ -2773,6 +2812,29 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             seen.add(why)
             log.info("rust_sched: nstep skipped -- %s", why)
 
+    def runner_steps(self, mirror, by_slot, slots, n) -> int:
+        """``burst_steps`` over the whole batch: the smallest headroom wins.
+
+        ``k > 1`` also needs an empty waiting queue -- a multi-burst residency must not
+        delay an admission by more than the one burst ``VTL_NSTEP_QUEUE_EMPTY_ONLY``
+        already allows.
+        """
+        if RUNNER_STEPS < 2 or self.waiting:
+            return 1
+        block_size = self.cache_config.block_size
+        k = RUNNER_STEPS
+        for slot in slots:
+            # `- 1`: num_computed_tokens as it was BEFORE _update_after_schedule advanced
+            # it, exactly as `commit_burst` reads it for the gate. `_burst_lim` was interned
+            # by that gate a moment ago, so the `-1` default never fires in practice.
+            k = burst_steps(
+                by_slot[slot].num_computed_tokens - 1, n, block_size,
+                mirror._burst_lim.get(slot, -1), k,
+            )
+            if k < 2:
+                return 1
+        return k
+
     def commit_burst(self, kv, so, by_slot, slots) -> None:
         """Decide and commit this step's burst factor -- or, failing that, in-graph N=1
         sampling. Runs after ``_update_after_schedule``.
@@ -2814,23 +2876,30 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                         if why is not None:
                             break
                 if why is None:
-                    # The Rust runner's promise for this step, taken BEFORE the commit. A
-                    # refusal (or no runner at all) just means the worker replays the
-                    # unroll graph itself, exactly as before.
+                    # The Rust runner's promise for this step, taken BEFORE the commit so
+                    # the committed budget can be several bursts wide. A refusal (or no
+                    # runner at all) leaves it at one burst, which the worker replays
+                    # itself exactly as before; a granted `steps > 1` that the worker then
+                    # cannot take is reconciled by `burst_uncommit`, same as a short burst.
                     stash = getattr(self, "_vtl_runner_stash", None)
+                    steps = 1
                     if stash is not None:
-                        stash(kv, so, by_slot, slots, n, 1)
-                    delta = n - 1
+                        steps = stash(
+                            kv, so, by_slot, slots, n,
+                            runner_steps(self, mirror, by_slot, slots, n),
+                        ) or 1
+                    delta = n * steps - 1
                     for slot in slots:
                         burst_commit(by_slot[slot], delta)
                     kv._rust.table_burst(slots, delta)
                     self._vtl_burst_commits = c = getattr(self, "_vtl_burst_commits", 0) + 1
                     if c == 1 or not c & 0x1FFF:
                         log.info(
-                            "rust_sched: nstep engaged -- %d bursts committed (n=%d, batch=%d)",
-                            c, n, len(slots),
+                            "rust_sched: nstep engaged -- %d bursts committed "
+                            "(n=%d, steps=%d, batch=%d)",
+                            c, n, steps, len(slots),
                         )
-                    so.vtl_burst_n = n
+                    so.vtl_burst_n = n * steps
                     return
                 skip_note(self, why)
             if one:
@@ -3904,6 +3973,22 @@ def _self_check() -> None:
     assert burst_sampler_blocked(REQ(max_tokens=2), 101, 1, 32768) is None
     assert burst_sampler_blocked(REQ(max_tokens=2), 102, 1, 32768), "max_tokens caps N=1 too"
     assert burst_sampler_blocked(REQ(max_tokens=1 << 20), 32768, 1, 32768) is not None
+
+    # The Rust runner's multi-burst headroom. At block_size 16 / N 4 a step can only take
+    # 4 launches from a block-aligned offset, 3 from offset 4, and so on -- and NEVER 0,
+    # because it is only ever asked about a request the single-burst gate already cleared.
+    for c in range(16):
+        k = burst_steps(c, 4, 16, 1 << 30, 8)
+        assert k == max(1, (16 - c % 16) // 4), (c, k)
+        if burst_request_blocked(REQ(), c, 4, 16, 32768) is None:
+            assert k >= 1 and c % 16 + k * 4 <= 16, (c, k)
+    assert burst_steps(0, 4, 16, 1 << 30, 8) == 4, "the whole block, and no more"
+    assert burst_steps(0, 4, 16, 1 << 30, 2) == 2, "VTL_RUST_RUNNER_STEPS is the ceiling"
+    assert burst_steps(0, 4, 16, 1 << 30, 1) == 1, "...and 1 disables the multi-launch step"
+    # The length cap binds too: 10 tokens left at N=4 is two launches, not three.
+    assert burst_steps(0, 4, 64, 10, 8) == 2
+    assert burst_steps(0, 4, 64, 4, 8) == 1
+    assert burst_steps(0, 4, 16, -1, 8) == 1, "an un-interned slot never multi-launches"
 
     # commit -> uncommit is exactly symmetric on both counters, and `is_prefill_chunk` is
     # computed BEFORE the placeholder bump (the ordering `_update_after_schedule` uses).

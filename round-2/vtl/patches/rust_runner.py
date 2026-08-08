@@ -126,7 +126,7 @@ class _Done(NamedTuple):
     stash: _Stash
     verdicts: list        # (num_accepted, status, stop_reason) for the LAST launch
     records: list         # R8 records that were NOT published inline, in order
-    exit: str             # LoopExit: "budget" | "stopped"
+    exit: str             # LoopExit: "budget" | "stopped" | "unpacked"
     ran: int              # launches that actually ran (<= stash.steps)
 
 

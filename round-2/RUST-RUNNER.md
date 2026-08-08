@@ -118,6 +118,24 @@ boot + prefill only, matching the frontier-audit endgame note.
    spin.
 6. `step_eplb_after` is a decorator, easy to lose in a port (inert here, but verify).
 7. `get_offloader().sync_prev_onload()` — verify no-op for the served config on-box.
+8. **The batch queue, found while wiring M2 and the one that gates Phase 2.** Rust commits
+   a step's tokens inside `sample_tokens` (`step_pack_locked`: token store, resident delta,
+   `cache_blocks`); Python commits them inside `update_from_output`. Async scheduling runs a
+   batch queue of depth `max_concurrent_batches` = pp_size + 1 = **2** on the V2 runner
+   (`config/vllm.py:490`), and `step_with_batch_queue` is `schedule(k) -> execute(k) ->
+   sample(k) -> update(k-1)`. So `sample(k)` runs while step k-1 is still unapplied, and a
+   Rust commit there would append step k's tokens AHEAD of step k-1's: scrambled output and
+   a block-hash chain over positions in the wrong order, with nothing to crash. Mixing the
+   two commit points is unsafe in BOTH directions, and "all steps Rust" cannot bootstrap
+   (the first step of a busy period is a prefill, which Python must commit). So the launch
+   is interlocked on `rust_runner.STATE.inflight == 1` and the runner idles under the served
+   config. **Phase 2 is therefore not a step-level optimisation at all — it only pays once
+   the runner owns the loop** (Phase 3 / `max_concurrent_batches` 1), which is also the only
+   configuration where its blocking `cuEventSynchronize` inside `sample_tokens` is not
+   giving up the overlap async scheduling exists to buy. The other way out, if the batch
+   queue must stay, is to make Rust hand the tokens back for Python to commit at update time
+   (a pinned ring of 2 instead of one buffer) — that keeps the pre-planned D2H and the
+   `decide()` elimination but not the multi-step loop.
 
 ## 5. Repo hygiene found during the investigation (fix regardless)
 

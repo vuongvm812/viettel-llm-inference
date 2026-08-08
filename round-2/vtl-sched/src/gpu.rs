@@ -37,9 +37,36 @@ pub struct GraphEntry {
     pub num_active_loras: u32,
     /// `cudaGraphExec_t` from `torch.cuda.CUDAGraph.raw_cuda_graph_exec()`. 0 = not a graph
     /// the runner may launch (exported for dispatch fidelity only).
+    ///
+    /// This is nstep's UNROLL graph, not stock's forward-only one: the runner's D2H reads
+    /// the burst accumulator, which only the unroll graph fills (`rust_runner.py`).
     pub exec: u64,
+    /// The CONTINUATION graph for launches 2..k of a multi-burst step: the same bodies with
+    /// no prologue, so it feeds off the last sampled token instead of hidden states nothing
+    /// refreshed. 0 = this shape can only take ONE launch per call; relaunching `exec`
+    /// back-to-back would re-emit the previous burst's first token.
+    pub cont: u64,
     /// True for `cg_mode == FULL`. Only these are launchable by the runner.
     pub full: bool,
+}
+
+/// The per-request token count a multi-launch call needs, or why it has none.
+///
+/// Launch i writes accumulator columns `[i*width, (i+1)*width)` for EVERY row, so one
+/// shared width is what makes the column offset a single number instead of a per-row one.
+/// A ragged batch would still gather plausible ids from the wrong columns, so it is refused
+/// rather than approximated -- and being pure integer logic, it is testable without CUDA.
+pub fn burst_width(counts: &[u32]) -> Result<u32, String> {
+    let Some(&width) = counts.first() else {
+        return Err("burst_width: no rows".to_string());
+    };
+    if width == 0 {
+        return Err("burst_width: a row claims zero tokens".to_string());
+    }
+    if counts.iter().any(|&c| c != width) {
+        return Err(format!("burst_width: ragged counts {counts:?}"));
+    }
+    Ok(width)
 }
 
 /// Priority-ordered candidates keyed by `(num_tokens, effective_loras)`, plus the LoRA
@@ -154,8 +181,23 @@ impl GraphTable {
         uniform_token_count: Option<u32>,
         num_active_loras: u32,
     ) -> Option<u64> {
+        self.launchable_pair(num_reqs, num_tokens, uniform_token_count, num_active_loras)
+            .map(|(exec, _)| exec)
+    }
+
+    /// [`GraphTable::launchable`] plus the continuation handle, which is `0` when this
+    /// shape has none. A caller that gets `0` must run exactly ONE launch: the first exec
+    /// begins with a prologue over hidden states nothing re-computes between launches, so
+    /// relaunching it would re-emit the token it already emitted.
+    pub fn launchable_pair(
+        &self,
+        num_reqs: u32,
+        num_tokens: u32,
+        uniform_token_count: Option<u32>,
+        num_active_loras: u32,
+    ) -> Option<(u64, u64)> {
         let e = self.dispatch(num_reqs, num_tokens, uniform_token_count, num_active_loras)?;
-        (e.full && e.exec != 0).then_some(e.exec)
+        (e.full && e.exec != 0).then_some((e.exec, e.cont))
     }
 }
 
@@ -346,6 +388,7 @@ mod tests {
             uniform_token_count: Some(1),
             num_active_loras: 0,
             exec,
+            cont: 0,
             full: true,
         }
     }
@@ -400,6 +443,7 @@ mod tests {
             uniform_token_count: None,
             num_active_loras: 0,
             exec: 0,
+            cont: 0,
             full: false,
         });
         t.set_candidates(16, 0, vec![idx]);
@@ -446,6 +490,7 @@ mod tests {
             uniform_token_count: Some(1),
             num_active_loras: 2,
             exec: 0x10A,
+            cont: 0,
             full: true,
         });
         t.set_candidates(4, 2, vec![e]);
@@ -478,5 +523,49 @@ mod tests {
     fn an_unknown_shape_declines() {
         let t = decode_table();
         assert!(t.dispatch(3, 3, Some(1), 0).is_none(), "size 3 was never captured");
+    }
+
+    #[test]
+    fn the_two_exec_classes_dispatch_together() {
+        // A shape WITH a continuation graph: launch 1 takes `exec`, launches 2..k take
+        // `cont`. Both come out of one dispatch -- looking the second one up separately
+        // could pick a different row than the first.
+        let mut t = GraphTable::new();
+        let mut e = full(4, 4, 0xE1);
+        e.cont = 0xC1;
+        let idx = t.push_entry(e);
+        t.set_candidates(4, 0, vec![idx]);
+        t.set_captured(true);
+        assert_eq!(t.launchable_pair(4, 4, Some(1), 0), Some((0xE1, 0xC1)));
+        // `launchable` is the same answer without the continuation, so the single-launch
+        // caller cannot accidentally see one.
+        assert_eq!(t.launchable(4, 4, Some(1), 0), Some(0xE1));
+    }
+
+    #[test]
+    fn a_missing_continuation_reports_zero_not_the_first_exec() {
+        // The whole hazard: relaunching the FIRST exec back-to-back re-reads hidden states
+        // nothing refreshed between launches and re-emits the token it already emitted. A
+        // shape with no continuation graph must therefore come back with 0, never with
+        // `exec` duplicated -- the caller clamps itself to one launch on 0.
+        let t = decode_table();
+        assert_eq!(t.launchable_pair(4, 4, Some(1), 0), Some((0x1002, 0)));
+    }
+
+    #[test]
+    fn a_declined_shape_has_no_pair_at_all() {
+        let t = decode_table();
+        assert!(t.launchable_pair(3, 3, Some(1), 0).is_none());
+    }
+
+    #[test]
+    fn burst_width_is_the_shared_row_count() {
+        assert_eq!(burst_width(&[4, 4, 4]), Ok(4));
+        assert_eq!(burst_width(&[1]), Ok(1));
+        // Ragged, empty and zero-width batches all break the `i * width` column offset a
+        // multi-launch call gathers with, so none of them may be guessed at.
+        assert!(burst_width(&[4, 4, 2]).is_err());
+        assert!(burst_width(&[]).is_err());
+        assert!(burst_width(&[0, 0]).is_err());
     }
 }

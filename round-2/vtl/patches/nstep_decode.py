@@ -438,6 +438,29 @@ def _burst_all(runner, b: _Burst, rows: int, pad: int, forward, n: int) -> None:
     _accum_tail(runner, b, rows, pad)
 
 
+def _burst_continue(runner, b: _Burst, rows: int, pad: int, forward, n: int) -> None:
+    """The burst AGAIN, continuing from the token the previous launch left in ``b.tok``.
+
+    NO PROLOGUE, which is the entire reason this graph exists. ``_prologue`` argmaxes
+    ``cudagraph_manager.hidden_states``, a buffer only the stock FULL replay ahead of the
+    burst refreshes -- so relaunching the UNROLL graph back-to-back would re-read stale
+    hidden states and re-emit the previous burst's first token. Here the feedback source is
+    ``b.tok``, written by the previous launch's own final argmax, so ``n`` bodies produce
+    ``n`` fresh tokens with no dependency on anything outside the graph.
+
+    NO ``step.zero_()`` either -- the unroll graph does one and this must not. The column
+    counter keeps running, so launch i fills accumulator columns ``[i*n, (i+1)*n)`` and the
+    whole multi-launch step is ONE contiguous token block: ``postprocess_sampled`` writes
+    every token into ``req_states.all_token_ids``, so a launch whose tokens were not visible
+    to it would leave a hole a later recompute would read. The first body rewrites column
+    ``i*n - 1`` with the value ``_accum_tail`` already stored there, which is a no-op by
+    construction.
+    """
+    for _ in range(n):
+        _burst_body(runner, b, rows, pad, forward)
+    _accum_tail(runner, b, rows, pad)
+
+
 def _hidden_is_persistent(runner, hidden, rows: int) -> bool:
     """Is ``hidden`` the cudagraph manager's persistent buffer, at exactly ``rows`` rows?
 
@@ -461,8 +484,10 @@ def _hidden_is_persistent(runner, hidden, rows: int) -> bool:
 # ---------------------------------------------------------------------------------------
 
 
-def _graph_matches_eager(runner, b: _Burst, graph, eager, rows: int, what: str) -> bool:
-    """Boot-time shadow: one graph replay vs the same work host-launched, from ONE state.
+def _graph_matches_eager(runner, b: _Burst, graph, eager, rows: int, what: str,
+                         launches: int = 1) -> bool:
+    """Boot-time shadow: ``launches`` graph replays vs the same work host-launched, from
+    ONE state.
 
     The graph bakes every pointer at capture. If any input it reads turns out NOT to be a
     persistent buffer, the replay silently computes from stale memory and produces
@@ -474,6 +499,12 @@ def _graph_matches_eager(runner, b: _Burst, graph, eager, rows: int, what: str) 
     covered: its whole premise is that ``cudagraph_manager.hidden_states`` is the address the
     graph may bake, so the two arms must provably start from the same bytes there. ``accum``
     is compared too -- the unroll graph is the only thing that fills it in-graph.
+
+    ``launches`` > 1 shadows the graph BACK-TO-BACK. A single replay cannot catch a graph
+    that is right once and stale on the next launch, which is exactly the failure mode the
+    continuation rung is built to avoid (the unroll graph HAS it: its prologue reads hidden
+    states nothing refreshed in between). Both arms run the same number of times from the
+    same snapshot, so a second-launch divergence shows up in ``tok``/``accum``.
 
     NOT a proof of runtime correctness (the dummy batch has no padded rows and no stale
     block tables); it is a smoke test for the pointer-staleness class specifically.
@@ -503,12 +534,14 @@ def _graph_matches_eager(runner, b: _Burst, graph, eager, rows: int, what: str) 
             hidden[:rows].copy_(snap[6])
 
     restore()
-    graph.replay()
+    for _ in range(launches):
+        graph.replay()
     torch.cuda.synchronize()
     from_graph = (b.tok[:rows].clone(), b.accum[:rows].clone())
 
     restore()
-    eager()
+    for _ in range(launches):
+        eager()
     torch.cuda.synchronize()
     from_eager = (b.tok[:rows].clone(), b.accum[:rows].clone())
 
@@ -610,28 +643,34 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
             ):
                 return runner.model(**_mi)
 
-        def capture(work, what):
-            """Warm up, capture, shadow-compare. ``None`` on any failure -- never raises."""
+        def capture(work, what, prime=None, launches=1):
+            """Warm up, capture, shadow-compare. ``None`` on any failure -- never raises.
+
+            ``prime`` puts the accumulator column counter where the graph will find it at
+            runtime; the default zeroes it, which is what every rung but the continuation
+            wants. ``launches`` is passed straight to the shadow (see
+            ``_graph_matches_eager``).
+            """
+            reset = prime or b.step.zero_
             try:
                 # Warm up outside the capture: the first call allocates workspaces and JITs
                 # the Triton kernels, neither of which is capturable.
-                b.step.zero_()
+                reset()
                 work()
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
-                b.step.zero_()
+                reset()
                 with torch.cuda.graph(graph, mgr.pool):
                     work()
             except Exception:
                 log.exception("vtl: nstep %s capture failed at num_reqs=%d", what, rows)
                 return None
 
-            def eager():
-                b.step.zero_()
-                work()
-
-            b.step.zero_()
-            if not _graph_matches_eager(runner, b, graph, eager, rows, what):
+            # `work` IS the eager arm: the shadow's own restore() puts every buffer -- the
+            # step counter included -- back to the snapshot between the two arms, so a
+            # reset inside the arm would only hide a graph that depends on one.
+            reset()
+            if not _graph_matches_eager(runner, b, graph, work, rows, what, launches):
                 return None
             return graph
 
@@ -662,6 +701,29 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
             else:
                 b.unroll_graphs[rows] = (whole, desc, b.n)
 
+        # The Rust runner's second exec class: launches 2..k of a multi-burst step. Not a
+        # ladder rung of its own -- losing it at one size only costs THAT size its
+        # multi-launch step (the crate falls back to a single launch and the scheduler
+        # reconciles the surplus), so it never demotes anything.
+        if b.rust_steps > 1 and rows in b.unroll_graphs:
+            cont = capture(
+                lambda: _burst_continue(runner, b, rows, rows, forward, b.n),
+                "burst continuation",
+                # Where the counter stands after a first launch, so the capture writes the
+                # columns it will write at runtime rather than the first burst's.
+                prime=lambda: b.step.fill_(b.n - 1),
+                # TWO launches: a single-replay shadow cannot see back-to-back staleness,
+                # and back-to-back staleness is the only thing this graph exists to avoid.
+                launches=2,
+            )
+            if cont is None:
+                log.warning(
+                    "vtl: nstep continuation capture failed at num_reqs=%d; the Rust "
+                    "runner takes one burst per step at that size", rows,
+                )
+            else:
+                b.continue_graphs[rows] = (cont, desc, b.n)
+
     if not captured:
         log.warning("vtl: nstep graph mode off -- no FULL 1-token-per-request descriptor")
         b.demote("fold", "no FULL decode descriptor matched")
@@ -676,9 +738,9 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
     MAX_BURST_REQS = BURST_SIZES[-1]
     log.info(
         "vtl: nstep captured %d burst body graph(s) for sizes %s "
-        "(+%.1f MiB; prologue=%s unroll=%s sample1=%s)",
+        "(+%.1f MiB; prologue=%s unroll=%s continuation=%s sample1=%s)",
         captured, sorted(b.graphs), (torch.cuda.memory_allocated() - before) / (1 << 20),
-        sorted(b.pro_graphs), sorted(b.unroll_graphs), b.sample1,
+        sorted(b.pro_graphs), sorted(b.unroll_graphs), sorted(b.continue_graphs), b.sample1,
     )
 
 
@@ -806,10 +868,9 @@ def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
         return None
     if not _hidden_is_persistent(runner, hidden, pad):
         return None
-    if steps > 1:
-        cont = b.continue_graphs.get(pad)
-        if cont is None or cont[1] != b.desc or cont[2] != n:
-            return None
+    # No check for `continue_graphs` here on purpose: the crate holds both exec classes per
+    # table row and CLAMPS itself to one launch when this shape has no continuation graph,
+    # which is strictly better than refusing the whole step (the surplus is reconciled).
 
     b.idx_map[:num_reqs].copy_(ib.idx_mapping, non_blocking=True)
     b.rows.fill_(num_reqs)
@@ -841,6 +902,10 @@ def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
     from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
     verdicts, records, exit_reason, ran = out
+    if not ran:
+        # Nothing was launched, so nothing was committed and the Python arm can still run
+        # this step whole. (Unreachable: the loop always takes its first launch.)
+        return None
     state.done = rust_runner._Done(stash, verdicts, list(records), exit_reason, int(ran))
     state.engaged += 1
     if state.engaged == 1 or not state.engaged & 0x1FFF:

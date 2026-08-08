@@ -1072,6 +1072,26 @@ impl Manager {
         Ok((&self.stops.out, packed))
     }
 
+    /// Would [`Manager::update_step_pack_store`] be able to PACK these slots? A pre-flight
+    /// for the Rust model runner, and the reason it exists is ordering: the runner asks
+    /// BEFORE it launches, because after the launch the graph has already fed its tokens
+    /// back into the persistent input buffers and there is no longer a step to decline.
+    ///
+    /// Mirrors `pack_inner`'s two refusals that are a property of the SLOT rather than of
+    /// this step's tokens: no interned stop params (the verdict would be `u8::MAX` and the
+    /// record would be dropped) and no live interned name (nothing to key the record row
+    /// on). What is left there -- a `RawPacker` write failing -- is a buffer fault, not a
+    /// state the caller could have avoided.
+    pub fn runner_packable(&self, slots: &[u32]) -> bool {
+        slots.iter().all(|&slot| {
+            self.stops.has(slot)
+                && match self.names.get(slot as usize) {
+                    Some(n) => self.ids.get(n.as_str()) == Some(&slot),
+                    None => false,
+                }
+        })
+    }
+
     /// R9: the per-request `cache_blocks` crossing folded into the packed step.
     ///
     /// Mirrors `AsyncScheduler._update_request_with_output`'s trailing call
