@@ -114,7 +114,8 @@ RUN set -eu; \
     grep -q sonic_rs /src/rust/src/server/src/routes/openai/utils/validated_json.rs; \
     test -f /src/rust/src/engine-core-client/src/shm_ipc.rs; \
     grep -q per_token_stream_enabled /src/rust/src/text/src/output/decoded.rs; \
-    echo "rust-frontend patches present (sonic_rs + shm_ipc + per_token_stream)"
+    grep -q encode_cache /src/rust/src/text/src/lib.rs; \
+    echo "rust-frontend patches present (sonic_rs + shm_ipc + per_token_stream + encode_cache)"
 
 # PGO training assets (only used by the rust-builder-pgo stage below).
 COPY vtl/pgo_train.sh /src/pgo_train.sh

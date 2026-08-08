@@ -51,6 +51,10 @@ pub struct Params {
     /// `VTL_ENABLE_SCHED_POLICY` — cache-aware SJF reorder of the waiting queue.
     pub sjf_reorder: bool,
     pub sjf_usage_tight: f64,
+    /// `VTL_RUST_SCHED_LEAN` — drop decision payload no V2 consumer reads. Currently:
+    /// skip the `num_common_prefix_blocks` epilogue (compute AND marshal). Optional on
+    /// the wire (`set_params` defaults it false), so an older plugin keeps working.
+    pub lean_decisions: bool,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -73,7 +77,6 @@ pub struct Decisions {
     /// Final `waiting`-queue order (slots) after the SJF reorder, front first.
     pub waiting_order: Vec<u32>,
     pub num_common_prefix_blocks: Vec<usize>,
-    pub token_budget_left: usize,
 }
 
 impl Decisions {
@@ -433,15 +436,18 @@ impl ScheduleCore {
         }
 
         // ---- 3. Epilogue (scheduler.py:1035) -------------------------------
-        let mut common = std::mem::take(&mut self.decisions.num_common_prefix_blocks);
-        common.clear();
-        if let Some(first) = self.running.first() {
-            common.extend_from_slice(kv.get_num_common_prefix_blocks(first.slot));
-        } else {
-            common.extend(std::iter::repeat(0).take(kv.coord.managers.len()));
+        // Under `lean_decisions` the vec is left EMPTY, which is also how `decisions_dict`
+        // knows to omit the key: the non-lean arms always push one entry per group.
+        if !params.lean_decisions {
+            let mut common = std::mem::take(&mut self.decisions.num_common_prefix_blocks);
+            common.clear();
+            if let Some(first) = self.running.first() {
+                common.extend_from_slice(kv.get_num_common_prefix_blocks(first.slot));
+            } else {
+                common.extend(std::iter::repeat(0).take(kv.coord.managers.len()));
+            }
+            self.decisions.num_common_prefix_blocks = common;
         }
-        self.decisions.num_common_prefix_blocks = common;
-        self.decisions.token_budget_left = token_budget;
         // Waiting requests that were admitted are dropped from the front; the rest keep
         // their (possibly reordered) order so Python can rewrite its deque verbatim.
         for r in &self.waiting[admitted_from_waiting..] {
@@ -563,6 +569,7 @@ mod tests {
             num_lookahead_tokens: 0,
             sjf_reorder: false,
             sjf_usage_tight: 0.90,
+            lean_decisions: false,
         }
     }
 
@@ -611,7 +618,6 @@ mod tests {
         assert_eq!(core.decisions.scheduled_admitted.len(), 2);
         assert_eq!(core.decisions.scheduled_admitted[0].1, 64);
         assert_eq!(core.decisions.scheduled_admitted[1].1, 32);
-        assert_eq!(core.decisions.token_budget_left, 4);
     }
 
     #[test]
@@ -664,6 +670,29 @@ mod tests {
             core.decisions.scheduled_admitted[0].0, short,
             "the 64-token prompt must jump the 512-token one"
         );
+    }
+
+    #[test]
+    fn lean_decisions_skips_the_common_prefix_epilogue() {
+        // Empty is the signal `decisions_dict` reads to omit the key entirely; every
+        // non-lean arm pushes one entry per KV group, so it can never be empty by accident.
+        let mut kv = Manager::new(cfg(512)).unwrap();
+        let a = seed(&mut kv, "a", 64, 1);
+        let mut core = ScheduleCore::new();
+        let mut p = params();
+
+        core.schedule(&mut kv, &[], &[req(a, 64)], &p).unwrap();
+        assert_eq!(core.decisions.num_common_prefix_blocks.len(), 2);
+        let admitted = core.decisions.scheduled_admitted.clone();
+
+        p.lean_decisions = true;
+        let mut kv2 = Manager::new(cfg(512)).unwrap();
+        let a2 = seed(&mut kv2, "a", 64, 1);
+        let mut core2 = ScheduleCore::new();
+        core2.schedule(&mut kv2, &[], &[req(a2, 64)], &p).unwrap();
+        assert!(core2.decisions.num_common_prefix_blocks.is_empty());
+        // ...and nothing else moved.
+        assert_eq!(core2.decisions.scheduled_admitted, admitted);
     }
 
     #[test]

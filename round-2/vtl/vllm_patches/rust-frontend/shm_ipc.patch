@@ -1,5 +1,5 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 435350c..5cf22ff 100644
+index 435350c..aafb52a 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -43,6 +43,10 @@ futures = "0.3.31"
@@ -34,7 +34,7 @@ index 14b9fe1..424efc3 100644
  tempfile = { workspace = true, optional = true }
  thiserror.workspace = true
 diff --git a/src/engine-core-client/src/client/imp.rs b/src/engine-core-client/src/client/imp.rs
-index c91a93d..f000299 100644
+index c91a93d..52dcb32 100644
 --- a/src/engine-core-client/src/client/imp.rs
 +++ b/src/engine-core-client/src/client/imp.rs
 @@ -9,7 +9,6 @@ use tokio::runtime::Handle;
@@ -45,11 +45,15 @@ index c91a93d..f000299 100644
  
  use crate::client::state::{OutputReceiver, RequestRegistry, UtilityReceiver, UtilityRegistry};
  use crate::client::stream::EngineCoreStreamOutput;
-@@ -21,11 +20,14 @@ use crate::protocol::output::{EngineCoreOutput, EngineCoreOutputs};
- use crate::protocol::request::EngineCoreRequestType;
+@@ -18,14 +17,17 @@ use crate::error::{client_closed, dispatcher_closed, unexpected_dispatcher_outpu
+ use crate::metrics::{LoraInfoExporter, SchedulerStatsRecorder};
+ use crate::protocol::encode_msgpack;
+ use crate::protocol::output::{EngineCoreOutput, EngineCoreOutputs};
+-use crate::protocol::request::EngineCoreRequestType;
++use crate::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
  use crate::protocol::stats::SchedulerStats;
  use crate::protocol::utility::UtilityOutput;
-+use crate::shm_ipc::InputSink;
++use crate::shm_ipc::{self, InputSink};
  use crate::transport::{ConnectedEngine, EngineId};
  use crate::{Error, Result, transport};
  
@@ -70,7 +74,39 @@ index c91a93d..f000299 100644
          handle: Handle,
          model_name: String,
          engines: &[ConnectedEngine],
-@@ -220,7 +222,15 @@ impl ClientInner {
+@@ -205,6 +207,31 @@ impl ClientInner {
+         }
+     }
+ 
++    /// vtl: ADD, with the prompt token ids carried as a raw little-endian `u32` block
++    /// instead of ~4400 msgpack ints (`VTL_SHM_IPC_RAW_ADD=1`). Everything else -- ordering,
++    /// registration, the ZMQ degrade path -- is [`Self::send_to_engine`] unchanged, which is
++    /// also where any failure here lands: the gate is off, the sink is not shm, the encode
++    /// refuses, or the publish finds no subscriber.
++    pub async fn send_add_to_engine(
++        &self,
++        engine_id: &EngineId,
++        req: &mut EngineCoreRequest,
++    ) -> Result<()> {
++        if shm_ipc::raw_add_enabled() {
++            match shm_ipc::encode_raw_add(req) {
++                Ok(body) => {
++                    if self.input_send.try_send_shm(shm_ipc::TAG_RAW_ADD, &body) {
++                        return Ok(());
++                    }
++                }
++                Err(error) => {
++                    warn!(error = %error.as_report(), "vtl shm_ipc: raw ADD encode failed, using msgpack");
++                }
++            }
++        }
++        self.send_to_engine(engine_id, EngineCoreRequestType::Add, req).await
++    }
++
+     /// Send the given message to the engine. The request should be first
+     /// registered via `register_request()` to ensure the request stream is
+     /// tracked.
+@@ -220,7 +247,15 @@ impl ClientInner {
          // TODO: for `EngineCoreRequest`, split outbound tensor raw views into aux
          // frames instead of always producing a single msgpack frame.
          let payload = encode_msgpack(payload)?;
@@ -87,7 +123,7 @@ index c91a93d..f000299 100644
          let engine_id = engine_id.clone();
  
          self.handle
-@@ -445,7 +455,7 @@ mod tests {
+@@ -445,7 +480,7 @@ mod tests {
          socket.bind("tcp://127.0.0.1:0").await.unwrap();
          let (send, _) = socket.split();
          ClientInner::new(
@@ -97,7 +133,7 @@ index c91a93d..f000299 100644
              "test-model".to_string(),
              &[ConnectedEngine {
 diff --git a/src/engine-core-client/src/client.rs b/src/engine-core-client/src/client.rs
-index eb899e3..90d2f57 100644
+index eb899e3..9a6906b 100644
 --- a/src/engine-core-client/src/client.rs
 +++ b/src/engine-core-client/src/client.rs
 @@ -285,12 +285,22 @@ impl EngineCoreClient {
@@ -124,6 +160,15 @@ index eb899e3..90d2f57 100644
          let output_task = AbortOnDropHandle::new(runtime.spawn(transport::run_output_loop(
              connected.output_socket,
              output_tx,
+@@ -499,7 +509,7 @@ impl EngineCoreClient {
+                 "registered request to engine"
+             );
+ 
+-            self.inner.send_to_engine(&engine_id, EngineCoreRequestType::Add, &req).await?;
++            self.inner.send_add_to_engine(&engine_id, &mut req).await?;
+             Ok(())
+         }
+         .await;
 diff --git a/src/engine-core-client/src/lib.rs b/src/engine-core-client/src/lib.rs
 index f4ae0e1..3cadbd7 100644
 --- a/src/engine-core-client/src/lib.rs
@@ -139,10 +184,10 @@ index f4ae0e1..3cadbd7 100644
  mod transport;
 diff --git a/src/engine-core-client/src/shm_ipc.rs b/src/engine-core-client/src/shm_ipc.rs
 new file mode 100644
-index 0000000..fa8d66d
+index 0000000..1645404
 --- /dev/null
 +++ b/src/engine-core-client/src/shm_ipc.rs
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,840 @@
 +//! iceoryx2 zero-copy shared-memory data plane for the frontend <-> EngineCore hop.
 +//!
 +//! Opt-in via `VTL_SHM_IPC=1`; with the flag unset **nothing in this module runs** and the
@@ -165,6 +210,7 @@ index 0000000..fa8d66d
 +//!   so there is no extra plumbing and no cross-boot staleness.
 +
 +use core::sync::atomic::{AtomicBool, Ordering};
++use std::sync::OnceLock;
 +
 +use iceoryx2::node::Node;
 +use iceoryx2::port::listener::Listener;
@@ -187,6 +233,8 @@ index 0000000..fa8d66d
 +    EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs, StopReason,
 +    decode_engine_core_outputs,
 +};
++use crate::protocol::encode_msgpack;
++use crate::protocol::request::EngineCoreRequest;
 +use crate::transport::ConnectedEngine;
 +
 +/// Master switch. Everything in this module is inert unless this is truthy.
@@ -222,6 +270,15 @@ index 0000000..fa8d66d
 +pub const TAG_RAW: u8 = b'R';
 +/// Output record tag: engine died; mirrors the ZMQ `ENGINE_CORE_DEAD` sentinel.
 +pub const TAG_DEAD: u8 = b'D';
++
++/// Request record tag: raw ADD (`VTL_SHM_IPC_RAW_ADD=1`). Deliberately outside
++/// `EngineCoreRequestType`'s 0x00-0x03 so both tag spaces share the one ordered request
++/// channel, exactly as `TAG_MSGPACK`/`TAG_RAW` do on the output channel.
++pub const TAG_RAW_ADD: u8 = 0x10;
++/// Body layout version for [`TAG_RAW_ADD`]. The engine drops a frame it does not speak.
++pub const RAW_ADD_VERSION: u8 = 1;
++/// Opt-in for the raw ADD encoding. Requires [`ENV_SHM_IPC`].
++pub const ENV_SHM_IPC_RAW_ADD: &str = "VTL_SHM_IPC_RAW_ADD";
 +
 +/// True when `name` is set to a truthy value.
 +fn env_flag(name: &str) -> bool {
@@ -432,6 +489,61 @@ index 0000000..fa8d66d
 +            InputSink::Zmq(zmq)
 +        }
 +    }
++}
++
++/// `VTL_SHM_IPC_RAW_ADD=1` (and `VTL_SHM_IPC=1`), resolved once per process.
++pub(crate) fn raw_add_enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| env_flag(ENV_SHM_IPC) && env_flag(ENV_SHM_IPC_RAW_ADD))
++}
++
++/// Encode an ADD as a [`TAG_RAW_ADD`] body: the prompt token ids as a little-endian `u32`
++/// block, then the msgpack of the same 20-element `EngineCoreRequest` array with element 1
++/// (`prompt_token_ids`) nil.
++///
++/// Offsets below are from the start of the RECORD, i.e. including the tag byte the
++/// publisher prepends:
++///
++/// ```text
++/// [0]      u8      TAG_RAW_ADD
++/// [1]      u8      RAW_ADD_VERSION
++/// [2..4]   u16     reserved (0)
++/// [4..8]   u32 LE  n_tokens
++/// [8..8+4n]        n x u32 LE prompt token ids
++/// [8+4n..]         msgpack EngineCoreRequest, element 1 = nil
++/// ```
++///
++/// The reserved `u16` is what puts the id block on a 4-byte boundary inside the record, so
++/// the engine's `np.frombuffer` view is aligned and Rust may later read it as `&[u32]`.
++///
++/// WHY. The engine's ingest thread otherwise turns ~4400 msgpack ints into that many
++/// PyLongs per request with the GIL held; from this block it takes one `np.frombuffer`.
++///
++/// The ids are moved OUT of `req` for the msgpack pass and put back before returning, so a
++/// caller that falls through to the stock encoder sends an unchanged request.
++pub(crate) fn encode_raw_add(req: &mut EngineCoreRequest) -> Result<Vec<u8>> {
++    let Some(ids) = req.prompt_token_ids.take() else {
++        return Err(Error::Encode {
++            target_type: "EngineCoreRequest",
++            message: "raw ADD needs prompt_token_ids".to_string(),
++        });
++    };
++    let tail = encode_msgpack(req);
++    req.prompt_token_ids = Some(ids);
++    let tail = tail?;
++    // SAFETY of the cast: `prompt_token_ids` is a `Vec<u32>`, so its length is a `usize`
++    // bounded by the payload the frontend itself built; `REQUEST_MAX_PAYLOAD` (1 MiB,
++    // growable) is the real ceiling and a longer prompt fails the loan, not this.
++    let ids = req.prompt_token_ids.as_deref().unwrap_or_default();
++    let mut body = Vec::with_capacity(7 + 4 * ids.len() + tail.len());
++    body.push(RAW_ADD_VERSION);
++    body.extend_from_slice(&0u16.to_le_bytes());
++    body.extend_from_slice(&(ids.len() as u32).to_le_bytes());
++    for id in ids {
++        body.extend_from_slice(&id.to_le_bytes());
++    }
++    body.extend_from_slice(&tail);
++    Ok(body)
 +}
 +
 +/// Start the engine -> frontend shm reader. It feeds the **same** mpsc channel as
@@ -831,6 +943,60 @@ index 0000000..fa8d66d
 +        let mut huge = decode_hex(GOLDEN_PLAIN_DECODE);
 +        huge[15..19].copy_from_slice(&u32::MAX.to_le_bytes());
 +        assert!(decode_raw_outputs(&huge).is_err());
++    }
++
++    /// The raw ADD record, byte for byte. Asserted verbatim by the Python landing's
++    /// `_self_check` (`GOLDEN_RAW_ADD` in `round-2/vtl/patches/shm_ipc.py`) minus nothing --
++    /// that constant carries the leading `TAG_RAW_ADD` byte the publisher prepends, so this
++    /// one is the same string with "10" in front.
++    const GOLDEN_RAW_ADD_BODY: &str = concat!(
++        "01",
++        "0000",
++        "03000000",
++        "01000000",
++        "02000000",
++        "2c010000",
++        // msgpack array16 of 20, request_id, then nil where the ids used to be.
++        "dc0014",
++        "ac",
++        "76746c2d676f6c64656e2d30",
++        "c0",
++        "c0c0c0",
++        "cb3ff8000000000000",
++        "c0c0c0c0c0",
++        "000000",
++        "c0c2c0c0c0",
++        "c2",
++    );
++
++    fn golden_request() -> EngineCoreRequest {
++        EngineCoreRequest {
++            request_id: "vtl-golden-0".to_string(),
++            prompt_token_ids: Some(vec![1, 2, 300]),
++            arrival_time: 1.5,
++            ..EngineCoreRequest::default()
++        }
++    }
++
++    #[test]
++    fn raw_add_matches_golden() {
++        let mut req = golden_request();
++        let body = encode_raw_add(&mut req).unwrap();
++        assert_eq!(hex::encode(&body), GOLDEN_RAW_ADD_BODY);
++        // The ids must be back where the msgpack fallback expects them.
++        assert_eq!(req.prompt_token_ids, Some(vec![1, 2, 300]));
++        // ...and the tail must be exactly the stock encoding with the ids dropped, which is
++        // what makes the engine's `add_request_decoder` work unchanged on it.
++        let mut stripped = golden_request();
++        stripped.prompt_token_ids = None;
++        assert_eq!(&body[7 + 4 * 3..], encode_msgpack(&stripped).unwrap());
++    }
++
++    #[test]
++    fn raw_add_refuses_a_request_without_prompt_ids() {
++        let mut req = golden_request();
++        req.prompt_token_ids = None;
++        assert!(encode_raw_add(&mut req).is_err());
 +    }
 +
 +    #[test]

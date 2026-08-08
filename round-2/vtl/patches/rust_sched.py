@@ -224,7 +224,244 @@ def modes() -> dict:
         # installer combines them (`R9.live = r9 and not r9_shadow`).
         "r9": tokstore and env_on("VTL_RUST_SCHED_R9"),
         "r9_shadow": env_on("VTL_RUST_SCHED_R9_SHADOW"),
+        # Phase A: stop producing decision payload no consumer on THIS boot reads
+        # (`num_common_prefix_blocks` in the crate, the four dead `CachedRequestData`
+        # fields in Python). Rides on the full loop -- it is that loop's apply block.
+        # The env gate is necessary but not sufficient: `lean_blocked` re-checks the
+        # runtime config at first schedule and refuses if any consumer is live.
+        "lean": full and env_on("VTL_RUST_SCHED_LEAN"),
+        "lean_check": env_on("VTL_SCHED_LEAN_CHECK"),
+        # Phase B: the decisions arrive in persistent numpy buffers instead of a per-step
+        # PyDict. Rides on `lean` -- the arena carries no `num_common_prefix_blocks` slot,
+        # which is only safe on exactly the boots `lean_blocked` clears.
+        "arena": (
+            full
+            and env_on("VTL_RUST_SCHED_LEAN")
+            and _arena_env() in ("1", "check")
+        ),
+        "arena_check": _arena_env() == "check",
+        # Phase C: re-serve a prebuilt SchedulerOutput on a pure-decode step. Needs the
+        # full loop (it IS that loop's tail) plus the runtime checks in `ring_blocked`.
+        "so_ring": full and env_on("VTL_SCHED_SO_RING"),
     }
+
+
+def _arena_env() -> str:
+    """``VTL_SCHED_DECISIONS_ARENA``: ``0``/unset off, ``1`` on, ``check`` = dual-run."""
+    raw = os.environ.get("VTL_SCHED_DECISIONS_ARENA", "").strip().lower()
+    if raw == "check":
+        return "check"
+    return "1" if raw in _TRUTHY else "0"
+
+
+# Shared across every lean step: no V2 consumer reads `num_common_prefix_blocks` at all
+# (only `warmup.py` writes its own), so handing out the same list cannot be observed.
+_ZERO_COMMON: dict[int, list] = {}
+
+
+def lean_cached_request_data(cls, running_reqs, req_to_new_blocks):
+    """``Scheduler._make_cached_request_data`` with every field ``lean_blocked`` proved
+    dead left empty. ``cls`` is passed in (not imported) so this stays testable, and this
+    module importable, without vLLM.
+
+    Resumed requests are not a case here: the caller has already folded them into
+    ``scheduled_new_reqs`` (that is what ``use_v2_model_runner`` does), so the stock
+    ``resumed_req_ids`` set would be empty too.
+    """
+    req_ids = []
+    new_block_ids = []
+    num_computed = []
+    for r in running_reqs:
+        rid = r.request_id
+        req_ids.append(rid)
+        new_block_ids.append(req_to_new_blocks[rid].get_block_ids(allow_none=True))
+        num_computed.append(r.num_computed_tokens)
+    return cls(
+        req_ids=req_ids,
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=new_block_ids,
+        num_computed_tokens=num_computed,
+        num_output_tokens=[],
+    )
+
+
+def lean_cached_check(lean, stock) -> str | None:
+    """``VTL_SCHED_LEAN_CHECK``: first divergence between the lean and stock payloads, or
+    None. Pure -- self-checked.
+
+    Two halves. The live fields must match exactly. The dead fields must be empty in the
+    STOCK output, which is the per-step runtime proof of ``lean_blocked``'s static
+    predicate -- if a boot ever fills one of them, the predicate missed a consumer.
+    (``num_output_tokens`` is deliberately absent from both lists: stock always fills it
+    and nothing on an eligible boot reads it.)
+    """
+    for name in ("req_ids", "new_block_ids", "num_computed_tokens"):
+        mine, theirs = getattr(lean, name), getattr(stock, name)
+        if mine != theirs:
+            return f"{name}: lean {mine!r} vs stock {theirs!r}"
+    for name in ("resumed_req_ids", "new_token_ids", "all_token_ids"):
+        theirs = getattr(stock, name)
+        if theirs:
+            return f"{name} is non-empty in the stock payload: {theirs!r}"
+    return None
+
+
+def ring_blocked(scheduler) -> str | None:
+    """Reason ``VTL_SCHED_SO_RING`` cannot engage on this boot, or None.
+
+    The ring hands the SAME ``SchedulerOutput`` object back every other step, so the two
+    things that must hold are (a) the ring is exactly as deep as the async batch queue, or
+    a slot could be mutated while its step is still in flight, and (b) nothing downstream
+    keeps a live reference into it -- with the `mp` executor the worker only ever sees a
+    pickled COPY, which is what makes the reuse invisible. `uni` hands the runner the very
+    object the next step mutates, so it is refused.
+    """
+    cfg = getattr(scheduler, "vllm_config", None)
+    depth = getattr(cfg, "max_concurrent_batches", 0)
+    if depth != 2:
+        return f"batch queue depth is {depth}, the ring is 2 slots"
+    backend = getattr(getattr(cfg, "parallel_config", None), "distributed_executor_backend", None)
+    if backend != "mp":
+        return f"executor backend {backend!r} may alias the reused SchedulerOutput"
+    if not getattr(scheduler, "use_v2_model_runner", False):
+        return "V1 model runner"
+    if getattr(scheduler, "needs_kv_cache_zeroing", False):
+        # `take_new_block_ids()` is a drain, so the fast path would have to call it anyway.
+        return "KV cache zeroing needs a fresh new_block_ids_to_zero every step"
+    if getattr(scheduler, "enable_return_routed_experts", False):
+        return "routed-expert block snapshots are rebuilt every step"
+    if not isinstance(getattr(scheduler.encoder_cache_manager, "freed", None), list):
+        # The fast path must PEEK at the pending frees; `get_freed_mm_hashes()` drains and
+        # would drop them on a step that then refuses the reuse.
+        return "encoder cache manager exposes no peekable `freed` list"
+    return None
+
+
+def ring_reuse(scheduler, slot, sched_running) -> object | None:
+    """Phase C: re-serve a prebuilt ``SchedulerOutput``, or None to build a fresh one.
+
+    ``slot`` is ``(scheduler_output, slots, requests)`` as populated two steps ago -- the
+    async batch queue holds two in flight, so the slot at this parity has been consumed.
+
+    NOTHING is mutated until the whole predicate has passed; a bail after a partial pass
+    would leave half the batch advanced. The five known hazards, in order:
+
+    1. ``finished_req_ids`` / ``preempted_req_ids`` are the slot's OWN sets and stay empty
+       (the caller only gets here when the scheduler's are empty), so stock's rebind of
+       `self.finished_req_ids` has nothing to protect -- but re-check them, because a
+       downstream mutation would otherwise persist into every later step.
+    2. ``CachedRequestData._req_id_to_num_output_tokens`` is a ``cached_property`` sized to
+       the payload it was first read with -- drop it.
+    3. ``has_structured_output_requests`` is ``|=`` in stock, which on a reused object
+       would latch; recompute it from scratch.
+    4. ``vtl_burst_n`` / ``vtl_sample_in_graph`` are injected by ``commit_burst`` AFTER
+       this returns; a stale one would make the runner sample in-graph on a step that
+       never committed to it.
+    5. ``decode_fastpath``'s ``decode_key`` / ``has_new_blocks`` read plain fields, which
+       are coherent by construction once the above hold.
+    """
+    so, slots, requests = slot
+    if len(sched_running) != len(slots):
+        return None
+    live = scheduler.requests
+    for i, (s, num_new) in enumerate(sched_running):
+        if num_new != 1 or s != slots[i]:
+            return None
+        # Slot numbers recycle: request A finishes, request B interns the same slot, and
+        # after one clean intervening step every cheap count is zero again -- the slot
+        # match alone would replay A's output for B. Identity against the live registry
+        # is the check `_free_request`'s `del self.requests[...]` makes authoritative.
+        r = requests[i]
+        if live.get(r.request_id) is not r:
+            return None
+    if so.finished_req_ids or so.preempted_req_ids:
+        return None
+    crd = so.scheduled_cached_reqs
+    nc = crd.num_computed_tokens
+    structured = False
+    defer = scheduler.defer_block_free
+    seq = scheduler.sched_step_seq + 1
+    for i, request in enumerate(requests):
+        # `_make_cached_request_data` reads this BEFORE `_update_after_schedule` advances
+        # it, so the payload carries the pre-advance value -- and reading it off the
+        # request (rather than `+= 1`) survives a burst that gave tokens back.
+        nc[i] = request.num_computed_tokens
+        request.num_computed_tokens += 1
+        if defer:
+            request.last_sched_seq = seq
+        request.is_prefill_chunk = request.num_computed_tokens < (
+            request.num_tokens + request.num_output_placeholders
+        )
+        # `_update_after_schedule`'s tail, verbatim -- it only ever DISCARDS here; the add
+        # belongs to the admission loop, which by construction did not run this step.
+        if not request.is_prefill_chunk:
+            scheduler._inflight_prefills.discard(request)
+            structured |= request.use_structured_output
+    crd.__dict__.pop("_req_id_to_num_output_tokens", None)
+    so.has_structured_output_requests = structured
+    d = so.__dict__
+    d.pop("vtl_burst_n", None)
+    d.pop("vtl_sample_in_graph", None)
+    if defer:
+        scheduler.sched_step_seq = seq
+    return so
+
+
+def arena_check(dict_decisions, running, admitted, blocks, lens, preempted, waiting) -> str | None:
+    """``VTL_SCHED_DECISIONS_ARENA=check``: first field where the arena marshalling
+    disagrees with the PyDict one, or None. Pure -- self-checked.
+
+    Both come from the SAME `Decisions` (the crate builds them in one call), so any
+    difference is a marshalling bug, never a scheduling one.
+    """
+    for name, mine, theirs in (
+        ("scheduled_running", running, dict_decisions["scheduled_running"]),
+        ("scheduled_admitted", admitted, dict_decisions["scheduled_admitted"]),
+        ("running_new_blocks", blocks, dict_decisions["running_new_blocks"]),
+        ("running_new_lens", lens, dict_decisions["running_new_lens"]),
+        ("preempted", preempted, dict_decisions["preempted"]),
+        ("waiting_order", waiting, dict_decisions["waiting_order"]),
+    ):
+        # The dict path hands back tuples where the arena hands back tuples too (`zip`),
+        # so a plain list compare is exact; `list()` normalizes the dict's own container.
+        if list(mine) != list(theirs):
+            return f"{name}: arena {list(mine)!r} vs dict {list(theirs)!r}"
+    return None
+
+
+def lean_blocked(scheduler) -> str | None:
+    """Reason ``VTL_RUST_SCHED_LEAN`` cannot engage on this boot, or None.
+
+    Each clause names the field the lean path would stop producing and the consumer that
+    would then read a wrong value:
+
+    * V1 model runner -- reads `num_common_prefix_blocks` for cascade attention
+      (gpu_model_runner.py:2600) and gets `all_token_ids` from the scheduler
+      (scheduler.py:1294). The V2 runner reads neither.
+    * PP without async scheduling -- the only producer of `new_token_ids`
+      (scheduler.py:1279).
+    * iteration-detail logging / the torch profiler -- the only callers of
+      `compute_iteration_details`, whose `is_context_phase` is the only reader of
+      `CachedRequestData.num_output_tokens` (utils.py:813, core.py:448,
+      gpu_worker.py:929).
+
+    NOTE (deviation from the plan): `num_output_tokens` is gated on
+    `enable_logging_iteration_details` + the profiler, NOT on `log_stats` -- serving runs
+    with `log_stats=True`, so keying on it would leave the lean path permanently off.
+    """
+    if not getattr(scheduler, "use_v2_model_runner", False):
+        return "V1 model runner reads num_common_prefix_blocks and all_token_ids"
+    cfg = getattr(scheduler, "scheduler_config", None)
+    if getattr(scheduler, "use_pp", False) and not getattr(cfg, "async_scheduling", False):
+        return "PP without async scheduling needs new_token_ids"
+    obs = getattr(scheduler, "observability_config", None)
+    if getattr(obs, "enable_logging_iteration_details", False):
+        return "iteration-detail logging reads is_context_phase"
+    if os.environ.get("VLLM_TORCH_PROFILER_DIR", "").strip():
+        return "torch profiler annotations read is_context_phase"
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -1329,7 +1566,11 @@ def pack_req(slot: int, request) -> tuple:
     return (
         slot,
         int(request.num_tokens),
-        int(request.num_tokens_with_spec),
+        # num_tokens_with_spec, by way of the invariant `schedule_supported` enforces:
+        # a spec config refuses the whole install, so `spec_token_ids` is always empty
+        # and the two counters are equal. Reading `num_tokens` twice beats an attribute
+        # lookup that is a property call on both the facade and stock `Request`.
+        int(request.num_tokens),
         int(request.num_computed_tokens),
         int(request.num_output_placeholders),
         int(request.num_prompt_tokens),
@@ -1483,10 +1724,10 @@ def _r9_cache_hit_counts(cache, r2i, sampled_counts):
     if cache is None or cache[0] is not r2i:
         return None
     _, _slots, rows, _requests = cache
-    counts = sampled_counts[rows]
-    if bool((counts == 0).any()):
-        return None
-    return counts.tolist()
+    # `0 in list` beats a numpy `(counts == 0).any()` here: the gather is a handful of
+    # elements at decode batch sizes, and the numpy reduction's fixed cost dwarfs the scan.
+    counts = sampled_counts[rows].tolist()
+    return None if 0 in counts else counts
 
 
 def _r9_maybe_check_fold_skips(rust) -> None:
@@ -1629,8 +1870,14 @@ def facade_class(base):
                 # Non-descriptors, so the instance __dict__ wins the lookup. The values
                 # here are never read: install() writes the instance attributes first.
                 "num_tokens": 0,
-                "num_tokens_with_spec": 0,
                 "num_output_tokens": 0,
+                # A property (data descriptor), so it is NOT in the instance __dict__ and
+                # needs no per-token bump: `schedule_supported` refuses any spec config, so
+                # `spec_token_ids` is empty for every request the Rust core ever sees and
+                # num_tokens_with_spec IS num_tokens. Aliasing rather than deleting keeps
+                # stock `Scheduler.schedule` (reachable via the bail path, scheduler.py:474)
+                # reading a live value instead of one frozen at facade install.
+                "num_tokens_with_spec": property(lambda self: self.num_tokens),
                 "__vtl_tokstore__": True,
             },
         )
@@ -1674,13 +1921,12 @@ def tok_facade_on(request) -> None:
     """Swap in the counter facade. Must run AFTER ``tok_store_init`` agreed."""
     base = type(request)
     n_tok = int(request.num_tokens)
-    n_spec = int(request.num_tokens_with_spec)
     n_out = int(request.num_output_tokens)
     # The class swap comes first: while `base` is bound, `num_tokens` is a getter-only
-    # property and the assignment below would raise.
+    # property and the assignment below would raise. (`num_tokens_with_spec` needs no
+    # assignment -- the facade aliases it onto `num_tokens`.)
     request.__class__ = facade_class(base)
     request.num_tokens = n_tok
-    request.num_tokens_with_spec = n_spec
     request.num_output_tokens = n_out
     request._vtl_tok_base = base
     TOK.facaded += 1
@@ -1719,7 +1965,7 @@ def tok_materialize(kv, request) -> None:
             log.exception("rust_sched: token store materialization failed for %s",
                           request.request_id)
             TOK.disable("materialization raised")
-    for name in ("num_tokens", "num_tokens_with_spec", "num_output_tokens"):
+    for name in ("num_tokens", "num_output_tokens"):
         request.__dict__.pop(name, None)
     request.__class__ = base
     request._vtl_tok_off = True
@@ -1979,15 +2225,23 @@ def _install_update_from_output(scheduler_cls, m: dict):
         if _pub_mod is not None:
             _pub_mod.PUB.enqueued += 1
 
+    # `out_is_open()` is monotone -- `out_open` only ever sets `Some` (python.rs), nothing
+    # closes it -- so latch the first True and stop paying an FFI call plus the shared
+    # read-lock every step.
+    _out_open_latched = False
+
     def out_publish_ready(rust) -> bool:
+        nonlocal _out_open_latched
         if _pub_mod is None:
             return False
-        try:
-            if not rust.out_is_open():
+        if not _out_open_latched:
+            try:
+                if not rust.out_is_open():
+                    return False
+            except BaseException as exc:
+                reraise_fatal(exc)
                 return False
-        except BaseException as exc:
-            reraise_fatal(exc)
-            return False
+            _out_open_latched = True
         return _pub_mod.PUB.enqueued == _pub_mod.PUB.published
 
     wrapped_ufo = scheduler_cls.update_from_output
@@ -2362,12 +2616,10 @@ def _install_update_from_output(scheduler_cls, m: dict):
         the finished-request bookkeeping is ``r8_apply`` verbatim.
         """
         burst_n = self._vtl_burst_n
-        rust = self.kv_cache_manager._rust
         stopped_running = None
         stopped_preempted = None
         for slot, request, (acc, status, stop_reason) in residue:
             request.num_tokens += acc
-            request.num_tokens_with_spec += acc
             request.num_output_tokens += acc
             request.num_output_placeholders = max(0, request.num_output_placeholders - acc)
             # `reconcile_burst`'s arithmetic, inlined: a burst that stopped short (or
@@ -2375,8 +2627,10 @@ def _install_update_from_output(scheduler_cls, m: dict):
             # to both the request and the resident table.
             short = burst_n - acc
             if short > 0:
+                # Resolved here, not before the loop: `short > 0` is the rare arm, so the
+                # two attribute lookups stay off the every-step path.
                 burst_uncommit(request, short)
-                rust.table_burst([slot], -short)
+                self.kv_cache_manager._rust.table_burst([slot], -short)
             if status == 0:
                 continue
             status_before = request.status
@@ -2635,11 +2889,9 @@ def _install_update_from_output(scheduler_cls, m: dict):
         if facaded(request):
             # Port-2: the tokens and the hash chain are already in Rust (appended by
             # `update_step_pack_np` for exactly `num_keep`), so the whole writer is two
-            # counter bumps. `num_tokens_with_spec` moves with `num_tokens` because
-            # `spec_token_ids` is empty on every path that reaches here (the Rust schedule
-            # loop refuses a spec config outright).
+            # counter bumps -- `num_tokens_with_spec` is a facade property aliasing
+            # `num_tokens` and needs no write of its own.
             request.num_tokens += num_keep
-            request.num_tokens_with_spec += num_keep
             request.num_output_tokens += num_keep
         else:
             # One list-extend + ONE block-hasher catch-up call (the hasher loops over every
@@ -2721,7 +2973,11 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     import time
 
     import vtl_sched
-    from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+    from vllm.v1.core.sched.output import (
+        CachedRequestData,
+        NewRequestData,
+        SchedulerOutput,
+    )
     from vllm.v1.engine import EngineCoreEventType
     from vllm.v1.request import RequestStatus
 
@@ -2737,6 +2993,23 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     TABLE, TABLE_SHADOW, SPEC = m["table"], m["table_shadow"], m["spec"]
     RESIDENT = TABLE and not TABLE_SHADOW
     TIMING = m["timing"]
+    # Phase A. Resolved to its final value at first schedule (`lean_blocked` needs the
+    # live scheduler), then constant: the crate is told once via `set_params`.
+    LEAN = m["lean"]
+    # VTL_SCHED_LEAN_CHECK: build BOTH payloads for this many FULL steps and compare the
+    # subset the lean path actually feeds forward, then disarm. Counts down.
+    lean_check_left = 32 if (m["lean"] and m["lean_check"]) else 0
+    # Phase B. Resolved at first schedule: needs the crate entry points to exist (an older
+    # wheel has none) and LEAN to have survived `lean_blocked`.
+    ARENA = m["arena"]
+    arena_check_left = 32 if (m["arena"] and m["arena_check"]) else 0
+    # The six persistent decision buffers, re-read whenever the crate reports a grow.
+    arena_bufs = None
+    # Phase C. Two slots, one per async-batch-queue parity; `ring_blocked` refuses the gate
+    # if the queue is not exactly that deep.
+    RING = m["so_ring"]
+    ring = [None, None]
+    ring_i = 0
     ns = time.monotonic_ns
     timers = PhaseTimers() if TIMING else None
     table_shadow_state = ShadowState(strict=False) if TABLE_SHADOW else None
@@ -2782,7 +3055,7 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             seen.add(why)
             log.info("rust_sched: nstep skipped -- %s", why)
 
-    def commit_burst(self, kv, so, by_slot, decisions) -> None:
+    def commit_burst(self, kv, so, by_slot, slots) -> None:
         """Decide and commit this step's burst factor -- or, failing that, in-graph N=1
         sampling. Runs after ``_update_after_schedule``.
 
@@ -2806,7 +3079,6 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             if batch_why is not None:
                 skip_note(self, batch_why)
                 return
-            slots = [slot for slot, _ in decisions["scheduled_running"]]
             mirror = kv._mirror
             # `- 1`: num_computed_tokens as it was BEFORE _update_after_schedule advanced it.
             if n >= 2:
@@ -2862,6 +3134,8 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             nstep_mod.BURST.disable("scheduler commit raised")
 
     def schedule(self, *args, **kwargs):
+        nonlocal LEAN, lean_check_left, ARENA, arena_check_left, arena_bufs
+        nonlocal RING, ring_i
         kv = self.kv_cache_manager
         core = getattr(self, "_vtl_rust_core", None)
         if core is None:
@@ -2884,6 +3158,31 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 self.num_lookahead_tokens = max(
                     self.num_lookahead_tokens, 2 * (nstep_mod.BURST.n - 1)
                 )
+            if LEAN:
+                why = lean_blocked(self)
+                if why is None:
+                    log.info("rust_sched: lean decisions active")
+                else:
+                    LEAN = False
+                    lean_check_left = 0
+                    log.warning("rust_sched: lean decisions refused -- %s", why)
+            if ARENA and not (LEAN and hasattr(core, "schedule_arena")):
+                # Old wheel + new plugin, or the lean predicate refused: both are the
+                # shipped dict path, which is still fully wired below.
+                ARENA = False
+                arena_check_left = 0
+                log.warning("rust_sched: decisions arena unavailable; staying on the dict")
+            elif ARENA:
+                arena_bufs = core.arena_buffers()
+                log.info("rust_sched: decisions arena active%s",
+                         " (CHECK)" if arena_check_left else "")
+            if RING:
+                why = ring_blocked(self)
+                if why is None:
+                    log.info("rust_sched: SchedulerOutput ring active")
+                else:
+                    RING = False
+                    log.warning("rust_sched: SchedulerOutput ring refused -- %s", why)
             # Engine constants: handed over once, not re-parsed from a dict per step.
             core.set_params(
                 {
@@ -2903,6 +3202,10 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     "cache_block_size": int(self.cache_config.block_size),
                     "num_lookahead_tokens": int(self.num_lookahead_tokens),
                     "sjf_reorder": bool(sjf_enabled),
+                    # Optional key on the crate side: a wheel older than this plugin
+                    # ignores it and keeps sending the full payload, which the apply
+                    # block below still reads correctly.
+                    "lean_decisions": bool(LEAN),
                 }
             )
             log.info(
@@ -2963,34 +3266,53 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             t_marshal = ns()
             timers.add("marshal", t_marshal - t_enter)
 
+        # Phase B: `counts` is the arena's 8-tuple, `decisions` the PyDict. Exactly one is
+        # non-None on any given step, except under CHECK where the crate hands back both
+        # marshallings of the SAME decisions (re-running schedule() would mutate twice).
         decisions = None
+        counts = None
         if resident:
             try:
                 # The worker speculated with an EMPTY waiting slice (spec.rs), and
                 # `take_speculative` checks the generation and slot order but NOT the
                 # queue -- so refusing here is what makes an admission step safe.
                 if SPEC and tbl.armed and not waiting:
-                    decisions = core.take_speculative(kv._rust, tbl.gen, running_slots)
+                    if ARENA:
+                        counts = core.take_speculative_arena(
+                            kv._rust, tbl.gen, running_slots, arena_check_left > 0
+                        )
+                    else:
+                        decisions = core.take_speculative(kv._rust, tbl.gen, running_slots)
                 tbl.armed = False
-                if decisions is None:
-                    decisions = core.schedule_resident(kv._rust, running_slots, waiting)
+                if decisions is None and counts is None:
+                    if ARENA:
+                        counts = core.schedule_resident_arena(
+                            kv._rust, running_slots, waiting, arena_check_left > 0
+                        )
+                    else:
+                        decisions = core.schedule_resident(kv._rust, running_slots, waiting)
             except Exception as exc:
                 # The documented failure is "slot N has no resident entry", i.e. the
                 # resync signal; every other rejection wants the same answer.
                 tbl.resync(f"resident schedule refused ({exc!r})")
-                decisions = None
+                decisions = counts = None
             except BaseException as exc:  # a crate panic
                 tbl.fail("schedule_resident", exc)
-                decisions = None
-            if decisions is None:
+                decisions = counts = None
+            if decisions is None and counts is None:
                 running = [pack_req(s, by_slot[s]) for s in running_slots]
-        if decisions is None:
+        if decisions is None and counts is None:
             if TABLE_SHADOW and tbl is not None and not tbl.dirty:
                 try:
                     shadow_table(kv, running, by_slot)
                 except BaseException as exc:
                     tbl.fail("table shadow", exc)
-            decisions = core.schedule(kv._rust, running, waiting)
+            if ARENA:
+                counts = core.schedule_arena(
+                    kv._rust, running, waiting, arena_check_left > 0
+                )
+            else:
+                decisions = core.schedule(kv._rust, running, waiting)
             if tbl is not None:
                 # `Scheduler.schedule` rewrites every running entry: this call is the
                 # full resync, and the only place `dirty` clears.
@@ -3012,11 +3334,101 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         # keeps the full table, but only for a waiting admission). The V2 runner appends
         # new_block_ids without overwriting, so re-sending the whole table every step
         # duplicates rows until the block table overflows.
-        flat = decisions["running_new_blocks"]
-        lens = decisions["running_new_lens"]
+        #
+        # Phase B binds the same six names off strided `[:n]` views instead of the PyDict.
+        # `zip` over two `.tolist()`s yields the same (slot, num_new) pairs the dict path
+        # yields, so every loop below is written once. Block ids are materialized here --
+        # they end up inside a `RustBlocks` that `SchedulerOutput` keeps across steps, and
+        # the arena buffer is overwritten by the next step.
+        if counts is not None:
+            n_run, n_adm, n_blk, n_len, n_pre, n_wait, grew, check_dict = counts
+            if grew:
+                arena_bufs = core.arena_buffers()
+            a_run, a_adm, a_blk, a_lens, a_pre, a_wait = arena_bufs
+            sched_running = zip(a_run[0:n_run:2].tolist(), a_run[1:n_run:2].tolist())
+            sched_admitted = zip(
+                a_adm[0:n_adm:3].tolist(),
+                a_adm[1:n_adm:3].tolist(),
+                a_adm[2:n_adm:3].tolist(),
+            )
+            flat = a_blk[:n_blk].tolist()
+            lens = a_lens[:n_len].tolist()
+            preempted = a_pre[:n_pre].tolist()
+            waiting_order = a_wait[:n_wait].tolist()
+            if check_dict is not None:
+                arena_check_left -= 1
+                sched_running = list(sched_running)
+                sched_admitted = list(sched_admitted)
+                why = arena_check(
+                    check_dict, sched_running, sched_admitted, flat, lens,
+                    preempted, waiting_order,
+                )
+                if why is not None:
+                    # The dict marshalling in `check_dict` is the trusted source; serve
+                    # it for this step and let the dict path own every later one. A raise
+                    # here would escape schedule() and fail the request -- the one thing
+                    # a soak arm must never do.
+                    log.error(
+                        "rust_sched: decisions arena diverged (%s); dict path takes over",
+                        why,
+                    )
+                    ARENA = False
+                    arena_check_left = 0
+                    sched_running = check_dict["scheduled_running"]
+                    sched_admitted = check_dict["scheduled_admitted"]
+                    flat = check_dict["running_new_blocks"]
+                    lens = check_dict["running_new_lens"]
+                    preempted = check_dict["preempted"]
+                    waiting_order = check_dict["waiting_order"]
+                elif not arena_check_left:
+                    log.info("rust_sched: VTL_SCHED_DECISIONS_ARENA check clean over 32 steps")
+        else:
+            sched_running = decisions["scheduled_running"]
+            sched_admitted = decisions["scheduled_admitted"]
+            flat = decisions["running_new_blocks"]
+            lens = decisions["running_new_lens"]
+            preempted = decisions["preempted"]
+            waiting_order = decisions["waiting_order"]
+        # Phase C. The ring is only ever consulted on a step where nothing but decode
+        # happened, so all the cheap counts have to be zero first; `ring_reuse` then
+        # confirms the running set itself is byte-identical to the slot's.
+        if RING:
+            # The arena's `zip` is one-shot AND always truthy, so both have to become real
+            # lists before the predicate can read them -- and so a refused reuse can still
+            # be applied below. On the dict path they already are lists.
+            sched_running = list(sched_running)
+            sched_admitted = list(sched_admitted)
+            slot = ring[ring_i]
+            if (
+                slot is not None
+                and not sched_admitted
+                and not preempted
+                and not flat
+                and not waiting_order
+                and not self.waiting
+                and not self.finished_req_ids
+                and not self.reset_preempted_req_ids
+                # PEEKED, not drained: `get_freed_mm_hashes()` clears the list, and the
+                # preempt/admit loops below can still append to it this step.
+                and not self.encoder_cache_manager.freed
+            ):
+                so = ring_reuse(self, slot, sched_running)
+                if so is not None:
+                    ring_i ^= 1
+                    if NSTEP:
+                        commit_burst(self, kv, so, by_slot, slot[1])
+                    if TIMING:
+                        t_exit = ns()
+                        timers.add("apply", t_exit - t_rust)
+                        timers.last_exit = t_exit
+                        timers.tick()
+                    return so
+
         num_groups = kv._rust.num_groups
         off = 0
-        for i, (slot, num_new) in enumerate(decisions["scheduled_running"]):
+        sched_slots = []
+        for i, (slot, num_new) in enumerate(sched_running):
+            sched_slots.append(slot)
             request = by_slot[slot]
             scheduled_running_reqs.append(request)
             num_scheduled_tokens[request.request_id] = num_new
@@ -3030,12 +3442,16 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         # Rebuild the waiting queue from the Rust core's view. This is NOT cosmetic: the
         # SJF reorder happens inside the core, so popping the Python deque's front would
         # drop the wrong requests. `waiting_order` is what is LEFT, in final order.
-        remaining = [by_slot[s] for s in decisions["waiting_order"]]
-        self.waiting.clear()
-        for request in remaining:
-            self.waiting.add_request(request)
+        # Skipped when both sides are empty -- clear-then-rebuild of empty-from-empty is
+        # a provable no-op, and that is every steady decode step. Only THAT case: for a
+        # non-empty queue the orders can match while the objects differ.
+        if waiting_order or self.waiting:
+            remaining = [by_slot[s] for s in waiting_order]
+            self.waiting.clear()
+            for request in remaining:
+                self.waiting.add_request(request)
 
-        for slot in decisions["preempted"]:
+        for slot in preempted:
             request = by_slot[slot]
             # Port-2: `num_computed_tokens = 0` below re-prefills from `_all_token_ids`, so
             # the store has to hand the tokens back first. (This loop IS the Rust loop's
@@ -3054,7 +3470,7 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             self.waiting.prepend_request(request)
             self.reset_preempted_req_ids.add(request.request_id)
 
-        for slot, num_new, num_computed in decisions["scheduled_admitted"]:
+        for slot, num_new, num_computed in sched_admitted:
             request = by_slot[slot]
             self.running.append(request)
             if self.log_stats:
@@ -3096,17 +3512,55 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 )
                 for r in scheduled_new_reqs
             ]
-        cached_reqs_data = self._make_cached_request_data(
-            scheduled_running_reqs,
-            scheduled_resumed_reqs,
-            num_scheduled_tokens,
-            {},
-            req_to_new_blocks,
-        )
+        cached_reqs_data = None
+        if LEAN:
+            try:
+                cached_reqs_data = lean_cached_request_data(
+                    CachedRequestData, scheduled_running_reqs, req_to_new_blocks
+                )
+                if lean_check_left:
+                    lean_check_left -= 1
+                    why = lean_cached_check(
+                        cached_reqs_data,
+                        self._make_cached_request_data(
+                            scheduled_running_reqs, scheduled_resumed_reqs,
+                            num_scheduled_tokens, {}, req_to_new_blocks,
+                        ),
+                    )
+                    if why is not None:
+                        raise AssertionError(why)
+                    if not lean_check_left:
+                        log.info("rust_sched: VTL_SCHED_LEAN_CHECK clean over 32 steps")
+            except BaseException as exc:
+                reraise_fatal(exc)
+                # The crate keeps its `lean_decisions` setting (set_params ran once), so
+                # `num_common_prefix_blocks` stays absent -- harmless, nothing reads it.
+                LEAN = False
+                lean_check_left = 0
+                cached_reqs_data = None
+                log.exception("rust_sched: lean CachedRequestData failed; back to stock")
+        if cached_reqs_data is None:
+            cached_reqs_data = self._make_cached_request_data(
+                scheduled_running_reqs,
+                scheduled_resumed_reqs,
+                num_scheduled_tokens,
+                {},
+                req_to_new_blocks,
+            )
+        # Absent = the crate ran the lean epilogue. No V2 consumer reads this at all, so
+        # one shared zero list per group count is enough (nothing can mutate it).
+        common = None if decisions is None else decisions.get("num_common_prefix_blocks")
+        if common is None:
+            common = _ZERO_COMMON.get(num_groups)
+            if common is None:
+                common = _ZERO_COMMON[num_groups] = [0] * num_groups
+        else:
+            common = list(common)
         if not self.use_v2_model_runner:
             self.prev_step_scheduled_req_ids.clear()
             self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
+        free_mm_hashes = self.encoder_cache_manager.get_freed_mm_hashes()
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -3114,10 +3568,10 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             total_num_scheduled_tokens=total,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=list(decisions["num_common_prefix_blocks"]),
+            num_common_prefix_blocks=common,
             preempted_req_ids=self.reset_preempted_req_ids,
             finished_req_ids=self.finished_req_ids,
-            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            free_encoder_mm_hashes=free_mm_hashes,
             new_block_ids_to_zero=(
                 (kv.take_new_block_ids() or None) if self.needs_kv_cache_zeroing else None
             ),
@@ -3126,8 +3580,33 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         if self.defer_block_free and total > 0:
             self.sched_step_seq += 1
         self._update_after_schedule(scheduler_output)
+        if RING:
+            # Populate THIS parity's slot -- but ONLY from a step that is itself a pure
+            # decode. Every payload a later reuse would re-send verbatim has to be empty
+            # already: `scheduled_new_reqs` would re-add requests to the runner,
+            # `new_block_ids` would re-append block ids, `free_encoder_mm_hashes` would
+            # re-free, and a non-empty finished/preempted set would be replayed. Anything
+            # else invalidates the slot instead, and the next clean step at this parity
+            # refills it.
+            #
+            # `finished_req_ids` / `preempted_req_ids` are the sets `_update_after_schedule`
+            # just ORPHANED by rebinding the scheduler's, so the slot owns them outright --
+            # that is hazard 1's whole answer.
+            ring[ring_i] = (
+                (scheduler_output, tuple(sched_slots), scheduled_running_reqs)
+                if (
+                    not new_reqs_data
+                    and not flat
+                    and not free_mm_hashes
+                    and not scheduler_output.finished_req_ids
+                    and not scheduler_output.preempted_req_ids
+                    and total == len(sched_slots)
+                )
+                else None
+            )
+            ring_i ^= 1
         if NSTEP:
-            commit_burst(self, kv, scheduler_output, by_slot, decisions)
+            commit_burst(self, kv, scheduler_output, by_slot, sched_slots)
         if TIMING:
             t_exit = ns()
             timers.add("apply", t_exit - t_rust)
@@ -3181,6 +3660,9 @@ def _install_rust_hasher() -> None:
         block_hashes = vtl_sched.block_hashes
         hash_block_tokens = vtl_sched.hash_block_tokens
         BlockHash = kv_cache_utils.BlockHash
+        # Present only on a wheel built with Item 2a. `getattr`, not an import guard: an
+        # older wheel then simply never takes the numpy arm.
+        block_hashes_u32 = getattr(vtl_sched, "block_hashes_u32", None)
 
         def rust_block_hasher(request):
             if (
@@ -3198,9 +3680,23 @@ def _install_rust_hasher() -> None:
             end = num_tokens - (num_tokens - start) % hash_block_size
             tokens = request.all_token_ids
             if have == 0:
-                return [
-                    BlockHash(h) for h in block_hashes(none_hash, hash_block_size, tokens[:end])
-                ]
+                # Prompt-only path (`have == 0` is admission, so `all_token_ids[:end]` IS
+                # `prompt_token_ids[:end]`). With the raw ADD record those ids already
+                # exist as a uint32 numpy view, so the crate can read them contiguously
+                # instead of extracting `end` PyLongs. `.flags.aligned` is the safety
+                # contract for the Rust-side `&[u32]`; the record's reserved u16 is what
+                # makes it hold, and a False here just takes the list path.
+                arr = getattr(request.prompt_token_ids, "numpy_u32", None)
+                if (
+                    block_hashes_u32 is not None
+                    and arr is not None
+                    and end <= len(arr)
+                    and arr.flags.aligned
+                ):
+                    hs = block_hashes_u32(none_hash, hash_block_size, arr[:end])
+                else:
+                    hs = block_hashes(none_hash, hash_block_size, tokens[:end])
+                return [BlockHash(h) for h in hs]
             out = []
             parent = request.block_hashes[-1]
             while start < end:
@@ -3374,6 +3870,8 @@ def _self_check() -> None:
         "VTL_SHM_IPC", "VTL_SHM_IPC_RAW", "VTL_NSTEP",
         "VTL_RUST_SCHED_TOKSTORE", "VTL_RUST_SCHED_TOKSTORE_SHADOW",
         "VTL_RUST_SCHED_R9", "VTL_RUST_SCHED_R9_SHADOW",
+        "VTL_RUST_SCHED_LEAN", "VTL_SCHED_LEAN_CHECK",
+        "VTL_SCHED_DECISIONS_ARENA", "VTL_SCHED_SO_RING",
     )}
     try:
         for k in saved:
@@ -3385,6 +3883,8 @@ def _self_check() -> None:
             "r8": False, "r8_shadow": False, "hasher": False, "nstep": False,
             "tokstore": False, "tokstore_shadow": False,
             "r9": False, "r9_shadow": False,
+            "lean": False, "lean_check": False,
+            "arena": False, "arena_check": False, "so_ring": False,
         }, modes()
         assert env_on("VTL_RUST_SCHED") is False
         for truthy in ("1", "true", "YES", " on "):
@@ -3438,6 +3938,32 @@ def _self_check() -> None:
             "R8 IS update_step plus a pack; it cannot arm without UFO"
         )
         os.environ["VTL_RUST_SCHED_UFO"] = "1"
+
+        # Phase A's lean payload IS the full loop's apply block, so it needs FULL too.
+        os.environ["VTL_RUST_SCHED_LEAN"] = "1"
+        assert modes()["lean"] is True
+        os.environ["VTL_RUST_SCHED_FULL"] = "0"
+        assert modes()["lean"] is False
+        os.environ["VTL_RUST_SCHED_FULL"] = "1"
+
+        # Phase B rides on the lean payload: the arena carries no common-prefix slot.
+        os.environ["VTL_SCHED_DECISIONS_ARENA"] = "1"
+        assert modes()["arena"] is True and modes()["arena_check"] is False
+        os.environ["VTL_RUST_SCHED_LEAN"] = "0"
+        assert modes()["arena"] is False
+        os.environ["VTL_RUST_SCHED_LEAN"] = "1"
+        os.environ["VTL_SCHED_DECISIONS_ARENA"] = "check"
+        assert modes()["arena"] is True and modes()["arena_check"] is True
+        os.environ["VTL_SCHED_DECISIONS_ARENA"] = "0"
+        assert modes()["arena"] is False
+
+        # Phase C is the same loop's tail.
+        os.environ["VTL_SCHED_SO_RING"] = "1"
+        assert modes()["so_ring"] is True
+        os.environ["VTL_RUST_SCHED_FULL"] = "0"
+        assert modes()["so_ring"] is False
+        os.environ["VTL_RUST_SCHED_FULL"] = "1"
+        os.environ["VTL_SCHED_SO_RING"] = "0"
 
         # The N-step commit lives inside the Rust schedule loop, so it needs FULL.
         os.environ["VTL_NSTEP"] = "1"
@@ -3808,6 +4334,164 @@ def _self_check() -> None:
         "a zero anywhere forces the miss path -- a prefill chunk may have appeared"
     )
 
+    # Phase A. `lean_blocked`'s clauses, the lean CachedRequestData, and the CHECK-mode
+    # comparator -- all pure, so a stub scheduler and a stub dataclass are enough.
+    class LeanSched:
+        use_v2_model_runner = True
+        use_pp = False
+        scheduler_config = type("C", (), {"async_scheduling": True})()
+        observability_config = type("O", (), {"enable_logging_iteration_details": False})()
+
+    ls = LeanSched()
+    assert lean_blocked(ls) is None
+    ls.use_pp = True
+    assert lean_blocked(ls) is None, "async scheduling makes PP not need new_token_ids"
+    ls.scheduler_config = type("C", (), {"async_scheduling": False})()
+    assert "PP" in lean_blocked(ls)
+    ls.use_pp = False
+    ls.observability_config = type("O", (), {"enable_logging_iteration_details": True})()
+    assert "iteration-detail" in lean_blocked(ls)
+    assert "V1 model runner" in lean_blocked(object())
+
+    class LeanCRD:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class LeanBlocks:
+        def __init__(self, ids):
+            self.ids = ids
+
+        def get_block_ids(self, allow_none=False):
+            return self.ids
+
+    class LeanReq:
+        def __init__(self, rid, computed):
+            self.request_id = rid
+            self.num_computed_tokens = computed
+
+    lreqs = [LeanReq("a", 7), LeanReq("b", 9)]
+    lblocks = {"a": LeanBlocks(([1],)), "b": LeanBlocks(None)}
+    lean = lean_cached_request_data(LeanCRD, lreqs, lblocks)
+    assert lean.req_ids == ["a", "b"]
+    assert lean.new_block_ids == [([1],), None]
+    assert lean.num_computed_tokens == [7, 9]
+    assert (lean.new_token_ids, lean.all_token_ids, lean.num_output_tokens) == ([], {}, [])
+    assert lean.resumed_req_ids == set() and lean.resumed_req_ids is not lean.all_token_ids
+    stock = LeanCRD(
+        req_ids=["a", "b"], resumed_req_ids=set(), new_token_ids=[], all_token_ids={},
+        new_block_ids=[([1],), None], num_computed_tokens=[7, 9], num_output_tokens=[3, 4],
+    )
+    assert lean_cached_check(lean, stock) is None, "num_output_tokens must not be compared"
+    stock.num_computed_tokens = [7, 10]
+    assert "num_computed_tokens" in lean_cached_check(lean, stock)
+    stock.num_computed_tokens = [7, 9]
+    stock.all_token_ids = {"a": [1]}
+    assert "all_token_ids" in lean_cached_check(lean, stock), (
+        "a dead field filled by stock means lean_blocked missed a consumer"
+    )
+
+    # Phase C's install predicate: every clause names a consumer the reuse would break.
+    class RingSched:
+        vllm_config = type("V", (), {
+            "max_concurrent_batches": 2,
+            "parallel_config": type("P", (), {"distributed_executor_backend": "mp"})(),
+        })()
+        use_v2_model_runner = True
+        needs_kv_cache_zeroing = False
+        enable_return_routed_experts = False
+        encoder_cache_manager = type("E", (), {"freed": []})()
+
+    assert ring_blocked(RingSched()) is None
+    rs = RingSched()
+    rs.needs_kv_cache_zeroing = True
+    assert "zeroing" in ring_blocked(rs)
+    rs = RingSched()
+    rs.vllm_config = type("V", (), {
+        "max_concurrent_batches": 1,
+        "parallel_config": RingSched.vllm_config.parallel_config,
+    })()
+    assert "batch queue depth" in ring_blocked(rs), (
+        "a ring deeper than the queue could be mutated mid-flight"
+    )
+    rs = RingSched()
+    rs.vllm_config = type("V", (), {
+        "max_concurrent_batches": 2,
+        "parallel_config": type("P", (), {"distributed_executor_backend": "uni"})(),
+    })()
+    assert "uni" in ring_blocked(rs), "uni hands the runner the object we mutate"
+
+    # `ring_reuse` refuses before it mutates anything: a changed running set, an extra
+    # token, or a set some downstream code dirtied.
+    class RingReq:
+        use_structured_output = False
+
+        def __init__(self, rid, computed, total):
+            self.request_id = rid
+            self.num_computed_tokens = computed
+            self.num_tokens = total
+            self.num_output_placeholders = 0
+            self.is_prefill_chunk = False
+
+    class RingCRD:
+        def __init__(self, n):
+            self.num_computed_tokens = [0] * n
+            self.__dict__["_req_id_to_num_output_tokens"] = {"stale": 1}
+
+    class RingSO:
+        def __init__(self, n):
+            self.scheduled_cached_reqs = RingCRD(n)
+            self.finished_req_ids = set()
+            self.preempted_req_ids = set()
+            self.has_structured_output_requests = True
+            self.vtl_burst_n = 4
+            self.vtl_sample_in_graph = True
+
+    class RingHost:
+        defer_block_free = False
+        sched_step_seq = 0
+        _inflight_prefills = set()
+
+    reqs = [RingReq("a", 10, 11), RingReq("b", 20, 21)]
+    rslot = (RingSO(2), (5, 6), reqs)
+    host = RingHost()
+    host.requests = {r.request_id: r for r in reqs}
+    assert ring_reuse(host, rslot, [(5, 1), (7, 1)]) is None, "a changed slot must refuse"
+    assert ring_reuse(host, rslot, [(5, 1), (6, 2)]) is None, "a chunk must refuse"
+    assert ring_reuse(host, rslot, [(5, 1)]) is None, "a shrunk batch must refuse"
+    # Slot numbers recycle: "a" finished and a NEW request interned slot 5 -- the slot
+    # list matches byte-for-byte, only the registry identity can tell them apart.
+    host.requests["a"] = RingReq("a2", 10, 11)
+    assert ring_reuse(host, rslot, [(5, 1), (6, 1)]) is None, "a recycled slot must refuse"
+    host.requests["a"] = reqs[0]
+    assert [r.num_computed_tokens for r in reqs] == [10, 20], "refusals must not mutate"
+    so = ring_reuse(host, rslot, [(5, 1), (6, 1)])
+    assert so is rslot[0]
+    assert so.scheduled_cached_reqs.num_computed_tokens == [10, 20], (
+        "the payload carries the PRE-advance values, like _make_cached_request_data"
+    )
+    assert [r.num_computed_tokens for r in reqs] == [11, 21]
+    assert "_req_id_to_num_output_tokens" not in so.scheduled_cached_reqs.__dict__
+    assert so.has_structured_output_requests is False, "recomputed, never |="
+    assert not hasattr(so, "vtl_burst_n") and not hasattr(so, "vtl_sample_in_graph")
+    rslot[0].finished_req_ids.add("dirty")
+    assert ring_reuse(host, rslot, [(5, 1), (6, 1)]) is None, (
+        "a dirtied slot set must refuse rather than serve a stale finished list"
+    )
+
+    # Phase B's arena comparator: same values compare equal regardless of container.
+    d_ok = {
+        "scheduled_running": [(1, 2)], "scheduled_admitted": [(3, 4, 5)],
+        "running_new_blocks": [7, 8], "running_new_lens": [1, 1],
+        "preempted": [9], "waiting_order": [10, 11],
+    }
+    assert arena_check(d_ok, zip([1], [2]), zip([3], [4], [5]), [7, 8], [1, 1], [9], [10, 11]) is None
+    assert "waiting_order" in arena_check(
+        d_ok, [(1, 2)], [(3, 4, 5)], [7, 8], [1, 1], [9], [11, 10]
+    ), "order matters -- the waiting queue is rebuilt from it verbatim"
+    assert "running_new_blocks" in arena_check(
+        d_ok, [(1, 2)], [(3, 4, 5)], [7], [1, 1], [9], [10, 11]
+    )
+
     # `RustMirror._batch_cache`: built by decide(), read on the next hit, and cleared by
     # every path that could make it point at the wrong requests.
     mirror._batch_cache = cache
@@ -3897,9 +4581,11 @@ def _self_check() -> None:
     for keep in (1, 4):
         before = r.num_tokens
         r.num_tokens += keep
-        r.num_tokens_with_spec += keep
         r.num_output_tokens += keep
         assert r.num_tokens == before + keep
+        # The alias tracks without a write of its own -- this is what lets the writer
+        # drop the third bump, and what keeps a bail to stock `schedule()` correct.
+        assert r.num_tokens_with_spec == r.num_tokens
     assert (r.num_tokens, r.num_output_tokens) == (107, 7)
     assert len(r._all_token_ids) == 102, "the list must stop growing under the facade"
 

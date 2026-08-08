@@ -1,0 +1,462 @@
+diff --git a/src/text/src/encode_cache.rs b/src/text/src/encode_cache.rs
+new file mode 100644
+index 0000000..9a84634
+--- /dev/null
++++ b/src/text/src/encode_cache.rs
+@@ -0,0 +1,408 @@
++//! vtl: prefix -> token-ids cache for chat prompts (`VTL_FRONTEND_ENCODE_CACHE`).
++//!
++//! WHY. 350 of the 420 graded-trace requests are strict *extensions* of an earlier request
++//! in the same conversation: the rendered prompt repeats a 2150-4400-token prefix verbatim
++//! and adds ~450 tokens. Stock re-tokenizes the whole thing every turn, which on a 3-vCPU
++//! box is milliseconds of frontend CPU per request, right on the TTFT path.
++//!
++//! HOW. Cache `(prefix_text, prefix_ids)` per conversation. On the next turn, if the cached
++//! prefix is a byte-prefix of the new prompt (plain `memcmp`), only the delta and the tail
++//! are encoded. The memcmp is the whole correctness argument, and it is stronger than any
++//! messages-hash: a template rewrite, `</think>` stripping, a changed system prompt --
++//! anything at all that edits an earlier turn -- fails the compare and falls back to a full
++//! encode.
++//!
++//! The split point is always immediately after a turn marker, so the assumption this rests
++//! on is `encode(a ++ b) == encode(a) ++ encode(b)` at a marker boundary. That is a property
++//! of the tokenizer AND the chat template, not something a build-time assert can settle, so
++//! the first [`SELF_VERIFY_REQUESTS`] cache hits run the full encode too and compare; a single
++//! mismatch trips a kill switch and the boot serves stock for good.
++//!
++//! Model-agnostic: the marker is `VTL_ENCODE_CACHE_SPLIT` (default ChatML `<|im_end|>\n`).
++//! A wrong marker yields fewer than two occurrences, which bypasses the cache entirely.
++
++use std::collections::HashMap;
++use std::collections::hash_map::DefaultHasher;
++use std::hash::{Hash, Hasher};
++use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
++
++use tracing::{info, warn};
++
++/// Master switch: unset / `0` = off, `1` = on, `check` = verify every request and still
++/// serve the stock result (the parity soak arm).
++const ENV_MODE: &str = "VTL_FRONTEND_ENCODE_CACHE";
++/// Turn boundary the prompt is split on. Default is ChatML; round-2 bakes in no model.
++const ENV_SPLIT: &str = "VTL_ENCODE_CACHE_SPLIT";
++const DEFAULT_SPLIT: &str = "<|im_end|>\n";
++/// ponytail: full clear at 256 entries; LRU if a trace ever has >256 live conversations.
++/// Worst case ~12 MB, ~3 MB on the graded trace.
++const MAX_ENTRIES: usize = 256;
++/// Requests that also run the full encode and compare, before the cache is trusted.
++const SELF_VERIFY_REQUESTS: u32 = 8;
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Mode {
++    Off,
++    On,
++    /// Verify every request against a full encode, and serve the full encode's result.
++    Check,
++}
++
++fn mode() -> Mode {
++    static MODE: OnceLock<Mode> = OnceLock::new();
++    *MODE.get_or_init(|| {
++        let raw = std::env::var(ENV_MODE).unwrap_or_default();
++        let mode = match raw.trim().to_ascii_lowercase().as_str() {
++            "1" | "true" | "yes" | "on" => Mode::On,
++            "check" => Mode::Check,
++            _ => Mode::Off,
++        };
++        if mode != Mode::Off {
++            info!(?mode, split = split_marker(), "vtl encode_cache: armed");
++        }
++        mode
++    })
++}
++
++fn split_marker() -> &'static str {
++    static SPLIT: OnceLock<String> = OnceLock::new();
++    SPLIT.get_or_init(|| match std::env::var(ENV_SPLIT) {
++        Ok(value) if !value.is_empty() => value,
++        _ => DEFAULT_SPLIT.to_string(),
++    })
++}
++
++/// `(key_end, split)` for a prompt with at least two turn markers, else `None`.
++///
++/// `key_end` ends the *second* marker block -- system plus first user turn, which is
++/// constant for a conversation and distinct across conversations, so it is what the cache
++/// is keyed on. `split` ends the *last* marker: everything before it is the reusable
++/// prefix, everything after is this turn's generation prompt.
++fn split_points(text: &str, marker: &str) -> Option<(usize, usize)> {
++    if marker.is_empty() {
++        return None;
++    }
++    let mut ends = text.match_indices(marker).map(|(at, m)| at + m.len());
++    let first = ends.next()?;
++    let second = ends.next()?;
++    debug_assert!(first < second);
++    Some((second, ends.last().unwrap_or(second)))
++}
++
++fn hash_key(text: &str) -> u64 {
++    let mut hasher = DefaultHasher::new();
++    text.hash(&mut hasher);
++    hasher.finish()
++}
++
++struct Entry {
++    /// Always ends immediately after a marker occurrence.
++    prefix: String,
++    /// `encode(prefix)`.
++    ids: Vec<u32>,
++}
++
++/// Per-`TextLlm` prefix cache. Cheap to construct and inert unless the mode is on.
++///
++/// The mode and marker are resolved ONCE here rather than read per request: they are boot
++/// constants, and holding them on the instance is also what lets the unit tests drive the
++/// cache without mutating process env behind other tests.
++pub struct EncodeCache {
++    mode: Mode,
++    marker: String,
++    entries: Mutex<HashMap<u64, Entry>>,
++    verify_left: AtomicU32,
++    /// Comparisons that have COMPLETED equal -- distinct from `verify_left`, which only
++    /// says the budget was claimed. The split path is trusted on the former, never the
++    /// latter.
++    verify_ok: AtomicU32,
++    killed: AtomicBool,
++    hits: AtomicU64,
++    misses: AtomicU64,
++}
++
++impl Default for EncodeCache {
++    fn default() -> Self {
++        Self::new(mode(), split_marker().to_string())
++    }
++}
++
++impl EncodeCache {
++    fn new(mode: Mode, marker: String) -> Self {
++        Self {
++            mode,
++            marker,
++            entries: Mutex::new(HashMap::new()),
++            verify_left: AtomicU32::new(SELF_VERIFY_REQUESTS),
++            verify_ok: AtomicU32::new(0),
++            killed: AtomicBool::new(false),
++            hits: AtomicU64::new(0),
++            misses: AtomicU64::new(0),
++        }
++    }
++
++    /// Encode `text`, reusing this conversation's cached prefix ids when it is safe to.
++    ///
++    /// `encode` is the tokenizer call the caller would have made; every bypass, every
++    /// failure and the kill switch all route back to it with the full text, so the result
++    /// is stock in all of them.
++    pub fn encode<F, E>(
++        &self,
++        text: &str,
++        add_special_tokens: bool,
++        encode: F,
++    ) -> Result<Vec<u32>, E>
++    where
++        F: Fn(&str) -> Result<Vec<u32>, E>,
++    {
++        // `add_special_tokens` would put a BOS in front of every fragment, not just the
++        // first -- the concatenation would then be wrong by construction.
++        if self.mode == Mode::Off || add_special_tokens || self.killed.load(Ordering::Relaxed) {
++            return encode(text);
++        }
++        let Some((key_end, split)) = split_points(text, &self.marker) else {
++            // Fewer than two turn markers: a single-turn prompt, or a marker that does not
++            // match this model's template. Nothing to reuse either way.
++            return encode(text);
++        };
++        let key = hash_key(&text[..key_end]);
++
++        // A hash collision lands here as a prefix that fails the memcmp -> treated as a
++        // miss -> stock. Cloning the ids is a ~17 KB memcpy against a multi-millisecond
++        // tokenize, and it keeps the lock hold to that memcpy.
++        let cached = {
++            let entries = self.lock();
++            entries
++                .get(&key)
++                .filter(|e| e.prefix.len() <= split && text.as_bytes().starts_with(e.prefix.as_bytes()))
++                .map(|e| (e.prefix.len(), e.ids.clone()))
++        };
++        let (reused, mut ids) = match cached {
++            Some(hit) => {
++                self.hits.fetch_add(1, Ordering::Relaxed);
++                hit
++            }
++            None => {
++                self.misses.fetch_add(1, Ordering::Relaxed);
++                (0, Vec::new())
++            }
++        };
++
++        // On a hit this is the ~450-token delta; on a miss it is the whole prefix, i.e.
++        // exactly the work stock would have done, just split in two.
++        ids.extend_from_slice(&encode(&text[reused..split])?);
++        let prefix_len = ids.len();
++        let mut out = ids;
++        out.extend_from_slice(&encode(&text[split..])?);
++
++        {
++            let mut entries = self.lock();
++            if entries.len() >= MAX_ENTRIES && !entries.contains_key(&key) {
++                entries.clear();
++            }
++            entries.insert(
++                key,
++                Entry {
++                    prefix: text[..split].to_string(),
++                    ids: out[..prefix_len].to_vec(),
++                },
++            );
++        }
++
++        if self.should_verify() {
++            let stock = encode(text)?;
++            if stock != out {
++                self.killed.store(true, Ordering::Relaxed);
++                warn!(
++                    cached_len = out.len(),
++                    stock_len = stock.len(),
++                    "vtl encode_cache: split encode disagrees with a full encode -- \
++                     the cache is off for this boot"
++                );
++                return Ok(stock);
++            }
++            self.verify_ok.fetch_add(1, Ordering::Relaxed);
++            if self.mode == Mode::Check {
++                return Ok(stock);
++            }
++        } else if self.verify_ok.load(Ordering::Relaxed) < SELF_VERIFY_REQUESTS {
++            // A claimed budget is not a settled one: with enough first requests in
++            // flight at once, this request would otherwise serve a split result no
++            // comparison has vouched for yet. Serve stock until every claimed
++            // comparison has completed equal; the entry cached above still warms the
++            // map either way.
++            return encode(text);
++        }
++        Ok(out)
++    }
++
++    /// `(hits, misses)` since boot. Only the unit tests read it -- the serving path
++    /// has no use for the numbers, so they do not exist outside tests.
++    #[cfg(test)]
++    fn stats(&self) -> (u64, u64) {
++        (
++            self.hits.load(Ordering::Relaxed),
++            self.misses.load(Ordering::Relaxed),
++        )
++    }
++
++    /// A poisoned mutex means some other request panicked mid-update; the map itself is
++    /// still a consistent `HashMap`, and refusing to serve requests over it would be a
++    /// worse outcome than reusing it.
++    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Entry>> {
++        self.entries.lock().unwrap_or_else(|e| e.into_inner())
++    }
++
++    /// Check mode verifies everything; otherwise the first [`SELF_VERIFY_REQUESTS`] cache
++    /// uses do. Misses count: a miss also serves a two-fragment concatenation, so the
++    /// split-additivity assumption is already load-bearing on the very first request.
++    fn should_verify(&self) -> bool {
++        if self.mode == Mode::Check {
++            return true;
++        }
++        self.verify_left
++            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
++                (left > 0).then(|| left - 1)
++            })
++            .is_ok()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const MARK: &str = "<|im_end|>\n";
++
++    /// Split-additive by construction, like a real BPE at a marker boundary.
++    fn additive(text: &str) -> Result<Vec<u32>, ()> {
++        Ok(text.bytes().map(u32::from).collect())
++    }
++
++    /// NOT split-additive: every fragment gets a length token appended. Stands in for a
++    /// tokenizer/template pair whose boundary assumption does not hold.
++    fn non_additive(text: &str) -> Result<Vec<u32>, ()> {
++        let mut ids: Vec<u32> = text.bytes().map(u32::from).collect();
++        ids.push(ids.len() as u32);
++        Ok(ids)
++    }
++
++    fn turns(n: usize) -> String {
++        let mut text = String::new();
++        for i in 0..n {
++            text.push_str(&format!("turn{i}{MARK}"));
++        }
++        text.push_str("assistant:");
++        text
++    }
++
++    #[test]
++    fn split_points_needs_two_markers() {
++        assert_eq!(split_points("nothing here", MARK), None);
++        assert_eq!(split_points(&format!("a{MARK}tail"), MARK), None);
++        let two = format!("a{MARK}b{MARK}tail");
++        // key ends after the SECOND marker; split ends after the LAST -- the same one here.
++        assert_eq!(split_points(&two, MARK), Some((two.len() - 4, two.len() - 4)));
++        let three = format!("a{MARK}b{MARK}c{MARK}tail");
++        let (key_end, split) = split_points(&three, MARK).unwrap();
++        assert!(key_end < split && split == three.len() - 4);
++        assert_eq!(split_points("anything", ""), None, "an empty marker is a bypass");
++    }
++
++    #[test]
++    fn cache_result_matches_a_full_encode_across_turns() {
++        let cache = EncodeCache::new(Mode::On, MARK.to_string());
++        for n in 2..8 {
++            let text = turns(n);
++            let got = cache.encode(&text, false, additive).unwrap();
++            assert_eq!(got, additive(&text).unwrap(), "turn {n}");
++        }
++        let (hits, misses) = cache.stats();
++        // One miss to prime the conversation, then every later turn extends it.
++        assert_eq!((hits, misses), (5, 1));
++    }
++
++    #[test]
++    fn a_rewritten_earlier_turn_misses_instead_of_corrupting() {
++        let cache = EncodeCache::new(Mode::On, MARK.to_string());
++        let first = turns(4);
++        assert_eq!(cache.encode(&first, false, additive).unwrap(), additive(&first).unwrap());
++        // Same conversation key (the first two turns are untouched), but turn 2 changed.
++        let edited = first.replace("turn2", "EDITED");
++        let got = cache.encode(&edited, false, additive).unwrap();
++        assert_eq!(got, additive(&edited).unwrap());
++        assert_eq!(cache.stats(), (0, 2), "the memcmp must reject the stale prefix");
++    }
++
++    #[test]
++    fn a_non_additive_tokenizer_trips_the_kill_switch_on_the_first_request() {
++        let cache = EncodeCache::new(Mode::On, MARK.to_string());
++        // A MISS already serves a two-fragment concatenation, so the very first request has
++        // to be verified -- and here it is wrong, so the kill switch fires immediately.
++        let first = turns(3);
++        assert_eq!(
++            cache.encode(&first, false, non_additive).unwrap(),
++            non_additive(&first).unwrap(),
++            "the mismatch must serve the full encode"
++        );
++        assert!(cache.killed.load(Ordering::Relaxed));
++        // ...and stay off: every later request is a plain full encode, no hit counted.
++        let second = turns(4);
++        assert_eq!(cache.encode(&second, false, non_additive).unwrap(), non_additive(&second).unwrap());
++        assert_eq!(cache.stats(), (0, 1));
++    }
++
++    #[test]
++    fn add_special_tokens_bypasses_the_cache() {
++        let cache = EncodeCache::new(Mode::On, MARK.to_string());
++        let text = turns(4);
++        assert_eq!(cache.encode(&text, true, additive).unwrap(), additive(&text).unwrap());
++        assert_eq!(cache.stats(), (0, 0), "a bypass must not even touch the map");
++    }
++
++    #[test]
++    fn eviction_clears_at_the_bound() {
++        let cache = EncodeCache::new(Mode::On, MARK.to_string());
++        for i in 0..MAX_ENTRIES {
++            let text = format!("conv{i}{MARK}b{MARK}tail");
++            cache.encode(&text, false, additive).unwrap();
++        }
++        assert_eq!(cache.lock().len(), MAX_ENTRIES);
++        let overflow = format!("conv-overflow{MARK}b{MARK}tail");
++        cache.encode(&overflow, false, additive).unwrap();
++        assert_eq!(cache.lock().len(), 1, "the clear must drop everything but the new entry");
++    }
++
++    #[test]
++    fn verification_is_bounded() {
++        let cache = EncodeCache::new(Mode::On, MARK.to_string());
++        for _ in 0..SELF_VERIFY_REQUESTS {
++            assert!(cache.should_verify());
++        }
++        assert!(!cache.should_verify(), "the budget must run out");
++        let checking = EncodeCache::new(Mode::Check, MARK.to_string());
++        for _ in 0..SELF_VERIFY_REQUESTS + 2 {
++            assert!(checking.should_verify(), "check mode verifies everything, forever");
++        }
++    }
++
++    #[test]
++    fn an_unsettled_verify_budget_serves_stock() {
++        let cache = EncodeCache::new(Mode::On, MARK.to_string());
++        let text = turns(3);
++        // Warm the map through one verified miss (verify_ok -> 1), then drain the rest
++        // of the budget the way concurrent claimers would: claimed, no comparison done.
++        cache.encode(&text, false, additive).unwrap();
++        while cache.should_verify() {}
++        let next = turns(4);
++        let calls = std::cell::Cell::new(0u32);
++        let counting = |t: &str| {
++            calls.set(calls.get() + 1);
++            additive(t)
++        };
++        let got = cache.encode(&next, false, counting).unwrap();
++        assert_eq!(got, additive(&next).unwrap());
++        assert_eq!(calls.get(), 3, "delta + tail + the stock fallback, not a trusted split");
++    }
++}
+diff --git a/src/text/src/lib.rs b/src/text/src/lib.rs
+index 130eaec..9379787 100644
+--- a/src/text/src/lib.rs
++++ b/src/text/src/lib.rs
+@@ -24,6 +24,8 @@ use vllm_llm::{GenerateOutputStream, Llm};
+ use vllm_tokenizer::DynTokenizer;
+ 
+ pub mod backend;
++/// vtl: prefix -> ids cache for chat prompts (`VTL_FRONTEND_ENCODE_CACHE`).
++mod encode_cache;
+ mod error;
+ mod lower;
+ pub mod output;
+@@ -49,6 +51,9 @@ pub struct TextLlm {
+     max_model_len: u32,
+     /// Maximum number of top log probabilities accepted by this text facade.
+     max_logprobs: i32,
++    /// vtl: per-conversation prompt-prefix encode cache. Inert unless
++    /// `VTL_FRONTEND_ENCODE_CACHE` is set -- see [`encode_cache`].
++    encode_cache: encode_cache::EncodeCache,
+ }
+ 
+ impl TextLlm {
+@@ -64,6 +69,7 @@ impl TextLlm {
+             backend,
+             max_model_len,
+             max_logprobs: SamplingLimits::DEFAULT_MAX_LOGPROBS,
++            encode_cache: encode_cache::EncodeCache::default(),
+         }
+     }
+ 
+@@ -138,7 +144,15 @@ impl TextLlm {
+ 
+         let tokenizer = self.backend.tokenizer();
+         let prompt_token_ids = match take(&mut request.prompt) {
+-            Prompt::Text(text) => tokenizer.encode(&text, request.add_special_tokens)?,
++            // vtl: 83% of the graded trace's prompts extend an earlier one verbatim, so
++            // this reuses that prefix's ids instead of re-tokenizing 2150-4400 tokens. Off
++            // by default, and every bypass/failure path calls the same closure with the
++            // whole text -- i.e. exactly the stock line this replaced.
++            Prompt::Text(text) => self.encode_cache.encode(
++                &text,
++                request.add_special_tokens,
++                |chunk| tokenizer.encode(chunk, request.add_special_tokens),
++            )?,
+             // Pre-tokenized prompts are the main completions-side escape hatch that lets benchmark
+             // and infra workloads bypass chat rendering and tokenizer overhead entirely.
+             Prompt::TokenIds(token_ids) => token_ids,

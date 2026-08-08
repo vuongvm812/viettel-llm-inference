@@ -27,7 +27,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyTuple};
@@ -906,6 +906,24 @@ impl KvManager {
     }
 }
 
+/// Phase B: persistent i64 buffers the decisions are written into, replacing the per-step
+/// PyDict of Python lists. One per decision vector, in the order the count tuple reports:
+/// running pairs, admitted triples, flat block ids, block lens, preempted, waiting order.
+///
+/// Separate from [`KvManager::bufs`] on purpose — those are single-slot and are overwritten
+/// mid-apply by `kv.get_blocks`.
+///
+/// ALIASING. Python consumes slot/count values inside the same `schedule()` call, so views
+/// over these are safe; block-id slices end up inside a `RustBlocks` that `SchedulerOutput`
+/// retains across steps (the async batch queue keeps two in flight), so the Python side
+/// copies those out with `.tolist()`. `commit_burst` reads decisions in-step only.
+const ARENA_BUFS: usize = 6;
+
+#[cfg(feature = "python")]
+struct Arena {
+    bufs: Vec<Py<PyArray1<i64>>>,
+}
+
 #[pyclass(module = "vtl_sched")]
 pub struct Scheduler {
     /// Engine constants, handed over once by `set_params` instead of rebuilt from a dict
@@ -915,6 +933,187 @@ pub struct Scheduler {
     /// speculation worker needs the manager and the core under one lock, and this class
     /// stays a thin, backward-compatible handle.
     params: Option<Params>,
+    /// Built on the first `*_arena` call. `None` on a dict-path boot, so a plugin that
+    /// never asks for the arena pays nothing.
+    arena: Option<Arena>,
+}
+
+impl Arena {
+    fn new() -> Self {
+        Arena {
+            bufs: Vec::with_capacity(ARENA_BUFS),
+        }
+    }
+
+    /// Write `n` values into buffer `idx`, growing it (to the next power of two) if it is
+    /// too small. Returns true when the buffer was REPLACED — Python then has stale views
+    /// and must re-read them from `arena_buffers()`.
+    fn fill<I>(&mut self, py: Python<'_>, idx: usize, n: usize, vals: I) -> PyResult<bool>
+    where
+        I: Iterator<Item = i64>,
+    {
+        while self.bufs.len() <= idx {
+            self.bufs
+                .push(PyArray1::<i64>::zeros_bound(py, 0, false).unbind());
+        }
+        let mut grew = false;
+        if self.bufs[idx].bind(py).len() < n {
+            self.bufs[idx] =
+                PyArray1::<i64>::zeros_bound(py, n.next_power_of_two(), false).unbind();
+            grew = true;
+        }
+        let bound = self.bufs[idx].bind(py);
+        // SAFETY: the buffer is owned by this Scheduler and only ever handed to Python as a
+        // read-only `[:n]` view; the GIL is held for the duration of the write.
+        let dst = unsafe { bound.as_slice_mut()? };
+        for (d, v) in dst.iter_mut().zip(vals) {
+            *d = v;
+        }
+        Ok(grew)
+    }
+}
+
+/// `(n_running, n_admitted, n_blocks, n_block_lens, n_preempted, n_waiting, grew, dict)`.
+///
+/// The trailing dict is `None` unless the caller passed `check=true`, in which case it is
+/// the PyDict marshalling of the SAME decisions -- the only way to compare the two
+/// marshalers without running `schedule()` twice (which would mutate state twice).
+type ArenaCounts<'py> = (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    bool,
+    Option<Bound<'py, PyDict>>,
+);
+
+impl Scheduler {
+    fn params(&self) -> PyResult<Params> {
+        self.params
+            .ok_or_else(|| PyRuntimeError::new_err("Scheduler.set_params was never called"))
+    }
+
+    /// Marshal `d` into the arena. Counts are ELEMENT counts of the flat buffers, not
+    /// tuple counts, so Python's strided views need no arity constant.
+    fn write_arena<'py>(
+        &mut self,
+        py: Python<'py>,
+        d: &Decisions,
+        check: bool,
+    ) -> PyResult<ArenaCounts<'py>> {
+        let arena = self.arena.get_or_insert_with(Arena::new);
+        let n_run = d.scheduled_running.len() * 2;
+        let n_adm = d.scheduled_admitted.len() * 3;
+        let mut grew = arena.fill(
+            py,
+            0,
+            n_run,
+            d.scheduled_running
+                .iter()
+                .flat_map(|&(slot, num_new)| [i64::from(slot), num_new as i64]),
+        )?;
+        grew |= arena.fill(
+            py,
+            1,
+            n_adm,
+            d.scheduled_admitted.iter().flat_map(|&(slot, num_new, computed)| {
+                [i64::from(slot), num_new as i64, computed as i64]
+            }),
+        )?;
+        grew |= arena.fill(
+            py,
+            2,
+            d.running_new_blocks.len(),
+            d.running_new_blocks.iter().map(|&b| i64::from(b)),
+        )?;
+        grew |= arena.fill(
+            py,
+            3,
+            d.running_new_lens.len(),
+            d.running_new_lens.iter().map(|&n| i64::from(n)),
+        )?;
+        grew |= arena.fill(
+            py,
+            4,
+            d.preempted.len(),
+            d.preempted.iter().map(|&s| i64::from(s)),
+        )?;
+        grew |= arena.fill(
+            py,
+            5,
+            d.waiting_order.len(),
+            d.waiting_order.iter().map(|&s| i64::from(s)),
+        )?;
+        Ok((
+            n_run,
+            n_adm,
+            d.running_new_blocks.len(),
+            d.running_new_lens.len(),
+            d.preempted.len(),
+            d.waiting_order.len(),
+            grew,
+            if check {
+                Some(decisions_dict(py, d)?)
+            } else {
+                None
+            },
+        ))
+    }
+
+    fn run_schedule(
+        py: Python<'_>,
+        kv: &KvManager,
+        running: &[SchedReq],
+        waiting: &[SchedReq],
+        p: &Params,
+    ) -> PyResult<Decisions> {
+        let shared = kv.shared.clone();
+        // The decisions are CLONED under the lock, not read back afterwards: a kick that
+        // is still sitting in the worker's mailbox could be picked up in the gap between
+        // dropping this guard and taking another, and would overwrite `core.decisions`
+        // with a speculative run's answer.
+        py.allow_threads(|| {
+            let mut sh = lock_shared(&shared);
+            sh.invalidate();
+            let Shared { manager, core, .. } = &mut *sh;
+            core.schedule(manager, running, waiting, p).cloned()
+        })
+        .map_err(err)
+    }
+
+    fn run_schedule_resident(
+        py: Python<'_>,
+        kv: &KvManager,
+        running_slots: &[u32],
+        waiting: &[SchedReq],
+        p: &Params,
+    ) -> PyResult<Decisions> {
+        let shared = kv.shared.clone();
+        py.allow_threads(|| {
+            let mut sh = lock_shared(&shared);
+            sh.invalidate();
+            let Shared { manager, core, .. } = &mut *sh;
+            core.schedule_resident(manager, running_slots, waiting, p)
+                .cloned()
+        })
+        .map_err(err)
+    }
+
+    fn run_take_speculative(
+        py: Python<'_>,
+        kv: &KvManager,
+        generation: u64,
+        running_slots: &[u32],
+        p: &Params,
+    ) -> Option<Decisions> {
+        let shared = kv.shared.clone();
+        py.allow_threads(|| {
+            let mut sh = lock_shared(&shared);
+            sh.take_speculative(generation, running_slots, p)
+        })
+    }
 }
 
 /// A running/waiting request as a flat tuple. Order must match `rust_sched.py::pack_req`.
@@ -966,8 +1165,12 @@ fn decisions_dict<'py>(py: Python<'py>, d: &Decisions) -> PyResult<Bound<'py, Py
     out.set_item("scheduled_admitted", d.scheduled_admitted.clone())?;
     out.set_item("preempted", d.preempted.clone())?;
     out.set_item("waiting_order", d.waiting_order.clone())?;
-    out.set_item("num_common_prefix_blocks", d.num_common_prefix_blocks.clone())?;
-    out.set_item("token_budget_left", d.token_budget_left)?;
+    // Empty ONLY under `lean_decisions` -- both non-lean arms of the epilogue push one
+    // entry per KV group, and there is always at least one group. Omitting the key beats
+    // sending a zero list: Python then reuses a shared module-level constant.
+    if !d.num_common_prefix_blocks.is_empty() {
+        out.set_item("num_common_prefix_blocks", d.num_common_prefix_blocks.clone())?;
+    }
     Ok(out)
 }
 
@@ -975,7 +1178,10 @@ fn decisions_dict<'py>(py: Python<'py>, d: &Decisions) -> PyResult<Bound<'py, Py
 impl Scheduler {
     #[new]
     fn new() -> Self {
-        Scheduler { params: None }
+        Scheduler {
+            params: None,
+            arena: None,
+        }
     }
 
     /// Install the engine constants. Called once at first schedule; every field is fixed
@@ -997,6 +1203,13 @@ impl Scheduler {
                 .map(|v| v.extract::<f64>())
                 .transpose()?
                 .unwrap_or(0.90),
+            // Optional key: a plugin older than this wheel does not send it, and false
+            // is the shipped behaviour.
+            lean_decisions: params
+                .get_item("lean_decisions")?
+                .map(|v| v.extract::<bool>())
+                .transpose()?
+                .unwrap_or(false),
         });
         Ok(())
     }
@@ -1015,25 +1228,78 @@ impl Scheduler {
         running: Vec<ReqTuple>,
         waiting: Vec<ReqTuple>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let p = self
-            .params
-            .ok_or_else(|| PyRuntimeError::new_err("Scheduler.set_params was never called"))?;
+        let p = self.params()?;
         let running: Vec<SchedReq> = running.iter().map(unpack).collect();
         let waiting: Vec<SchedReq> = waiting.iter().map(unpack).collect();
-        let shared = kv.shared.clone();
-        // The decisions are CLONED under the lock, not read back afterwards: a kick that
-        // is still sitting in the worker's mailbox could be picked up in the gap between
-        // dropping this guard and taking another, and would overwrite `core.decisions`
-        // with a speculative run's answer.
-        let d = py
-            .allow_threads(|| {
-                let mut sh = lock_shared(&shared);
-                sh.invalidate();
-                let Shared { manager, core, .. } = &mut *sh;
-                core.schedule(manager, &running, &waiting, &p).cloned()
-            })
-            .map_err(err)?;
+        let d = Self::run_schedule(py, kv, &running, &waiting, &p)?;
         decisions_dict(py, &d)
+    }
+
+    /// The persistent decision buffers, in count-tuple order. Python reads them once and
+    /// again whenever a `*_arena` call reports `grew`.
+    fn arena_buffers(&mut self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+        let arena = self.arena.get_or_insert_with(Arena::new);
+        while arena.bufs.len() < ARENA_BUFS {
+            arena
+                .bufs
+                .push(PyArray1::<i64>::zeros_bound(py, 0, false).unbind());
+        }
+        Ok(arena
+            .bufs
+            .iter()
+            .map(|b| b.clone_ref(py).into_any())
+            .collect())
+    }
+
+    /// [`Self::schedule`] writing into the arena instead of building a PyDict.
+    #[pyo3(signature = (kv, running, waiting, check=false))]
+    fn schedule_arena<'py>(
+        &mut self,
+        py: Python<'py>,
+        kv: &KvManager,
+        running: Vec<ReqTuple>,
+        waiting: Vec<ReqTuple>,
+        check: bool,
+    ) -> PyResult<ArenaCounts<'py>> {
+        let p = self.params()?;
+        let running: Vec<SchedReq> = running.iter().map(unpack).collect();
+        let waiting: Vec<SchedReq> = waiting.iter().map(unpack).collect();
+        let d = Self::run_schedule(py, kv, &running, &waiting, &p)?;
+        self.write_arena(py, &d, check)
+    }
+
+    /// [`Self::schedule_resident`] writing into the arena.
+    #[pyo3(signature = (kv, running_slots, waiting, check=false))]
+    fn schedule_resident_arena<'py>(
+        &mut self,
+        py: Python<'py>,
+        kv: &KvManager,
+        running_slots: Vec<u32>,
+        waiting: Vec<ReqTuple>,
+        check: bool,
+    ) -> PyResult<ArenaCounts<'py>> {
+        let p = self.params()?;
+        let waiting: Vec<SchedReq> = waiting.iter().map(unpack).collect();
+        let d = Self::run_schedule_resident(py, kv, &running_slots, &waiting, &p)?;
+        self.write_arena(py, &d, check)
+    }
+
+    /// [`Self::take_speculative`] writing into the arena. `None` still means "no usable
+    /// speculation, call the resident path".
+    #[pyo3(signature = (kv, generation, running_slots, check=false))]
+    fn take_speculative_arena<'py>(
+        &mut self,
+        py: Python<'py>,
+        kv: &KvManager,
+        generation: u64,
+        running_slots: Vec<u32>,
+        check: bool,
+    ) -> PyResult<Option<ArenaCounts<'py>>> {
+        let p = self.params()?;
+        match Self::run_take_speculative(py, kv, generation, &running_slots, &p) {
+            Some(d) => Ok(Some(self.write_arena(py, &d, check)?)),
+            None => Ok(None),
+        }
     }
 
     /// R6b: the same step with the running set read from the Rust-resident table.
@@ -1045,20 +1311,9 @@ impl Scheduler {
         running_slots: Vec<u32>,
         waiting: Vec<ReqTuple>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let p = self
-            .params
-            .ok_or_else(|| PyRuntimeError::new_err("Scheduler.set_params was never called"))?;
+        let p = self.params()?;
         let waiting: Vec<SchedReq> = waiting.iter().map(unpack).collect();
-        let shared = kv.shared.clone();
-        let d = py
-            .allow_threads(|| {
-                let mut sh = lock_shared(&shared);
-                sh.invalidate();
-                let Shared { manager, core, .. } = &mut *sh;
-                core.schedule_resident(manager, &running_slots, &waiting, &p)
-                    .cloned()
-            })
-            .map_err(err)?;
+        let d = Self::run_schedule_resident(py, kv, &running_slots, &waiting, &p)?;
         decisions_dict(py, &d)
     }
 
@@ -1072,9 +1327,7 @@ impl Scheduler {
     /// Returns False when speculation is unavailable (thread spawn failed, or it was
     /// permanently disabled by a worker panic).
     fn kick(&self, kv: &mut KvManager, generation: u64, running_slots: Vec<u32>) -> PyResult<bool> {
-        let p = self
-            .params
-            .ok_or_else(|| PyRuntimeError::new_err("Scheduler.set_params was never called"))?;
+        let p = self.params()?;
         if kv.r().spec.disabled {
             return Ok(false);
         }
@@ -1109,15 +1362,8 @@ impl Scheduler {
         generation: u64,
         running_slots: Vec<u32>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let p = self
-            .params
-            .ok_or_else(|| PyRuntimeError::new_err("Scheduler.set_params was never called"))?;
-        let shared = kv.shared.clone();
-        let taken = py.allow_threads(|| {
-            let mut sh = lock_shared(&shared);
-            sh.take_speculative(generation, &running_slots, &p)
-        });
-        match taken {
+        let p = self.params()?;
+        match Self::run_take_speculative(py, kv, generation, &running_slots, &p) {
             Some(d) => Ok(Some(decisions_dict(py, &d)?)),
             None => Ok(None),
         }
@@ -1235,6 +1481,42 @@ fn block_hashes<'py>(
     ))
 }
 
+/// [`block_hashes`] fed by a numpy `uint32` array instead of a Python list.
+///
+/// Same hashes, one contiguous read instead of `n` `PyLong_AsLongLong` calls: with the raw
+/// ADD record (`shm_ipc.py`) the prompt already exists as a `uint32` view over the shm
+/// frame, and hashing a 4400-token prompt at admission is otherwise 4400 extractions.
+///
+/// ALIGNMENT is the caller's contract — the record's reserved `u16` exists to give the id
+/// block a 4-byte boundary, and `rust_sched.py` re-checks `arr.flags.aligned` before
+/// choosing this entry point. Non-contiguous is refused here (Python then falls back).
+#[pyfunction]
+#[pyo3(signature = (none_hash, hash_block_size, token_ids, extra_keys=None))]
+fn block_hashes_u32<'py>(
+    py: Python<'py>,
+    none_hash: &Bound<'py, PyBytes>,
+    hash_block_size: usize,
+    token_ids: PyReadonlyArray1<'py, u32>,
+    extra_keys: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyList>> {
+    let nh = digest_from(none_hash.as_bytes())?;
+    if hash_block_size == 0 {
+        return Err(PyValueError::new_err("hash_block_size must be > 0"));
+    }
+    let ids = token_ids.as_slice().map_err(|_| {
+        PyValueError::new_err("block_hashes_u32 needs a C-contiguous uint32 array")
+    })?;
+    let keys = extra_keys_from(extra_keys)?;
+    // vLLM's hashed byte stream is a pickle of a list of Python ints, which is i64-shaped;
+    // the widening is one pass over a contiguous buffer, not a Python round trip.
+    let ids: Vec<i64> = ids.iter().map(|&t| i64::from(t)).collect();
+    let hs = hash::hash_request_tokens(&nh, hash_block_size, &ids, keys.as_deref());
+    Ok(PyList::new_bound(
+        py,
+        hs.iter().map(|h| PyBytes::new_bound(py, h)),
+    ))
+}
+
 /// The exact byte stream vLLM's `sha256()` hashes — exposed so the parity test can diff
 /// it against `pickle.dumps(...)` instead of only comparing digests.
 #[pyfunction]
@@ -1272,6 +1554,7 @@ fn vtl_sched(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(none_hash_from_seed, m)?)?;
     m.add_function(wrap_pyfunction!(hash_block_tokens, m)?)?;
     m.add_function(wrap_pyfunction!(block_hashes, m)?)?;
+    m.add_function(wrap_pyfunction!(block_hashes_u32, m)?)?;
     m.add_function(wrap_pyfunction!(pickle_block_hash_input, m)?)?;
     m.add_function(wrap_pyfunction!(block_hash_with_group_id, m)?)?;
     Ok(())

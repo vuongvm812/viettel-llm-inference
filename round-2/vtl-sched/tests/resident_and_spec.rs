@@ -70,6 +70,7 @@ fn params() -> Params {
         num_lookahead_tokens: 0,
         sjf_reorder: false,
         sjf_usage_tight: 0.90,
+        lean_decisions: false,
     }
 }
 

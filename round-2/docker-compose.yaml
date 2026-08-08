@@ -500,6 +500,43 @@ services:
                                          # cache is still built and diffed against it every
                                          # step (pre-flight soak, independent of R9 itself).
                                          # Revert: "0".
+      VTL_RUST_SCHED_LEAN: "1"           # Phase A: stop producing decision payload no
+                                         # consumer on a V2 / no-PP / no-iteration-logging
+                                         # boot reads -- num_common_prefix_blocks in the
+                                         # crate, four dead CachedRequestData fields here.
+                                         # `lean_blocked` re-checks the live config at first
+                                         # schedule and logs + reverts if any reader exists.
+                                         # Revert: "0" = the full payload.
+      VTL_SCHED_DECISIONS_ARENA: "1"     # Phase B: the decisions arrive in persistent numpy
+                                         # buffers instead of a per-step PyDict of lists.
+                                         # Needs LEAN (the arena has no common-prefix slot)
+                                         # and a wheel carrying schedule_arena; a hasattr
+                                         # probe falls back to the dict path otherwise.
+                                         # "check" = run both marshalers for 32 steps and
+                                         # assert they agree. Revert: "0" = the dict.
+      VTL_SCHED_SO_RING: "1"             # Phase C: re-serve a prebuilt SchedulerOutput on a
+                                         # pure-decode step (2 slots = the async batch-queue
+                                         # depth, asserted at install). Refuses itself unless
+                                         # the executor is `mp` -- `uni` would hand the runner
+                                         # the very object the next step mutates.
+                                         # Revert: "0" = a fresh output every step.
+      VTL_SHM_IPC_RAW_ADD: "1"           # Item 2a: the frontend sends ADD prompt ids as a
+                                         # raw little-endian u32 block instead of ~4400
+                                         # msgpack ints, so the ingest thread stops building
+                                         # that many PyLongs with the GIL held. Needs
+                                         # VTL_SHM_IPC. Revert: "0" = msgpack. (fork patch)
+      VTL_FRONTEND_ENCODE_CACHE: "1"     # Item 2b: per-conversation prompt-prefix -> ids
+                                         # cache in the Rust frontend. 83% of the trace's
+                                         # requests extend an earlier prompt verbatim; only
+                                         # the delta is tokenized. The first 8 requests are
+                                         # verified against a full encode and a mismatch
+                                         # kills the cache for the boot. "check" = verify
+                                         # every request and serve the full encode (soak).
+                                         # Revert: "0". (fork patch)
+      VTL_ENCODE_CACHE_SPLIT: "<|im_end|>\n"  # The turn boundary the cache splits on. ChatML
+                                         # default; round-2 bakes in no model, and a marker
+                                         # that does not match the live template yields <2
+                                         # occurrences per prompt = cache bypassed. (fork patch)
       VTL_STREAM_PER_TOKEN: "1"          # Rust frontend: one SSE chunk per TOKEN instead of
                                          # per engine record. MANDATORY with the burst -- a
                                          # chunk-counting ITL metric would otherwise score it

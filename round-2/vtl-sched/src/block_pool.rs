@@ -732,10 +732,19 @@ impl BlockPool {
     }
 
     /// `BlockPool.touch` (block_pool.py:597).
+    ///
+    /// The null placeholder is NOT ref-counted here, unlike Python. Python bumps it on
+    /// touch and decrements it on free and simply tolerates the drift (`is_null` keeps
+    /// it out of the free queue either way); a drifting counter on this side would trip
+    /// `free_blocks`' double-free assert in debug and wrap in release, so both paths
+    /// skip it and its counter stays honestly at 0.
     pub fn touch(&mut self, blocks: &[u32]) -> Result<(), String> {
         for &id in blocks {
             let b = self.arena.get(id);
-            if b.ref_cnt == 0 && !b.is_null {
+            if b.is_null {
+                continue;
+            }
+            if b.ref_cnt == 0 {
                 // Freed-but-cached block: pull it out of the eviction queue. A failure
                 // here means the free list and the ref counts disagree -- unwinding is
                 // the only safe answer, since the next allocation would hand this block
@@ -756,9 +765,15 @@ impl BlockPool {
         without_hash.clear();
         for &id in ordered {
             let b = self.arena.get_mut(id);
+            // Mamba-align rows pad request tables with the null placeholder, so it
+            // arrives here on every hybrid free -- skip it (see `touch`), which is what
+            // keeps the double-free assert meaningful for real blocks.
+            if b.is_null {
+                continue;
+            }
             debug_assert!(b.ref_cnt > 0, "double free of block {id}");
             b.ref_cnt -= 1;
-            if b.ref_cnt == 0 && !b.is_null {
+            if b.ref_cnt == 0 {
                 if b.hash.is_none() {
                     without_hash.push(id);
                 } else {

@@ -50,6 +50,7 @@ import os
 import struct
 import threading
 from collections import deque
+from collections.abc import Sequence
 from contextlib import ExitStack
 
 from vtl.registry import already_patched, mark_patched, register_patch
@@ -85,6 +86,27 @@ TAG_MSGPACK = b"M"
 TAG_RAW = b"R"
 TAG_DEAD = b"D"
 RAW_VERSION = 1
+
+# Request-channel tag for the raw ADD record (`VTL_SHM_IPC_RAW_ADD=1` on the frontend).
+# 0x10 sits outside `EngineCoreRequestType`'s 0x00-0x03 so both tag spaces share the one
+# ordered channel, exactly as TAG_MSGPACK/TAG_RAW do on the output channel.
+# Offsets are from the START OF THE RECORD, tag byte included:
+#   [0]      u8      TAG_RAW_ADD
+#   [1]      u8      RAW_ADD_VERSION
+#   [2..4]   u16     reserved (0)
+#   [4..8]   u32 LE  n_tokens
+#   [8..8+4n]        n x u32 LE prompt token ids
+#   [8+4n..]         msgpack EngineCoreRequest array, element 1 (prompt_token_ids) = nil
+# The reserved u16 exists to put the id block on a 4-byte boundary within the record, so
+# the `np.frombuffer` view is ALIGNED -- `vtl_sched.block_hashes_u32` reads it as `&[u32]`
+# from Rust, where an unaligned load is undefined behaviour, not just slow.
+TAG_RAW_ADD = b"\x10"
+RAW_ADD_VERSION = 1
+_RAW_ADD_HEAD = struct.Struct("<BHI")
+_RAW_ADD_IDS_AT = 1 + _RAW_ADD_HEAD.size
+
+assert _RAW_ADD_HEAD.size == 7, _RAW_ADD_HEAD.size
+assert _RAW_ADD_IDS_AT % 4 == 0, "the id block must land 4-byte aligned"
 
 # Header: version u8, reserved u16, engine_index u32, timestamp f64, n_out u32, n_fin u32.
 _RAW_HEADER = struct.Struct("<BHIdII")
@@ -562,6 +584,77 @@ class _OutputPublisher:
         return True
 
 
+class RawTokens(Sequence):
+    """Prompt token ids as a numpy view straight over the shm ADD record's byte range.
+
+    WHY. The msgpack ADD makes the ingest thread build one PyLong per prompt token --
+    ~4400 of them per request on this trace, with the GIL held. The raw record carries the
+    ids as little-endian u32, so the only list that ever gets built is the one
+    ``Request.__init__`` demands (``prompt_token_ids.copy()``, request.py:133), and numpy's
+    ``tolist()`` is a C loop where msgpack's is an interpreter loop.
+
+    ``__reduce__`` hands pickle a plain list: this object rides inside ``NewRequestData``
+    across the MultiprocExecutor boundary, and the worker must not need vtl importable --
+    nor a numpy view of a buffer that lives in this process -- to unpickle it.
+    """
+
+    __slots__ = ("_arr", "_cached")
+
+    def __init__(self, arr):
+        self._arr = arr
+        self._cached = None
+
+    @property
+    def numpy_u32(self):
+        """The backing ``uint32`` view. Named for its one cross-module consumer:
+        ``rust_sched``'s block hasher hands it to ``vtl_sched.block_hashes_u32``."""
+        return self._arr
+
+    def _list(self):
+        cached = self._cached
+        if cached is None:
+            cached = self._cached = self._arr.tolist()
+        return cached
+
+    def __len__(self):
+        return len(self._arr)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return self._list()[index]
+        return int(self._arr[index])
+
+    def __iter__(self):
+        return iter(self._list())
+
+    def copy(self):
+        # A FRESH list every call, not `self._list()`: `Request.__init__` extends the
+        # result in place as `_all_token_ids`.
+        return self._arr.tolist()
+
+    def __reduce__(self):
+        return (list, (self._list(),))
+
+
+def raw_add_split(record):
+    """Split a ``TAG_RAW_ADD`` record (tag byte included) into ``(ids, msgpack_tail)``.
+
+    ``ids`` is a zero-copy ``uint32`` view -- ``record`` owns the bytes and keeps it alive.
+    ``ValueError`` on a version this build does not speak: the caller drops the frame
+    rather than guess at a layout. Pure -- self-checked against ``GOLDEN_RAW_ADD``.
+    """
+    import numpy as np
+
+    version, _reserved, n = _RAW_ADD_HEAD.unpack_from(record, 1)
+    if version != RAW_ADD_VERSION:
+        raise ValueError(f"raw ADD version {version}, this build speaks {RAW_ADD_VERSION}")
+    end = _RAW_ADD_IDS_AT + 4 * n
+    if end > len(record):
+        raise ValueError(f"raw ADD claims {n} tokens, record is {len(record)} bytes")
+    ids = np.frombuffer(record, np.uint32, count=n, offset=_RAW_ADD_IDS_AT)
+    return ids, memoryview(record)[end:]
+
+
 def _run_input_thread(engine, input_address: str, engine_index: int, ready: threading.Event):
     """Mirror of ``core.py`` ``process_input_sockets``' recv loop over the shm channel.
 
@@ -570,6 +663,11 @@ def _run_input_thread(engine, input_address: str, engine_index: int, ready: thre
     their upstream semantics.
     """
     import iceoryx2 as ix
+    # Imported here, not on first raw ADD: a broken numpy must kill the channel at
+    # startup (frontend sees 0 subscribers and demotes to ZMQ for good) rather than
+    # drop already-committed ADD records one by one -- each such drop is a request the
+    # client waits on forever.
+    import numpy  # noqa: F401
 
     from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
     from vllm.v1.serial_utils import MsgpackDecoder
@@ -608,10 +706,32 @@ def _run_input_thread(engine, input_address: str, engine_index: int, ready: thre
                 record = ctypes.string_at(payload.as_ptr(), payload.len())
                 try:
                     # upstream: core.py:1558-1587, frame split replaced by our framing.
-                    request_type = EngineCoreRequestType(record[:1])
-                    data_frames = [memoryview(record)[1:]]
+                    if record[:1] == TAG_RAW_ADD:
+                        # An ADD in every other respect; only the prompt ids arrive as a
+                        # raw u32 block instead of 4400 msgpack ints. A malformed or
+                        # unknown-version frame is dropped like any other bad record --
+                        # but named for what it costs: the frontend committed this ADD on
+                        # publish, so the dropped request hangs until the client times
+                        # out. Unreachable in a same-image deployment (one build writes
+                        # and reads the format; GOLDEN_RAW_ADD pins it at make check).
+                        try:
+                            raw_ids, tail = raw_add_split(record)
+                        except ValueError:
+                            log.exception(
+                                "vtl shm_ipc: dropping undecodable raw ADD -- the "
+                                "frontend already committed it, this request WILL hang"
+                            )
+                            continue
+                        request_type = EngineCoreRequestType.ADD
+                        data_frames = [tail]
+                    else:
+                        raw_ids = None
+                        request_type = EngineCoreRequestType(record[:1])
+                        data_frames = [memoryview(record)[1:]]
                     if request_type == EngineCoreRequestType.ADD:
                         req = add_request_decoder.decode(data_frames)
+                        if raw_ids is not None:
+                            req.prompt_token_ids = RawTokens(raw_ids)
                         try:
                             request = engine.preprocess_add_request(req)
                         except Exception:
@@ -904,6 +1024,28 @@ GOLDEN_FINISHED = (
     "05000000" "7265712d61"
     "05000000" "7265712d62"
 )
+# The raw ADD request record (Item 2a), asserted byte-for-byte by BOTH `raw_add_split`
+# below and `encode_raw_add`'s unit test in shm_ipc.patch. The msgpack tail is what
+# rmp_serde's `to_vec_named` produces for the 20-field `Serialize_tuple`
+# `EngineCoreRequest` -- an array16 header (20 > 15, so no fixarray), element 1 nil, the
+# rest of this fixture's fields at their defaults.
+GOLDEN_RAW_ADD_REQUEST_ID = "vtl-golden-0"
+GOLDEN_RAW_ADD_TOKENS = (1, 2, 300)
+GOLDEN_RAW_ADD_ARRIVAL = 1.5
+GOLDEN_RAW_ADD = (
+    "10"                                    # TAG_RAW_ADD
+    "01" "0000" "03000000"                  # version, reserved, n_tokens
+    "01000000" "02000000" "2c010000"        # the ids, little-endian u32
+    "dc0014"                                # msgpack array16, 20 elements
+    "ac" "76746c2d676f6c64656e2d30"         # [0]  request_id
+    "c0"                                    # [1]  prompt_token_ids -> nil
+    "c0" "c0" "c0"                          # [2]  mm/sampling/pooling params
+    "cb3ff8000000000000"                    # [5]  arrival_time 1.5
+    "c0" "c0" "c0" "c0" "c0"                # [6]  lora..prompt_is_token_ids
+    "00" "00" "00"                          # [11] client_index, current_wave, priority
+    "c0" "c2" "c0" "c0" "c0"                # [14] trace_headers..reasoning_parser_kwargs
+    "c2"                                    # [19] abort_immediately
+)
 
 
 def _self_check() -> None:
@@ -1063,6 +1205,48 @@ def _self_check() -> None:
     assert not raw_schema_ok(_DriftedOut, _StructOuts)
     assert not raw_schema_ok(_StructOut, _DriftedOuts)
     log.disabled = False
+
+    # --- raw ADD record (Item 2a) ---------------------------------------------------------
+    import numpy as np
+
+    record = bytes.fromhex(GOLDEN_RAW_ADD)
+    assert record[:1] == TAG_RAW_ADD
+    ids, tail = raw_add_split(record)
+    assert tuple(ids.tolist()) == GOLDEN_RAW_ADD_TOKENS, ids
+    # The tail is exactly what is left; both halves must account for every byte.
+    assert _RAW_ADD_IDS_AT + 4 * len(ids) + len(tail) == len(record)
+    assert ids.flags.aligned, "the reserved u16 exists exactly to make this true"
+    # msgspec is not importable off-box, so the tail is pinned structurally instead of
+    # decoded: array16 of 20, then the request id, then nil where the ids used to be.
+    assert bytes(tail[:3]) == b"\xdc\x00\x14", "20-element msgpack array header"
+    assert GOLDEN_RAW_ADD_REQUEST_ID.encode() in bytes(tail)
+    assert bytes(tail)[3 + 1 + len(GOLDEN_RAW_ADD_REQUEST_ID)] == 0xC0, (
+        "element 1 (prompt_token_ids) must be nil -- the ids ride in the header"
+    )
+    for bad, why in (
+        (b"\x10\x02" + record[2:], "version"),
+        (record[:4] + b"\xff\xff\x00\x00" + record[8:], "truncated"),
+    ):
+        try:
+            raw_add_split(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{why} record must be refused")
+
+    toks = RawTokens(ids)
+    assert toks.numpy_u32 is ids, "the hasher's numpy arm reads this straight through"
+    assert len(toks) == 3 and toks[2] == 300 and type(toks[2]) is int
+    assert list(toks) == list(GOLDEN_RAW_ADD_TOKENS) and toks[1:] == [2, 300]
+    first = toks.copy()
+    assert first == list(GOLDEN_RAW_ADD_TOKENS)
+    first.append(9)  # Request.__init__ extends the copy in place
+    assert toks.copy() == list(GOLDEN_RAW_ADD_TOKENS), "copy() must hand out a fresh list"
+    import pickle
+
+    assert pickle.loads(pickle.dumps(toks)) == list(GOLDEN_RAW_ADD_TOKENS), (
+        "pickle must yield a plain list -- the worker has no vtl and no shm buffer"
+    )
 
     # --- service naming -------------------------------------------------------------------
     addr = GOLDEN_SEED_ADDRESS

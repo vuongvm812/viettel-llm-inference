@@ -32,7 +32,8 @@ Applied idempotently **per patch**: the stage skips a patch iff its *reverse* dr
 (i.e. it is already in the checkout) and applies the rest, so a locally-modified checkout that
 carries some of them still gets the others. The stage then asserts one marker per independent
 group (`sonic_rs` in `validated_json.rs`, `src/engine-core-client/src/shm_ipc.rs` exists,
-`per_token_stream_enabled` in `decoded.rs`) and fails the build if any is missing.
+`per_token_stream_enabled` in `decoded.rs`, `encode_cache` in `src/text/src/lib.rs`) and
+fails the build if any is missing.
 
 ## `per_token_stream.patch`
 - `src/text/src/output/decoded.rs` — emit one `TextDelta` per decoded TOKEN instead of one
@@ -57,10 +58,21 @@ group (`sonic_rs` in `validated_json.rs`, `src/engine-core-client/src/shm_ipc.rs
   `mod shm_ipc`, build the sink + spawn the shm output reader in `from_connected`, and try the
   shm publish before the ZMQ `transport::send_message` in `send_to_engine`.
 
+- `src/engine-core-client/src/shm_ipc.rs` + `client.rs` + `client/imp.rs` — the **raw ADD**
+  record (tag `0x10`, outside `EngineCoreRequestType`'s `0x00-0x03`): the prompt token ids
+  ride as a little-endian `u32` block ahead of the msgpack, whose element 1 is then nil.
+  Otherwise the engine's ingest thread builds ~4400 PyLongs per request with the GIL held;
+  from the block it takes one `np.frombuffer`. `ClientInner::send_add_to_engine` is the only
+  new seam and every failure in it (gate off, not an shm sink, encode refuses, no
+  subscriber) falls through to the stock `send_to_engine`.
+
 Gated on **`VTL_SHM_IPC=1`** (read by the Rust frontend *and* by `vtl/patches/shm_ipc.py` in
 the EngineCore process). Unset — the default — nothing in the module runs and the transport is
 byte-for-byte stock. `VTL_SHM_IPC_RAW=1` (Python-side only; requires `VTL_SHM_IPC=1`) switches
 the output records from msgpack to the fixed layout, with automatic per-message fallback.
+`VTL_SHM_IPC_RAW_ADD=1` (frontend-side; also requires `VTL_SHM_IPC=1`) does the same for the
+request path's ADD records. Both halves ship in one image, so there is no version skew — and
+the record carries a version byte anyway, which the engine drops the frame on.
 ZMQ is never torn down: it carries the handshake/registration, stays as the request-path
 degrade path, and its output loop remains the `ENGINE_CORE_DEAD` detector.
 
@@ -77,6 +89,36 @@ The unit tests in `shm_ipc.rs` are run by `Dockerfile.vllm-fork`
 drift in the record layout or the service-name seed fails the **image build**. The golden
 record vectors and the seed literal are shared verbatim with
 `round-2/vtl/patches/shm_ipc.py::_self_check`, which `make check` runs.
+
+## `encode_cache.patch`
+- `src/text/src/encode_cache.rs` (new) — per-conversation prompt-prefix → token-ids cache.
+  350 of the 420 graded-trace requests are strict byte-prefix *extensions* of an earlier
+  request in the same conversation; stock re-tokenizes the whole 2150-4400-token prefix
+  every turn. The cache keeps `(prefix_text, prefix_ids)` per conversation and, when the
+  cached prefix is a byte-prefix of the new prompt (plain `memcmp` — stronger than any
+  messages-hash: template drift, `</think>` stripping and edited earlier turns all fail it),
+  encodes only the delta and the generation-prompt tail.
+- `src/text/src/lib.rs` — one call site: `TextLlm::generate_inner`'s `Prompt::Text` arm.
+  `Prompt::TokenIds` needs no plumbing, and the tokenizer already lives there.
+
+The prompt is split immediately after a turn marker, so correctness rests on
+`encode(a ++ b) == encode(a) ++ encode(b)` at that boundary — a property of the tokenizer
+*and* the chat template, which no build-time assert can settle. So the first **8 requests**
+(hits *and* misses — a miss also serves a two-fragment concatenation) additionally run the
+full encode and compare; one mismatch trips an `AtomicBool` and the boot serves stock for
+good.
+
+Gated on **`VTL_FRONTEND_ENCODE_CACHE`** (unset = off, `1` = on, `check` = verify every
+request and still serve the full-encode result — the parity soak arm). The marker is
+**`VTL_ENCODE_CACHE_SPLIT`** (default `<|im_end|>\n`, ChatML) because round-2 bakes in no
+model: a marker that does not match the live template yields fewer than two occurrences per
+prompt, which bypasses the cache entirely. Eviction is a full clear at 256 entries
+(`// ponytail:` — LRU only if a trace ever has >256 live conversations).
+
+Its unit tests (split-point finder, cross-turn parity against a full encode, rejected stale
+prefix, kill switch under a deliberately non-additive mock tokenizer, eviction, verification
+budget) ride the existing `cargo test --release -p vllm-text --lib` in
+`Dockerfile.vllm-fork`, whose marker assert gained `grep encode_cache src/text/src/lib.rs`.
 
 ## Regenerating
 Paths are workspace-relative (`patch -p1 -d <rust-workspace>`). To regenerate after

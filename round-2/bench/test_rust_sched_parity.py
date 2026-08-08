@@ -686,6 +686,78 @@ def test_schedule_returns_per_step_deltas_for_running_requests():
 
 
 @requires_crate
+def test_decisions_arena_marshals_exactly_what_the_dict_does():
+    """Phase B: the arena buffers and the PyDict must carry identical decisions.
+
+    Both come out of ONE crate call (`check=True`), so this compares the two marshalers
+    over the same `Decisions` -- which is the only way to compare them at all, since
+    re-running `schedule()` would mutate the manager twice. Also pins the `grew` protocol:
+    a buffer replacement must be announced, or Python keeps reading a stale view.
+    """
+    block_size = 16
+    none_hash = vtl_sched.none_hash_from_seed("0")
+    kv = vtl_sched.KvManager(rust_config(num_blocks=512, max_model_len=4096))
+    core = vtl_sched.Scheduler()
+    core.set_params(sched_params(block_size, 4096, 8192))
+    bufs = core.arena_buffers()
+    assert len(bufs) == 6
+
+    def req(slot, num_tokens, computed, status):
+        return (slot, num_tokens, num_tokens, computed, 0, 64, 128, status, 0, False, False)
+
+    def compare(counts):
+        nonlocal bufs
+        n_run, n_adm, n_blk, n_len, n_pre, n_wait, grew, d = counts
+        if grew:
+            bufs = core.arena_buffers()
+        a_run, a_adm, a_blk, a_lens, a_pre, a_wait = bufs
+        assert d is not None, "check=True must hand back the dict"
+        assert list(zip(a_run[0:n_run:2].tolist(), a_run[1:n_run:2].tolist())) == [
+            tuple(x) for x in d["scheduled_running"]
+        ]
+        assert list(
+            zip(
+                a_adm[0:n_adm:3].tolist(),
+                a_adm[1:n_adm:3].tolist(),
+                a_adm[2:n_adm:3].tolist(),
+            )
+        ) == [tuple(x) for x in d["scheduled_admitted"]]
+        assert a_blk[:n_blk].tolist() == list(d["running_new_blocks"])
+        assert a_lens[:n_len].tolist() == list(d["running_new_lens"])
+        assert a_pre[:n_pre].tolist() == list(d["preempted"])
+        assert a_wait[:n_wait].tolist() == list(d["waiting_order"])
+        return d
+
+    slots = []
+    for i in range(4):
+        tokens = [7000 + i * 1000 + t for t in range(80)]
+        slot = kv.intern(f"r{i}")
+        kv.push_hashes(
+            slot, b"".join(vtl_sched.block_hashes(none_hash, block_size, tokens)), 80
+        )
+        slots.append(slot)
+
+    # Admission step: non-empty scheduled_admitted and waiting_order.
+    d = compare(core.schedule_arena(kv, [], [req(s, 64, 0, 0) for s in slots], True))
+    assert len(d["scheduled_admitted"]) > 0
+    # Decode step: non-empty scheduled_running plus the block deltas.
+    d = compare(
+        core.schedule_arena(kv, [req(s, 65, 64, 1) for s in slots], [], True)
+    )
+    assert len(d["scheduled_running"]) == len(slots)
+    # ...and the lean epilogue really did drop the key when asked for.
+    assert "num_common_prefix_blocks" in d
+    lean = dict(sched_params(block_size, 4096, 8192))
+    lean["lean_decisions"] = True
+    core.set_params(lean)
+    _, _, _, _, _, _, _, d = core.schedule_arena(
+        kv, [req(s, 66, 65, 1) for s in slots], [], True
+    )
+    assert "num_common_prefix_blocks" not in d
+    assert "token_budget_left" not in d, "A1 deleted an unread key"
+
+
+@requires_crate
 def test_workload_actually_exercises_the_prefix_cache():
     """Guard against a vacuously-passing suite: the fixture must produce real reuse."""
     block_size = 16
