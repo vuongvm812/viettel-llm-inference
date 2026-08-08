@@ -31,13 +31,42 @@ loras)`` tuple is dispatched through both vLLM's manager and the Rust table, and
 disagreement refuses the arm. That check is the whole reason it is safe to have a second
 dispatcher at all.
 
+THE PER-STEP HANDSHAKE (M2). Three module globals, same lifetime story as ``BURST``:
+
+  * ``STATE.step`` -- the STASH. ``rust_sched.commit_burst`` writes it at schedule time
+    with everything the launch needs that only the scheduler knows (slot layout, the
+    committed burst width, the publish hint). ``nstep_decode``'s ``sample_tokens`` takes it,
+    matches it against the batch it is actually holding, and either launches or drops it.
+  * ``STATE.done`` -- the RESULT. Written by the launch, applied by
+    ``rust_sched.update_from_output`` through the existing ``r9_apply`` residue loop.
+  * ``STATE.inflight`` -- scheduled steps not yet applied. See below.
+
+WHY ``inflight`` EXISTS, and why it is not optional. Rust commits a step's tokens INSIDE
+``sample_tokens`` (``step_pack_locked`` appends to the token store, applies the resident
+table delta and caches blocks); Python commits them later, inside ``update_from_output``.
+With async scheduling the engine runs a batch queue of depth 2
+(``vllm_config.max_concurrent_batches`` = pp_size + 1 on the V2 runner), and its loop is
+
+    schedule(k) -> execute(k) -> sample(k) -> update(k-1)
+
+so ``sample(k)`` runs BEFORE step k-1 has been applied. A Rust commit at ``sample(k)``
+would therefore append step k's tokens ahead of step k-1's -- scrambled output text and a
+block-hash chain fingerprinting positions in the wrong order. Nothing crashes. So the
+launch requires ``STATE.inflight == 1``: this step is the only one not yet applied, i.e.
+every earlier step's tokens are already in the store. Under the served async-scheduling
+config that is only true when the batch queue is empty, so the runner arms, self-checks and
+stays idle; making it engage in steady state means giving the runner the loop (RUST-RUNNER.md
+Phase 3 / ``max_concurrent_batches`` = 1), not relaxing this gate.
+
 ``VTL_RUST_RUNNER``: "0" off, "1" on.
+``VTL_RUST_RUNNER_STEPS``: burst launches per FFI call (M4 ceiling).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from typing import NamedTuple
 
 log = logging.getLogger("vllm.vtl.runner")
 
@@ -59,15 +88,49 @@ def max_steps() -> int:
     return max(1, min(n, 64))
 
 
+class _Stash(NamedTuple):
+    """What the scheduler committed, handed to the launch site. One per scheduled step.
+
+    ``key`` is the request ids in ``slots`` ORDER, not in ``num_scheduled_tokens`` order --
+    built that way on purpose: the launch site checks ``key == tuple(ib.req_ids)``, and
+    because the key was derived from the slot list, a passing check is the proof that
+    ``slots[i]`` is the slot of the batch row ``i`` the runner is about to sample. There is
+    no separate ordering assert to keep in sync.
+    """
+
+    key: tuple
+    slots: tuple
+    reqs: tuple           # the Request objects, in the same order (residue needs them)
+    n: int                # tokens per burst launch
+    steps: int            # launches committed; the step's token budget is n * steps
+    max_model_len: int
+    fold: bool            # fold cache_blocks into the crossing (R9.live)
+    publish: bool         # inline shm publish is safe this step
+
+
+class _Done(NamedTuple):
+    """What the launch produced, handed back to ``update_from_output``."""
+
+    stash: _Stash
+    verdicts: list        # (num_accepted, status, stop_reason) for the LAST launch
+    records: list         # R8 records that were NOT published inline, in order
+    exit: str             # LoopExit: "budget" | "stopped"
+    ran: int              # launches that actually ran (<= stash.steps)
+
+
 class _State:
     """Module-global, like ``BURST`` and ``decode_fastpath._C``: one runner per process."""
 
-    __slots__ = ("runner", "live", "why")
+    __slots__ = ("runner", "live", "why", "step", "done", "inflight", "engaged")
 
     def __init__(self) -> None:
         self.runner = None      # the vtl_sched.Runner, once armed
-        self.live = False       # may run_step() be called?
+        self.live = False       # may run_steps() be called?
         self.why = "not armed"  # the one reason, logged once
+        self.step = None        # the pending _Stash, or None
+        self.done = None        # the pending _Done, or None
+        self.inflight = 0       # scheduled steps not yet applied; see the module docstring
+        self.engaged = 0        # launches taken this boot, for the once-in-a-while log
 
     def refuse(self, why: str) -> None:
         """Permanent stand-down for the boot. Never raises -- the caller keeps the stock path."""
@@ -77,11 +140,20 @@ class _State:
             log.info("vtl: rust runner not armed -- %s", why)
         self.live = False
         self.why = why
+        self.step = None
+        self.done = None
         if self.runner is not None:
             try:
                 self.runner.disarm()
             except Exception:  # pragma: no cover - a disarm that throws must not propagate
                 log.exception("vtl: rust runner disarm failed")
+
+    def take_step(self) -> "_Stash | None":
+        """Pop the stash. Always popped, launch or no launch: a stash names a SCHEDULED
+        step, and the next step's batch can have the identical request-id key, so a
+        leftover would match a step it was never written for."""
+        stash, self.step = self.step, None
+        return stash
 
 
 STATE = _State()
@@ -393,12 +465,31 @@ def _self_check() -> None:
 
     s = _State()
     s.runner, s.live = Boom(), True
+    stash = _Stash(("a",), (0,), (object(),), 4, 1, 32768, True, True)
+    s.step = stash
+    s.done = _Done(stash, [(4, 0, -1)], [], "budget", 1)
     logging.disable(logging.CRITICAL)  # the traceback below is expected; don't print it
     try:
         s.refuse("testing")
     finally:
         logging.disable(logging.NOTSET)
     assert not s.live and s.why == "testing"
+    assert s.step is None and s.done is None, "a refusal must strand no handshake"
+
+    # The stash is POPPED, launch or no launch: the next step's batch can have the exact
+    # same request-id key, so a leftover would match a step it was never written for.
+    s = _State()
+    s.step = stash
+    assert s.take_step() is stash
+    assert s.take_step() is None and s.step is None
+
+    # `inflight` is the ordering interlock: a launch is only legal when this step is the
+    # only one not yet applied. The counter itself is scheduler-side; what has to hold
+    # here is that it starts clean and clamps at zero (an unpaired update must not make
+    # the interlock read as open on the step after it).
+    assert _State().inflight == 0
+    s.inflight = max(0, s.inflight - 1)
+    assert s.inflight == 0
 
     print("rust_runner self-check ok")
 

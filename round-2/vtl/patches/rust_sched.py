@@ -183,6 +183,14 @@ def modes() -> dict:
         # C1a: N-step decode burst commitment. Needs the full Rust loop (the commit
         # extends the resident table in the same place the schedule decisions land).
         "nstep": full and env_on("VTL_NSTEP"),
+        # The Rust steady-state runner's SCHEDULER half: stash the step layout at commit,
+        # apply the crate's verdicts instead of running decide(). Rides on the burst commit
+        # (the runner launches the burst's unroll graph) and on R9 (the runner drives
+        # `step_pack_locked`, whose output only the R9 residue loop knows how to apply).
+        # `VTL_RUST_RUNNER` is NOT read here -- it defaults ON, which `env_on` cannot
+        # express; the install resolves it through `rust_runner.mode()`.
+        "runner": full and env_on("VTL_NSTEP") and tokstore
+                  and env_on("VTL_RUST_SCHED_R9"),
         "tokstore": tokstore,
         # R9: collapse decide()/r8_apply's per-request Python loops into the single
         # update_step_pack_np crossing (+ the crate-side cache_blocks fold). Needs the
@@ -1916,6 +1924,22 @@ def _install_update_from_output(scheduler_cls, m: dict):
             _out_open_latched = True
         return _pub_mod.PUB.enqueued == _pub_mod.PUB.published
 
+    # The Rust steady-state runner's scheduler half. Resolved here rather than in `modes()`
+    # because it needs `rust_runner.mode()` (which defaults ON) and, more importantly,
+    # because the stash it writes is only applicable on exactly the boots this function's
+    # R9 residue path is live on -- the runner commits through `step_pack_locked`, the same
+    # crate entry point `update_step_pack_np` takes, so `r9_apply` is what applies it.
+    RUNNER = m["runner"]
+    runner_mod = None
+    if RUNNER:
+        try:
+            from vtl.patches import rust_runner as runner_mod
+
+            RUNNER = runner_mod.mode() == "on"
+        except Exception:
+            log.exception("rust_sched: rust_runner not importable; no runner handshake")
+            RUNNER = False
+
     wrapped_ufo = scheduler_cls.update_from_output
     wrapped_urwo = scheduler_cls._update_request_with_output
     monotonic = time.monotonic
@@ -1984,6 +2008,28 @@ def _install_update_from_output(scheduler_cls, m: dict):
             tok_facade_on(request)
         return True
 
+    def step_packable_here(self, scheduler_output) -> bool:
+        """The half of ``step_packable`` that does not need the ModelRunnerOutput.
+
+        Split out so the Rust runner's commit-time stash can ask the same question one step
+        EARLIER, at schedule time, when the mro does not exist yet. The clauses left to
+        ``step_packable`` are all properties of a step's output, and the runner's stash gate
+        excludes every one of them by other means: the burst gate refuses logprobs and
+        structured output, `_emit` builds no pooler output or routed experts, and
+        `kv_connector_output` is `None` exactly when `self.connector is None` (checked
+        here).
+        """
+        return (
+            not scheduler_output.has_structured_output_requests
+            and not self.log_stats
+            and self.connector is None
+            and self.finished_req_ids_dict is None
+            and not self.defer_block_free
+            and not self.enable_kv_cache_events
+            and not self.enable_return_routed_experts
+            and (self.perf_metrics is None or not self.perf_metrics.is_enabled())
+        )
+
     def step_packable(self, scheduler_output, mro) -> bool:
         """R8 gate: can this whole step's OUTPUT be a single Rust-built raw record?
 
@@ -2005,15 +2051,103 @@ def _install_update_from_output(scheduler_cls, m: dict):
             and mro.kv_connector_output is None
             and mro.routed_experts is None
             and mro.cudagraph_stats is None
-            and not scheduler_output.has_structured_output_requests
-            and not self.log_stats
-            and self.connector is None
-            and self.finished_req_ids_dict is None
-            and not self.defer_block_free
-            and not self.enable_kv_cache_events
-            and not self.enable_return_routed_experts
-            and (self.perf_metrics is None or not self.perf_metrics.is_enabled())
+            and step_packable_here(self, scheduler_output)
         )
+
+    def runner_stash(self, kv, scheduler_output, by_slot, slots, n, steps) -> bool:
+        """Promise the Rust runner this step, or ``False``. Called from ``commit_burst``.
+
+        WHAT THE PROMISE IS: "if you launch, ``step_pack_locked`` will pack, and the
+        residue will be applied by ``r9_apply``". So every predicate ``decide()``'s lazy R9
+        branch would have checked is checked HERE instead, one step earlier -- the runner
+        cannot fall back mid-step, because by then the graph has already fed its tokens
+        back into the persistent input buffers.
+
+        The per-slot half is two set lookups: ``mirror._stops`` (the slot has interned stop
+        params, so the crate can decide the stop rather than returning 255) and
+        ``mirror._pack_ok`` (the six clauses the R8 record has no field for). Both are
+        populated by ``decide()`` on an earlier step, so the first decode step of a request
+        never stashes -- which is also when its counters are least likely to be interned.
+
+        ``facaded`` is the third: ``r9_apply``'s counter writes ARE the facade branch of
+        ``_urwo_inner``, and the crate's token store is what holds the tokens the launch
+        will append.
+        """
+        state = runner_mod.STATE
+        if not state.live or state.step is not None or state.done is not None:
+            return False
+        if not (R9.live and TOK.live and r8_live()):
+            return False
+        if not step_packable_here(self, scheduler_output):
+            return False
+        mirror = kv._mirror
+        reqs = []
+        for slot in slots:
+            if slot not in mirror._stops or slot not in mirror._pack_ok:
+                return False
+            request = by_slot[slot]
+            if not facaded(request):
+                return False
+            reqs.append(request)
+        state.step = runner_mod._Stash(
+            # From the SLOT order, so the launch site's `key == tuple(ib.req_ids)` check
+            # doubles as the proof that slots[i] is the slot of batch row i.
+            key=tuple(r.request_id for r in reqs),
+            slots=tuple(slots),
+            reqs=tuple(reqs),
+            n=n,
+            steps=steps,
+            max_model_len=int(self.max_model_len),
+            fold=True,               # == R9.live, checked above
+            publish=out_publish_ready(kv._rust),
+        )
+        return True
+
+    def runner_consume(self, done) -> None:
+        """Turn the runner's ``_Done`` into exactly the state ``r9_apply`` reads.
+
+        Rust already took the crossing (``step_pack_locked`` IS ``update_step_pack_np``'s
+        locked body: token store, resident delta, R8 record, inline publish), so
+        ``decide()`` must not run -- it would append the same tokens a second time. What is
+        left is the residue loop, which is ``r9_apply`` unchanged.
+        """
+        stash = done.stash
+        n, ran = stash.n, done.ran
+        # `run_steps` breaks on the FIRST non-zero verdict, so every launch before the last
+        # one accepted the full width; only the last one's verdicts can be short.
+        base = (ran - 1) * n
+        verdicts = done.verdicts
+        if done.exit == "unpacked":
+            # Should-never-happen: the crate refuses the pre-flight rather than reach here.
+            # The failed launch appended NOTHING to the token store (`store_apply` runs
+            # only on a packed step) but did advance the resident table, so drop that
+            # launch from the residue, force a table resync, and let `burst_uncommit` give
+            # its tokens back -- the same reconcile a stopped burst uses.
+            log.error("rust_sched: the runner could not pack launch %d; standing down", ran)
+            runner_mod.STATE.refuse("a launch did not pack")
+            self._vtl_ufo_clean = False
+            verdicts = [(0, 0, -1)] * len(stash.slots)
+            base = max(0, base - n)
+        self._vtl_r9_residue = [
+            (slot, req, (base + acc, status, stop))
+            for slot, req, (acc, status, stop) in zip(stash.slots, stash.reqs, verdicts)
+        ]
+        # Read off the STASH, not off `scheduler_output.vtl_burst_n`: the stash is what the
+        # tokens were committed against, so the shortfall stays right either way.
+        self._vtl_burst_n = n * stash.steps
+        records = done.records
+        self._vtl_r8_record = records[0] if records else None
+        self._vtl_r8_published = not records
+        if len(records) > 1:
+            # `update_from_output` returns ONE record per engine index, so there is nowhere
+            # to put the rest. Cannot happen: a multi-launch commit requires the inline
+            # publish. If it ever does, say so and stand down rather than drop outputs on
+            # every later step too.
+            log.error(
+                "rust_sched: the runner returned %d unpublished records for one step; "
+                "%d cannot be delivered", len(records), len(records) - 1,
+            )
+            runner_mod.STATE.refuse("multi-record step without the inline publish")
 
     def decide(self, kv, scheduler_output, model_runner_output, pack: bool):
         """Build the flat batch and take the single crossing. None = nothing portable.
@@ -2343,8 +2477,22 @@ def _install_update_from_output(scheduler_cls, m: dict):
         # delta and must be resynced before it can be scheduled from again.
         self._vtl_ufo_clean = True
         kv = self.kv_cache_manager
+        done = None
+        if RUNNER:
+            # THE ONE PLACE a scheduled step is counted as applied. `inflight` is the
+            # runner's launch interlock -- Rust commits at sample time and Python commits
+            # here, so a launch while an earlier step is still unapplied would order this
+            # step's tokens ahead of that one's (rust_runner's module docstring).
+            state = runner_mod.STATE
+            state.step = None
+            state.inflight = max(0, state.inflight - 1)
+            done = state.done
         sampled = model_runner_output.sampled_token_ids
-        if (
+        if done is not None:
+            # Rust ran and committed this step. Skip decide() -- it would append the same
+            # tokens again -- and hand `r9_apply` the residue it already knows how to take.
+            runner_consume(self, done)
+        elif (
             hasattr(kv, "_rust")
             and sampled
             and not scheduler_output.scheduled_spec_decode_tokens
@@ -2401,6 +2549,10 @@ def _install_update_from_output(scheduler_cls, m: dict):
             self._vtl_r8_published = False
             self._vtl_r9_residue = None
             self._vtl_burst_n = 1
+            if RUNNER:
+                # Applied (or dropped, if the branch above raised): either way this step's
+                # result must not be seen again, and the next launch is unblocked.
+                state.done = None
         if spec:
             maybe_kick(self, kv)
         if outputs:
@@ -2491,14 +2643,20 @@ def _install_update_from_output(scheduler_cls, m: dict):
     mark_patched(_update_request_with_output, wrapped_urwo, patch="rust_sched_ufo")
     scheduler_cls.update_from_output = update_from_output
     scheduler_cls._update_request_with_output = _update_request_with_output
+    if RUNNER:
+        # `commit_burst` lives in `_install_full_schedule`'s closure, which cannot see
+        # `r8_live` / `out_publish_ready` / this function's R9 view. Publishing the stash
+        # writer on the class is the one narrow seam between the two installs; its absence
+        # is also how `commit_burst` knows the runner handshake is not available.
+        scheduler_cls._vtl_runner_stash = runner_stash
     if STORE:
         _install_preempt_hook(scheduler_cls)
         if TOK.live:
             _install_async_output()
     log.info(
         "rust_sched: UFO batched stop decision active "
-        "(kick=%s, r8=%s, tokstore=%s, r9=%s)",
-        spec, _r8[0], STORE, R9.live,
+        "(kick=%s, r8=%s, tokstore=%s, r9=%s, runner=%s)",
+        spec, _r8[0], STORE, R9.live, RUNNER,
     )
 
 
@@ -2592,6 +2750,22 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         "VTL_NSTEP_QUEUE_EMPTY_ONLY", "1"
     ).strip().lower() in _TRUTHY
 
+    # The Rust runner's scheduler half. `runner_mod` is only used for the in-flight counter
+    # and the multi-step ceiling here -- the stash itself is written by the closure
+    # `_install_update_from_output` published on the class (see `commit_burst`).
+    RUNNER = m["runner"]
+    runner_mod = None
+    RUNNER_STEPS = 1
+    if RUNNER:
+        try:
+            from vtl.patches import rust_runner as runner_mod
+
+            RUNNER = runner_mod.mode() == "on"
+            RUNNER_STEPS = runner_mod.max_steps()
+        except Exception:
+            log.exception("rust_sched: rust_runner not importable; no runner handshake")
+            RUNNER = False
+
     def skip_note(self, why: str) -> None:
         """First-reason-only logging: names each new reason once, then stays quiet."""
         seen = self._vtl_burst_skips
@@ -2640,6 +2814,12 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                         if why is not None:
                             break
                 if why is None:
+                    # The Rust runner's promise for this step, taken BEFORE the commit. A
+                    # refusal (or no runner at all) just means the worker replays the
+                    # unroll graph itself, exactly as before.
+                    stash = getattr(self, "_vtl_runner_stash", None)
+                    if stash is not None:
+                        stash(kv, so, by_slot, slots, n, 1)
                     delta = n - 1
                     for slot in slots:
                         burst_commit(by_slot[slot], delta)
@@ -2680,6 +2860,11 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     def schedule(self, *args, **kwargs):
         nonlocal LEAN, lean_check_left, ARENA, arena_check_left, arena_bufs
         nonlocal RING, ring_i
+        if RUNNER:
+            # Counted BEFORE any fallback return: every step that gets scheduled also gets
+            # an `update_from_output` (the engine pops every batch it queues), and the
+            # runner's launch interlock is the difference between the two.
+            runner_mod.STATE.inflight += 1
         kv = self.kv_cache_manager
         core = getattr(self, "_vtl_rust_core", None)
         if core is None:
@@ -3415,7 +3600,7 @@ def _self_check() -> None:
             "authority": False,
             "full": False, "radix": False, "ufo": False,
             "table": False, "spec": False, "timing": False,
-            "r8": False, "hasher": False, "nstep": False,
+            "r8": False, "hasher": False, "nstep": False, "runner": False,
             "tokstore": False,
             "r9": False,
             "lean": False, "lean_check": False,
@@ -3525,6 +3710,23 @@ def _self_check() -> None:
         os.environ["VTL_RUST_SCHED_R9"] = "1"
         assert modes()["r9"] is False, "R9 cannot arm without the token store"
         os.environ.pop("VTL_RUST_SCHED_R9")
+
+        # The Rust runner's scheduler half needs the burst commit (it launches the burst's
+        # own graph) AND R9 (its verdicts are applied by the residue loop, nothing else).
+        os.environ["VTL_RUST_SCHED_TOKSTORE"] = "1"
+        os.environ["VTL_RUST_SCHED_R9"] = "1"
+        assert modes()["runner"] is True
+        os.environ["VTL_NSTEP"] = "0"
+        assert modes()["runner"] is False, "no burst commit, no unroll graph to launch"
+        os.environ["VTL_NSTEP"] = "1"
+        os.environ["VTL_RUST_SCHED_R9"] = "0"
+        assert modes()["runner"] is False, "only r9_apply knows how to apply the verdicts"
+        os.environ["VTL_RUST_SCHED_R9"] = "1"
+        os.environ["VTL_RUST_SCHED_TOKSTORE"] = "0"
+        assert modes()["runner"] is False
+        os.environ.pop("VTL_RUST_SCHED_R9")
+        os.environ.pop("VTL_RUST_SCHED_TOKSTORE")
+        os.environ["VTL_NSTEP"] = "1"
 
         # The hasher is independent: it needs only the extension, not the scheduler.
         os.environ["VTL_RUST_SCHED_FULL"] = "0"

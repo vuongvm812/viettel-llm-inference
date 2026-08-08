@@ -65,8 +65,18 @@ MODES (``VTL_NSTEP_MODE``), a ladder that degrades on its own:
 IN-GRAPH LADDER (each rung is captured independently at boot and each failure demotes to the
 rung below, logging once; nothing is ever retried):
 
+  0. ``VTL_RUST_RUNNER=1`` -- the unroll graph is launched by the Rust runner
+     (``rust_runner.py``) instead of by ``replay()``, which also moves the D2H and the whole
+     step commit into the crate; with ``VTL_RUST_RUNNER_STEPS>1`` it launches the
+     CONTINUATION graph (rung 0b, below) for launches 2..k without returning to Python.
+     Strictly a rung above the unroll graph: it launches exactly that exec, and every
+     refusal falls through to rung 1.
   1. ``VTL_NSTEP_UNROLL=1``  -- ONE graph per burst size holding the prologue, all N-1
      bodies AND the final accumulator store. The whole burst is a single ``replay()``.
+     With the runner on, a CONTINUATION graph is captured alongside it: N bodies and the
+     accumulator store with NO prologue, so it feeds off ``b.tok`` (the previous launch's
+     last token) instead of the hidden states, which is what makes back-to-back launches
+     legal.
   2. ``VTL_NSTEP_FOLD_T1=1`` -- the PROLOGUE graph: ``compute_logits`` on the
      ``cudagraph_manager.hidden_states`` persistent buffer plus the ``argmax`` for token 1.
      Replayed once ahead of the N-1 body replays, so no logits/argmax is host-launched.
@@ -142,6 +152,8 @@ class _Burst:
         # in-graph ladder (VTL_NSTEP_FOLD_T1 / VTL_NSTEP_UNROLL / VTL_SAMPLE_IN_GRAPH)
         "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs",
         "ones", "zeros", "pending1",
+        # the Rust runner's rung (VTL_RUST_RUNNER / _STEPS)
+        "continue_graphs", "rust_steps", "nsampled_k", "nrejected_k",
     )
 
     def __init__(self) -> None:
@@ -173,6 +185,11 @@ class _Burst:
         self.ones = None         # [max_num_reqs] int32 filled with 1  (num_sampled, N=1)
         self.zeros = None        # [max_num_reqs] int32 filled with 0  (num_rejected, N=1)
         self.pending1 = False    # in-graph N=1 sampling committed for this step
+        # --- the Rust runner's rung ---
+        self.continue_graphs: dict = {}  # rows -> (graph, desc, n): launches 2..k
+        self.rust_steps = 1      # VTL_RUST_RUNNER_STEPS, or 1 when the runner is off
+        self.nsampled_k = None   # [max_num_reqs] int32, a multi-launch step's real total
+        self.nrejected_k = None  # [max_num_reqs] int32, -(total - 1)
 
     def disable(self, why: str) -> None:
         """Permanent, process-lifetime fallback to one token per step."""
@@ -189,6 +206,8 @@ class _Burst:
         if rung == "unroll":
             self.unroll = False
             self.unroll_graphs = {}
+            # The Rust runner launches the unroll exec, so it cannot outlive it either.
+            self.continue_graphs = {}
         elif rung == "fold":
             self.fold = False
             self.sample1 = False
@@ -196,6 +215,7 @@ class _Burst:
             # The unroll graph CONTAINS the prologue, so it cannot outlive it.
             self.unroll = False
             self.unroll_graphs = {}
+            self.continue_graphs = {}
 
 
 BURST = _Burst()
@@ -744,6 +764,104 @@ def _run_burst(runner, b: _Burst, n: int, ib, hidden):
     return _burst_output(b, num_reqs, n, SamplerOutput)
 
 
+def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
+    """The same burst, launched and committed by the Rust runner. ``None`` = declined.
+
+    THE ONLY DIFFERENCE FROM ``_run_burst``'s graph arm is who calls ``cuGraphLaunch`` and
+    what happens after it: the crate replays the very same unroll exec on the very same
+    stream from the very same thread (``python.rs`` re-checks ``cuCtxGetCurrent`` against
+    arm-time), then does its pre-planned pinned D2H and commits the tokens through
+    ``step_pack_locked`` -- the identical crate entry point ``update_step_pack_np`` takes,
+    so the scheduler's per-request Python loop (``decide()``) has nothing left to do.
+
+    EVERY refusal below falls through to ``_run_burst``, which is a complete, correct step:
+    the scheduler committed ``n * steps`` tokens, the Python arm produces ``n``, and the
+    shortfall is reconciled by the same ``burst_uncommit`` path a stopped burst uses.
+
+    Host prep stays here rather than moving into the crate (RUST-RUNNER.md 2, "few host
+    inputs"): two writes, both into buffers the graph baked.
+    """
+    import time
+
+    from vtl.patches import rust_runner
+
+    stash = rust_runner.STATE.take_step()
+    state = rust_runner.STATE
+    if not state.live or stash is None or state.done is not None:
+        return None
+    # See rust_runner's module docstring: Rust commits at SAMPLE time and Python commits at
+    # UPDATE time, so a launch while an earlier step is still unapplied would put this
+    # step's tokens into the store ahead of that one's.
+    if state.inflight != 1:
+        return None
+    num_reqs = ib.num_reqs
+    if stash.key != tuple(ib.req_ids) or stash.n != n or stash.steps != steps:
+        return None
+    pad = ib.num_reqs_after_padding
+    entry = b.unroll_graphs.get(pad)
+    # The same three predicates `_run_burst`'s graph arm applies before it replays: the
+    # descriptor the step actually dispatched, the burst width the graph was captured for,
+    # and this step's hidden states living at the address the prologue baked.
+    if entry is None or entry[1] != b.desc or entry[2] != n:
+        return None
+    if not _hidden_is_persistent(runner, hidden, pad):
+        return None
+    if steps > 1:
+        cont = b.continue_graphs.get(pad)
+        if cont is None or cont[1] != b.desc or cont[2] != n:
+            return None
+
+    b.idx_map[:num_reqs].copy_(ib.idx_mapping, non_blocking=True)
+    b.rows.fill_(num_reqs)
+    # No `b.step.zero_()`: the unroll graph does it in-graph, and the continuation graphs
+    # deliberately do NOT (they keep filling the next `n` accumulator columns).
+
+    try:
+        out = rust_runner.STATE.runner.run_steps(
+            steps, num_reqs, pad, 1, 0,
+            list(range(num_reqs)), [n] * num_reqs, list(stash.slots),
+            stash.max_model_len, 0, time.monotonic(), (),
+            stash.fold, stash.publish,
+        )
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        # Includes a crate panic (PanicException derives from BaseException). The tokens
+        # were either all committed or none were -- `step_pack_locked` is one locked call
+        # per launch -- but we cannot tell which from here, so stand down for the boot and
+        # let this step run in Python. A double-commit would show up immediately as garbled
+        # output rather than silently.
+        log.exception("vtl: rust runner launch raised; disabled for this boot")
+        rust_runner.STATE.refuse("run_steps raised")
+        return None
+    if out is None:
+        # Declined inside the crate: not armed, or the shape has no launchable graph.
+        return None
+
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+    verdicts, records, exit_reason, ran = out
+    state.done = rust_runner._Done(stash, verdicts, list(records), exit_reason, int(ran))
+    state.engaged += 1
+    if state.engaged == 1 or not state.engaged & 0x1FFF:
+        log.info(
+            "vtl: rust runner engaged -- %d launches (n=%d, steps=%d, ran=%d, batch=%d)",
+            state.engaged, n, steps, ran, num_reqs,
+        )
+    total = ran * n
+    if total == b.n:
+        # The k=1 case, i.e. every step until VTL_RUST_RUNNER_STEPS>1 has headroom: the
+        # pre-filled pair already says exactly this.
+        return _burst_output(b, num_reqs, total, SamplerOutput)
+    # `post_update` reads BOTH of these off the device, so a multi-launch step has to say
+    # how many tokens it really produced (`ran`, not `steps` -- a stop verdict exits early).
+    return _burst_output(
+        b, num_reqs, total, SamplerOutput,
+        b.nsampled_k.fill_(total)[:num_reqs],
+        b.nrejected_k.fill_(-(total - 1))[:num_reqs],
+    )
+
+
 def _sample_one_in_graph(runner, b: _Burst, ib, hidden):
     """In-graph greedy sampling for a plain 1-token decode step. ``None`` = use stock.
 
@@ -779,7 +897,14 @@ def _sample_one_in_graph(runner, b: _Burst, ib, hidden):
     )
 
 
-def _burst_output(b: _Burst, num_reqs: int, n: int, SamplerOutput):
+def _burst_output(b: _Burst, num_reqs: int, n: int, SamplerOutput,
+                  num_sampled=None, num_rejected=None):
+    """``n`` tokens per request out of the accumulator's first ``n`` columns.
+
+    ``num_sampled`` / ``num_rejected`` default to the pre-filled ``BURST.n`` pair; the Rust
+    multi-launch path passes its own, because there ``n`` is ``ran * width`` and not the
+    burst width the constant pair was filled with.
+    """
     return SamplerOutput(
         # CLONED, not a view of the persistent accumulator: `AsyncOutput` copies this to
         # the host on a SECOND stream and the copy is still in flight when the next step
@@ -788,12 +913,12 @@ def _burst_output(b: _Burst, num_reqs: int, n: int, SamplerOutput):
         sampled_token_ids=b.accum[:num_reqs, :n].clone(),
         logprobs_tensors=None,
         num_nans=None,
-        num_sampled=b.num_sampled[:num_reqs],
+        num_sampled=b.num_sampled[:num_reqs] if num_sampled is None else num_sampled,
         # ponytail: post_update computes `computed_delta = query_len - num_rejected`
         # (input_batch.py:509) and query_len is 1 on a decode step, so a num_rejected of
         # -(N-1) is how a plain N is expressed with no kernel change. It is used for
         # nothing else on this path -- there is no speculator and no PP broadcast.
-        num_rejected=b.num_rejected[:num_reqs],
+        num_rejected=b.num_rejected[:num_reqs] if num_rejected is None else num_rejected,
     )
 
 
@@ -807,7 +932,13 @@ def _alloc(runner, b: _Burst) -> None:
 
     dev = runner.device
     m = runner.max_num_reqs
-    b.accum = torch.zeros((m, b.n), dtype=torch.int64, device=dev)
+    # WIDER THAN ONE BURST when the Rust runner may drive several launches per step: the
+    # continuation graph does NOT reset the accumulator column counter, so launch i fills
+    # columns [i*n, (i+1)*n) and `postprocess_sampled` gets every token the step produced
+    # (it writes them into `req_states.all_token_ids`, so a missing one is a wrong resume).
+    # `+ 2` is capture headroom: the boot shadow launches the continuation graph twice from
+    # a step counter primed at n-1, i.e. up to column 3n-1.
+    b.accum = torch.zeros((m, b.n * (b.rust_steps + 2)), dtype=torch.int64, device=dev)
     b.tok = torch.zeros(m, dtype=torch.int64, device=dev)
     b.step = torch.zeros(1, dtype=torch.int32, device=dev)
     # The real request count, as a DEVICE scalar so a captured graph (whose grid is baked at
@@ -820,6 +951,9 @@ def _alloc(runner, b: _Burst) -> None:
     # `post_update`'s `computed_delta = query_len - num_rejected` reads on a normal step.
     b.ones = torch.ones(m, dtype=torch.int32, device=dev)
     b.zeros = torch.zeros(m, dtype=torch.int32, device=dev)
+    # Filled per multi-launch Rust step; unused (and untouched) on every other path.
+    b.nsampled_k = torch.full((m,), b.n, dtype=torch.int32, device=dev)
+    b.nrejected_k = torch.full((m,), -(b.n - 1), dtype=torch.int32, device=dev)
 
 
 def _patch_runner(b: _Burst) -> None:
@@ -971,9 +1105,23 @@ def _patch_runner(b: _Burst) -> None:
             b.disable("readiness probe raised")
 
     def _sample_burst(runner, b, n, state):
+        """``n`` is the whole step's committed token BUDGET, which the Rust runner's
+        multi-step commit makes a multiple of the burst width.
+
+        The width is always ``b.n`` -- it is the only width any burst graph was captured
+        for -- so the launch count follows from the budget and needs no second field on the
+        SchedulerOutput to disagree with. The Rust runner takes all the launches in one FFI
+        call; the Python arm runs ONE burst and the scheduler reconciles the rest through
+        ``burst_uncommit``, the same shortfall path a stopped burst already uses.
+        """
         ib = state.input_batch
+        width = b.n if n >= b.n and not n % b.n else n
+        steps = n // width
+        out = _run_burst_rust(runner, b, width, steps, ib, state.hidden_states)
+        if out is None:
+            out = _run_burst(runner, b, width, ib, state.hidden_states)
         runner.execute_model_state = None
-        return _emit(runner, state, _run_burst(runner, b, n, ib, state.hidden_states))
+        return _emit(runner, state, out)
 
     def _emit(runner, state, sampler_output):
         """``sample_tokens``' last-rank tail, with ``sampler_output`` already produced.
@@ -1041,6 +1189,17 @@ def apply() -> None:
     b.fold = graph and _flag("VTL_NSTEP_FOLD_T1")
     b.unroll = b.fold and _flag("VTL_NSTEP_UNROLL")
     b.sample1 = b.fold and _flag("VTL_SAMPLE_IN_GRAPH")
+    # The Rust runner rides the unroll rung (it launches exactly that graph), so it can
+    # never outlive it. Read here rather than at capture time so `_alloc` can size the
+    # accumulator for the widest multi-launch step the runner may ever take.
+    b.rust_steps = 1
+    if b.unroll:
+        try:
+            from vtl.patches import rust_runner
+
+            b.rust_steps = rust_runner.max_steps() if rust_runner.mode() == "on" else 1
+        except Exception:
+            log.exception("vtl: rust runner module not importable; one launch per step")
     if b.mode not in ("graph", "eager"):
         log.info("vtl: nstep decode off (VTL_NSTEP_MODE=%s)", b.mode)
         return
@@ -1050,8 +1209,9 @@ def apply() -> None:
     b.advance, b.bump = _build_kernels()
     _patch_runner(b)
     log.info(
-        "vtl: nstep decode installed (N=%d, mode=%s, fold_t1=%s, unroll=%s, sample1=%s); "
-        "the scheduler arms it", b.n, b.mode, b.fold, b.unroll, b.sample1,
+        "vtl: nstep decode installed (N=%d, mode=%s, fold_t1=%s, unroll=%s, sample1=%s, "
+        "rust_steps=%d); the scheduler arms it",
+        b.n, b.mode, b.fold, b.unroll, b.sample1, b.rust_steps,
     )
 
 
@@ -1147,7 +1307,8 @@ def _self_check() -> None:
                  "num_sampled", "num_rejected", "desc", "pending", "graphs", "runner",
                  "armed", "ready", "key", "n", "mode",
                  "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs",
-                 "ones", "zeros", "pending1"):
+                 "ones", "zeros", "pending1",
+                 "continue_graphs", "rust_steps", "nsampled_k", "nrejected_k"):
         setattr(BURST, name, getattr(BURST, name))
     assert set(_Burst.__slots__) == {
         "armed", "ready", "key", "n", "mode", "runner", "graphs", "accum", "tok", "step",
@@ -1155,6 +1316,7 @@ def _self_check() -> None:
         "advance", "bump", "idx_map", "rows", "max_seq_len",
         "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs", "ones", "zeros",
         "pending1",
+        "continue_graphs", "rust_steps", "nsampled_k", "nrejected_k",
     }, "the slot list above and __slots__ must not drift"
 
     # The in-graph ladder demotes ONE rung at a time, and `fold` takes `unroll` with it
@@ -1164,18 +1326,21 @@ def _self_check() -> None:
         log.disabled = True
         b.fold = b.unroll = b.sample1 = True
         b.unroll_graphs = {1: object()}
+        b.continue_graphs = {1: object()}
         b.demote("unroll", "test")
         assert not b.unroll and b.unroll_graphs == {}
+        assert b.continue_graphs == {}, "the runner launches the unroll exec"
         assert b.fold and b.sample1, "an unroll failure must not cost the prologue"
         b.unroll = True
         b.pro_graphs = {1: object()}
+        b.continue_graphs = {1: object()}
         b.demote("fold", "test")
         assert not b.fold and not b.sample1 and not b.unroll
-        assert b.pro_graphs == {} and b.unroll_graphs == {}
+        assert b.pro_graphs == {} and b.unroll_graphs == {} and b.continue_graphs == {}
     finally:
         log.disabled = False
         b.fold, b.unroll, b.sample1 = saved_ladder
-        b.pro_graphs, b.unroll_graphs = {}, {}
+        b.pro_graphs, b.unroll_graphs, b.continue_graphs = {}, {}, {}
 
     assert _int("VTL_NOT_SET_ANYWHERE", 4) == 4
     os.environ["VTL_NOT_SET_ANYWHERE"] = "not-a-number"
