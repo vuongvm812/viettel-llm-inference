@@ -7,11 +7,20 @@ failure here sets ``BURST.armed = False`` and the boot keeps the stock path) and
 
 WHAT IT EXPORTS, and why each piece:
 
-  * the GRAPH TABLE -- one row per captured descriptor plus its ``raw_cuda_graph_exec()``,
-    and ``mgr._candidates`` flattened. The candidate lists are copied rather than re-derived
-    because ``_init_candidates`` (cudagraph_utils.py:181) is a policy that can change under
-    us; a second implementation that drifted would silently pick a DIFFERENT graph than vLLM
-    would, which is a wrong answer rather than a crash.
+  * the GRAPH TABLE -- one row per captured descriptor, and ``mgr._candidates`` flattened.
+    The candidate lists are copied rather than re-derived because ``_init_candidates``
+    (cudagraph_utils.py:181) is a policy that can change under us; a second implementation
+    that drifted would silently pick a DIFFERENT graph than vLLM would, which is a wrong
+    answer rather than a crash.
+
+    THE HANDLE IN EACH ROW IS NOT STOCK'S. ``mgr.graphs[desc]`` is the FORWARD-ONLY graph:
+    it ends with hidden states and never writes ``BURST.accum``, which is the buffer
+    ``arm()`` points the pre-planned D2H at. The graph that ends a step with tokens in
+    ``accum`` is nstep's UNROLL graph (``nstep_decode._burst_all``: in-graph ``step.zero_``
+    -> prologue -> N-1 bodies -> accumulator tail), so that is the handle the runner is
+    given. Descriptors with no unroll graph get a row (dispatch fidelity) with a NULL
+    handle, which makes the runner decline that shape instead of launching a graph that
+    would leave `accum` holding the previous step's tokens.
   * the STREAM the graphs were captured on, and nothing else -- the runner uses one stream.
   * the OUTPUT BUFFER: ``BURST.accum``'s device pointer and shape, so the per-step D2H is
     pre-planned into pinned memory the crate owns, replacing ``AsyncOutput``'s freshly
@@ -96,34 +105,60 @@ def _descriptor_fields(desc):
     )
 
 
-def _build_table(runner_obj, mgr, b) -> dict:
-    """Register every captured graph and candidate list. Returns ``{desc: row_index}``."""
-    index = {}
+def _graph_execs(graphs: dict, what: str) -> dict:
+    """``{desc: exec_handle}`` for one of nstep's whole-burst graph dicts.
 
-    def add(desc, graph, full_override=None):
+    ``graphs`` is ``BURST.unroll_graphs`` / ``BURST.continue_graphs``: ``rows -> (graph,
+    desc, n)``. A graph whose handle cannot be read is DROPPED rather than exported as 0,
+    so the descriptor falls through to the null-handle row ``_build_table`` writes for
+    everything else -- same outcome, one code path.
+    """
+    execs = {}
+    for entry in graphs.values():
+        graph, desc = entry[0], entry[1]
+        try:
+            handle = int(graph.raw_cuda_graph_exec())
+        except Exception as exc:
+            log.warning("vtl: no raw_cuda_graph_exec for the %s graph at %s: %s",
+                        what, desc, exc)
+            continue
+        if handle:
+            execs[desc] = handle
+    return execs
+
+
+def _build_table(runner_obj, mgr, b) -> tuple[dict, dict]:
+    """Register every captured graph and candidate list.
+
+    Returns ``({desc: row_index}, {desc: unroll_exec})`` -- the second is what
+    ``_verify_dispatch`` must compare against, since it is what the rows actually hold.
+    """
+    index = {}
+    execs = _graph_execs(getattr(b, "unroll_graphs", {}), "unroll")
+    conts = _graph_execs(getattr(b, "continue_graphs", {}), "continuation")
+
+    def add(desc):
         if desc in index:
             return index[desc]
         num_tokens, num_reqs, uniform, loras, is_full = _descriptor_fields(desc)
-        try:
-            handle = int(graph.raw_cuda_graph_exec()) if graph is not None else 0
-        except Exception:
-            # Exported for dispatch fidelity even if we cannot drive it -- a 0 handle is
-            # never launchable, so the runner declines that shape instead of guessing.
-            log.warning("vtl: no raw_cuda_graph_exec for %s; not launchable", desc)
-            handle = 0
-        full = is_full if full_override is None else full_override
-        idx = runner_obj.register_graph(num_tokens, num_reqs, uniform, loras, handle, full)
+        # The whole-burst handle or nothing: see the module docstring. A 0 handle is never
+        # launchable, so the runner declines that shape instead of replaying a graph that
+        # does not fill the accumulator.
+        idx = runner_obj.register_graph(
+            num_tokens, num_reqs, uniform, loras,
+            execs.get(desc, 0), is_full, conts.get(desc, 0),
+        )
         index[desc] = idx
         return idx
 
-    # Stock's own graphs first, so dispatch's priority order can reference them.
-    for desc, graph in mgr.graphs.items():
-        add(desc, graph)
+    # Stock's own descriptors first, so dispatch's priority order can reference them.
+    for desc in mgr.graphs:
+        add(desc)
 
     # The candidate lists, verbatim. A descriptor appearing here that stock never captured
     # (possible in principle) still gets a row, with a null handle.
     for (num_tokens, loras), descs in getattr(mgr, "_candidates", {}).items():
-        idx = [add(d, mgr.graphs.get(d)) for d in descs]
+        idx = [add(d) for d in descs]
         runner_obj.set_candidates(int(num_tokens), int(loras), idx)
 
     runner_obj.set_lora_dispatch(
@@ -131,10 +166,10 @@ def _build_table(runner_obj, mgr, b) -> dict:
         int(getattr(mgr, "_max_lora_case", 0)),
     )
     runner_obj.set_captured(bool(getattr(mgr, "_graphs_captured", False)))
-    return index
+    return index, execs
 
 
-def _verify_dispatch(runner_obj, mgr, max_num_reqs: int) -> str | None:
+def _verify_dispatch(runner_obj, mgr, max_num_reqs: int, execs: dict) -> str | None:
     """Reason the Rust table disagrees with vLLM's dispatcher, or ``None``.
 
     Exhaustive over what the live config can actually produce: every captured token count
@@ -175,13 +210,9 @@ def _verify_dispatch(runner_obj, mgr, max_num_reqs: int) -> str | None:
                         f"vs {theirs.cg_mode}"
                     )
                 if want_full:
-                    graph = mgr.graphs.get(theirs)
-                    handle = 0
-                    if graph is not None:
-                        try:
-                            handle = int(graph.raw_cuda_graph_exec())
-                        except Exception:
-                            handle = 0
+                    # Against the UNROLL handle, which is what the row holds -- comparing
+                    # against `mgr.graphs[theirs]` would now fail on every decode size.
+                    handle = execs.get(theirs, 0)
                     if handle and mine[0] != handle:
                         return (
                             f"rust picked a different graph at (num_reqs={num_reqs}, "
@@ -244,12 +275,22 @@ def export(runner, b) -> None:
     if b.accum is None or b.rows is None:
         STATE.refuse("the burst accumulator was never allocated")
         return
+    if not b.unroll_graphs:
+        # M1's ordering enforcement. Without the unroll rung the only handles on offer are
+        # stock's forward-only graphs, which never write `accum` -- a runner armed against
+        # those would launch a step and then commit whatever tokens were left over from the
+        # previous one. Never arm.
+        STATE.refuse("nstep captured no unroll graphs; there is nothing launchable")
+        return
 
     try:
         rust_runner = vtl_sched.Runner(kv)
-        _build_table(rust_runner, mgr, b)
+        _, execs = _build_table(rust_runner, mgr, b)
+        if not execs:
+            STATE.refuse("no unroll graph exposed a usable cudaGraphExec_t")
+            return
 
-        why = _verify_dispatch(rust_runner, mgr, int(runner.max_num_reqs))
+        why = _verify_dispatch(rust_runner, mgr, int(runner.max_num_reqs), execs)
         if why is not None:
             STATE.refuse(f"dispatch parity failed: {why}")
             return
@@ -270,14 +311,11 @@ def export(runner, b) -> None:
 
         # Handle stability (RUST-RUNNER.md 0): torch destroys the exec on a later
         # instantiate(), and vLLM never calls one -- so this should be constant. The runner
-        # CACHES it, which makes a moving handle a use-after-free, not a wrong number.
-        for desc, graph in list(mgr.graphs.items())[:4]:
-            try:
-                if int(graph.raw_cuda_graph_exec()) == 0:
-                    STATE.refuse(f"null cudaGraphExec_t for {desc}")
-                    return
-            except Exception as exc:
-                STATE.refuse(f"raw_cuda_graph_exec unavailable: {exc}")
+        # CACHES it, which makes a moving handle a use-after-free, not a wrong number. Read
+        # every unroll handle a SECOND time and require the same number.
+        for rows, entry in b.unroll_graphs.items():
+            if execs.get(entry[1]) != int(entry[0].raw_cuda_graph_exec()):
+                STATE.refuse(f"the unroll cudaGraphExec_t at num_reqs={rows} moved")
                 return
     except Exception as exc:
         STATE.refuse(f"export raised: {exc}")
@@ -286,9 +324,14 @@ def export(runner, b) -> None:
     STATE.runner = rust_runner
     STATE.live = True
     STATE.why = ""
+    # The armed SIZES, not just the count: 17% of the scored trace's tokens decode at a
+    # batch size outside the captured set, so which sizes armed is the number an H200 boot
+    # log has to be auditable for.
     log.info(
-        "vtl: rust runner armed (%d graphs, mode=%s, max_steps=%d)",
-        rust_runner.num_graphs(), want, max_steps(),
+        "vtl: rust runner armed (%d rows, launchable sizes %s, continuation sizes %s, "
+        "mode=%s, max_steps=%d)",
+        rust_runner.num_graphs(), sorted(b.unroll_graphs),
+        sorted(getattr(b, "continue_graphs", {})), want, max_steps(),
     )
 
 
@@ -320,6 +363,28 @@ def _self_check() -> None:
             os.environ.pop("VTL_RUST_RUNNER_STEPS", None)
         else:
             os.environ["VTL_RUST_RUNNER_STEPS"] = saved_n
+
+    # `_graph_execs` is the M1 override: only WHOLE-BURST graphs are launchable, and a
+    # graph whose handle cannot be read drops out rather than exporting a 0.
+    class Graph:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def raw_cuda_graph_exec(self):
+            if self.handle is None:
+                raise RuntimeError("no exec")
+            return self.handle
+
+    assert _graph_execs({}, "unroll") == {}
+    logging.disable(logging.CRITICAL)  # the "no raw_cuda_graph_exec" warning is expected
+    try:
+        got = _graph_execs(
+            {1: (Graph(0x11), "d1", 4), 2: (Graph(None), "d2", 4), 4: (Graph(0), "d4", 4)},
+            "unroll",
+        )
+    finally:
+        logging.disable(logging.NOTSET)
+    assert got == {"d1": 0x11}, got
 
     # The refusal latch is permanent and must survive a runner that throws on disarm.
     class Boom:
