@@ -158,6 +158,16 @@ def register_rust_kv(kv) -> None:
     _RUST_KV.kv = kv
 
 
+def rust_kv():
+    """The crate `KvManager` for this boot, or None if the Rust scheduler is not authority.
+
+    Read by `rust_runner.export`, which needs the same `Shared` the scheduler mutates. NOT
+    gated on VTL_SHM_IPC_RUST_PUB -- that flag governs who owns the OUTPUT CHANNEL, which is
+    a different question from whether the manager exists.
+    """
+    return _RUST_KV.kv
+
+
 class _PubCounters:
     """Inline-publish ordering guard: two SINGLE-WRITER counters, so neither needs a lock
     under the GIL (a lone `+= 1` on an int attribute is one atomic-enough read + write from

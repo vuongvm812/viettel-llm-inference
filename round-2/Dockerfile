@@ -64,13 +64,20 @@ RUN mkdir -p /wheels; \
 the wheel will not be built and the engine keeps the Python scheduler"
 COPY vtl-sched /src/vtl-sched
 # `cargo test` here is the compile-time correctness gate: free-queue LRU order, refcounts,
-# eviction order, the pickle golden vectors and the hybrid mamba clamp rules all run
-# before the wheel is allowed out of this stage. Fatal on purpose -- see the header above.
+# eviction order, the pickle golden vectors, the hybrid mamba clamp rules and the CUDA-graph
+# dispatch table all run before the wheel is allowed out of this stage. Fatal on purpose --
+# see the header above.
+#
+# The second, `--features cuda --no-run` line only COMPILES the driver half: gpu.rs dlopens
+# libcuda at runtime and links nothing, so it builds in a stage with no CUDA toolkit -- but
+# without this line a break in that half would first surface in `maturin build` below, after
+# the tests have already reported green.
 RUN if [ ! -f /tmp/toolchain-ok ]; then \
       echo "vtl_sched: SKIPPED (no toolchain) -- /wheels stays empty"; \
     else \
       cd /src/vtl-sched \
       && cargo test --release --quiet \
+      && cargo test --release --quiet --features cuda --no-run \
       && maturin build --release --out /wheels \
       && ls -la /wheels \
       && echo "vtl_sched: OK"; \

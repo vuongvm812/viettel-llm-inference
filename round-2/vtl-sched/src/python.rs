@@ -40,11 +40,66 @@ use crate::manager::Manager;
 use crate::sched::{Decisions, Params, SchedReq};
 use crate::single_type::{cdiv, Kind};
 use crate::spec::{lock_shared, Shared, SpecDriver};
-use crate::update::StopParams;
+use crate::update::{gather_sampled, StopParams};
 
 
 fn err(e: String) -> PyErr {
     PyRuntimeError::new_err(e)
+}
+
+/// The locked half of a step commit: stop decisions, the resident-table delta, the R8 record
+/// and (optionally) the inline shm publish.
+///
+/// Extracted verbatim from `update_step_pack_np`'s `allow_threads` body so the Rust model
+/// runner drives THE SAME code rather than a parallel implementation -- which is what lets
+/// `bench/test_rust_sched_parity.py` keep covering both paths. Callers must not hold the GIL.
+#[allow(clippy::too_many_arguments)]
+fn step_pack_locked(
+    shared: &Arc<Mutex<Shared>>,
+    slots: &[u32],
+    counts: &[u32],
+    flat: &[i64],
+    max_model_len: usize,
+    engine_index: u32,
+    timestamp: f64,
+    finished: &[String],
+    fold_cache: bool,
+    publish: bool,
+) -> Result<(Vec<(u32, u8, i64)>, Option<Vec<u8>>, bool), String> {
+    let mut sh = lock_shared(shared);
+    sh.invalidate();
+    let (verdicts, packed) = sh.manager.update_step_pack_store(
+        slots,
+        counts,
+        flat,
+        max_model_len,
+        engine_index,
+        timestamp,
+        finished,
+        fold_cache,
+    )?;
+    let out: Vec<(u32, u8, i64)> = verdicts
+        .iter()
+        .map(|v| (v.num_accepted, v.status, v.stop_reason))
+        .collect();
+    if packed && publish {
+        #[cfg(feature = "shm")]
+        let delivered = match &sh.out {
+            Some(ch) => ch.publish_record(sh.manager.raw.finish()?),
+            None => false,
+        };
+        #[cfg(not(feature = "shm"))]
+        let delivered = false;
+        if delivered {
+            return Ok((out, None, true));
+        }
+    }
+    let rec = if packed {
+        Some(sh.manager.raw.finish()?.to_vec())
+    } else {
+        None
+    };
+    Ok((out, rec, false))
 }
 
 fn get_usize(d: &Bound<'_, PyDict>, key: &str) -> PyResult<usize> {
@@ -503,23 +558,13 @@ impl KvManager {
         let arr = sampled.as_slice().map_err(|_| {
             PyValueError::new_err("update_step_pack_np needs a C-contiguous sampled array")
         })?;
-        let mut flat: Vec<i64> = Vec::with_capacity(n * 2);
-        for i in 0..n {
-            let row = rows[i] as usize;
-            let cnt = counts[i] as usize;
-            if row >= nrows || cnt > ncols {
-                return Err(PyValueError::new_err(format!(
-                    "update_step_pack_np row {row} / count {cnt} outside [{nrows}, {ncols}]"
-                )));
-            }
-            flat.extend_from_slice(&arr[row * ncols..row * ncols + cnt]);
-        }
+        // Gather while the GIL is still held: `arr` borrows a Python-owned buffer.
+        let flat = gather_sampled(arr, nrows, ncols, &rows, &counts).map_err(err)?;
         let shared = self.shared.clone();
         let (verdicts, record, published) = py
             .allow_threads(move || {
-                let mut sh = lock_shared(&shared);
-                sh.invalidate();
-                let (verdicts, packed) = sh.manager.update_step_pack_store(
+                step_pack_locked(
+                    &shared,
                     &slots,
                     &counts,
                     &flat,
@@ -528,29 +573,8 @@ impl KvManager {
                     timestamp,
                     &finished,
                     fold_cache,
-                )?;
-                let out: Vec<(u32, u8, i64)> = verdicts
-                    .iter()
-                    .map(|v| (v.num_accepted, v.status, v.stop_reason))
-                    .collect();
-                if packed && publish {
-                    #[cfg(feature = "shm")]
-                    let delivered = match &sh.out {
-                        Some(ch) => ch.publish_record(sh.manager.raw.finish()?),
-                        None => false,
-                    };
-                    #[cfg(not(feature = "shm"))]
-                    let delivered = false;
-                    if delivered {
-                        return Ok::<_, String>((out, None, true));
-                    }
-                }
-                let rec = if packed {
-                    Some(sh.manager.raw.finish()?.to_vec())
-                } else {
-                    None
-                };
-                Ok::<_, String>((out, rec, false))
+                    publish,
+                )
             })
             .map_err(err)?;
         Ok((
@@ -1559,11 +1583,563 @@ fn block_hash_with_group_id<'py>(
     PyBytes::new_bound(py, &out)
 }
 
+// ---------------------------------------------------------------------------------------
+// The Rust steady-state model runner (round-2/RUST-RUNNER.md, phases 2-3).
+// ---------------------------------------------------------------------------------------
+
+/// Drives a captured whole-step CUDA graph and commits its output without re-entering Python.
+///
+/// One step is: launch the dispatched graph -> pre-planned D2H of the sampled tokens into a
+/// pinned buffer this object owns -> `step_pack_locked`, the SAME core `update_step_pack_np`
+/// runs -> stop verdicts + the R8 record + the inline shm publish. What that removes is the
+/// Python between those points: `_burst_output`, `_emit`'s ModelRunnerOutput + AsyncOutput
+/// construction and its three fresh-tensor D2H copies, `postprocess_sampled`, and the hop
+/// back through the engine.
+///
+/// EVERY refusal path returns `None` rather than raising, and `rust_sched.py` runs the normal
+/// Python step on `None`. That includes: no graph for this shape, a graph that is not FULL,
+/// a null exec handle, the CUDA context having moved, or the runner never having been armed.
+///
+/// THREADING: `run_step` must be called from the thread that owns the CUDA context -- the
+/// engine's step thread. It releases the GIL for the launch + wait + commit, but never moves
+/// to another thread: `torch.inference_mode` and the current stream are thread-local, and
+/// `Shared`'s module-state assumptions (RUST-RUNNER.md hazard 4) are single-step-loop
+/// assumptions. The context recorded at `arm()` is re-checked every step so a violation is a
+/// refusal, not corruption.
+#[cfg(feature = "cuda")]
+#[pyclass]
+pub struct Runner {
+    table: crate::gpu::GraphTable,
+    shared: Arc<Mutex<Shared>>,
+    /// `CUstream` the graphs were captured on, from `torch.cuda.current_stream().cuda_stream`.
+    stream: u64,
+    /// `cuCtxGetCurrent()` at arm time. A different context per step means someone moved us
+    /// to another thread; refuse rather than launch into the wrong context.
+    ctx: u64,
+    /// Device address of the sampled-token accumulator (`BURST.accum`) and its `[rows, cols]`
+    /// shape. Persistent for the boot -- that is what makes the D2H pre-plannable.
+    out_ptr: u64,
+    out_rows: usize,
+    out_cols: usize,
+    pinned: Option<crate::gpu::live::PinnedBuf>,
+    event: u64,
+    armed: bool,
+}
+
+#[cfg(feature = "cuda")]
+#[pymethods]
+impl Runner {
+    /// Borrows the manager's `Shared` so the commit half runs against the same state the
+    /// scheduler mutates -- there is exactly one engine and one runner per process.
+    #[new]
+    fn new(kv: PyRef<'_, KvManager>) -> Self {
+        Runner {
+            table: crate::gpu::GraphTable::new(),
+            shared: kv.shared.clone(),
+            stream: 0,
+            ctx: 0,
+            out_ptr: 0,
+            out_rows: 0,
+            out_cols: 0,
+            pinned: None,
+            event: 0,
+            armed: false,
+        }
+    }
+
+    /// True only if the wheel can actually reach libcuda. Called before arming so a driver
+    /// that will not dlopen is one logged line at boot, not a per-step surprise.
+    #[staticmethod]
+    fn driver_available() -> bool {
+        crate::gpu::live::driver().is_ok()
+    }
+
+    #[staticmethod]
+    fn driver_error() -> Option<String> {
+        crate::gpu::live::driver().err()
+    }
+
+    /// Add one captured graph. `exec` is `torch.cuda.CUDAGraph.raw_cuda_graph_exec()`.
+    #[pyo3(signature = (num_tokens, num_reqs, uniform_token_count, num_active_loras, exec, full))]
+    fn register_graph(
+        &mut self,
+        num_tokens: u32,
+        num_reqs: Option<u32>,
+        uniform_token_count: Option<u32>,
+        num_active_loras: u32,
+        exec: u64,
+        full: bool,
+    ) -> u32 {
+        self.table.push_entry(crate::gpu::GraphEntry {
+            num_tokens,
+            num_reqs,
+            uniform_token_count,
+            num_active_loras,
+            exec,
+            full,
+        })
+    }
+
+    /// One `mgr._candidates` entry, priority order preserved.
+    fn set_candidates(&mut self, num_tokens: u32, loras: u32, idx: Vec<u32>) {
+        self.table.set_candidates(num_tokens, loras, idx);
+    }
+
+    fn set_lora_dispatch(&mut self, map: std::collections::HashMap<u32, u32>, max_case: u32) {
+        self.table
+            .set_lora_dispatch(map.into_iter().collect(), max_case);
+    }
+
+    fn set_captured(&mut self, captured: bool) {
+        self.table.set_captured(captured);
+    }
+
+    fn num_graphs(&self) -> usize {
+        self.table.len()
+    }
+
+    /// The boot-time parity hook: what WOULD this dispatch to? Python compares the answer
+    /// against `mgr.dispatch(...)` for every reachable tuple and refuses to arm on any
+    /// mismatch, because a divergence here silently runs a different graph than vLLM would.
+    ///
+    /// Returns `(exec_handle, is_full)`, or `None` where vLLM would fall back to eager.
+    #[pyo3(signature = (num_reqs, num_tokens, uniform_token_count, num_active_loras))]
+    fn dispatch_probe(
+        &self,
+        num_reqs: u32,
+        num_tokens: u32,
+        uniform_token_count: Option<u32>,
+        num_active_loras: u32,
+    ) -> Option<(u64, bool)> {
+        self.table
+            .dispatch(num_reqs, num_tokens, uniform_token_count, num_active_loras)
+            .map(|e| (e.exec, e.full))
+    }
+
+    /// Bind the stream, the context and the output buffer, and allocate the pinned
+    /// destination + the blocking event. Idempotent-ish: re-arming reallocates.
+    ///
+    /// `out_ptr` is `BURST.accum.data_ptr()`; `[out_rows, out_cols]` its shape. The pinned
+    /// buffer is sized for the whole accumulator once, so no step allocates.
+    fn arm(
+        &mut self,
+        stream: u64,
+        out_ptr: u64,
+        out_rows: usize,
+        out_cols: usize,
+    ) -> PyResult<()> {
+        let d = crate::gpu::live::driver().map_err(err)?;
+        let mut ctx: *mut std::os::raw::c_void = std::ptr::null_mut();
+        // SAFETY: valid out-param; the call only reads the calling thread's current context.
+        crate::gpu::live::check("cuCtxGetCurrent", unsafe {
+            (d.ctx_get_current)(&mut ctx as *mut _)
+        })
+        .map_err(err)?;
+        if ctx.is_null() {
+            return Err(err(
+                "no current CUDA context on the arming thread; the runner would launch into \
+                 nothing"
+                    .to_string(),
+            ));
+        }
+        let bytes = out_rows
+            .checked_mul(out_cols)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<i64>()))
+            .ok_or_else(|| err("accumulator size overflows".to_string()))?;
+        let pinned = crate::gpu::live::PinnedBuf::new(bytes).map_err(err)?;
+        let mut event: *mut std::os::raw::c_void = std::ptr::null_mut();
+        // SAFETY: valid out-param. BLOCKING_SYNC so the wait parks instead of spinning --
+        // the judge box has 3 vCPUs and a spin starves the shm ingest thread.
+        crate::gpu::live::check("cuEventCreate", unsafe {
+            (d.event_create)(
+                &mut event as *mut _,
+                crate::gpu::live::CU_EVENT_BLOCKING_SYNC,
+            )
+        })
+        .map_err(err)?;
+        self.stream = stream;
+        self.ctx = ctx as u64;
+        self.out_ptr = out_ptr;
+        self.out_rows = out_rows;
+        self.out_cols = out_cols;
+        self.pinned = Some(pinned);
+        self.event = event as u64;
+        self.armed = true;
+        Ok(())
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Permanently stand down for this boot. Called by the Python side's degrade path so a
+    /// later step cannot re-enter the Rust runner after a divergence.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// One steady-state decode step, entirely in Rust.
+    ///
+    /// `None` = declined; the caller must run the Python step. Anything else returns the same
+    /// `(verdicts, record, published)` triple as `update_step_pack_np`, so `rust_sched.py`'s
+    /// existing handling applies unchanged.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (num_reqs, num_tokens, uniform_token_count, num_active_loras, rows,
+                        counts, slots, max_model_len, engine_index, timestamp, finished,
+                        fold_cache, publish))]
+    fn run_step(
+        &self,
+        py: Python<'_>,
+        num_reqs: u32,
+        num_tokens: u32,
+        uniform_token_count: Option<u32>,
+        num_active_loras: u32,
+        rows: Vec<u32>,
+        counts: Vec<u32>,
+        slots: Vec<u32>,
+        max_model_len: usize,
+        engine_index: u32,
+        timestamp: f64,
+        finished: Vec<String>,
+        fold_cache: bool,
+        publish: bool,
+    ) -> PyResult<Option<(Vec<(u32, u8, i64)>, Option<Py<PyBytes>>, bool)>> {
+        if !self.armed {
+            return Ok(None);
+        }
+        if rows.len() != counts.len() || rows.len() != slots.len() {
+            return Err(PyValueError::new_err(format!(
+                "run_step arity mismatch: {} rows, {} counts, {} slots",
+                rows.len(),
+                counts.len(),
+                slots.len()
+            )));
+        }
+        // Decline BEFORE touching the driver if this shape has no FULL graph: vLLM would run
+        // eager or PIECEWISE here, and substituting a different graph would be a wrong answer.
+        let Some(exec) =
+            self.table
+                .launchable(num_reqs, num_tokens, uniform_token_count, num_active_loras)
+        else {
+            return Ok(None);
+        };
+        let d = crate::gpu::live::driver().map_err(err)?;
+        let pinned = self
+            .pinned
+            .as_ref()
+            .ok_or_else(|| err("runner armed without a pinned buffer".to_string()))?;
+
+        let shared = self.shared.clone();
+        // Everything crossing into `allow_threads` goes as an INTEGER: a raw pointer is not
+        // `Send`, and making it so would be asserting something about the pointee we do not
+        // want to assert. These are opaque driver handles and device addresses; they are cast
+        // back inside, on the same thread, after the context check confirms they still mean
+        // what they meant at arm().
+        let stream_u = self.stream;
+        let event_u = self.event;
+        let pinned_ptr = pinned.as_ptr() as u64;
+        let pinned_len = pinned.len();
+        let out_ptr = self.out_ptr;
+        let (out_rows, out_cols) = (self.out_rows, self.out_cols);
+        let expect_ctx = self.ctx;
+
+        let result = py.allow_threads(move || -> Result<_, String> {
+            let stream = stream_u as *mut std::os::raw::c_void;
+            let event = event_u as *mut std::os::raw::c_void;
+            // Hazard 2: the context is thread-local. If we are not on the thread that armed,
+            // every pointer below belongs to a different address space.
+            let mut ctx: *mut std::os::raw::c_void = std::ptr::null_mut();
+            // SAFETY: valid out-param, read-only call.
+            crate::gpu::live::check("cuCtxGetCurrent", unsafe {
+                (d.ctx_get_current)(&mut ctx as *mut _)
+            })?;
+            if ctx as u64 != expect_ctx {
+                return Err(
+                    "CUDA context changed since arm(); the runner is on the wrong thread"
+                        .to_string(),
+                );
+            }
+            // 1. Replay the whole-step graph. Inputs were written into the graph's own
+            //    persistent buffers before this call, on this same stream, so ordering holds
+            //    without an explicit wait.
+            // SAFETY: `exec` is a cudaGraphExec_t torch instantiated and never re-instantiates
+            // (verified at export); `stream` is the stream it was captured on.
+            crate::gpu::live::check("cuGraphLaunch", unsafe {
+                (d.graph_launch)(exec as *mut std::os::raw::c_void, stream)
+            })?;
+            // 2. Pre-planned D2H into our own pinned buffer -- this is what replaces
+            //    AsyncOutput's freshly allocated CPU tensors. Same stream as the launch, so
+            //    it cannot start before the graph finishes.
+            let bytes = out_rows * out_cols * std::mem::size_of::<i64>();
+            if bytes > pinned_len {
+                return Err(format!(
+                    "accumulator is {bytes} bytes but the pinned buffer is {pinned_len}"
+                ));
+            }
+            // SAFETY: both pointers are live for the boot and the byte count is bounds-checked
+            // against the pinned allocation immediately above.
+            crate::gpu::live::check("cuMemcpyDtoHAsync", unsafe {
+                (d.memcpy_dtoh_async)(pinned_ptr as *mut std::os::raw::c_void, out_ptr, bytes, stream)
+            })?;
+            // SAFETY: `event` was created in arm() and belongs to this context.
+            crate::gpu::live::check("cuEventRecord", unsafe { (d.event_record)(event, stream) })?;
+            // 3. Park in the driver until the copy lands (BLOCKING_SYNC, never a spin).
+            // SAFETY: same event.
+            crate::gpu::live::check("cuEventSynchronize", unsafe {
+                (d.event_synchronize)(event)
+            })?;
+            // 4. Commit. SAFETY: cuMemHostAlloc returns memory aligned well past i64, the
+            //    element count is the same one the bounds check above validated, and the
+            //    synchronised event is precisely the "copy has completed" guarantee.
+            let arr = unsafe {
+                std::slice::from_raw_parts(pinned_ptr as *const i64, out_rows * out_cols)
+            };
+            let flat = crate::update::gather_sampled(arr, out_rows, out_cols, &rows, &counts)?;
+            step_pack_locked(
+                &shared,
+                &slots,
+                &counts,
+                &flat,
+                max_model_len,
+                engine_index,
+                timestamp,
+                &finished,
+                fold_cache,
+                publish,
+            )
+        });
+
+        let (verdicts, record, published) = result.map_err(err)?;
+        Ok(Some((
+            verdicts,
+            record.map(|r| PyBytes::new_bound(py, &r).unbind()),
+            published,
+        )))
+    }
+
+    /// Phase 3: run up to `max_steps` decode steps back-to-back without returning to Python.
+    ///
+    /// Every iteration is the same sequence `run_step` performs. The loop exits as soon as
+    /// anything happens that the scheduler must see -- a request finishing, or a shape with
+    /// no FULL graph -- so the caller never has to unwind a step it did not expect.
+    ///
+    /// Returns `(records, exit_reason, steps_run)`. `records` holds one entry per step that
+    /// produced an R8 record and did NOT publish it inline, in order; a step that published
+    /// contributes nothing, exactly as in the single-step path. Verdicts are returned for the
+    /// LAST step only -- the intermediate ones are, by the exit rule above, all "nothing
+    /// stopped", and materialising them would allocate per step for data nobody reads.
+    ///
+    /// WHY THE BATCH SHAPE IS FIXED FOR THE WHOLE CALL: the caller passes one
+    /// `(num_reqs, num_tokens, uniform, loras)` and one slot/row/count layout. A step that
+    /// would change any of them is precisely a step the scheduler has to re-plan, so it
+    /// belongs to the next call. This is the same align-gate reasoning the burst already
+    /// uses, one level up.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (max_steps, num_reqs, num_tokens, uniform_token_count,
+                        num_active_loras, rows, counts, slots, max_model_len, engine_index,
+                        timestamp, finished, fold_cache, publish))]
+    fn run_steps(
+        &self,
+        py: Python<'_>,
+        max_steps: u32,
+        num_reqs: u32,
+        num_tokens: u32,
+        uniform_token_count: Option<u32>,
+        num_active_loras: u32,
+        rows: Vec<u32>,
+        counts: Vec<u32>,
+        slots: Vec<u32>,
+        max_model_len: usize,
+        engine_index: u32,
+        timestamp: f64,
+        finished: Vec<String>,
+        fold_cache: bool,
+        publish: bool,
+    ) -> PyResult<Option<(Vec<(u32, u8, i64)>, Vec<Py<PyBytes>>, String, u32)>> {
+        if !self.armed || max_steps == 0 {
+            return Ok(None);
+        }
+        if rows.len() != counts.len() || rows.len() != slots.len() {
+            return Err(PyValueError::new_err(format!(
+                "run_steps arity mismatch: {} rows, {} counts, {} slots",
+                rows.len(),
+                counts.len(),
+                slots.len()
+            )));
+        }
+        let Some(exec) =
+            self.table
+                .launchable(num_reqs, num_tokens, uniform_token_count, num_active_loras)
+        else {
+            return Ok(None);
+        };
+        let d = crate::gpu::live::driver().map_err(err)?;
+        let pinned = self
+            .pinned
+            .as_ref()
+            .ok_or_else(|| err("runner armed without a pinned buffer".to_string()))?;
+
+        let shared = self.shared.clone();
+        let stream_u = self.stream;
+        let event_u = self.event;
+        let pinned_ptr = pinned.as_ptr() as u64;
+        let pinned_len = pinned.len();
+        let out_ptr = self.out_ptr;
+        let (out_rows, out_cols) = (self.out_rows, self.out_cols);
+        let expect_ctx = self.ctx;
+
+        let outcome = py.allow_threads(move || -> Result<_, String> {
+            let stream = stream_u as *mut std::os::raw::c_void;
+            let event = event_u as *mut std::os::raw::c_void;
+            let mut ctx: *mut std::os::raw::c_void = std::ptr::null_mut();
+            // SAFETY: valid out-param, read-only call. Checked ONCE for the whole loop --
+            // the context cannot change under us without the thread changing, and we never
+            // yield the thread inside.
+            crate::gpu::live::check("cuCtxGetCurrent", unsafe {
+                (d.ctx_get_current)(&mut ctx as *mut _)
+            })?;
+            if ctx as u64 != expect_ctx {
+                return Err(
+                    "CUDA context changed since arm(); the runner is on the wrong thread"
+                        .to_string(),
+                );
+            }
+            let bytes = out_rows * out_cols * std::mem::size_of::<i64>();
+            if bytes > pinned_len {
+                return Err(format!(
+                    "accumulator is {bytes} bytes but the pinned buffer is {pinned_len}"
+                ));
+            }
+
+            let mut records: Vec<Vec<u8>> = Vec::new();
+            let mut last: Vec<(u32, u8, i64)> = Vec::new();
+            let mut ran: u32 = 0;
+            let mut exit = LoopExit::Budget;
+
+            for _ in 0..max_steps {
+                // SAFETY / ordering: identical to run_step's, once per iteration. The next
+                // launch is enqueued on the same stream AFTER the previous event was
+                // synchronised, so no step overlaps its predecessor's D2H.
+                crate::gpu::live::check("cuGraphLaunch", unsafe {
+                    (d.graph_launch)(exec as *mut std::os::raw::c_void, stream)
+                })?;
+                crate::gpu::live::check("cuMemcpyDtoHAsync", unsafe {
+                    (d.memcpy_dtoh_async)(
+                        pinned_ptr as *mut std::os::raw::c_void,
+                        out_ptr,
+                        bytes,
+                        stream,
+                    )
+                })?;
+                crate::gpu::live::check("cuEventRecord", unsafe {
+                    (d.event_record)(event, stream)
+                })?;
+                crate::gpu::live::check("cuEventSynchronize", unsafe {
+                    (d.event_synchronize)(event)
+                })?;
+                // SAFETY: the synchronised event is the copy-completed guarantee.
+                let arr = unsafe {
+                    std::slice::from_raw_parts(pinned_ptr as *const i64, out_rows * out_cols)
+                };
+                let flat =
+                    crate::update::gather_sampled(arr, out_rows, out_cols, &rows, &counts)?;
+                let (verdicts, rec, published) = step_pack_locked(
+                    &shared,
+                    &slots,
+                    &counts,
+                    &flat,
+                    max_model_len,
+                    engine_index,
+                    timestamp,
+                    &finished,
+                    fold_cache,
+                    publish,
+                )?;
+                ran += 1;
+                if let Some(r) = rec {
+                    if !published {
+                        records.push(r);
+                    }
+                }
+                // A non-zero status is a finish. Stop BEFORE generating another token for a
+                // slot the scheduler still thinks is running.
+                let stopped = verdicts.iter().any(|(_, status, _)| *status != 0);
+                last = verdicts;
+                if stopped {
+                    exit = LoopExit::Stopped;
+                    break;
+                }
+            }
+            Ok((last, records, exit, ran))
+        });
+
+        let (verdicts, records, exit, ran) = outcome.map_err(err)?;
+        Ok(Some((
+            verdicts,
+            records
+                .into_iter()
+                .map(|r| PyBytes::new_bound(py, &r).unbind())
+                .collect(),
+            exit.as_str().to_string(),
+            ran,
+        )))
+    }
+}
+
+/// Phase 3: the exits a Rust-owned multi-step loop can decide FOR ITSELF.
+///
+/// Everything here is derivable from state the runner already produced this step, which is
+/// the whole point -- an exit condition that needed Python would defeat the loop. The
+/// conditions that are NOT here (a request arriving, a batch-shape change) are the caller's:
+/// it re-enters with fresh arguments, so they are naturally checked between calls.
+///
+/// "Dispatch declined" is deliberately NOT a variant: `run_steps` returns `None` before the
+/// loop in that case, and giving it a second spelling here would let a caller handle one and
+/// miss the other.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopExit {
+    /// Ran the full `max_steps` budget without anything else intervening.
+    Budget,
+    /// A request finished (any non-zero verdict status). The scheduler must be told before
+    /// another token is generated for a slot that is done.
+    Stopped,
+}
+
+#[cfg(feature = "cuda")]
+impl LoopExit {
+    fn as_str(self) -> &'static str {
+        match self {
+            LoopExit::Budget => "budget",
+            LoopExit::Stopped => "stopped",
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for Runner {
+    fn drop(&mut self) {
+        if self.event == 0 {
+            return;
+        }
+        if let Ok(d) = crate::gpu::live::driver() {
+            // SAFETY: created by cuEventCreate in arm(), destroyed exactly once here.
+            unsafe { (d.event_destroy)(self.event as *mut std::os::raw::c_void) };
+        }
+    }
+}
+
 #[pymodule]
 fn vtl_sched(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<KvManager>()?;
     m.add_class::<Scheduler>()?;
+    // Absent unless the wheel was built with the `cuda` feature. `rust_sched.py` probes with
+    // hasattr and leaves VTL_RUST_RUNNER inert if it is missing, so an old wheel degrades
+    // instead of raising.
+    #[cfg(feature = "cuda")]
+    m.add_class::<Runner>()?;
+    m.add("HAS_CUDA_RUNNER", cfg!(feature = "cuda"))?;
     m.add_function(wrap_pyfunction!(none_hash_from_seed, m)?)?;
     m.add_function(wrap_pyfunction!(hash_block_tokens, m)?)?;
     m.add_function(wrap_pyfunction!(block_hashes, m)?)?;

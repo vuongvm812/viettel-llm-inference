@@ -24,6 +24,10 @@ rustc-hash = "2"
 # share a shm data segment layout and iceoryx2 makes no cross-minor-version promise.
 # Optional: default `cargo test` must not need it (no libpython either -- see `python` above).
 iceoryx2 = { version = "0.9.3", optional = true }
+# The Rust steady-state runner dlopens libcuda at runtime (`src/gpu.rs`). Optional and
+# runtime-loaded on purpose: there is no link-time CUDA and no CUDA headers, so the builder
+# stage compiles this without a toolkit and default `cargo test` never touches a GPU.
+libloading = { version = "0.8", optional = true }
 
 [features]
 default = []
@@ -31,6 +35,10 @@ python = ["dep:pyo3", "dep:numpy"]
 # Batch 3: crate-owned iceoryx2 output publisher (`src/out.rs`). Independent of `python` in
 # principle; the wheel maturin ships needs both (see pyproject.toml).
 shm = ["dep:iceoryx2"]
+# The Rust model runner's driver half (`src/gpu.rs::live`). The dispatch TABLE in that module
+# is unconditional so its unit tests run under default features -- only the libcuda calls are
+# gated, which is the same split `out.rs` uses for iceoryx2.
+cuda = ["dep:libloading"]
 
 [profile.release]
 opt-level = 3

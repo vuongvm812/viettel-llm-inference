@@ -1020,15 +1020,19 @@ def _install_authority(base, mirror_modes):
             # lives on EngineCoreProc, not here). shm_ipc calls `out_open` itself, lazily,
             # once it starts -- registering here just makes the handle reachable. Cheap and
             # harmless if the gate ends up off: an unread registration is a no-op.
-            if env_on("VTL_SHM_IPC_RUST_PUB"):
-                try:
-                    from vtl.patches import shm_ipc
+            #
+            # UNCONDITIONAL as of the Rust runner: `_process_output_sockets` re-checks
+            # VTL_SHM_IPC_RUST_PUB when it READS the handle (shm_ipc.py:795), so gating the
+            # WRITE changed nothing for shm_ipc while making the handle invisible to every
+            # other consumer -- and `rust_runner.export` needs it to build the runner.
+            try:
+                from vtl.patches import shm_ipc
 
-                    shm_ipc.register_rust_kv(self._rust)
-                except Exception:
-                    log.exception(
-                        "rust_sched: could not register the rust kv handle with shm_ipc"
-                    )
+                shm_ipc.register_rust_kv(self._rust)
+            except Exception:
+                log.exception(
+                    "rust_sched: could not register the rust kv handle with shm_ipc"
+                )
             # R6b/R6c state. Always constructed (cheap); the gates decide who reads it.
             self._vtl_table = TableState()
             self._empty = RustBlocks(tuple([] for _ in range(self._rust.num_groups)))

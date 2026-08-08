@@ -11,7 +11,13 @@ set -euo pipefail
 
 : "${V025:?set V025 to a pristine vllm-0.25.0 source root (containing vllm/)}"
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)   # round-2/..
-LOCAL="$REPO/vllm"                              # the edited (gitignored) checkout
+# The edited checkout MUST be the v0.25.0 one. `$REPO/vllm` has drifted to v0.26.0 (it no
+# longer defines AttentionStatePair), so diffing against it produced v0.26-shaped hunks in a
+# directory named v0.25.0 -- patches that cannot apply to the tree they claim to patch. The
+# dry-run at the bottom (and Dockerfile.vllm-fork's own `patch --dry-run || exit 1`) turns
+# that into a loud build failure rather than a silent fuzzy apply, but only if this points
+# at the right tree.
+LOCAL="$REPO/vllm-v0.25.0-edited"               # the edited v0.25.0 (gitignored) checkout
 OUT="$REPO/round-2/vtl/vllm_patches/v0.25.0"
 
 gen() {  # $1 = package-relative path, $2 = patch basename

@@ -137,7 +137,7 @@ class _Burst:
     __slots__ = (
         "armed", "ready", "key", "n", "mode", "runner", "graphs",
         "accum", "tok", "step", "num_sampled", "num_rejected", "desc", "pending",
-        "advance", "bump", "idx_map",
+        "advance", "bump", "idx_map", "rows",
         "max_seq_len",
         # in-graph ladder (VTL_NSTEP_FOLD_T1 / VTL_NSTEP_UNROLL / VTL_SAMPLE_IN_GRAPH)
         "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs",
@@ -148,6 +148,7 @@ class _Burst:
         self.advance = None      # the jitted feedback kernel
         self.bump = None         # the jitted step-counter increment
         self.idx_map = None      # [max_num_reqs] i32, persistent copy of ib.idx_mapping
+        self.rows = None         # [1] i32 device scalar -- the REAL request count
         self.max_seq_len = 0     # host scalar the FA3 AOT schedule needs, per iteration
         self.armed = False       # apply() ran and the patch is live
         self.ready = False       # the LAST executed step could have carried a burst
@@ -256,6 +257,7 @@ def _build_kernels():
         input_ids_ptr,    # [max_num_batched_tokens] i32
         positions_ptr,    # [max_num_batched_tokens] i64
         seq_lens_ptr,     # [max_num_reqs] i32
+        rows_ptr,         # [1] i32 -- the REAL request count; see below
         max_model_len,
         FEED: tl.constexpr,
     ):
@@ -263,18 +265,25 @@ def _build_kernels():
         step = tl.load(step_ptr)
         tok = tl.load(tok_ptr + req)
         tl.store(accum_ptr + req * accum_stride + step, tok)
+        # PADDED ROWS MUST NOT BE FED. Eager mode could express that by sizing the grid at
+        # num_reqs, but a captured graph bakes its grid -- so to let ONE graph serve a padded
+        # batch (grid = num_reqs_after_padding) the real count has to arrive as a device
+        # scalar, exactly like `step_ptr`. Feeding a padded row would advance the seq_len the
+        # stock step left at 0, and the FA3 schedule (built for the padded width) would then
+        # dispatch real work against a block-table row `gather_block_tables` zero-filled.
+        #
+        # The `accum` store above stays unguarded: `_burst_output` slices [:num_reqs], so a
+        # padded row's column is written and never read.
         if FEED:
-            # One token per request, so batch index == token index. Clamps mirror the
-            # speculator's (speculator.py:706-731): a request that walks into
-            # max_model_len must not index past the block table.
-            tl.store(input_ids_ptr + req, tok)
-            pos = tl.load(positions_ptr + req)
-            tl.store(positions_ptr + req, tl.minimum(pos + 1, max_model_len - 1))
-            seq = tl.load(seq_lens_ptr + req)
-            tl.store(seq_lens_ptr + req, tl.minimum(seq + 1, max_model_len))
-        # PADDED ROWS ARE NOT TOUCHED: the grid is num_reqs, so rows >= num_reqs keep the
-        # seq_len 0 the stock step left them at. (The speculator re-masks because its
-        # kernel writes the whole padded range; ours does not.)
+            if req < tl.load(rows_ptr):
+                # One token per request, so batch index == token index. Clamps mirror the
+                # speculator's (speculator.py:706-731): a request that walks into
+                # max_model_len must not index past the block table.
+                tl.store(input_ids_ptr + req, tok)
+                pos = tl.load(positions_ptr + req)
+                tl.store(positions_ptr + req, tl.minimum(pos + 1, max_model_len - 1))
+                seq = tl.load(seq_lens_ptr + req)
+                tl.store(seq_lens_ptr + req, tl.minimum(seq + 1, max_model_len))
 
     @triton.jit
     def _bump(step_ptr):
@@ -326,9 +335,11 @@ def _burst_body(runner, b: _Burst, rows: int, pad: int, forward):
     from vtl.patches import decode_fastpath as dfp
 
     ibuf = runner.input_buffers
-    b.advance[(rows,)](
+    # Grid is PAD, not rows: one captured graph must serve every real count that pads to
+    # this size, so the kernel masks on `b.rows` instead of on the grid extent.
+    b.advance[(pad,)](
         b.tok, b.accum, b.accum.stride(0), b.step,
-        ibuf.input_ids, ibuf.positions, ibuf.seq_lens,
+        ibuf.input_ids, ibuf.positions, ibuf.seq_lens, b.rows,
         runner.max_model_len,
         FEED=True,
     )
@@ -375,7 +386,7 @@ def _prologue(runner, b: _Burst, rows: int) -> None:
     )
 
 
-def _accum_tail(runner, b: _Burst, rows: int) -> None:
+def _accum_tail(runner, b: _Burst, rows: int, pad: int | None = None) -> None:
     """Store the LAST iteration's token into the accumulator, in-graph.
 
     The final token is sampled after the final feedback, so no ``_advance`` wrote it. Running
@@ -384,9 +395,11 @@ def _accum_tail(runner, b: _Burst, rows: int) -> None:
     ``_run_burst`` has no tail work left.
     """
     ibuf = runner.input_buffers
-    b.advance[(rows,)](
+    # FEED=False, so this touches only `accum` -- the padded columns it writes are never
+    # read. Grid still goes to `pad` in graph mode so the captured node matches `_burst_body`.
+    b.advance[(pad or rows,)](
         b.tok, b.accum, b.accum.stride(0), b.step,
-        ibuf.input_ids, ibuf.positions, ibuf.seq_lens,
+        ibuf.input_ids, ibuf.positions, ibuf.seq_lens, b.rows,
         runner.max_model_len,
         FEED=False,
     )
@@ -402,7 +415,7 @@ def _burst_all(runner, b: _Burst, rows: int, pad: int, forward, n: int) -> None:
     _prologue(runner, b, rows)
     for _ in range(n - 1):
         _burst_body(runner, b, rows, pad, forward)
-    _accum_tail(runner, b, rows)
+    _accum_tail(runner, b, rows, pad)
 
 
 def _hidden_is_persistent(runner, hidden, rows: int) -> bool:
@@ -537,7 +550,11 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
     for desc, pair in states.items():
         if desc.cg_mode != CUDAGraphMode.FULL or desc.uniform_token_count != 1:
             continue
-        if desc.num_reqs not in BURST_SIZES or desc.num_active_loras:
+        # Every captured FULL decode size gets a graph, not just BURST_SIZES. Compose
+        # captures [1,2,4,8,16,32] while BURST_SIZES stopped at 8, so sizes 16/32 previously
+        # fell back to the eager loop; with `b.rows` masking the feedback there is no longer
+        # a reason to skip them. LoRA graphs stay out -- the burst has no LoRA story.
+        if desc.num_active_loras:
             continue
         if desc.num_tokens != desc.num_reqs:
             # One token per request is what a decode graph is; anything else is not a
@@ -552,6 +569,9 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
         # per step before the replay.
         InputBatch.make_dummy(rows, rows, runner.input_buffers)
         b.idx_map[:rows].copy_(torch.arange(rows, dtype=torch.int32, device=runner.device))
+        # Capture with the mask wide open (rows == pad here), so the captured graph exercises
+        # the same code path a full batch takes. Per-step `b.rows.fill_()` narrows it.
+        b.rows.fill_(rows)
         b.max_seq_len = runner.max_model_len
         model_inputs = {
             "input_ids": runner.input_buffers.input_ids[:rows],
@@ -623,11 +643,17 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
                 b.unroll_graphs[rows] = (whole, desc, b.n)
 
     if not captured:
-        log.warning("vtl: nstep graph mode off -- no FULL decode descriptor matched %s",
-                    BURST_SIZES)
+        log.warning("vtl: nstep graph mode off -- no FULL 1-token-per-request descriptor")
         b.demote("fold", "no FULL decode descriptor matched")
         b.mode = "eager"
         return
+    # BURST_SIZES is now an OUTCOME, not a filter: whatever FULL decode sizes the manager
+    # captured are the sizes a burst can ride. Published back to the module because
+    # `rust_sched.py:3088` reads `MAX_BURST_REQS` to gate its commit, and `_publish_ready`
+    # reads it per step -- both would otherwise still be capped at the old hardcoded 8.
+    global BURST_SIZES, MAX_BURST_REQS
+    BURST_SIZES = tuple(sorted(b.graphs))
+    MAX_BURST_REQS = BURST_SIZES[-1]
     log.info(
         "vtl: nstep captured %d burst body graph(s) for sizes %s "
         "(+%.1f MiB; prologue=%s unroll=%s sample1=%s)",
@@ -644,18 +670,16 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
 def _graph_shape_ok(b: _Burst, ib, num_reqs: int, entry) -> bool:
     """Is ``entry``'s captured graph usable for THIS step's batch?
 
-    A burst graph is used ONLY when the real batch is exactly the captured size. With padded
-    rows the graph's baked grid would advance positions/seq_lens for rows that do not exist,
-    so those steps take the eager loop -- which recomputes the grid per iteration and is
-    always correct. ``==``, not ``is``: ``BatchExecutionDescriptor`` is a frozen dataclass, so
-    equal descriptors need not be the same object.
+    PADDED BATCHES ARE NOW ALLOWED. The graph's baked grid runs to the padded width, but
+    ``_advance`` masks the feedback on the device scalar ``b.rows``, so a padded row keeps the
+    ``seq_len`` 0 the stock step left it at. What still has to hold is that the descriptor
+    matches -- it already encodes BOTH widths, so an equal descriptor means the captured
+    attention metadata was built for exactly this padded shape.
+
+    ``==``, not ``is``: ``BatchExecutionDescriptor`` is a frozen dataclass, so equal
+    descriptors need not be the same object.
     """
-    return (
-        entry is not None
-        and entry[1] == b.desc
-        and ib.num_reqs_after_padding == num_reqs
-        and ib.num_tokens_after_padding == num_reqs
-    )
+    return entry is not None and entry[1] == b.desc
 
 
 def _run_burst(runner, b: _Burst, n: int, ib, hidden):
@@ -668,23 +692,33 @@ def _run_burst(runner, b: _Burst, n: int, ib, hidden):
     # value, so iteration j wants base + j. Read once, incremented on the host -- no sync.
     base_max_seq_len = int(ib.seq_lens_cpu_upper_bound[:num_reqs].max())
     b.idx_map[:num_reqs].copy_(ib.idx_mapping, non_blocking=True)
+    # The padded-batch mask the captured `_advance` reads. Must be written EVERY step, before
+    # any replay: the graph baked the grid at the padded width, so a stale value here feeds a
+    # padded row (or starves a real one).
+    b.rows.fill_(num_reqs)
     b.step.zero_()
 
     graph_mode = b.mode == "graph"
-    entry = b.graphs.get(num_reqs) if graph_mode else None
+    # Graphs are keyed by the CAPTURED (padded) size, not the real request count -- a batch
+    # of 5 rides the size-8 graph with `b.rows` masking rows 5..7. Before padded batches were
+    # allowed these were the same number, which is why this used to read `num_reqs`.
+    pad = ib.num_reqs_after_padding
+    entry = b.graphs.get(pad) if graph_mode else None
     shape_ok = _graph_shape_ok(b, ib, num_reqs, entry)
     # The prologue/unroll graphs bake the address of `cudagraph_manager.hidden_states`, so
-    # they are only usable when this step's hidden states actually live there.
-    folded = shape_ok and b.fold and _hidden_is_persistent(runner, hidden, num_reqs)
+    # they are only usable when this step's hidden states actually live there. The persistent
+    # buffer is sliced to the PADDED width by the stock FULL replay, so that is what the
+    # prologue captured against.
+    folded = shape_ok and b.fold and _hidden_is_persistent(runner, hidden, pad)
 
     if folded:
-        whole = b.unroll_graphs.get(num_reqs)
+        whole = b.unroll_graphs.get(pad)
         if whole is not None and whole[1] == b.desc and whole[2] == n:
             # ONE replay for the whole burst: prologue, N-1 bodies, accumulator tail.
             whole[0].replay()
             return _burst_output(b, num_reqs, n, SamplerOutput)
 
-    pro = b.pro_graphs.get(num_reqs) if folded else None
+    pro = b.pro_graphs.get(pad) if folded else None
     if pro is not None and pro[1] == b.desc:
         pro[0].replay()
     else:
@@ -725,10 +759,13 @@ def _sample_one_in_graph(runner, b: _Burst, ib, hidden):
     from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
     rows = ib.num_reqs
-    entry = b.pro_graphs.get(rows)
+    # Keyed by the padded width, like the burst graphs: the prologue was captured against the
+    # persistent hidden-states buffer sliced to `desc.num_tokens`.
+    pad = ib.num_reqs_after_padding
+    entry = b.pro_graphs.get(pad)
     if not _graph_shape_ok(b, ib, rows, entry):
         return None
-    if not _hidden_is_persistent(runner, hidden, rows):
+    if not _hidden_is_persistent(runner, hidden, pad):
         return None
     entry[0].replay()
     return SamplerOutput(
@@ -773,6 +810,9 @@ def _alloc(runner, b: _Burst) -> None:
     b.accum = torch.zeros((m, b.n), dtype=torch.int64, device=dev)
     b.tok = torch.zeros(m, dtype=torch.int64, device=dev)
     b.step = torch.zeros(1, dtype=torch.int32, device=dev)
+    # The real request count, as a DEVICE scalar so a captured graph (whose grid is baked at
+    # the padded width) can still mask the padded rows out of the feedback. See `_advance`.
+    b.rows = torch.zeros(1, dtype=torch.int32, device=dev)
     b.idx_map = torch.zeros(m, dtype=torch.int32, device=dev)
     b.num_sampled = torch.full((m,), b.n, dtype=torch.int32, device=dev)
     b.num_rejected = torch.full((m,), -(b.n - 1), dtype=torch.int32, device=dev)
@@ -825,6 +865,17 @@ def _patch_runner(b: _Burst) -> None:
                     _capture_burst_graphs(self, b)
                 b.armed = True
                 log.info("vtl: nstep burst armed (N=%d, mode=%s)", b.n, b.mode)
+                # Phase 2: hand the captured graphs to the Rust runner. Its OWN try/except,
+                # nested inside this one, because the runner is strictly downstream of the
+                # burst: `export` already swallows everything and refuses on failure, so the
+                # only thing left that can throw is the import -- and a missing runner module
+                # must not cost the burst that was just armed above.
+                try:
+                    from vtl.patches import rust_runner
+
+                    rust_runner.export(self, b)
+                except Exception:
+                    log.exception("vtl: rust runner export failed; burst continues without it")
             except Exception:
                 log.exception("vtl: nstep burst setup failed; one token per step")
                 b.armed = False
@@ -1085,12 +1136,14 @@ def _self_check() -> None:
         assert len(range(1, n)) == n - 1
         assert (n - 1) not in range(0, n - 1), "the last column is written on the host"
 
-    assert MAX_BURST_REQS == 8 and BURST_SIZES[0] == 1
+    # The pre-capture defaults. `_capture_burst_graphs` REPLACES both with whatever FULL
+    # decode sizes actually captured, so this pins the seed value, not an invariant.
+    assert MAX_BURST_REQS == BURST_SIZES[-1] and BURST_SIZES[0] == 1
 
     # `__slots__` must be able to hold everything apply() and the burst assign. Omitting a
     # name here is an AttributeError at BOOT, after the model has been loaded -- i.e. the
     # most expensive place to find out.
-    for name in ("advance", "bump", "idx_map", "max_seq_len", "accum", "tok", "step",
+    for name in ("advance", "bump", "idx_map", "rows", "max_seq_len", "accum", "tok", "step",
                  "num_sampled", "num_rejected", "desc", "pending", "graphs", "runner",
                  "armed", "ready", "key", "n", "mode",
                  "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs",
@@ -1099,7 +1152,7 @@ def _self_check() -> None:
     assert set(_Burst.__slots__) == {
         "armed", "ready", "key", "n", "mode", "runner", "graphs", "accum", "tok", "step",
         "num_sampled", "num_rejected", "desc", "pending",
-        "advance", "bump", "idx_map", "max_seq_len",
+        "advance", "bump", "idx_map", "rows", "max_seq_len",
         "fold", "unroll", "sample1", "pro_graphs", "unroll_graphs", "ones", "zeros",
         "pending1",
     }, "the slot list above and __slots__ must not drift"

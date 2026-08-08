@@ -27,6 +27,7 @@ import re
 import sys
 from pathlib import Path
 
+from _ci_report import _ers
 from metrics import aggregate
 
 NAME_RE = re.compile(r"bench-sched-(?P<arm>.+)-b(?P<boot>\d+)\.json$")
@@ -34,7 +35,7 @@ BASELINE = "heuristic"  # the sentinel arm = kernel heuristic = what submissions
 
 # (label, metrics.aggregate key, decimal places). p50 for both: the sweep asks which schedule
 # is faster, and the tails are dominated by prefill scheduling, not by the tile choice.
-METRICS = (("TPOT p50", "itl_ms", 3), ("TTFT p50", "ttft_ms", 1))
+METRICS = (("TPOT p50", "itl_ms", 3), ("TTFT p50", "ttft_ms", 1), ("ERS", "ers", 4))
 
 
 def makefile_schedules(makefile):
@@ -75,7 +76,14 @@ def collect(paths):
             skipped.append(p)
             continue
         run = json.loads(Path(p).read_text())
-        arms.setdefault(key[0], []).append(aggregate(run["records"], run["wall_time"]))
+        agg = aggregate(run["records"], run["wall_time"])
+        # The scored quantity, so an arm that trades TPOT against TTFT can be ranked without
+        # doing the 1 ms ~= 28 ms conversion by hand. `_ers` divides by the FULL record count,
+        # so failed requests drag the arm down exactly as the scoring spec intends. Stuffed
+        # under a "p50" key because that is the shape `summarize` reads; it is a mean, not a
+        # median -- the label below says ERS, not ERS p50, for that reason.
+        agg["ers"] = {"p50": _ers(run)}
+        arms.setdefault(key[0], []).append(agg)
     return arms, skipped
 
 
@@ -134,27 +142,54 @@ def render(rows, floors, baseline=BASELINE):
         print()
         return
     floor_text = ", ".join(
-        f"{label} {floors[key]:.{places}f}ms" for label, key, places in METRICS
+        # ERS is a dimensionless score, not a duration -- the `ms` suffix is per-metric.
+        f"{label} {floors[key]:.{places}f}{'' if key == 'ers' else 'ms'}"
+        for label, key, places in METRICS
         if floors[key] is not None
     )
     print(f"  ± is peak-to-peak across boots. This run's own noise floor (the `{baseline}` arm's")
     print(f"  boot-to-boot spread): {floor_text}.")
     print("  ~ = delta is inside that floor: NOT a result — add boots (BOOTS=n) or drop the arm.")
     print("  ! = delta clears the floor. Rank those, and remember 1 ms TPOT ~= 28 ms TTFT.")
+    print("  DIRECTION: TPOT/TTFT are lower-is-better, ERS is HIGHER-is-better — so a winning")
+    print("  arm shows NEGATIVE TPOT/TTFT deltas and a POSITIVE ERS delta. ERS is the scored")
+    print("  quantity; when it disagrees with TPOT, ERS wins.")
     print()
 
 
 def main():
-    paths = sys.argv[1:]
+    # `--baseline NAME` because the sentinel arm is only called `heuristic` for the W4A8
+    # schedule sweep; a topology sweep's baseline is the shipped config (`mp`). Everything
+    # downstream already takes `baseline=` -- only this entry point hardcoded it.
+    argv = sys.argv[1:]
+    baseline = BASELINE
+    paths = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--baseline":
+            if i + 1 >= len(argv):
+                sys.exit("--baseline needs an arm name")
+            baseline, i = argv[i + 1], i + 2
+            continue
+        if argv[i].startswith("--baseline="):
+            baseline, i = argv[i].split("=", 1)[1], i + 1
+            continue
+        paths.append(argv[i])
+        i += 1
     if not paths:
-        sys.exit("usage: python bench/sweep_report.py bench-sched-*.json")
+        sys.exit("usage: python bench/sweep_report.py [--baseline ARM] bench-sched-*.json")
     arms, skipped = collect(paths)
     if skipped:
         print(f"  skipped (not a bench-sched-<arm>-b<n>.json): {skipped}")
     if not arms:
         sys.exit("  nothing to summarise")
-    rows, floors = summarize(arms)
-    render(rows, floors)
+    if baseline not in arms:
+        # Not fatal -- the table is still readable -- but every delta and the noise floor
+        # silently vanish, which reads like "no arm moved anything".
+        print(f"  WARNING: baseline arm {baseline!r} not among {sorted(arms)}; "
+              "no deltas and no noise floor will be computed")
+    rows, floors = summarize(arms, baseline=baseline)
+    render(rows, floors, baseline=baseline)
 
 
 def _check_schedule_names():

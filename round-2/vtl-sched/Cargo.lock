@@ -966,6 +966,7 @@ name = "vtl-sched"
 version = "0.1.0"
 dependencies = [
  "iceoryx2",
+ "libloading",
  "numpy",
  "pyo3",
  "rustc-hash 2.1.3",

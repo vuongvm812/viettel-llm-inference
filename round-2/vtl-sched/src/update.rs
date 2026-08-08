@@ -148,6 +148,54 @@ pub fn finish_reason(status: u8) -> Option<u8> {
     }
 }
 
+/// Gather each request's accepted tokens out of the sampler's `[nrows, ncols]` array.
+///
+/// Two callers, one implementation: `update_step_pack_np` (source = a numpy array the
+/// sampler wrote) and the Rust model runner (source = its own pinned D2H buffer). The layout
+/// and the bounds rules are identical, and the row/column arithmetic here is exactly the
+/// kind of thing that fails silently -- a wrong `row * ncols` reads another request's tokens
+/// and still returns a plausible id -- so it lives OUTSIDE the `python` feature to stay in
+/// the default `cargo test` gate the Dockerfile runs.
+///
+/// Returns an owned `Vec` because the numpy caller must copy before releasing the GIL.
+pub fn gather_sampled(
+    arr: &[i64],
+    nrows: usize,
+    ncols: usize,
+    rows: &[u32],
+    counts: &[u32],
+) -> Result<Vec<i64>, String> {
+    if rows.len() != counts.len() {
+        return Err(format!(
+            "gather_sampled arity mismatch: {} rows, {} counts",
+            rows.len(),
+            counts.len()
+        ));
+    }
+    let mut flat: Vec<i64> = Vec::with_capacity(rows.len() * 2);
+    for i in 0..rows.len() {
+        let row = rows[i] as usize;
+        let cnt = counts[i] as usize;
+        if row >= nrows || cnt > ncols {
+            return Err(format!(
+                "gather_sampled row {row} / count {cnt} outside [{nrows}, {ncols}]"
+            ));
+        }
+        let base = row * ncols;
+        // Belt and braces: `nrows`/`ncols` are what the caller CLAIMS the array is. If they
+        // over-describe a short buffer, the slice below would panic (or, in the runner's
+        // case, read past a pinned allocation) -- so check against the real length too.
+        if base + cnt > arr.len() {
+            return Err(format!(
+                "gather_sampled slice {base}+{cnt} past the {}-element array",
+                arr.len()
+            ));
+        }
+        flat.extend_from_slice(&arr[base..base + cnt]);
+    }
+    Ok(flat)
+}
+
 /// Streaming writer for one TAG_RAW record into a reused buffer.
 ///
 /// Streaming rather than "build a Vec of rows then serialize": the row count is known
@@ -323,6 +371,66 @@ impl StopTable {
             }
         }
         Ok(&self.out)
+    }
+}
+
+#[cfg(test)]
+mod gather_tests {
+    use super::gather_sampled;
+
+    /// `[3 rows, 4 cols]`, values encode (row, col) so a mis-strided read is obvious.
+    fn arr() -> Vec<i64> {
+        (0..3).flat_map(|r| (0..4).map(move |c| r * 100 + c)).collect()
+    }
+
+    #[test]
+    fn gathers_variable_counts_from_the_right_rows() {
+        let out = gather_sampled(&arr(), 3, 4, &[0, 2, 1], &[1, 3, 2]).unwrap();
+        // row 0 x1, row 2 x3, row 1 x2 -- in REQUEST order, not row order.
+        assert_eq!(out, vec![0, 200, 201, 202, 100, 101]);
+    }
+
+    #[test]
+    fn a_zero_count_contributes_nothing() {
+        // A request that accepted no token still occupies a slot; it must not shift the
+        // ones after it.
+        let out = gather_sampled(&arr(), 3, 4, &[0, 1, 2], &[1, 0, 1]).unwrap();
+        assert_eq!(out, vec![0, 200]);
+    }
+
+    #[test]
+    fn full_width_rows_round_trip() {
+        let out = gather_sampled(&arr(), 3, 4, &[1], &[4]).unwrap();
+        assert_eq!(out, vec![100, 101, 102, 103]);
+    }
+
+    #[test]
+    fn out_of_range_row_is_an_error_not_a_wrong_answer() {
+        assert!(gather_sampled(&arr(), 3, 4, &[3], &[1]).is_err());
+    }
+
+    #[test]
+    fn count_wider_than_the_array_is_refused() {
+        assert!(gather_sampled(&arr(), 3, 4, &[0], &[5]).is_err());
+    }
+
+    #[test]
+    fn a_short_buffer_is_caught_even_when_the_shape_looks_fine() {
+        // The caller claims [3, 4] but hands over 8 elements. Row 2 is in range per the
+        // shape and past the end of the buffer -- this is the runner's failure mode if a
+        // pinned allocation is sized from a stale batch.
+        let short = vec![0i64; 8];
+        assert!(gather_sampled(&short, 3, 4, &[2], &[1]).is_err());
+    }
+
+    #[test]
+    fn mismatched_arity_is_refused() {
+        assert!(gather_sampled(&arr(), 3, 4, &[0, 1], &[1]).is_err());
+    }
+
+    #[test]
+    fn empty_batch_yields_empty() {
+        assert_eq!(gather_sampled(&arr(), 3, 4, &[], &[]).unwrap(), Vec::<i64>::new());
     }
 }
 

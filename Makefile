@@ -396,6 +396,49 @@ sweep-schedule: $(if $(MICRO),sweep-schedule-micro)
 	@echo "verdict: cd $(ROUND) && python3 bench/sweep_report.py bench-sched-*.json"
 	@echo "  (compare.py prints one column per BOOT and cannot group arms -- use sweep_report)"
 
+## Executor-topology A/B: does dropping `mp` for `uni` pay? Compose ships `uni` (no backend
+## flag at TP=1), which revives three shipped optimizations that a two-process split had
+## silently disabled -- the N-step burst, VTL_SAMPLE_IN_GRAPH and the R9 fast hit -- at the
+## cost of VTL_SCHED_SO_RING (Phase C), which requires `mp` and self-refuses under uni.
+## `uni-nofast` is the attribution arm: uni WITHOUT the fast path, so the pickle-hop saving
+## can be separated from the features the flip unlocks.
+##
+## Why the base compose is REWRITTEN per arm instead of overlaid: a compose override replaces
+## `command:` wholesale, so an overlay carrying one serve flag would have to duplicate the
+## whole 40-line arg list -- which then rots silently the next time a flag changes here.
+TOPOLOGY_ARMS ?= mp uni uni-nofast
+TOPO_BASE := /tmp/vtl-topology-base.yaml
+TOPO_OVERLAY := /tmp/vtl-topology-sweep.yaml
+## Same overlay stack as COMPOSE_FILES, with the SUBMISSION file swapped for the per-arm copy.
+TOPO_DC := docker compose -f $(TOPO_BASE) -f docker-compose-optimized.yaml \
+           -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml -f $(TOPO_OVERLAY)
+sweep-topology:
+	@for name in $(TOPOLOGY_ARMS); do \
+	  fast=1; \
+	  case "$$name" in *-nofast) fast=0;; esac; \
+	  if [ "$$name" = "mp" ]; then \
+	    awk '{print} /--tensor-parallel-size=1$$/{print "      - --distributed-executor-backend=mp"}' \
+	      $(ROUND)/docker-compose.yaml > $(TOPO_BASE); \
+	    grep -qE '^[[:space:]]*- --distributed-executor-backend=mp$$' $(TOPO_BASE) \
+	      || { echo "FATAL: could not insert the mp flag -- the --tensor-parallel-size=1 anchor moved."; \
+	           echo "  Without it the 'mp' arm would boot uni and the whole sweep would compare uni to uni."; \
+	           exit 1; }; \
+	  else \
+	    cp $(ROUND)/docker-compose.yaml $(TOPO_BASE); \
+	  fi; \
+	  printf 'services:\n  model:\n    environment:\n      VTL_ENABLE_DECODE_FASTPATH: "%s"\n' "$$fast" > $(TOPO_OVERLAY); \
+	  b=0; while [ $$b -lt $(BOOTS) ]; do b=$$((b+1)); \
+	    echo "=== $$name boot $$b/$(BOOTS) (fastpath=$$fast)"; \
+	    ( cd $(ROUND) && $(TOPO_DC) up -d --force-recreate --wait \
+	      && python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	           --out bench-sched-$$name-b$$b.json \
+	      ; rc=$$?; $(TOPO_DC) down; exit $$rc ) || exit 1; \
+	  done; \
+	done
+	@echo "verdict: cd $(ROUND) && python3 bench/sweep_report.py --baseline mp bench-sched-*.json"
+	@echo "  mp is the baseline (today's shipped config); its own boot spread IS the noise floor."
+	@echo "  Check the boot logs for 'classified N FA' and 'SO_RING refused' before trusting a delta."
+
 ## Kernel-level filter to run BEFORE committing $(BOOTS) boots x $(words $(SCHEDULES)) arms of
 ## trace replay to the box. Same microbench `make bench-kernel` runs (bench/test_*.py print
 ## CUDA-event tables), once per schedule: minutes instead of hours, and an arm that already

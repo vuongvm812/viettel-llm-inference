@@ -11,6 +11,10 @@
 pub mod block_pool;
 pub mod config;
 pub mod coordinator;
+/// The Rust steady-state runner's GPU half. The CUDA-graph dispatch table is unconditional
+/// (pure integer logic, unit-tested under default features -- it is the part that can be
+/// silently WRONG rather than merely absent); the dlopen'd libcuda calls are behind `cuda`.
+pub mod gpu;
 pub mod hash;
 /// Crate-internal: the journal is an implementation detail of `spec.rs`, and every type
 /// in it (`Block`, the index snapshots) is one callers must not be able to forge.

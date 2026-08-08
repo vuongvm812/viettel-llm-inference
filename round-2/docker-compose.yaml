@@ -56,7 +56,18 @@ services:
       - --max-model-len=32768
       - --gpu-memory-utilization=0.90
       - --tensor-parallel-size=1
-      - --distributed-executor-backend=mp
+      # EXECUTOR BACKEND: deliberately UNSET -> UniProcExecutor at TP=1 (parallel.py:915).
+      # Was `mp`, which put EngineCore and the GPU worker in separate processes talking over
+      # pickled shm queues. That split silently killed three SHIPPED optimizations, because
+      # each is a module global written in one process and read in the other:
+      #   * the N-step burst      -- BURST.armed set in WorkerProc (nstep_decode.py:826),
+      #                              read in EngineCoreProc (:213-238) -> never commits;
+      #   * VTL_SAMPLE_IN_GRAPH   -- same handshake (:227-238);
+      #   * the R9 fast-hit path  -- keyed on id(req_id_to_index) (rust_sched.py:1734), and
+      #                              pickle never preserves identity across processes.
+      # The cost of `uni` is VTL_SCHED_SO_RING (Phase C), which requires `mp` and now
+      # self-refuses (rust_sched.py:325-327) -- that trade is what `make sweep-topology`
+      # measures. Revert by restoring `- --distributed-executor-backend=mp`.
       # - --attention-backend=FLASHINFER
 
       # Intra-conversation prefix reuse is the biggest win (turn N reuses turns 0..N-1).
@@ -479,6 +490,28 @@ services:
                                          # queue-empty gate (one token crosses no block
                                          # boundary and delays no admission). Needs FOLD_T1.
                                          # Revert: "0" = stock sampler every step.
+
+      # ---- The Rust steady-state runner (round-2/RUST-RUNNER.md) -----------------------
+      # Rust drives the captured whole-step graph directly: host writes -> cuGraphLaunch ->
+      # a pre-planned D2H into a pinned Rust buffer -> the same update_step_pack core the
+      # scheduler already calls -> stop-check -> shm publish. A steady decode step touches
+      # no Python. Requires the uni executor (see the command block above) and the graphs
+      # nstep_decode captures, so it rides VTL_ENABLE_NSTEP_DECODE / VTL_NSTEP_MODE=graph.
+      # Every failure path degrades to the Python step rather than crashing: a missing
+      # raw_cuda_graph_exec, an unstable handle, a dispatch-table mismatch against vLLM's
+      # own dispatch, a non-Noop offloader or a libcuda that will not dlopen all just log
+      # once and leave the boot on the stock path.
+      VTL_RUST_RUNNER: "1"               # 0 = off (Python owns the step), 1 = Rust owns it,
+                                         # "check" = shadow: BOTH paths run and the sampled
+                                         # ids + stop verdicts are diffed per step, which is
+                                         # the arm to boot first after any capture change.
+                                         # Revert: "0".
+      VTL_RUST_RUNNER_STEPS: "8"         # Max decode steps Rust runs back-to-back before
+                                         # returning to Python. The loop also exits early on
+                                         # a request arriving on the shm listener, a stop
+                                         # verdict or a batch-shape change, so this is only
+                                         # the ceiling. "1" = one step per FFI call, which
+                                         # is the Phase-3 kill switch (Phase-2 behaviour).
       VTL_RUST_SCHED_TOKSTORE: "1"       # Port 2: Rust owns each slot's output tokens,
                                          # counters and block-hash chain. Deletes the two
                                          # tolist()s in AsyncOutput.get_output, decide()'s

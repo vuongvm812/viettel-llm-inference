@@ -75,6 +75,7 @@ Both parts are ON by default and independently killable:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 
@@ -217,7 +218,12 @@ def _classify(runner):  # noqa: ANN001
             if b.aot_sliding_window is None:
                 return None  # populated on the builder's first real build(); retry
             fa.append((b, group_id))
-    if not fa or not mamba:
+    # An EMPTY mamba list is legal: a dense (attention-only) model has no SSM group, and
+    # every mamba consumer is a loop (`_fast_model_attn`, `_snapshot`) or an unpack
+    # (`nstep_decode._burst_body`), so it no-ops. The mamba-specific refusals above all sit
+    # inside the `state_indices_tensor_d` branch and are simply unreachable -- which is why
+    # a dense model needs no `--mamba_cache_mode=align`. No FA builder is still fatal.
+    if not fa:
         return False
     return fa, mamba
 
@@ -393,6 +399,7 @@ def _patch_runner() -> None:
     import torch
     from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
     shadow = _flag("VTL_DECODE_FASTPATH_SHADOW", "0")
@@ -517,7 +524,14 @@ def _patch_runner() -> None:
 
     _install(GPUModelRunner, "prepare_inputs", wrap_prepare_inputs)
     _install(GPUModelRunner, "prepare_attn", wrap_prepare_attn)
+    # BOTH model states, because which one is live depends on the model: a hybrid gets
+    # MambaHybridModelState, a dense (attention-only) model gets DefaultModelState. The two
+    # `prepare_attn` signatures are identical (default.py:132-141 vs mamba_hybrid.py:228-239)
+    # and only one class is ever instantiated per boot, so the other install is inert.
+    # Patching only the hybrid was what left `_fast_model_attn` -- the biggest of the three
+    # seams -- dead on a dense model even with the builders classified.
     _install(MambaHybridModelState, "prepare_attn", wrap_model_prepare_attn)
+    _install(DefaultModelState, "prepare_attn", wrap_model_prepare_attn)
     log.info("vtl: decode_fastpath armed (shadow=%s)", shadow)
 
 
@@ -658,6 +672,28 @@ def _self_check() -> None:
         assert _flag("VTL_NOT_SET_ANYWHERE") is False
     finally:
         del os.environ["VTL_NOT_SET_ANYWHERE"]
+
+    # A dense (attention-only) model has no mamba builder, so it needs BOTH halves of the
+    # dense unlock. `_classify` itself needs torch+vLLM and cannot run here, but the two
+    # things that silently re-kill the fast path on dense models are checkable from source:
+    #
+    #   1. the third seam installed on DefaultModelState as well as MambaHybridModelState --
+    #      a hybrid-only install leaves `_fast_model_attn` (the biggest seam) dead;
+    #   2. `_classify` not refusing on an empty mamba list.
+    # Match the CALL, not the name: `DefaultModelState` also appears in `_patch_runner`'s
+    # import line, so a `co_names` membership test still passes with the install deleted.
+    installs = inspect.getsource(_patch_runner)
+    for cls_name in ("MambaHybridModelState", "DefaultModelState"):
+        assert f'_install({cls_name}, "prepare_attn"' in installs, (
+            f"decode_fastpath must install prepare_attn on {cls_name}; a dense model "
+            "instantiates DefaultModelState and would otherwise take the stock metadata "
+            "build every step, leaving the biggest of the three seams dead"
+        )
+    src = inspect.getsource(_classify)
+    assert "if not fa:" in src and "if not fa or not mamba:" not in src, (
+        "_classify must accept an empty mamba list (dense model); the mamba-specific "
+        "refusals live inside the state_indices_tensor_d branch and are unreachable there"
+    )
 
     from vtl.registry import PATCH_REGISTRY
 
