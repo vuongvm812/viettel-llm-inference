@@ -168,13 +168,17 @@ def _classify(runner):  # noqa: ANN001
     ``state_indices_tensor_d``. Anything we cannot place (FlashInfer -- which is what the
     sm_86 dev box picks under fp8 KV -- or a backend swap after a version bump) disables the
     fast path rather than guessing: a wrong metadata buffer is a silent wrong answer, not a
-    crash. ``None`` means "retry next step" (builders not primed yet); ``False`` is final.
+    crash. ``False`` is final, and every bail logs its reason -- a classify that fails at
+    ``capture_model`` time costs nstep its one shot at the burst graphs, so "which arm"
+    must be readable off the boot log. (``None`` used to mean "retry next step" for the
+    unprimed ``aot_sliding_window``; that arm now primes it in place, stock-identically.)
     """
     import vllm.envs as envs
     from vllm.v1.attention.backends import flash_attn as fa_mod
 
     if not hasattr(fa_mod, "get_scheduler_metadata"):
-        return False  # FA varlen not built into this image; nothing to fast-path
+        log.info("vtl: decode_fastpath off -- no FA varlen in this image")
+        return False
 
     fa, mamba = [], []
     for group_id, groups in enumerate(runner.attn_groups):
@@ -183,8 +187,10 @@ def _classify(runner):  # noqa: ANN001
             if hasattr(b, "state_indices_tensor_d"):
                 spec = b.kv_cache_spec
                 if getattr(spec, "num_speculative_blocks", 0) != 0 or b.num_spec_tokens:
+                    log.info("vtl: decode_fastpath off -- mamba builder carries spec-decode state")
                     return False
                 if runner.vllm_config.cache_config.mamba_cache_mode != "align":
+                    log.info("vtl: decode_fastpath off -- mamba_cache_mode is not align")
                     return False
                 # _mamba_write gathers state indices for PADDED rows too (stock tail-fills
                 # NULL instead, mamba_attn.py:574). That is safe only while gather_block_tables
@@ -205,11 +211,31 @@ def _classify(runner):  # noqa: ANN001
                          type(b).__name__)
                 return False
             if getattr(b, "dcp_world_size", 1) != 1 or envs.VLLM_BATCH_INVARIANT:
+                log.info("vtl: decode_fastpath off -- DCP or VLLM_BATCH_INVARIANT is set")
                 return False
             if b.max_cudagraph_size is None:
+                log.info("vtl: decode_fastpath off -- %s has no max_cudagraph_size",
+                         type(b).__name__)
                 return False
             if b.aot_sliding_window is None:
-                return None  # populated on the builder's first real build(); retry
+                # Stock populates this inside the first REAL build() (flash_attn.py:454-468)
+                # -- graph capture only runs dummy builds, so at capture_model time it is
+                # still None and a "retry next step" answer would cost nstep its one shot at
+                # the burst graphs. Replicate the stock block verbatim; idempotent by
+                # construction (build() re-derives the identical value).
+                b.aot_sliding_window = (-1, -1)
+                cfgs = fa_mod._get_sliding_window_configs(b.vllm_config)
+                if len(cfgs) == 1:
+                    cfg = cfgs.pop()
+                    if cfg is not None:
+                        b.aot_sliding_window = cfg
+                elif len(cfgs) > 1:
+                    # Stock's answer too (aot_schedule = False): layers disagree on the
+                    # window, so there is no single AOT schedule to precompute.
+                    b.aot_schedule = False
+                    log.info("vtl: decode_fastpath off -- mixed sliding windows disable "
+                             "the AOT schedule")
+                    return False
             fa.append((b, group_id))
     # An EMPTY mamba list is legal: a dense (attention-only) model has no SSM group, and
     # every mamba consumer is a loop (`_fast_model_attn`) or an unpack
@@ -217,6 +243,7 @@ def _classify(runner):  # noqa: ANN001
     # inside the `state_indices_tensor_d` branch and are simply unreachable -- which is why
     # a dense model needs no `--mamba_cache_mode=align`. No FA builder is still fatal.
     if not fa:
+        log.info("vtl: decode_fastpath off -- no FA builder in any attention group")
         return False
     return fa, mamba
 
