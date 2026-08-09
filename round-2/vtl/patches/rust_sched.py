@@ -105,6 +105,17 @@ def refuse(reason: str) -> None:
         raise RuntimeError(
             f"VTL_RUST_SCHED_REQUIRE=1 but the Rust scheduler cannot engage: {reason}"
         )
+    # The Rust runner needs this scheduler as its KV authority, so a disengage here is
+    # also the runner's death -- and with the runner's arming now DEFERRED to scheduler
+    # init (the capture-time REQUIRE check waives the not-yet-armed state), this is the
+    # only place left that can enforce VTL_RUST_RUNNER_REQUIRE on a boot where the
+    # scheduler never engages at all.
+    if env_on("VTL_RUST_RUNNER_REQUIRE") \
+            and os.environ.get("VTL_RUST_RUNNER", "1").strip().lower() in _TRUTHY:
+        raise RuntimeError(
+            "VTL_RUST_RUNNER_REQUIRE=1 but the Rust scheduler cannot engage, so the "
+            f"runner has no KV authority: {reason}"
+        )
     log.warning("rust_sched: NOT ENGAGED -- %s", reason)
 
 
@@ -785,6 +796,29 @@ def _install_authority(base, mirror_modes):
                 self._rust.num_groups,
                 cfg["num_blocks"],
             )
+            # Second half of the runner's arming rendezvous: on a server boot the graphs
+            # were captured (and stashed) BEFORE this Scheduler existed, so the deferred
+            # export can only complete now that `register_rust_kv` has run. `try_arm`
+            # itself raises under VTL_RUST_RUNNER_REQUIRE for permanent refusals; the
+            # explicit check below catches the one case it cannot see -- nothing was ever
+            # captured to arm against (import failure upstream, runner mode off at capture).
+            try:
+                from vtl.patches import rust_runner as _runner_mod
+
+                _runner_mod.try_arm()
+                if (
+                    _runner_mod.require()
+                    and _runner_mod.mode() == "on"
+                    and not _runner_mod.STATE.live
+                ):
+                    raise RuntimeError(
+                        "VTL_RUST_RUNNER_REQUIRE=1 but the Rust runner could not arm at "
+                        f"scheduler init: {_runner_mod.STATE.why}"
+                    )
+            except RuntimeError:
+                raise
+            except Exception:
+                log.exception("rust_sched: rust_runner.try_arm failed")
 
         # --- helpers --------------------------------------------------------
 

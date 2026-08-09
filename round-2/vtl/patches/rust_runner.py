@@ -182,7 +182,7 @@ class _State:
     """Module-global, like ``BURST`` and ``decode_fastpath._C``: one runner per process."""
 
     __slots__ = ("runner", "live", "why", "step", "done", "inflight", "engaged",
-                 "update", "pending")
+                 "update", "pending", "captured", "refused")
 
     def __init__(self) -> None:
         self.runner = None      # the vtl_sched.Runner, once armed
@@ -194,6 +194,8 @@ class _State:
         self.engaged = 0        # launches taken this boot, for the once-in-a-while log
         self.update = True      # commit at UPDATE time (the default mode); set by `export`
         self.pending = []       # update mode: FIFO of (ring slot, _Stash) not yet committed
+        self.captured = None    # (model runner, BURST) stashed at capture, armed later
+        self.refused = False    # PERMANENT stand-down (vs. merely not-yet-armed)
 
     def refuse(self, why: str) -> None:
         """Permanent stand-down for the boot.
@@ -208,6 +210,7 @@ class _State:
         else:
             log.info("vtl: rust runner not armed -- %s", why)
         self.live = False
+        self.refused = True
         self.why = why
         self.step = None
         self.done = None
@@ -387,35 +390,50 @@ def _verify_dispatch(runner_obj, mgr, max_num_reqs: int, execs: dict) -> str | N
 
 
 def export(runner, b) -> None:
-    """Arm the Rust runner against this boot's graphs. Never raises.
+    """Stash this boot's graphs and arm if the scheduler side is already up. Never raises.
 
     Called from ``nstep_decode``'s ``capture_model`` wrapper AFTER the burst graphs are
-    captured, so ``b.accum`` exists and ``mgr.graphs`` is complete.
+    captured, so ``b.accum`` exists and ``mgr.graphs`` is complete. On a server boot that
+    is BEFORE the scheduler exists (``capture_model`` runs inside
+    ``EngineCore._initialize_kv_caches``; the Scheduler -- and with it the Rust KV manager
+    -- is constructed only after that returns), so arming is a RENDEZVOUS: whichever of
+    capture and ``register_rust_kv`` happens second completes it via ``try_arm``.
     """
+    STATE.captured = (runner, b)
+    try_arm()
+
+
+def try_arm() -> bool:
+    """Arm the runner if BOTH halves of the rendezvous exist. Never raises (except via
+    ``refuse`` under ``VTL_RUST_RUNNER_REQUIRE``). True = live.
+
+    Permanent impossibilities (wheel without the feature, no driver, no unroll graphs,
+    a real offloader) latch ``refused``; a missing Rust KV manager merely DEFERS -- the
+    scheduler half calls back in when it registers.
+    """
+    if STATE.live:
+        return True
+    if STATE.refused or STATE.captured is None:
+        return False
+    runner, b = STATE.captured
+
     want = mode()
     if want == "off":
         STATE.refuse("VTL_RUST_RUNNER=0")
-        return
+        return False
 
     try:
         import vtl_sched
     except Exception as exc:
         STATE.refuse(f"vtl_sched not importable: {exc}")
-        return
+        return False
     if not getattr(vtl_sched, "HAS_CUDA_RUNNER", False):
         STATE.refuse("this vtl_sched wheel was built without the `cuda` feature")
-        return
-
-    from vtl.patches.shm_ipc import rust_kv
-
-    kv = rust_kv()
-    if kv is None:
-        STATE.refuse("the Rust KV manager is not the authority this boot")
-        return
+        return False
 
     if not vtl_sched.Runner.driver_available():
         STATE.refuse(f"libcuda unavailable: {vtl_sched.Runner.driver_error()}")
-        return
+        return False
 
     # Hazard 7: `run_fullgraph` calls `get_offloader().sync_prev_onload()` before every
     # replay. That is a no-op for the served config (NoopOffloader), and the runner does not
@@ -428,36 +446,47 @@ def export(runner, b) -> None:
                 f"offloader is {type(get_offloader()).__name__}, not NoopOffloader; "
                 "run_fullgraph's sync_prev_onload is not a no-op here"
             )
-            return
+            return False
     except ImportError:
         log.info("vtl: no offloader module in this build; nothing to sync")
 
     mgr = getattr(runner, "cudagraph_manager", None)
     if mgr is None or not getattr(mgr, "graphs", None):
         STATE.refuse("no captured cudagraphs")
-        return
+        return False
     if b.accum is None or b.rows is None:
         STATE.refuse("the burst accumulator was never allocated")
-        return
+        return False
     if not b.unroll_graphs:
         # M1's ordering enforcement. Without the unroll rung the only handles on offer are
         # stock's forward-only graphs, which never write `accum` -- a runner armed against
         # those would launch a step and then commit whatever tokens were left over from the
         # previous one. Never arm.
         STATE.refuse("nstep captured no unroll graphs; there is nothing launchable")
-        return
+        return False
+
+    # LAST among the gates, and the one that DEFERS instead of refusing: on a server boot
+    # capture runs before the Scheduler exists, so at that point there is no Rust KV
+    # manager YET -- `rust_sched` calls `try_arm` again right after `register_rust_kv`.
+    from vtl.patches.shm_ipc import rust_kv
+
+    kv = rust_kv()
+    if kv is None:
+        STATE.why = "waiting for the Rust KV manager (the scheduler is not built yet)"
+        log.info("vtl: rust runner arming deferred -- %s", STATE.why)
+        return False
 
     try:
         rust_runner = vtl_sched.Runner(kv)
         _, execs = _build_table(rust_runner, mgr, b)
         if not execs:
             STATE.refuse("no unroll graph exposed a usable cudaGraphExec_t")
-            return
+            return False
 
         why = _verify_dispatch(rust_runner, mgr, int(runner.max_num_reqs), execs)
         if why is not None:
             STATE.refuse(f"dispatch parity failed: {why}")
-            return
+            return False
 
         import torch
 
@@ -468,7 +497,7 @@ def export(runner, b) -> None:
                 "runner.main_stream is not the current stream; the export would bind a "
                 "stream the graphs were not captured against"
             )
-            return
+            return False
 
         rows, cols = int(b.accum.shape[0]), int(b.accum.shape[1])
         rust_runner.arm(stream, int(b.accum.data_ptr()), rows, cols)
@@ -480,10 +509,10 @@ def export(runner, b) -> None:
         for rows, entry in b.unroll_graphs.items():
             if execs.get(entry[1]) != int(entry[0].raw_cuda_graph_exec()):
                 STATE.refuse(f"the unroll cudaGraphExec_t at num_reqs={rows} moved")
-                return
+                return False
     except Exception as exc:
         STATE.refuse(f"export raised: {exc}")
-        return
+        return False
 
     STATE.runner = rust_runner
     STATE.live = True
@@ -504,6 +533,7 @@ def export(runner, b) -> None:
         "update" if STATE.update else "sample",
         1 if STATE.update else max_steps(),
     )
+    return True
 
 
 def _self_check() -> None:
@@ -544,6 +574,15 @@ def _self_check() -> None:
         finally:
             logging.disable(logging.NOTSET)
         assert not s.live and s.why == "required"
+        # The rendezvous latch: refuse() is PERMANENT, a fresh state is merely unarmed.
+        assert s.refused, "refuse() must latch `refused`"
+        fresh = _State()
+        assert not fresh.refused and fresh.captured is None
+        # try_arm with nothing captured is the deferral, never a refusal -- the other
+        # rendezvous half (scheduler init) must still be able to arm later.
+        os.environ.pop("VTL_RUST_RUNNER_REQUIRE", None)
+        assert try_arm() is False and not STATE.refused, \
+            "try_arm with nothing captured must defer, not refuse"
     finally:
         if saved_r is None:
             os.environ.pop("VTL_RUST_RUNNER_REQUIRE", None)

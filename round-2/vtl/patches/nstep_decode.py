@@ -1147,14 +1147,23 @@ def _patch_runner(b: _Burst) -> None:
             # VTL_RUST_RUNNER_REQUIRE, checked HERE: every guard above swallows on purpose
             # (a runner that cannot arm must not cost the boot), so the loud arm has to sit
             # outside all of them. An unimportable module raises on its own, which is the
-            # same answer.
+            # same answer. Only PERMANENT refusals (and a burst that never armed) fail the
+            # boot at this point -- on a server boot the Scheduler does not exist yet
+            # (capture runs inside `_initialize_kv_caches`), so "waiting for the Rust KV
+            # manager" is the expected state; `rust_sched` completes the rendezvous at
+            # scheduler init and enforces REQUIRE for that half.
             if _flag("VTL_RUST_RUNNER_REQUIRE", "0"):
                 from vtl.patches import rust_runner
 
-                if not rust_runner.STATE.live:
+                if rust_runner.STATE.refused or not b.armed:
                     raise RuntimeError(
-                        "VTL_RUST_RUNNER_REQUIRE=1 but the Rust runner is not armed: "
-                        f"{rust_runner.STATE.why}"
+                        "VTL_RUST_RUNNER_REQUIRE=1 but the Rust runner cannot arm: "
+                        f"{rust_runner.STATE.why if b.armed else 'the burst never armed'}"
+                    )
+                if not rust_runner.STATE.live:
+                    log.info(
+                        "vtl: rust runner REQUIRE deferred to scheduler init -- %s",
+                        rust_runner.STATE.why,
                     )
             return size
 
