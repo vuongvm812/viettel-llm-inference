@@ -274,19 +274,25 @@ services:
       # pre-planned D2H -> update_step_pack -> stop-check -> shm publish. A steady decode step
       # touches no Python. Requires the uni executor and the graphs nstep_decode captures.
       # Every failure path degrades to the Python step rather than crashing.
-      # ARMED IS NOT ENGAGED. Rust commits a step's tokens at sample time and Python commits
-      # them at update time, and async scheduling runs a depth-2 batch queue
-      # (schedule(k) -> sample(k) -> update(k-1)), so a launch while an earlier step is still
-      # unapplied would order the token store wrong. The launch therefore requires exactly one
-      # step in flight, which under this config means the runner arms, self-checks and idles
-      # until the queue drains. Engaging it in steady state = give the runner the loop
-      # (max_concurrent_batches 1), not a weaker interlock. See rust_runner.py's docstring.
+      # THE BATCH QUEUE (RUST-RUNNER.md hazard 8), resolved by committing at UPDATE time.
+      # Async scheduling runs a depth-2 batch queue (schedule(k) -> sample(k) -> update(k-1)),
+      # so a Rust commit inside sample(k) would order step k's tokens ahead of step k-1's.
+      # COMMIT="update" splits the step: sample(k) only enqueues cuGraphLaunch + the pinned
+      # D2H into the free ring slot, and the commit runs in update_from_output, where the
+      # steps ARE ordered. No interlock, the depth-2 overlap is kept, and the runner engages
+      # under this config. "sample" is the legacy interlocked path (idles here; only it can use
+      # the multi-step residency loop). See rust_runner.py's docstring.
       VTL_RUST_RUNNER: "1"               # 0 = off (Python owns the step), 1 = Rust owns it
-      VTL_RUST_RUNNER_STEPS: "8"         # max burst launches Rust takes back-to-back before
-                                         #   returning to Python (launch 1 replays the unroll
-                                         #   graph, 2..k the continuation graph). The loop also
-                                         #   exits on a stop verdict, and the scheduler caps it
-                                         #   at the align window's headroom, so this is only the
+      VTL_RUST_RUNNER_COMMIT: "update"   # "update" = launch at sample time, commit at update
+                                         #   time behind a pinned ring of 2. "sample" = legacy.
+      VTL_RUST_RUNNER_STEPS: "8"         # SAMPLE-MODE ONLY (update mode pins it to 1, which is
+                                         #   also what leaves the continuation graphs -- and
+                                         #   their burst-graph memory -- uncaptured). Max burst
+                                         #   launches Rust takes back-to-back before returning
+                                         #   to Python: launch 1 replays the unroll graph, 2..k
+                                         #   the continuation graph. The loop also exits on a
+                                         #   stop verdict, and the scheduler caps it at the
+                                         #   align window's headroom, so this is only the
                                          #   ceiling. "1" = one burst per engine step.
       # "1" DELIBERATELY, on this dev branch: 1 turns a silent runner refusal into a BOOT
       # FAILURE. A runner that armed and then quietly stood down measures the Python step

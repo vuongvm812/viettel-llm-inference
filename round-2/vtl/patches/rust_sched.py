@@ -2117,12 +2117,25 @@ def _install_update_from_output(scheduler_cls, m: dict):
                 return 0
             reqs.append(request)
         publish = out_publish_ready(kv._rust)
-        if steps > 1 and not publish:
+        if state.update:
+            # Update mode has no residency loop to grant launches to: the step is split
+            # across `launch` and `commit`, one burst each. Pinned here rather than left to
+            # `runner_steps` so the committed token budget can never exceed what one launch
+            # produces.
+            steps = 1
+        elif steps > 1 and not publish:
             # `update_from_output` hands back ONE record per engine index, so the second
             # launch's record would have nowhere to go. With the inline publish live each
             # launch delivers its own and there is nothing left to return -- which is why
             # k > 1 is gated on it instead of on a queue of records.
             steps = 1
+        # WHICH SCHEDULED STEP THIS IS. Update mode commits one step late, so the pending
+        # FIFO's head has to be matched against the step being updated -- and the request-id
+        # key cannot do it (two consecutive steps routinely have the identical key). The
+        # counter rides the SchedulerOutput, which is the only object both ends see.
+        seq = getattr(self, "_vtl_runner_seq", 0) + 1
+        self._vtl_runner_seq = seq
+        scheduler_output.vtl_runner_seq = seq
         state.step = runner_mod._Stash(
             # From the SLOT order, so the launch site's `key == tuple(ib.req_ids)` check
             # doubles as the proof that slots[i] is the slot of batch row i.
@@ -2134,6 +2147,7 @@ def _install_update_from_output(scheduler_cls, m: dict):
             max_model_len=int(self.max_model_len),
             fold=True,               # == R9.live, checked above
             publish=publish,
+            seq=seq,
         )
         return steps
 
@@ -2154,7 +2168,7 @@ def _install_update_from_output(scheduler_cls, m: dict):
         # Deferred to the end of the function: `refuse` RAISES under
         # VTL_RUST_RUNNER_REQUIRE, and the state below has to be applied first either way.
         stand_down = None
-        if done.exit == "unpacked":
+        if done.exit.startswith("unpacked"):
             # Should-never-happen: the crate refuses the pre-flight rather than reach here.
             # The failed launch appended NOTHING to the token store (`store_apply` runs
             # only on a packed step) but the WORKER did advance -- `postprocess_sampled`
@@ -2165,7 +2179,8 @@ def _install_update_from_output(scheduler_cls, m: dict):
             # generates again from worker/scheduler-divergent state. `ran` already counts
             # the unpacked launch, so `base` -- the packed launches' tokens -- is already
             # right and the residue accepts exactly those.
-            log.error("rust_sched: the runner could not pack launch %d; standing down", ran)
+            log.error("rust_sched: the runner could not pack launch %d (%s); standing down",
+                      ran, done.exit)
             stand_down = "a launch did not pack"
             self._vtl_ufo_clean = False
             verdicts = [(0, 2, -1)] * len(stash.slots)  # 2 = FINISHED_LENGTH_CAPPED
@@ -2191,6 +2206,71 @@ def _install_update_from_output(scheduler_cls, m: dict):
             stand_down = "multi-record step without the inline publish"
         if stand_down is not None:
             runner_mod.STATE.refuse(stand_down)
+
+    def runner_commit(self, scheduler_output, mro, state):
+        """Update mode: commit the launch this step's tokens came from. ``None`` = don't.
+
+        The pending FIFO holds one entry per launch, in launch order, and updates arrive in
+        the SAME order -- that is the whole reason the commit was moved here (RUST-RUNNER.md
+        hazard 8, option b). So only the head can belong to this step, and which step that is
+        is decided by the sequence number ``runner_stash`` stamped on the SchedulerOutput.
+
+        Three answers:
+
+          * head seq > this step's -- this step never launched (it fell through to Python, or
+            the launch declined). Leave the FIFO alone and let ``decide()`` run: the head
+            belongs to a LATER step whose update has not happened yet.
+          * head seq == this step's -- commit it, and hand ``runner_consume`` the same
+            ``_Done`` shape the sample-time path produces.
+          * head seq < this step's -- a launched step whose update never came, which cannot
+            happen (every scheduled step is updated). Drop it and stand down rather than
+            commit a batch's tokens against the wrong step.
+
+        Every ``None`` here is safe by construction: a launch commits nothing, so the tokens
+        are still in the ``AsyncOutput`` the worker built and ``decide()`` is a complete
+        commit for the step.
+        """
+        slot, stash = state.pending[0]
+        seq = getattr(scheduler_output, "vtl_runner_seq", 0)
+        if stash.seq != seq:
+            if stash.seq > seq:
+                return None
+            state.pending.pop(0)
+            log.error("rust_sched: pending launch %d never updated; standing down", stash.seq)
+            state.refuse("a pending launch was never updated")
+            return None
+        state.pending.pop(0)
+        if stash.key != tuple(mro.req_ids) or self._vtl_burst_n != stash.n * stash.steps:
+            # The launch site already proved this once (`key == tuple(ib.req_ids)`), so a
+            # disagreement here means the batch changed underneath the sequence number.
+            log.error("rust_sched: pending launch %d does not match its update", stash.seq)
+            state.refuse("a pending launch does not match its update")
+            return None
+        rows = len(stash.slots)
+        try:
+            out = state.runner.commit(
+                slot, list(range(rows)), [stash.n] * rows, list(stash.slots),
+                list(stash.key), stash.max_model_len, 0, monotonic(), (),
+                stash.fold, stash.publish,
+            )
+        except BaseException as exc:
+            reraise_fatal(exc)
+            # The crate only raises BEFORE it mutates anything (a driver call, the gather,
+            # an arity check); a failure inside the commit comes back as the "unpacked"
+            # marker instead. So `decide()` can still take this step.
+            log.exception("rust_sched: the runner commit raised; this step uses decide()")
+            state.refuse("commit raised")
+            return None
+        if out is None:
+            # Declined without mutating: a slot in the batch is no longer the request the
+            # launch planned against (it finished at update(k-1), and schedule(k+1) may
+            # already have given the slot away). decide() owns the step.
+            return None
+        verdicts, record, published, exit_reason = out
+        return runner_mod._Done(
+            stash, list(verdicts), [] if record is None else [record],
+            "budget" if exit_reason == "ok" else exit_reason, 1,
+        )
 
     def decide(self, kv, scheduler_output, model_runner_output, pack: bool):
         """Build the flat batch and take the single crossing. None = nothing portable.
@@ -2522,14 +2602,18 @@ def _install_update_from_output(scheduler_cls, m: dict):
         kv = self.kv_cache_manager
         done = None
         if RUNNER:
-            # THE ONE PLACE a scheduled step is counted as applied. `inflight` is the
-            # runner's launch interlock -- Rust commits at sample time and Python commits
-            # here, so a launch while an earlier step is still unapplied would order this
-            # step's tokens ahead of that one's (rust_runner's module docstring).
+            # THE ONE PLACE a scheduled step is counted as applied. `inflight` is SAMPLE
+            # mode's launch interlock -- there Rust commits at sample time and Python
+            # commits here, so a launch while an earlier step is still unapplied would order
+            # this step's tokens ahead of that one's (rust_runner's module docstring).
             state = runner_mod.STATE
             state.step = None
             state.inflight = max(0, state.inflight - 1)
             done = state.done
+            if state.update and state.pending:
+                # Update mode: THIS is where the launch's tokens are committed, in step
+                # order. `None` = not this step's launch (or a decline), and `decide()` runs.
+                done = runner_commit(self, scheduler_output, model_runner_output, state)
         sampled = model_runner_output.sampled_token_ids
         if done is not None:
             # Rust ran and committed this step. Skip decide() -- it would append the same
@@ -2682,6 +2766,7 @@ def _install_update_from_output(scheduler_cls, m: dict):
     scheduler_cls._vtl_r8_published = False
     scheduler_cls._vtl_r9_residue = None
     scheduler_cls._vtl_burst_n = 1
+    scheduler_cls._vtl_runner_seq = 0
     mark_patched(update_from_output, wrapped_ufo, patch="rust_sched_ufo")
     mark_patched(_update_request_with_output, wrapped_urwo, patch="rust_sched_ufo")
     scheduler_cls.update_from_output = update_from_output

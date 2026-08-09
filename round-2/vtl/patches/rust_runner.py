@@ -31,35 +31,50 @@ loras)`` tuple is dispatched through both vLLM's manager and the Rust table, and
 disagreement refuses the arm. That check is the whole reason it is safe to have a second
 dispatcher at all.
 
-THE PER-STEP HANDSHAKE (M2). Three module globals, same lifetime story as ``BURST``:
+THE PER-STEP HANDSHAKE. Module globals, same lifetime story as ``BURST``:
 
   * ``STATE.step`` -- the STASH. ``rust_sched.commit_burst`` writes it at schedule time
     with everything the launch needs that only the scheduler knows (slot layout, the
     committed burst width, the publish hint). ``nstep_decode``'s ``sample_tokens`` takes it,
     matches it against the batch it is actually holding, and either launches or drops it.
-  * ``STATE.done`` -- the RESULT. Written by the launch, applied by
+  * ``STATE.pending`` -- update mode: the FIFO of ``(ring slot, stash)`` for launches whose
+    ``update_from_output`` has not arrived yet. At most two, see below.
+  * ``STATE.done`` -- sample mode: the RESULT. Written by the launch, applied by
     ``rust_sched.update_from_output`` through the existing ``r9_apply`` residue loop.
-  * ``STATE.inflight`` -- scheduled steps not yet applied. See below.
+  * ``STATE.inflight`` -- sample mode: scheduled steps not yet applied.
 
-WHY ``inflight`` EXISTS, and why it is not optional. Rust commits a step's tokens INSIDE
-``sample_tokens`` (``step_pack_locked`` appends to the token store, applies the resident
-table delta and caches blocks); Python commits them later, inside ``update_from_output``.
+WHERE THE COMMIT HAPPENS, and why there are two modes (``VTL_RUST_RUNNER_COMMIT``).
 With async scheduling the engine runs a batch queue of depth 2
 (``vllm_config.max_concurrent_batches`` = pp_size + 1 on the V2 runner), and its loop is
 
     schedule(k) -> execute(k) -> sample(k) -> update(k-1)
 
-so ``sample(k)`` runs BEFORE step k-1 has been applied. A Rust commit at ``sample(k)``
-would therefore append step k's tokens ahead of step k-1's -- scrambled output text and a
-block-hash chain fingerprinting positions in the wrong order. Nothing crashes. So the
-launch requires ``STATE.inflight == 1``: this step is the only one not yet applied, i.e.
-every earlier step's tokens are already in the store. Under the served async-scheduling
-config that is only true when the batch queue is empty, so the runner arms, self-checks and
-stays idle; making it engage in steady state means giving the runner the loop (RUST-RUNNER.md
-Phase 3 / ``max_concurrent_batches`` = 1), not relaxing this gate.
+so ``sample(k)`` runs BEFORE step k-1 has been applied.
+
+  * ``"sample"`` (legacy) -- the crate's ``run_steps`` launches AND commits inside
+    ``sample_tokens``. That would append step k's tokens ahead of step k-1's, so the launch
+    is interlocked on ``STATE.inflight == 1`` (this step is the only unapplied one). Under
+    the served config that is only true when the batch queue drains, so the runner arms,
+    self-checks and idles. Its one advantage is the multi-step residency loop
+    (``VTL_RUST_RUNNER_STEPS`` > 1), which needs the whole burst chain inside one FFI call.
+  * ``"update"`` (default, shipped) -- the crate's ``launch`` and ``commit`` split the step
+    in two. ``sample(k)`` only enqueues: ``cuGraphLaunch`` + the pre-planned D2H into the
+    free ring slot + an event record, no wait. The commit runs in ``update_from_output``, and
+    UPDATES are strictly ordered even though samples are not, so there is no ordering
+    hazard and no interlock -- the depth-2 overlap is preserved. Two pinned buffers is
+    exactly what the depth-2 queue needs; a third outstanding launch cannot exist, and if
+    one ever did the launch side simply declines and Python runs the step.
+
+    What is kept: ``cuGraphLaunch`` in place of torch's replay dispatch, the pre-planned
+    pinned D2H, and the ``decide()`` collapse at update time (event sync + gather +
+    ``step_pack_locked`` instead of the per-request Python loop and its numpy crossing).
+    What is given up: the multi-step loop, and ``AsyncOutput`` stays (its D2H is now
+    redundant with the ring's) -- which is also the property that makes every decline safe,
+    since a dropped launch just means Python's ``decide()`` commits the same tokens.
 
 ``VTL_RUST_RUNNER``: "0" off, "1" on.
-``VTL_RUST_RUNNER_STEPS``: burst launches per FFI call (M4 ceiling).
+``VTL_RUST_RUNNER_COMMIT``: "update" (default) | "sample" (legacy interlocked path).
+``VTL_RUST_RUNNER_STEPS``: burst launches per FFI call. SAMPLE MODE ONLY.
 ``VTL_RUST_RUNNER_REQUIRE``: "1" makes a refusal a BOOT FAILURE instead of a silent
 degrade -- see ``_State.refuse``.
 """
@@ -74,11 +89,27 @@ log = logging.getLogger("vllm.vtl.runner")
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+#: Pinned ring depth, mirroring ``RING`` in python.rs. The batch queue is depth 2, so two
+#: launches is the most that can be outstanding; the crate allocates exactly this many
+#: buffers and events at ``arm()``.
+RING = 2
+
 
 def mode() -> str:
     """"off" | "on"."""
     raw = os.environ.get("VTL_RUST_RUNNER", "1").strip().lower()
     return "on" if raw in _TRUTHY else "off"
+
+
+def commit_mode() -> str:
+    """"update" (default) | "sample". See the module docstring.
+
+    Anything unrecognised reads as the default rather than as an error: this knob picks
+    between two working paths, and a typo must not be the thing that turns the shipped one
+    off silently.
+    """
+    raw = os.environ.get("VTL_RUST_RUNNER_COMMIT", "update").strip().lower()
+    return "sample" if raw == "sample" else "update"
 
 
 def require() -> bool:
@@ -92,7 +123,12 @@ def require() -> bool:
 
 
 def max_steps() -> int:
-    """Phase 3's ceiling. 1 = one step per FFI call, i.e. Phase-2 behaviour."""
+    """Phase 3's ceiling, SAMPLE MODE ONLY. 1 = one step per FFI call.
+
+    Update mode splits the step across two FFI calls and commits at update time, so there is
+    no residency loop for this to bound -- ``nstep_decode.apply`` pins it to 1 there, which
+    is also what keeps the continuation graphs (and their burst-graph memory) uncaptured.
+    """
     try:
         n = int(os.environ.get("VTL_RUST_RUNNER_STEPS", "8").strip() or 8)
     except ValueError:
@@ -118,6 +154,7 @@ class _Stash(NamedTuple):
     max_model_len: int
     fold: bool            # fold cache_blocks into the crossing (R9.live)
     publish: bool         # inline shm publish is safe this step
+    seq: int = 0          # update mode: which scheduled step this is. See `_State.pending`.
 
 
 class _Done(NamedTuple):
@@ -133,16 +170,19 @@ class _Done(NamedTuple):
 class _State:
     """Module-global, like ``BURST`` and ``decode_fastpath._C``: one runner per process."""
 
-    __slots__ = ("runner", "live", "why", "step", "done", "inflight", "engaged")
+    __slots__ = ("runner", "live", "why", "step", "done", "inflight", "engaged",
+                 "update", "pending")
 
     def __init__(self) -> None:
         self.runner = None      # the vtl_sched.Runner, once armed
-        self.live = False       # may run_steps() be called?
+        self.live = False       # may the runner be called?
         self.why = "not armed"  # the one reason, logged once
         self.step = None        # the pending _Stash, or None
-        self.done = None        # the pending _Done, or None
-        self.inflight = 0       # scheduled steps not yet applied; see the module docstring
+        self.done = None        # sample mode: the pending _Done, or None
+        self.inflight = 0       # sample mode: scheduled steps not yet applied
         self.engaged = 0        # launches taken this boot, for the once-in-a-while log
+        self.update = True      # commit at UPDATE time (the default mode); set by `export`
+        self.pending = []       # update mode: FIFO of (ring slot, _Stash) not yet committed
 
     def refuse(self, why: str) -> None:
         """Permanent stand-down for the boot.
@@ -160,6 +200,10 @@ class _State:
         self.why = why
         self.step = None
         self.done = None
+        # Dropping the pending launches is SAFE, and that is a property of update mode
+        # rather than a hope: a launch commits nothing, so a step whose entry is dropped is
+        # committed by Python's `decide()` off the `AsyncOutput` the worker kept.
+        self.pending = []
         if self.runner is not None:
             try:
                 self.runner.disarm()
@@ -176,6 +220,21 @@ class _State:
         leftover would match a step it was never written for."""
         stash, self.step = self.step, None
         return stash
+
+    def free_slot(self) -> "int | None":
+        """The ring index no outstanding launch holds, or ``None`` when both are taken.
+
+        THE OWNERSHIP RULE, in one place: a slot is owned from the moment its
+        ``(slot, stash)`` goes into ``pending`` until ``update_from_output`` pops it, and the
+        crate only ever indexes what it is handed. ``None`` is not an error -- the launch
+        site declines and Python runs the step, which is what happens whenever a third step
+        would otherwise be in flight.
+        """
+        used = [slot for slot, _ in self.pending]
+        for slot in range(RING):
+            if slot not in used:
+                return slot
+        return None
 
 
 STATE = _State()
@@ -418,14 +477,21 @@ def export(runner, b) -> None:
     STATE.runner = rust_runner
     STATE.live = True
     STATE.why = ""
+    # Read ONCE, here: the mode picks which of two code paths every later step takes, and a
+    # per-step getenv that could flip mid-boot would mean a launch in one mode and a commit
+    # in the other.
+    STATE.update = commit_mode() == "update"
+    STATE.pending = []
     # The armed SIZES, not just the count: 17% of the scored trace's tokens decode at a
     # batch size outside the captured set, so which sizes armed is the number an H200 boot
     # log has to be auditable for.
     log.info(
         "vtl: rust runner armed (%d rows, launchable sizes %s, continuation sizes %s, "
-        "mode=%s, max_steps=%d)",
+        "mode=%s, commit=%s, max_steps=%d)",
         rust_runner.num_graphs(), sorted(b.unroll_graphs),
-        sorted(getattr(b, "continue_graphs", {})), want, max_steps(),
+        sorted(getattr(b, "continue_graphs", {})), want,
+        "update" if STATE.update else "sample",
+        1 if STATE.update else max_steps(),
     )
 
 
@@ -473,6 +539,20 @@ def _self_check() -> None:
         else:
             os.environ["VTL_RUST_RUNNER_REQUIRE"] = saved_r
 
+    saved_c = os.environ.get("VTL_RUST_RUNNER_COMMIT")
+    try:
+        for raw, want in (("update", "update"), ("sample", "sample"), ("SAMPLE", "sample"),
+                          ("", "update"), ("nonsense", "update")):
+            os.environ["VTL_RUST_RUNNER_COMMIT"] = raw
+            assert commit_mode() == want, (raw, commit_mode(), want)
+        os.environ.pop("VTL_RUST_RUNNER_COMMIT", None)
+        assert commit_mode() == "update", "compose ships update; the default must match"
+    finally:
+        if saved_c is None:
+            os.environ.pop("VTL_RUST_RUNNER_COMMIT", None)
+        else:
+            os.environ["VTL_RUST_RUNNER_COMMIT"] = saved_c
+
     saved_n = os.environ.get("VTL_RUST_RUNNER_STEPS")
     try:
         for raw, want in (("8", 8), ("1", 1), ("0", 1), ("-5", 1), ("999", 64), ("x", 1)):
@@ -515,9 +595,10 @@ def _self_check() -> None:
 
     s = _State()
     s.runner, s.live = Boom(), True
-    stash = _Stash(("a",), (0,), (object(),), 4, 1, 32768, True, True)
+    stash = _Stash(("a",), (0,), (object(),), 4, 1, 32768, True, True, 7)
     s.step = stash
     s.done = _Done(stash, [(4, 0, -1)], [], "budget", 1)
+    s.pending = [(0, stash)]
     logging.disable(logging.CRITICAL)  # the traceback below is expected; don't print it
     try:
         s.refuse("testing")
@@ -525,6 +606,7 @@ def _self_check() -> None:
         logging.disable(logging.NOTSET)
     assert not s.live and s.why == "testing"
     assert s.step is None and s.done is None, "a refusal must strand no handshake"
+    assert s.pending == [], "a dropped launch is committed by decide(); a stranded one is not"
 
     # The stash is POPPED, launch or no launch: the next step's batch can have the exact
     # same request-id key, so a leftover would match a step it was never written for.
@@ -540,6 +622,23 @@ def _self_check() -> None:
     assert _State().inflight == 0
     s.inflight = max(0, s.inflight - 1)
     assert s.inflight == 0
+
+    # Update mode's ring accounting: the FIFO is what owns the slots, so two outstanding
+    # launches must leave nothing free (a third would overwrite a buffer whose D2H has not
+    # been read yet), and popping the head must hand that slot straight back.
+    s = _State()
+    assert s.update and s.pending == [], "update is the default mode"
+    assert s.free_slot() == 0
+    s.pending.append((0, stash))
+    assert s.free_slot() == 1
+    s.pending.append((1, stash))
+    assert s.free_slot() is None, "a third launch has nowhere to land; decline it"
+    assert s.pending.pop(0) == (0, stash), "updates arrive in step order, so FIFO"
+    assert s.free_slot() == 0
+    # ...and the slots are reused in whatever order they free, not round-robin: the head
+    # popped is the only one that matters.
+    s.pending = [(0, stash)]
+    assert s.free_slot() == 1
 
     print("rust_runner self-check ok")
 

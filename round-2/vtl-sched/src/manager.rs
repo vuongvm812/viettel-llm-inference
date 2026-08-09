@@ -1092,6 +1092,25 @@ impl Manager {
         })
     }
 
+    /// [`Manager::runner_packable`] plus the identity an UPDATE-TIME commit needs: every
+    /// slot must still hold the request the launch was planned for.
+    ///
+    /// WHY THE NAMES. Under the depth-2 batch queue the pinned-ring commit for step k runs
+    /// after `schedule(k + 1)`, so between the launch and the commit a request in the batch
+    /// can finish (`update(k - 1)` frees its slot) and the freed slot can be handed to a NEW
+    /// request. `runner_packable` alone would then say yes -- the slot has stop params and a
+    /// live name, just a different request's -- and the commit would append step k's tokens
+    /// to somebody else's store. Checking the names is what makes the decline happen instead,
+    /// and a decline costs only the Python `decide()` for that step.
+    pub fn runner_owns(&self, slots: &[u32], names: &[String]) -> bool {
+        slots.len() == names.len()
+            && slots.iter().zip(names).all(|(&slot, want)| {
+                self.stops.has(slot)
+                    && self.names.get(slot as usize).map(String::as_str) == Some(want.as_str())
+                    && self.ids.get(want.as_str()) == Some(&slot)
+            })
+    }
+
     /// R9: the per-request `cache_blocks` crossing folded into the packed step.
     ///
     /// Mirrors `AsyncScheduler._update_request_with_output`'s trailing call
@@ -1726,6 +1745,26 @@ mod tests {
         assert_eq!(b, a, "the slot is recycled -- that is the hazard being tested");
         assert!(m.slot_tokens(b).is_none());
         assert_eq!(m.num_hashes(b), 0, "forget also cleared the chain");
+    }
+
+    #[test]
+    fn runner_owns_catches_a_slot_that_changed_hands() {
+        // The update-time commit's real hazard: between the launch and the commit the
+        // request finished, its slot was freed, and `schedule(k + 1)` handed the SAME slot
+        // to a new request. `runner_packable` cannot see that -- the slot has stop params
+        // and a live name again -- so the commit needs the names it planned against.
+        let (mut m, a) = store_mgr("req-a", 10);
+        let names = vec!["req-a".to_string()];
+        assert!(m.runner_packable(&[a]));
+        assert!(m.runner_owns(&[a], &names));
+        m.forget("req-a");
+        assert!(!m.runner_owns(&[a], &names), "a freed slot owns nothing");
+        let b = m.intern("req-b");
+        m.stops.set(b, stop_params());
+        assert_eq!(b, a, "the slot is recycled -- that is the hazard being tested");
+        assert!(m.runner_packable(&[b]), "packable says yes to the NEW request");
+        assert!(!m.runner_owns(&[b], &names), "...but it is not the one we launched for");
+        assert!(!m.runner_owns(&[b], &[]), "arity mismatches are a decline, not a panic");
     }
 
     #[test]

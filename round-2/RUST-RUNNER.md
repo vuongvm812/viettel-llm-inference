@@ -137,6 +137,25 @@ boot + prefill only, matching the frontier-audit endgame note.
    (a pinned ring of 2 instead of one buffer) — that keeps the pre-planned D2H and the
    `decide()` elimination but not the multi-step loop.
 
+   **RESOLVED (2026-08-09) via option (b), update-time commit.** `VTL_RUST_RUNNER_COMMIT`
+   picks the commit point; compose ships `"update"`. The per-step FFI is split in two:
+   `Runner::launch(slot, ...)` runs at sample time and only ENQUEUES (`cuGraphLaunch` ->
+   `cuMemcpyDtoHAsync` into pinned ring slot `slot` -> `cuEventRecord`; no wait, no commit),
+   and `Runner::commit(slot, ...)` runs inside `update_from_output` (`cuEventSynchronize` ->
+   `gather_sampled` -> `step_pack_locked`). Updates arrive in strict step order, so there is
+   no out-of-order hazard and no `inflight` interlock, and the depth-2 async overlap is
+   preserved -- which is also why the ring is 2 (= `max_concurrent_batches`). Python owns the
+   ring slots through a FIFO of `(slot, stash)` on `rust_runner.STATE` and declines a launch
+   when both are outstanding. The commit re-checks that every slot still holds the request
+   the launch planned for (`Manager::runner_owns`): between `sample(k)` and `update(k)` a
+   request can finish at `update(k-1)` and `schedule(k+1)` can hand its slot to a new one. A
+   decline there costs only the Python `decide()` -- a launch commits nothing, and the
+   worker's `AsyncOutput` is still carrying the same tokens, which is what makes every
+   fallback on this path safe. Kept from Phase 2: `cuGraphLaunch` in place of torch's replay
+   dispatch, the pre-planned pinned D2H, and the `decide()` collapse at update time. Given
+   up: the multi-step residency loop (`run_steps` / `VTL_RUST_RUNNER_STEPS`) and its
+   continuation-graph capture rung, both now sample-mode-only and off in the served config.
+
 ## 5. Repo hygiene found during the investigation (fix regardless)
 
 - The root `vllm/` checkout is **v0.26.0**, and `gen.sh` regenerates

@@ -827,18 +827,29 @@ def _run_burst(runner, b: _Burst, n: int, ib, hidden):
 
 
 def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
-    """The same burst, launched and committed by the Rust runner. ``None`` = declined.
+    """The same burst, launched by the Rust runner. ``None`` = declined.
 
     THE ONLY DIFFERENCE FROM ``_run_burst``'s graph arm is who calls ``cuGraphLaunch`` and
     what happens after it: the crate replays the very same unroll exec on the very same
     stream from the very same thread (``python.rs`` re-checks ``cuCtxGetCurrent`` against
-    arm-time), then does its pre-planned pinned D2H and commits the tokens through
-    ``step_pack_locked`` -- the identical crate entry point ``update_step_pack_np`` takes,
-    so the scheduler's per-request Python loop (``decide()``) has nothing left to do.
+    arm-time), then issues its pre-planned pinned D2H.
+
+    WHERE THE TOKENS ARE COMMITTED depends on ``VTL_RUST_RUNNER_COMMIT`` (see rust_runner's
+    module docstring):
+
+      * update mode (default) -- ``launch`` only enqueues, into ring slot ``free_slot()``,
+        and the FIFO entry it pushes is what ``rust_sched.update_from_output`` commits with
+        one step's delay. That is the only ordering the depth-2 batch queue allows, and it
+        needs no interlock, so the runner actually engages under the served config.
+      * sample mode -- ``run_steps`` launches AND commits here through ``step_pack_locked``,
+        which requires this step to be the only unapplied one (``inflight == 1``).
 
     EVERY refusal below falls through to ``_run_burst``, which is a complete, correct step:
     the scheduler committed ``n * steps`` tokens, the Python arm produces ``n``, and the
-    shortfall is reconciled by the same ``burst_uncommit`` path a stopped burst uses.
+    shortfall is reconciled by the same ``burst_uncommit`` path a stopped burst uses. After
+    a SUCCESSFUL launch there is no falling back -- the graph has fed its tokens into the
+    persistent input buffers -- so nothing that can fail sits between the launch and the
+    return.
 
     Host prep stays here rather than moving into the crate (RUST-RUNNER.md 2, "few host
     inputs"): two writes, both into buffers the graph baked.
@@ -851,10 +862,17 @@ def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
     state = rust_runner.STATE
     if not state.live or stash is None or state.done is not None:
         return None
-    # See rust_runner's module docstring: Rust commits at SAMPLE time and Python commits at
-    # UPDATE time, so a launch while an earlier step is still unapplied would put this
-    # step's tokens into the store ahead of that one's.
-    if state.inflight != 1:
+    slot = None
+    if state.update:
+        # Both ring buffers still hold a launch nobody has read back: a third would
+        # overwrite one of them before its D2H had been gathered.
+        slot = state.free_slot()
+        if slot is None:
+            return None
+    elif state.inflight != 1:
+        # Sample mode: Rust commits here and Python commits at update time, so a launch
+        # while an earlier step is still unapplied would put this step's tokens into the
+        # store ahead of that one's.
         return None
     num_reqs = ib.num_reqs
     if stash.key != tuple(ib.req_ids) or stash.n != n or stash.steps != steps:
@@ -883,6 +901,38 @@ def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
     # No `b.step.zero_()`: the unroll graph does it in-graph, and the continuation graphs
     # deliberately do NOT (they keep filling the next `n` accumulator columns).
 
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+    if state.update:
+        try:
+            launched = state.runner.launch(
+                slot, num_reqs, pad, 1, 0, list(stash.slots),
+            )
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            # Nothing is committed by a launch, so unlike sample mode this is unambiguous:
+            # either the graph ran (and this step's tokens are also in the AsyncOutput the
+            # Python arm is about to build) or it did not. Either way the Python arm below
+            # produces the step. Stand down for the boot regardless -- a driver call that
+            # raised once will raise again.
+            log.exception("vtl: rust runner launch raised; disabled for this boot")
+            rust_runner.STATE.refuse("launch raised")
+            return None
+        if not launched:
+            # Declined inside the crate: not armed, no launchable graph for this shape, or
+            # a slot in the batch that cannot pack.
+            return None
+        # From here on the graph HAS run. Nothing below may fail or fall through.
+        state.pending.append((slot, stash))
+        state.engaged += 1
+        if state.engaged == 1 or not state.engaged & 0x1FFF:
+            log.info(
+                "vtl: rust runner engaged -- %d launches (n=%d, batch=%d, slot=%d)",
+                state.engaged, n, num_reqs, slot,
+            )
+        return _burst_output(b, num_reqs, n, SamplerOutput)
+
     try:
         out = rust_runner.STATE.runner.run_steps(
             steps, num_reqs, pad, 1, 0,
@@ -904,8 +954,6 @@ def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
     if out is None:
         # Declined inside the crate: not armed, or the shape has no launchable graph.
         return None
-
-    from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
     verdicts, records, exit_reason, ran = out
     if not ran:
@@ -1275,12 +1323,18 @@ def apply() -> None:
     # The Rust runner rides the unroll rung (it launches exactly that graph), so it can
     # never outlive it. Read here rather than at capture time so `_alloc` can size the
     # accumulator for the widest multi-launch step the runner may ever take.
+    #
+    # UPDATE-MODE COMMIT PINS THIS TO 1, which is also what keeps `continue_graphs`
+    # uncaptured: the multi-launch residency loop only exists inside the sample-time
+    # `run_steps` call, and a continuation graph per burst size doubles the burst-graph
+    # memory for a rung nothing would launch.
     b.rust_steps = 1
     if b.unroll:
         try:
             from vtl.patches import rust_runner
 
-            b.rust_steps = rust_runner.max_steps() if rust_runner.mode() == "on" else 1
+            if rust_runner.mode() == "on" and rust_runner.commit_mode() == "sample":
+                b.rust_steps = rust_runner.max_steps()
         except Exception:
             log.exception("vtl: rust runner module not importable; one launch per step")
     if b.mode not in ("graph", "eager"):

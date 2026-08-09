@@ -1556,6 +1556,19 @@ fn block_hash_with_group_id<'py>(
 // The Rust steady-state model runner (round-2/RUST-RUNNER.md, phases 2-3).
 // ---------------------------------------------------------------------------------------
 
+/// Pinned-ring depth. Two, because the served V2 async scheduler runs a batch queue of
+/// `max_concurrent_batches` = pp_size + 1 = 2, so at most two launches can be waiting for
+/// their `update_from_output`. One buffer per outstanding launch is what lets the commit move
+/// to update time (RUST-RUNNER.md hazard 8, option b): the D2H for step k is enqueued behind
+/// step k's graph and read back at `update(k)`, by which time step k+1 may already have
+/// launched into the OTHER slot.
+///
+/// Slot ownership is the caller's: `rust_runner.STATE` keeps a FIFO of the outstanding
+/// `(slot, stash)` pairs and declines a launch when both are taken. The crate only bounds-
+/// checks the index -- it cannot know when Python has retired a step.
+#[cfg(feature = "cuda")]
+const RING: usize = 2;
+
 /// Drives a captured whole-step CUDA graph and commits its output without re-entering Python.
 ///
 /// One step is: launch the dispatched graph -> pre-planned D2H of the sampled tokens into a
@@ -1590,9 +1603,28 @@ pub struct Runner {
     out_ptr: u64,
     out_rows: usize,
     out_cols: usize,
-    pinned: Option<crate::gpu::live::PinnedBuf>,
-    event: u64,
+    /// The pinned ring: `RING` destinations, one per outstanding launch. Empty until `arm`.
+    /// `run_steps` (sample-time commit) only ever uses slot 0 -- it syncs before it returns,
+    /// so it has nothing to overlap with.
+    pinned: Vec<crate::gpu::live::PinnedBuf>,
+    events: [u64; RING],
     armed: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl Runner {
+    /// One ring slot's `(pinned_ptr, pinned_len, event)`, as integers ready to cross
+    /// `allow_threads`. An out-of-range index is the caller's bookkeeping bug and raises;
+    /// an unarmed runner has no slots at all, which is the same error either way.
+    fn ring(&self, slot: usize) -> PyResult<(u64, usize, u64)> {
+        let buf = self.pinned.get(slot).ok_or_else(|| {
+            err(format!(
+                "ring slot {slot} does not exist ({} allocated)",
+                self.pinned.len()
+            ))
+        })?;
+        Ok((buf.as_ptr() as u64, buf.len(), self.events[slot]))
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1610,8 +1642,8 @@ impl Runner {
             out_ptr: 0,
             out_rows: 0,
             out_cols: 0,
-            pinned: None,
-            event: 0,
+            pinned: Vec::new(),
+            events: [0; RING],
             armed: false,
         }
     }
@@ -1693,10 +1725,10 @@ impl Runner {
             .map(|e| (e.exec, e.full))
     }
 
-    /// Bind the stream, the context and the output buffer, and allocate the pinned
-    /// destination + the blocking event. Idempotent-ish: re-arming reallocates.
+    /// Bind the stream, the context and the output buffer, and allocate the pinned RING
+    /// (`RING` destinations + `RING` blocking events). Idempotent-ish: re-arming reallocates.
     ///
-    /// `out_ptr` is `BURST.accum.data_ptr()`; `[out_rows, out_cols]` its shape. The pinned
+    /// `out_ptr` is `BURST.accum.data_ptr()`; `[out_rows, out_cols]` its shape. Each pinned
     /// buffer is sized for the whole accumulator once, so no step allocates.
     fn arm(
         &mut self,
@@ -1723,24 +1755,29 @@ impl Runner {
             .checked_mul(out_cols)
             .and_then(|n| n.checked_mul(std::mem::size_of::<i64>()))
             .ok_or_else(|| err("accumulator size overflows".to_string()))?;
-        let pinned = crate::gpu::live::PinnedBuf::new(bytes).map_err(err)?;
-        let mut event: *mut std::os::raw::c_void = std::ptr::null_mut();
-        // SAFETY: valid out-param. BLOCKING_SYNC so the wait parks instead of spinning --
-        // the judge box has 3 vCPUs and a spin starves the shm ingest thread.
-        crate::gpu::live::check("cuEventCreate", unsafe {
-            (d.event_create)(
-                &mut event as *mut _,
-                crate::gpu::live::CU_EVENT_BLOCKING_SYNC,
-            )
-        })
-        .map_err(err)?;
+        let mut pinned = Vec::with_capacity(RING);
+        let mut events = [0u64; RING];
+        for e in events.iter_mut() {
+            pinned.push(crate::gpu::live::PinnedBuf::new(bytes).map_err(err)?);
+            let mut event: *mut std::os::raw::c_void = std::ptr::null_mut();
+            // SAFETY: valid out-param. BLOCKING_SYNC so the wait parks instead of spinning --
+            // the judge box has 3 vCPUs and a spin starves the shm ingest thread.
+            crate::gpu::live::check("cuEventCreate", unsafe {
+                (d.event_create)(
+                    &mut event as *mut _,
+                    crate::gpu::live::CU_EVENT_BLOCKING_SYNC,
+                )
+            })
+            .map_err(err)?;
+            *e = event as u64;
+        }
         self.stream = stream;
         self.ctx = ctx as u64;
         self.out_ptr = out_ptr;
         self.out_rows = out_rows;
         self.out_cols = out_cols;
-        self.pinned = Some(pinned);
-        self.event = event as u64;
+        self.pinned = pinned;
+        self.events = events;
         self.armed = true;
         Ok(())
     }
@@ -1753,6 +1790,225 @@ impl Runner {
     /// later step cannot re-enter the Rust runner after a divergence.
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    /// UPDATE-TIME COMMIT, half 1: launch this step's graph and START its D2H. No event
+    /// sync, no commit -- see [`Runner::commit`].
+    ///
+    /// This is the half that replaces `torch.cuda.CUDAGraph.replay()`: a direct
+    /// `cuGraphLaunch` plus the pre-planned `cuMemcpyDtoHAsync` into ring slot `slot`, both
+    /// on the captured stream, then an event record so the commit has something to park on.
+    /// Everything is enqueued and nothing is waited for, which is what keeps the depth-2
+    /// async overlap the batch queue exists to buy.
+    ///
+    /// `False` = declined, and the caller runs the Python step: not armed, no FULL graph for
+    /// this shape, or a slot in the batch that cannot pack. The `runner_packable` pre-flight
+    /// stays HERE as well as at commit time for the reason it was written: once the graph has
+    /// run it has already fed its tokens back into the persistent input buffers, so declining
+    /// is only free before the launch.
+    ///
+    /// `slot` is the caller's ring index; it owns the accounting (see [`RING`]). An index out
+    /// of range is a programming error and raises, not a decline.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (slot, num_reqs, num_tokens, uniform_token_count, num_active_loras,
+                        slots))]
+    fn launch(
+        &self,
+        py: Python<'_>,
+        slot: usize,
+        num_reqs: u32,
+        num_tokens: u32,
+        uniform_token_count: Option<u32>,
+        num_active_loras: u32,
+        slots: Vec<u32>,
+    ) -> PyResult<bool> {
+        if !self.armed {
+            return Ok(false);
+        }
+        let (pinned_ptr, pinned_len, event_u) = self.ring(slot)?;
+        let Some(exec) =
+            self.table
+                .launchable(num_reqs, num_tokens, uniform_token_count, num_active_loras)
+        else {
+            return Ok(false);
+        };
+        let d = crate::gpu::live::driver().map_err(err)?;
+        let shared = self.shared.clone();
+        // Integers only across `allow_threads`, exactly as in `run_step`: raw pointers are
+        // not `Send`, and they are cast back on this same thread after the context check.
+        let stream_u = self.stream;
+        let out_ptr = self.out_ptr;
+        let (out_rows, out_cols) = (self.out_rows, self.out_cols);
+        let expect_ctx = self.ctx;
+
+        py.allow_threads(move || -> Result<bool, String> {
+            let stream = stream_u as *mut std::os::raw::c_void;
+            let event = event_u as *mut std::os::raw::c_void;
+            let mut ctx: *mut std::os::raw::c_void = std::ptr::null_mut();
+            // SAFETY: valid out-param, read-only call. Hazard 2: the context is thread-local.
+            crate::gpu::live::check("cuCtxGetCurrent", unsafe {
+                (d.ctx_get_current)(&mut ctx as *mut _)
+            })?;
+            if ctx as u64 != expect_ctx {
+                return Err(
+                    "CUDA context changed since arm(); the runner is on the wrong thread"
+                        .to_string(),
+                );
+            }
+            let bytes = out_rows * out_cols * std::mem::size_of::<i64>();
+            if bytes > pinned_len {
+                return Err(format!(
+                    "accumulator is {bytes} bytes but the pinned buffer is {pinned_len}"
+                ));
+            }
+            if !lock_shared(&shared).manager.runner_packable(&slots) {
+                return Ok(false);
+            }
+            // SAFETY: `exec` is a cudaGraphExec_t torch instantiated and never
+            // re-instantiates (verified at export); `stream` is its capture stream.
+            crate::gpu::live::check("cuGraphLaunch", unsafe {
+                (d.graph_launch)(exec as *mut std::os::raw::c_void, stream)
+            })?;
+            // SAFETY: both pointers live for the boot and the byte count was bounds-checked
+            // against this slot's pinned allocation immediately above.
+            crate::gpu::live::check("cuMemcpyDtoHAsync", unsafe {
+                (d.memcpy_dtoh_async)(
+                    pinned_ptr as *mut std::os::raw::c_void,
+                    out_ptr,
+                    bytes,
+                    stream,
+                )
+            })?;
+            // SAFETY: this slot's event, created in arm() in this context.
+            crate::gpu::live::check("cuEventRecord", unsafe { (d.event_record)(event, stream) })?;
+            Ok(true)
+        })
+        .map_err(err)
+    }
+
+    /// UPDATE-TIME COMMIT, half 2: wait for ring slot `slot`'s D2H and commit its tokens.
+    ///
+    /// Runs from `update_from_output`, i.e. in step order, which is the whole point of
+    /// option (b): `sample(k)` may already have launched step k+1 into the other ring slot,
+    /// but step k's tokens land in the store before step k+1's because the UPDATES are
+    /// ordered even though the samples are not (RUST-RUNNER.md hazard 8).
+    ///
+    /// `names` is `slots`' request ids as the launch planned them. They are re-checked here,
+    /// not just at launch time: between the two, `update(k-1)` can free a finished request's
+    /// slot and `schedule(k+1)` can hand that slot to a NEW request, and committing this
+    /// step's tokens into the new occupant's store would be a wrong answer with nothing to
+    /// crash. See [`crate::manager::Manager::runner_owns`].
+    ///
+    /// Returns:
+    ///   * `None` -- nothing was committed and nothing was mutated. The caller runs the
+    ///     Python `decide()` for this step, which is a complete, correct commit: the worker
+    ///     kept its `AsyncOutput`, so the same tokens are still on their way through it.
+    ///   * `(verdicts, record, published, "ok")` -- the normal commit, the same triple
+    ///     `update_step_pack_np` returns plus the marker.
+    ///   * `(verdicts, record, published, "unpacked...")` -- the step MUTATED state (the
+    ///     resident-table delta and the stop decisions are applied) but could not be packed,
+    ///     so its tokens never reached the store and `decide()` can no longer be run without
+    ///     double-applying. Same contract as `run_steps`' `LoopExit::Unpacked`: the caller
+    ///     retires the batch and stands the runner down. `runner_owns` above makes it
+    ///     unreachable in every state the caller could have avoided.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (slot, rows, counts, slots, names, max_model_len, engine_index,
+                        timestamp, finished, fold_cache, publish))]
+    fn commit(
+        &self,
+        py: Python<'_>,
+        slot: usize,
+        rows: Vec<u32>,
+        counts: Vec<u32>,
+        slots: Vec<u32>,
+        names: Vec<String>,
+        max_model_len: usize,
+        engine_index: u32,
+        timestamp: f64,
+        finished: Vec<String>,
+        fold_cache: bool,
+        publish: bool,
+    ) -> PyResult<Option<(Vec<(u32, u8, i64)>, Option<Py<PyBytes>>, bool, String)>> {
+        // No `armed` check: the launch already happened, so there is a copy in flight whose
+        // event has to be waited on either way. The Python side drops its pending FIFO when
+        // it stands the runner down, so a commit after a refusal never reaches here.
+        if rows.len() != counts.len() || rows.len() != slots.len() || rows.len() != names.len() {
+            return Err(PyValueError::new_err(format!(
+                "commit arity mismatch: {} rows, {} counts, {} slots, {} names",
+                rows.len(),
+                counts.len(),
+                slots.len(),
+                names.len()
+            )));
+        }
+        let (pinned_ptr, _pinned_len, event_u) = self.ring(slot)?;
+        let d = crate::gpu::live::driver().map_err(err)?;
+        let shared = self.shared.clone();
+        let out_shape = (self.out_rows, self.out_cols);
+        let expect_ctx = self.ctx;
+
+        let outcome = py.allow_threads(move || -> Result<_, String> {
+            let event = event_u as *mut std::os::raw::c_void;
+            let mut ctx: *mut std::os::raw::c_void = std::ptr::null_mut();
+            // SAFETY: valid out-param, read-only call.
+            crate::gpu::live::check("cuCtxGetCurrent", unsafe {
+                (d.ctx_get_current)(&mut ctx as *mut _)
+            })?;
+            if ctx as u64 != expect_ctx {
+                return Err(
+                    "CUDA context changed since arm(); the runner is on the wrong thread"
+                        .to_string(),
+                );
+            }
+            // Park in the driver until this slot's copy has landed (BLOCKING_SYNC, never a
+            // spin). SAFETY: the event recorded behind that slot's D2H in `launch`.
+            crate::gpu::live::check("cuEventSynchronize", unsafe {
+                (d.event_synchronize)(event)
+            })?;
+            let (out_rows, out_cols) = out_shape;
+            // SAFETY: cuMemHostAlloc returns memory aligned well past i64, the element count
+            // is the one `launch` bounds-checked against this slot, and the synchronised
+            // event is precisely the "copy has completed" guarantee.
+            let arr =
+                unsafe { std::slice::from_raw_parts(pinned_ptr as *const i64, out_rows * out_cols) };
+            // Column offset 0: one launch per ring slot, so there are no shifted windows to
+            // walk the way `run_steps`' multi-launch loop has.
+            let flat = crate::update::gather_sampled(arr, out_rows, out_cols, &rows, &counts)?;
+            let sh = lock_shared(&shared);
+            if !sh.manager.runner_owns(&slots, &names) {
+                // Nothing mutated yet -- decline and let Python's `decide()` take the step.
+                return Ok(None);
+            }
+            drop(sh);
+            Ok(Some(step_pack_locked(
+                &shared,
+                &slots,
+                &counts,
+                &flat,
+                max_model_len,
+                engine_index,
+                timestamp,
+                &finished,
+                fold_cache,
+                publish,
+            )))
+        });
+
+        let Some(packed) = outcome.map_err(err)? else {
+            return Ok(None);
+        };
+        Ok(Some(match packed {
+            Ok((verdicts, record, published)) => (
+                verdicts,
+                record.map(|r| PyBytes::new_bound(py, &r).unbind()),
+                published,
+                "ok".to_string(),
+            ),
+            // A failure INSIDE the commit cannot be handed back as a raise: `pack_inner`
+            // applies the resident-table delta before it can fail, so "run decide() instead"
+            // is no longer available. Report it as the unpacked marker, reason included.
+            Err(why) => (Vec::new(), None, false, format!("unpacked: {why}")),
+        }))
     }
 
     /// One steady-state decode step, entirely in Rust.
@@ -1801,9 +2057,11 @@ impl Runner {
             return Ok(None);
         };
         let d = crate::gpu::live::driver().map_err(err)?;
+        // Ring slot 0: the sample-time path syncs before it returns, so it never overlaps
+        // itself and has nothing to put in the second slot.
         let pinned = self
             .pinned
-            .as_ref()
+            .first()
             .ok_or_else(|| err("runner armed without a pinned buffer".to_string()))?;
 
         let shared = self.shared.clone();
@@ -1813,7 +2071,7 @@ impl Runner {
         // back inside, on the same thread, after the context check confirms they still mean
         // what they meant at arm().
         let stream_u = self.stream;
-        let event_u = self.event;
+        let event_u = self.events[0];
         let pinned_ptr = pinned.as_ptr() as u64;
         let pinned_len = pinned.len();
         let out_ptr = self.out_ptr;
@@ -1965,14 +2223,16 @@ impl Runner {
         let max_steps = if cont == 0 { 1 } else { max_steps };
         let width = crate::gpu::burst_width(&counts).map_err(err)? as usize;
         let d = crate::gpu::live::driver().map_err(err)?;
+        // Ring slot 0: the sample-time path syncs before it returns, so it never overlaps
+        // itself and has nothing to put in the second slot.
         let pinned = self
             .pinned
-            .as_ref()
+            .first()
             .ok_or_else(|| err("runner armed without a pinned buffer".to_string()))?;
 
         let shared = self.shared.clone();
         let stream_u = self.stream;
-        let event_u = self.event;
+        let event_u = self.events[0];
         let pinned_ptr = pinned.as_ptr() as u64;
         let pinned_len = pinned.len();
         let out_ptr = self.out_ptr;
@@ -2155,12 +2415,14 @@ impl LoopExit {
 #[cfg(feature = "cuda")]
 impl Drop for Runner {
     fn drop(&mut self) {
-        if self.event == 0 {
+        if self.events.iter().all(|&e| e == 0) {
             return;
         }
         if let Ok(d) = crate::gpu::live::driver() {
-            // SAFETY: created by cuEventCreate in arm(), destroyed exactly once here.
-            unsafe { (d.event_destroy)(self.event as *mut std::os::raw::c_void) };
+            for &event in self.events.iter().filter(|&&e| e != 0) {
+                // SAFETY: created by cuEventCreate in arm(), destroyed exactly once here.
+                unsafe { (d.event_destroy)(event as *mut std::os::raw::c_void) };
+            }
         }
     }
 }
