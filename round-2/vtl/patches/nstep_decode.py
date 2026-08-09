@@ -904,6 +904,10 @@ def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
     from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
     if state.update:
+        # Ownership BEFORE the launch: from this append until `update_from_output` pops
+        # it, the slot is taken (`free_slot` reads occupancy off `pending`), so there is
+        # no instant where a launched slot is untracked. A decline pops it right back.
+        state.pending.append((slot, stash))
         try:
             launched = state.runner.launch(
                 slot, num_reqs, pad, 1, 0, list(stash.slots),
@@ -915,23 +919,31 @@ def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
             # either the graph ran (and this step's tokens are also in the AsyncOutput the
             # Python arm is about to build) or it did not. Either way the Python arm below
             # produces the step. Stand down for the boot regardless -- a driver call that
-            # raised once will raise again.
+            # raised once will raise again. (`refuse` clears `pending`, ours included.)
             log.exception("vtl: rust runner launch raised; disabled for this boot")
             rust_runner.STATE.refuse("launch raised")
             return None
         if not launched:
             # Declined inside the crate: not armed, no launchable graph for this shape, or
-            # a slot in the batch that cannot pack.
+            # a slot in the batch that cannot pack. Ours is the tail; older entries stay.
+            state.pending.pop()
             return None
-        # From here on the graph HAS run. Nothing below may fail or fall through.
-        state.pending.append((slot, stash))
-        state.engaged += 1
-        if state.engaged == 1 or not state.engaged & 0x1FFF:
-            log.info(
-                "vtl: rust runner engaged -- %d launches (n=%d, batch=%d, slot=%d)",
-                state.engaged, n, num_reqs, slot,
-            )
-        return _burst_output(b, num_reqs, n, SamplerOutput)
+        # From here on the graph HAS run and its commit is pending. Falling back to stock
+        # sampling would run the step a SECOND time, so a failure below is fatal for the
+        # step, not a degrade -- see PostLaunchError.
+        try:
+            state.engaged += 1
+            if state.engaged == 1 or not state.engaged & 0x1FFF:
+                log.info(
+                    "vtl: rust runner engaged -- %d launches (n=%d, batch=%d, slot=%d)",
+                    state.engaged, n, num_reqs, slot,
+                )
+            return _burst_output(b, num_reqs, n, SamplerOutput)
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, rust_runner.PostLaunchError)):
+                raise
+            log.exception("vtl: rust runner post-launch failure; the step cannot fall back")
+            raise rust_runner.PostLaunchError(f"post-launch: {exc}") from exc
 
     try:
         out = rust_runner.STATE.runner.run_steps(
@@ -1180,6 +1192,12 @@ def _patch_runner(b: _Burst) -> None:
                     out = _sample_burst(self, b, n, state)
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                from vtl.patches import rust_runner
+                if isinstance(exc, rust_runner.PostLaunchError):
+                    # A Rust launch already fed this step back and its commit is pending
+                    # in the FIFO -- `original()` would sample the step a second time on
+                    # top of it. No degrade exists here; surface the engine error.
                     raise
                 # A committed burst that produced fewer than N tokens IS reconciled by
                 # the scheduler (rust_sched's `_burst_uncommit`), so this is recoverable

@@ -388,6 +388,10 @@ def ring_reuse(scheduler, slot, sched_running) -> object | None:
     d = so.__dict__
     d.pop("vtl_burst_n", None)
     d.pop("vtl_sample_in_graph", None)
+    # A re-served object must not carry the previous occupant's runner stamp: a stale seq
+    # would make `runner_commit` misjudge the pending FIFO head (block it, or worse,
+    # drop a live launch). This reuse grants no stash, so there is no seq to keep.
+    d.pop("vtl_runner_seq", None)
     if defer:
         scheduler.sched_step_seq = seq
     return so

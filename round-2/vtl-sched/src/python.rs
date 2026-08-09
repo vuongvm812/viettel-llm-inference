@@ -68,6 +68,37 @@ fn step_pack_locked(
 ) -> Result<(Vec<(u32, u8, i64)>, Option<Vec<u8>>, bool), String> {
     let mut sh = lock_shared(shared);
     sh.invalidate();
+    step_pack_guarded(
+        &mut sh,
+        slots,
+        counts,
+        flat,
+        max_model_len,
+        engine_index,
+        timestamp,
+        finished,
+        fold_cache,
+        publish,
+    )
+}
+
+/// The body of [`step_pack_locked`] AFTER the lock + speculation rollback: split out so
+/// `Runner::commit` can run its `runner_owns` precondition and the pack under the SAME
+/// `MutexGuard` -- an owns check that releases the lock before the pack is a TOCTOU (the
+/// SPEC precompute thread also takes this mutex between engine phases).
+#[allow(clippy::too_many_arguments)]
+fn step_pack_guarded(
+    sh: &mut Shared,
+    slots: &[u32],
+    counts: &[u32],
+    flat: &[i64],
+    max_model_len: usize,
+    engine_index: u32,
+    timestamp: f64,
+    finished: &[String],
+    fold_cache: bool,
+    publish: bool,
+) -> Result<(Vec<(u32, u8, i64)>, Option<Vec<u8>>, bool), String> {
     let (verdicts, packed) = sh.manager.update_step_pack_store(
         slots,
         counts,
@@ -1974,14 +2005,18 @@ impl Runner {
             // Column offset 0: one launch per ring slot, so there are no shifted windows to
             // walk the way `run_steps`' multi-launch loop has.
             let flat = crate::update::gather_sampled(arr, out_rows, out_cols, &rows, &counts)?;
-            let sh = lock_shared(&shared);
+            let mut sh = lock_shared(&shared);
+            // Same order as `step_pack_locked`: roll back in-flight speculation FIRST, so
+            // the owns check below judges the real table, then keep the guard across the
+            // pack -- checking and packing under separate locks would let the SPEC thread
+            // (or any other FFI entry) change hands in between.
+            sh.invalidate();
             if !sh.manager.runner_owns(&slots, &names) {
                 // Nothing mutated yet -- decline and let Python's `decide()` take the step.
                 return Ok(None);
             }
-            drop(sh);
-            Ok(Some(step_pack_locked(
-                &shared,
+            Ok(Some(step_pack_guarded(
+                &mut sh,
                 &slots,
                 &counts,
                 &flat,

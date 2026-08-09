@@ -1102,6 +1102,12 @@ impl Manager {
     /// live name, just a different request's -- and the commit would append step k's tokens
     /// to somebody else's store. Checking the names is what makes the decline happen instead,
     /// and a decline costs only the Python `decide()` for that step.
+    /// INVARIANT this guard rests on: request ids are unique for the process lifetime
+    /// (both the stock api_server and the vllm-rs frontend stamp every request with a
+    /// fresh uuid; client-supplied ids never reach the engine core verbatim). A freed
+    /// slot re-assigned to a DIFFERENT id fails the name compare below; a re-used id
+    /// would not, and only that invariant rules it out -- if an id-recycling frontend
+    /// ever appears, this needs a slot epoch instead.
     pub fn runner_owns(&self, slots: &[u32], names: &[String]) -> bool {
         slots.len() == names.len()
             && slots.iter().zip(names).all(|(&slot, want)| {

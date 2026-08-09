@@ -95,6 +95,17 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 RING = 2
 
 
+class PostLaunchError(RuntimeError):
+    """A failure AFTER a successful update-mode ``launch``.
+
+    The graph has run and its commit is pending in the FIFO, so the one degrade every
+    other refusal on this path uses -- "fall through and let Python run the step" -- is
+    the one thing that must NOT happen: stock sampling would run the step a second time
+    on top of state the graph already advanced. ``wrap_sample_tokens`` re-raises this
+    instead of falling back; an honest engine error beats a silently garbled stream.
+    """
+
+
 def mode() -> str:
     """"off" | "on"."""
     raw = os.environ.get("VTL_RUST_RUNNER", "1").strip().lower()
