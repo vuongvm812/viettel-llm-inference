@@ -12,3 +12,9 @@ services:
         - linux/amd64
     volumes:
       - ../hf-model:/model:ro # shared HF weights at repo root (not duplicated per round)
+    environment:
+      # A non-Hopper dev GPU (sm_86) falls back to FlashInfer under fp8 KV, and without
+      # FA3's capturable AOT seam the burst graphs -- and so the Rust runner -- CANNOT
+      # arm there, ever. REQUIRE=1 would fail every dev boot for a reason no code change
+      # fixes; waive it here and keep the main compose strict for H200/bench boots.
+      VTL_RUST_RUNNER_REQUIRE: "0"
