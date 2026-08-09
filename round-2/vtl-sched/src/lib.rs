@@ -16,6 +16,11 @@ pub mod coordinator;
 /// silently WRONG rather than merely absent); the dlopen'd libcuda calls are behind `cuda`.
 pub mod gpu;
 pub mod hash;
+/// Phase 3b: the iceoryx2 REQUEST subscriber -- `out`'s mirror image, so the framing split
+/// and the park both happen without the GIL. Same feature split: the record split (and its
+/// golden test, shared with `shm_ipc.py::GOLDEN_RAW_ADD`) compiles under default features,
+/// the iceoryx2 ports are behind `shm`.
+pub mod input;
 /// Crate-internal: the journal is an implementation detail of `spec.rs`, and every type
 /// in it (`Block`, the index snapshots) is one callers must not be able to forge.
 pub(crate) mod journal;

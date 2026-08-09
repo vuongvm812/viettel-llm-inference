@@ -71,6 +71,9 @@ fn params() -> Params {
         sjf_reorder: false,
         sjf_usage_tight: 0.90,
         lean_decisions: false,
+        // The burst gate is a `rust_sched.py` handshake, not part of the resident/spec
+        // parity this suite covers; 0 keeps `burst_eligible` false throughout.
+        burst_max_reqs: 0,
     }
 }
 

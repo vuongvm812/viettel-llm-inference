@@ -196,6 +196,67 @@ pub fn gather_sampled(
     Ok(flat)
 }
 
+/// One flat verdict as it crosses into Python: `(num_accepted, status, stop_reason)`.
+pub type FlatVerdict = (u32, u8, i64);
+
+/// Fold ONE launch's verdicts of a multi-step burst into the batch's running totals, and
+/// drop every slot that stopped from the live set.
+///
+/// WHY THIS EXISTS AT ALL. A `k`-launch burst has already run all `k` graphs by the time
+/// the commit gathers them (one D2H at the tail, see `Runner::launch`), so a slot that
+/// stops at launch `j` still has tokens sitting in columns `j+1..k` of the accumulator that
+/// nothing may append. Masking it out of the SUBSEQUENT packs is the only way the store and
+/// the worker keep the same token count for that request; the wasted GPU work for those
+/// rows is accepted (it is the same trade a stopped single burst already makes, times k).
+///
+/// `out` is indexed by ORIGINAL batch row and holds the AGGREGATE: `step * width + acc`.
+/// A survivor's `acc` is exactly `width`, so after `s` calls a survivor reads `s * width`
+/// and the caller needs no separate finish pass — which is also what makes the partial
+/// answer on an unpacked launch correct rather than merely non-empty.
+///
+/// Returns `true` when the live set SHRANK, i.e. the caller must rebuild its per-launch
+/// row/count/slot/name subsets. Feature-free on purpose: this is the arithmetic that fails
+/// silently (a wrong base is a plausible-looking token count), and it must stay inside the
+/// default `cargo test` gate the Dockerfile runs.
+pub fn merge_step_verdicts(
+    live: &mut Vec<usize>,
+    out: &mut [FlatVerdict],
+    step: u32,
+    width: u32,
+    verdicts: &[FlatVerdict],
+) -> Result<bool, String> {
+    if verdicts.len() != live.len() {
+        return Err(format!(
+            "merge_step_verdicts: {} verdicts for {} live rows",
+            verdicts.len(),
+            live.len()
+        ));
+    }
+    let base = step * width;
+    let before = live.len();
+    let mut kept = 0usize;
+    for i in 0..live.len() {
+        let row = live[i];
+        let (acc, status, stop_reason) = verdicts[i];
+        if row >= out.len() {
+            return Err(format!(
+                "merge_step_verdicts: live row {row} outside the {}-row batch",
+                out.len()
+            ));
+        }
+        out[row] = (base + acc, status, stop_reason);
+        // Anything non-zero is a finish -- including `u8::MAX` ("Rust has no params for
+        // this slot"), which the runner's pre-flight excludes but which must never be read
+        // as "not stopped" if it ever appears.
+        if status == NOT_STOPPED {
+            live[kept] = row;
+            kept += 1;
+        }
+    }
+    live.truncate(kept);
+    Ok(kept != before)
+}
+
 /// Streaming writer for one TAG_RAW record into a reused buffer.
 ///
 /// Streaming rather than "build a Vec of rows then serialize": the row count is known
@@ -431,6 +492,112 @@ mod gather_tests {
     #[test]
     fn empty_batch_yields_empty() {
         assert_eq!(gather_sampled(&arr(), 3, 4, &[], &[]).unwrap(), Vec::<i64>::new());
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::{merge_step_verdicts, FlatVerdict, FINISHED_STOPPED, NOT_STOPPED, NO_STOP_REASON};
+
+    const W: u32 = 4;
+
+    fn batch(rows: usize) -> (Vec<usize>, Vec<FlatVerdict>) {
+        (
+            (0..rows).collect(),
+            vec![(0, NOT_STOPPED, NO_STOP_REASON); rows],
+        )
+    }
+
+    fn ran(width: u32) -> FlatVerdict {
+        (width, NOT_STOPPED, NO_STOP_REASON)
+    }
+
+    #[test]
+    fn survivors_accumulate_a_full_width_per_launch() {
+        let (mut live, mut out) = batch(2);
+        for step in 0..3u32 {
+            assert_eq!(
+                merge_step_verdicts(&mut live, &mut out, step, W, &[ran(W), ran(W)]),
+                Ok(false)
+            );
+        }
+        assert_eq!(out, vec![(12, NOT_STOPPED, -1), (12, NOT_STOPPED, -1)]);
+        assert_eq!(live, vec![0, 1]);
+    }
+
+    #[test]
+    fn a_stop_at_step_j_is_masked_out_of_every_later_launch() {
+        let (mut live, mut out) = batch(3);
+        // Launch 0: everyone runs.
+        merge_step_verdicts(&mut live, &mut out, 0, W, &[ran(W), ran(W), ran(W)]).unwrap();
+        // Launch 1: row 1 stops after 2 of its 4 tokens.
+        assert_eq!(
+            merge_step_verdicts(
+                &mut live,
+                &mut out,
+                1,
+                W,
+                &[ran(W), (2, FINISHED_STOPPED, 99), ran(W)],
+            ),
+            Ok(true),
+            "a stop must be reported so the caller rebuilds its packed subsets"
+        );
+        assert_eq!(live, vec![0, 2], "the stopped row is gone, order preserved");
+        // Launch 2 packs only the survivors -- two verdicts, not three.
+        assert!(
+            merge_step_verdicts(&mut live, &mut out, 2, W, &[ran(W), ran(W), ran(W)]).is_err(),
+            "an arity that still counts the stopped row must be refused"
+        );
+        merge_step_verdicts(&mut live, &mut out, 2, W, &[ran(W), ran(W)]).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                (12, NOT_STOPPED, -1),
+                // 1 * 4 + 2: the launches before the stop, plus the accepted tail.
+                (6, FINISHED_STOPPED, 99),
+                (12, NOT_STOPPED, -1),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_slot_stopping_empties_the_live_set() {
+        let (mut live, mut out) = batch(2);
+        merge_step_verdicts(
+            &mut live,
+            &mut out,
+            0,
+            W,
+            &[(1, FINISHED_STOPPED, -1), (3, FINISHED_STOPPED, -1)],
+        )
+        .unwrap();
+        assert!(live.is_empty(), "nothing is left to launch a further pack for");
+        assert_eq!(out, vec![(1, FINISHED_STOPPED, -1), (3, FINISHED_STOPPED, -1)]);
+    }
+
+    #[test]
+    fn a_partial_run_leaves_the_launches_that_did_pack() {
+        // Launches 0 and 1 packed, launch 2 failed -> the caller returns THESE verdicts on
+        // the "unpacked" arm. `acc = 0` for the survivors would tell Python the step
+        // produced nothing, and `r9_apply` would hand the whole budget back.
+        let (mut live, mut out) = batch(2);
+        merge_step_verdicts(&mut live, &mut out, 0, W, &[ran(W), ran(W)]).unwrap();
+        merge_step_verdicts(&mut live, &mut out, 1, W, &[ran(W), ran(W)]).unwrap();
+        assert_eq!(out, vec![(8, NOT_STOPPED, -1), (8, NOT_STOPPED, -1)]);
+    }
+
+    #[test]
+    fn an_unregistered_slot_counts_as_a_stop_not_as_a_survivor() {
+        let (mut live, mut out) = batch(1);
+        merge_step_verdicts(&mut live, &mut out, 0, W, &[(0, u8::MAX, -1)]).unwrap();
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn a_live_row_outside_the_batch_is_an_error_not_a_panic() {
+        let mut live = vec![7usize];
+        let mut out = vec![(0, NOT_STOPPED, NO_STOP_REASON); 2];
+        assert!(merge_step_verdicts(&mut live, &mut out, 0, W, &[ran(W)]).is_err());
     }
 }
 

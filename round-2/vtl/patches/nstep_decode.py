@@ -837,10 +837,12 @@ def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
     WHERE THE TOKENS ARE COMMITTED depends on ``VTL_RUST_RUNNER_COMMIT`` (see rust_runner's
     module docstring):
 
-      * update mode (default) -- ``launch`` only enqueues, into ring slot ``free_slot()``,
-        and the FIFO entry it pushes is what ``rust_sched.update_from_output`` commits with
-        one step's delay. That is the only ordering the depth-2 batch queue allows, and it
-        needs no interlock, so the runner actually engages under the served config.
+      * update mode (default) -- ``launch`` only enqueues (``steps`` back-to-back
+        ``cuGraphLaunch``es and ONE tail D2H, into ring slot ``free_slot()``), and the FIFO
+        entry it pushes is what ``rust_sched.update_from_output`` commits with one step's
+        delay -- gathering one accumulator window per launch. That is the only ordering the
+        depth-2 batch queue allows, and it needs no interlock, so the runner actually
+        engages under the served config.
       * sample mode -- ``run_steps`` launches AND commits here through ``step_pack_locked``,
         which requires this step to be the only unapplied one (``inflight == 1``).
 
@@ -907,10 +909,11 @@ def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
         # Ownership BEFORE the launch: from this append until `update_from_output` pops
         # it, the slot is taken (`free_slot` reads occupancy off `pending`), so there is
         # no instant where a launched slot is untracked. A decline pops it right back.
-        state.pending.append((slot, stash))
+        # The third element is overwritten with what `launch` actually took, below.
+        state.pending.append((slot, stash, steps))
         try:
             launched = state.runner.launch(
-                slot, num_reqs, pad, 1, 0, list(stash.slots),
+                slot, num_reqs, pad, 1, 0, list(stash.slots), steps, n,
             )
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -932,13 +935,30 @@ def _run_burst_rust(runner, b: _Burst, n: int, steps: int, ib, hidden):
         # sampling would run the step a SECOND time, so a failure below is fatal for the
         # step, not a degrade -- see PostLaunchError.
         try:
+            # What the crate ACTUALLY launched: it clamps itself to one launch where this
+            # shape has no continuation graph. `commit` must gather exactly this many
+            # windows, and the scheduler reconciles the surplus it committed.
+            took = int(launched)
+            state.pending[-1] = (slot, stash, took)
             state.engaged += 1
             if state.engaged == 1 or not state.engaged & 0x1FFF:
                 log.info(
-                    "vtl: rust runner engaged -- %d launches (n=%d, batch=%d, slot=%d)",
-                    state.engaged, n, num_reqs, slot,
+                    "vtl: rust runner engaged -- %d launches "
+                    "(n=%d, steps=%d, took=%d, batch=%d, slot=%d)",
+                    state.engaged, n, steps, took, num_reqs, slot,
                 )
-            return _burst_output(b, num_reqs, n, SamplerOutput)
+            total = took * n
+            if total == b.n:
+                # The k=1 case at the captured burst width: the pre-filled constant pair
+                # already says exactly this.
+                return _burst_output(b, num_reqs, total, SamplerOutput)
+            # `post_update` reads BOTH of these off the device, so a multi-launch step has
+            # to say how many tokens it really produced.
+            return _burst_output(
+                b, num_reqs, total, SamplerOutput,
+                b.nsampled_k.fill_(total)[:num_reqs],
+                b.nrejected_k.fill_(-(total - 1))[:num_reqs],
+            )
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit, rust_runner.PostLaunchError)):
                 raise
@@ -1236,7 +1256,22 @@ def _patch_runner(b: _Burst) -> None:
         return _emit(runner, state, sampler_output)
 
     def _publish_ready(runner, state) -> None:
-        """Tell the scheduler whether the NEXT step with this exact shape may burst."""
+        """Tell the scheduler whether the NEXT step with this exact shape may burst.
+
+        WORKER-ONLY PREDICATES. Every clause here is something only this process knows: a
+        FULL descriptor was dispatched, the padded width matches it, the request-id list
+        agrees with the row count, there is no speculator, and the decode fast path's
+        builders exist. The batch-shape clauses that used to live here -- no prefill row,
+        every scheduled count 1, no draft tokens, no structured output, batch within the
+        captured sizes -- moved into the crate's schedule decision
+        (``Decisions::burst_eligible``, consumed by ``rust_sched.commit_burst``).
+
+        That is not just cheaper (two numpy reductions over <=8 elements are gone); it is
+        the more CORRECT home. This runs at sample(k) and was predicting step k+1's batch
+        from step k's, so it could only ever be a hint the scheduler had to re-check
+        anyway -- and ``burst_blocked_batch`` did re-check every one of them, one step
+        later, against the batch it actually holds.
+        """
         if not b.armed:
             b.ready = False
             return
@@ -1248,13 +1283,8 @@ def _patch_runner(b: _Burst) -> None:
                 and b.desc.cg_mode == CUDAGraphMode.FULL
                 and b.desc.num_reqs is not None
                 and ib.num_reqs_after_padding == b.desc.num_reqs
-                and ib.num_reqs <= MAX_BURST_REQS
                 and ib.num_reqs == len(ib.req_ids)
                 and runner.speculator is None
-                and ib.num_draft_tokens == 0
-                and not ib.has_structured_output_reqs
-                and not ib.is_prefilling_np.any()
-                and int(ib.num_scheduled_tokens.max()) == 1
                 and dfp._C.builders
             )
             b.key = tuple(ib.req_ids) if b.ready else ()
@@ -1351,16 +1381,18 @@ def apply() -> None:
     # never outlive it. Read here rather than at capture time so `_alloc` can size the
     # accumulator for the widest multi-launch step the runner may ever take.
     #
-    # UPDATE-MODE COMMIT PINS THIS TO 1, which is also what keeps `continue_graphs`
-    # uncaptured: the multi-launch residency loop only exists inside the sample-time
-    # `run_steps` call, and a continuation graph per burst size doubles the burst-graph
-    # memory for a rung nothing would launch.
+    # BOTH COMMIT MODES take the residency loop: update mode enqueues all k launches in
+    # `Runner.launch` (one tail D2H) and gathers them launch-by-launch in `Runner.commit`,
+    # so `k > 1` no longer depends on the legacy sample-time `run_steps`. This value is also
+    # what arms the continuation capture below (:708) and sizes the accumulator (`_alloc`),
+    # so `> 1` here costs a continuation graph per burst size -- accepted: the sizes are
+    # (1, 2, 4, 8) at n=4, and a capture failure demotes the `unroll` rung on its own.
     b.rust_steps = 1
     if b.unroll:
         try:
             from vtl.patches import rust_runner
 
-            if rust_runner.mode() == "on" and rust_runner.commit_mode() == "sample":
+            if rust_runner.mode() == "on":
                 b.rust_steps = rust_runner.max_steps()
         except Exception:
             log.exception("vtl: rust runner module not importable; one launch per step")

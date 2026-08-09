@@ -1137,23 +1137,32 @@ def bail_reason(scheduler):
 # --------------------------------------------------------------------------
 
 
-def burst_blocked_batch(so, cap: int) -> str | None:
+def burst_blocked_batch(so, cap: int, eligible=None) -> str | None:
     """The batch-level gate MINUS the queue-empty guard. Pure -- self-checked.
 
     Split out because the N=1 in-graph sampling commit wants exactly this and not the queue
     guard: sampling one token in a graph delays no admission, so a non-empty waiting queue is
     irrelevant to it while it is the whole TTFT argument against a burst.
+
+    ``eligible`` is the crate's ``Decisions::burst_eligible`` for THIS step, when the Rust
+    loop produced this SchedulerOutput. It answers exactly the four scheduler-known clauses
+    below (admissions, preemption, the batch cap, all-counts-are-1) off data
+    ``schedule_resident`` already built, so they are not re-derived from the dict here.
+    ``None`` -- an older wheel, the burst off, or a step the stock loop scheduled -- keeps
+    the full Python derivation, which is the shipped behaviour.
     """
-    if so.scheduled_new_reqs:
-        return "new requests admitted this step"
-    if so.preempted_req_ids:
-        return "a request was preempted"
     if so.scheduled_spec_decode_tokens or so.scheduled_encoder_inputs:
         return "spec-decode or encoder inputs scheduled"
     if so.has_structured_output_requests:
         return "structured output"
     if so.new_block_ids_to_zero:
         return "fresh blocks need zeroing"
+    if eligible is not None:
+        return None if eligible else "the crate's schedule decision refused a burst"
+    if so.scheduled_new_reqs:
+        return "new requests admitted this step"
+    if so.preempted_req_ids:
+        return "a request was preempted"
     nst = so.num_scheduled_tokens
     if not nst:
         return "empty step"
@@ -1485,6 +1494,58 @@ def _pack_ok_clauses(request) -> bool:
         and request.prefill_stats is None
         and not request.events
     )
+
+
+def stop_params(request):
+    """The immutable half of this request's ``check_stop`` condition, or ``None`` to refuse.
+
+    ``(min_tokens, max_tokens, eos_token_id, stop_token_ids)`` -- exactly the argument tail
+    ``KvManager.set_stop_params`` / ``set_request_meta`` take. Module level and PURE so the
+    two callers cannot drift: ``register()`` (first decode step, engine thread) and the
+    add-time preregistration hook (input thread). A predicate that lived in only one of them
+    would mean the runner's launch-time promise rested on a check the other never ran.
+    Self-checked.
+    """
+    sp = request.sampling_params
+    if sp is None or request.pooling_params is not None:
+        return None
+    # check_stop's two unported branches. `repetition_detection` is an O(n) scan over
+    # the whole output with its own tuning knobs; a structured-output request can be
+    # terminated by the grammar, which lives entirely in Python.
+    if getattr(sp, "repetition_detection", None) is not None:
+        return None
+    if getattr(request, "structured_output_request", None) is not None:
+        return None
+    # A resumable streaming session can be stopped, resumed via
+    # _update_request_as_session with REPLACED sampling_params, and keep its
+    # request_id -- so the interned "immutable half" would go stale on the same
+    # slot. Not judge traffic; refuse rather than model re-registration.
+    if getattr(request, "resumable", False):
+        return None
+    max_tokens = getattr(request, "max_tokens", None)
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        return None
+    eos = getattr(sp, "eos_token_id", None)
+    return (
+        int(getattr(sp, "min_tokens", 0) or 0),
+        max_tokens,
+        None if eos is None else int(eos),
+        [int(t) for t in (sp.stop_token_ids or ())],
+    )
+
+
+def prereg_meta(rust, slot: int):
+    """Phase 2: the crate's add-time pack-ok bit for ``slot``, or ``None``.
+
+    ``None`` covers every reason the fast arm is unavailable at once -- the request was
+    never preregistered, the wheel predates ``request_meta``, or the crossing raised -- and
+    ``decide()`` then does exactly what it did before this port.
+    """
+    try:
+        return rust.request_meta(slot)
+    except BaseException as exc:
+        reraise_fatal(exc)
+        return None
 
 
 def _r9_cache_hit_counts(cache, r2i, sampled_counts):
@@ -2014,34 +2075,15 @@ def _install_update_from_output(scheduler_cls, m: dict):
     }
 
     def register(rust, request, slot) -> bool:
-        """Intern the immutable half of this request's stop condition. False = refuse."""
-        sp = request.sampling_params
-        if sp is None or request.pooling_params is not None:
+        """Intern the immutable half of this request's stop condition. False = refuse.
+
+        The predicates live in the module-level ``stop_params`` so the add-time
+        preregistration hook interns the SAME tuple this would (see its docstring).
+        """
+        params = stop_params(request)
+        if params is None:
             return False
-        # check_stop's two unported branches. `repetition_detection` is an O(n) scan over
-        # the whole output with its own tuning knobs; a structured-output request can be
-        # terminated by the grammar, which lives entirely in Python.
-        if getattr(sp, "repetition_detection", None) is not None:
-            return False
-        if getattr(request, "structured_output_request", None) is not None:
-            return False
-        # A resumable streaming session can be stopped, resumed via
-        # _update_request_as_session with REPLACED sampling_params, and keep its
-        # request_id -- so the interned "immutable half" would go stale on the same
-        # slot. Not judge traffic; refuse rather than model re-registration.
-        if getattr(request, "resumable", False):
-            return False
-        max_tokens = getattr(request, "max_tokens", None)
-        if not isinstance(max_tokens, int) or max_tokens <= 0:
-            return False
-        eos = getattr(sp, "eos_token_id", None)
-        rust.set_stop_params(
-            slot,
-            int(getattr(sp, "min_tokens", 0) or 0),
-            max_tokens,
-            None if eos is None else int(eos),
-            [int(t) for t in (sp.stop_token_ids or ())],
-        )
+        rust.set_stop_params(slot, *params)
         return True
 
     def store_take_over(kv, request, slot) -> bool:
@@ -2155,13 +2197,7 @@ def _install_update_from_output(scheduler_cls, m: dict):
                 return 0
             reqs.append(request)
         publish = out_publish_ready(kv._rust)
-        if state.update:
-            # Update mode has no residency loop to grant launches to: the step is split
-            # across `launch` and `commit`, one burst each. Pinned here rather than left to
-            # `runner_steps` so the committed token budget can never exceed what one launch
-            # produces.
-            steps = 1
-        elif steps > 1 and not publish:
+        if steps > 1 and not publish:
             # `update_from_output` hands back ONE record per engine index, so the second
             # launch's record would have nowhere to go. With the inline publish live each
             # launch delivers its own and there is nothing left to return -- which is why
@@ -2199,8 +2235,11 @@ def _install_update_from_output(scheduler_cls, m: dict):
         """
         stash = done.stash
         n, ran = stash.n, done.ran
-        # `run_steps` breaks on the FIRST non-zero verdict, so every launch before the last
-        # one accepted the full width; only the last one's verdicts can be short.
+        # SAMPLE mode (`run_steps`) breaks on the FIRST non-zero verdict and returns the
+        # LAST launch's verdicts only, so every launch before it accepted the full width and
+        # the base is `(ran - 1) * n`. UPDATE mode (`Runner.commit`) returns ONE AGGREGATED
+        # verdict per row and reports `ran = 1`, which makes this exactly 0 -- the same
+        # expression, no second branch to keep in step with the crate.
         base = (ran - 1) * n
         verdicts = done.verdicts
         # Deferred to the end of the function: `refuse` RAISES under
@@ -2210,18 +2249,27 @@ def _install_update_from_output(scheduler_cls, m: dict):
             # Should-never-happen: the crate refuses the pre-flight rather than reach here.
             # The failed launch appended NOTHING to the token store (`store_apply` runs
             # only on a packed step) but the WORKER did advance -- `postprocess_sampled`
-            # consumed all `ran * n` tokens, including the unpacked launch's. The two sides
+            # consumed every launched token, the unpacked launch's included. The two sides
             # cannot be re-aligned after the fact (re-running `decide()` would double-append
             # the packed launches), so retire every slot in the batch as length-capped:
             # the client gets the tokens the store actually holds, and no request ever
-            # generates again from worker/scheduler-divergent state. `ran` already counts
-            # the unpacked launch, so `base` -- the packed launches' tokens -- is already
-            # right and the residue accepts exactly those.
+            # generates again from worker/scheduler-divergent state.
+            #
+            # The COUNTS come from the crate, not from a fabricated zero: on a multi-launch
+            # commit the launches before the failure DID append, and claiming `acc = 0`
+            # would hand their tokens back through `burst_uncommit` on top of the tokens the
+            # store actually holds. `Runner.commit` returns the partial aggregate for
+            # exactly this reason; only the STATUS is overridden here.
             log.error("rust_sched: the runner could not pack launch %d (%s); standing down",
                       ran, done.exit)
             stand_down = "a launch did not pack"
             self._vtl_ufo_clean = False
-            verdicts = [(0, 2, -1)] * len(stash.slots)  # 2 = FINISHED_LENGTH_CAPPED
+            # 2 = FINISHED_LENGTH_CAPPED.
+            verdicts = [(acc, 2, -1) for acc, _status, _stop in verdicts]
+            if len(verdicts) != len(stash.slots):
+                # An older wheel returned an EMPTY list on this arm. Nothing accepted is
+                # the only answer left, and it is the conservative one.
+                verdicts = [(0, 2, -1)] * len(stash.slots)
         self._vtl_r9_residue = [
             (slot, req, (base + acc, status, stop))
             for slot, req, (acc, status, stop) in zip(stash.slots, stash.reqs, verdicts)
@@ -2267,8 +2315,14 @@ def _install_update_from_output(scheduler_cls, m: dict):
         Every ``None`` here is safe by construction: a launch commits nothing, so the tokens
         are still in the ``AsyncOutput`` the worker built and ``decide()`` is a complete
         commit for the step.
+
+        ``took`` -- what ``launch`` returned -- is what gets committed, NOT ``stash.steps``:
+        the crate clamps itself to a single launch where the shape has no continuation
+        graph, and gathering a window no graph filled would commit the previous step's
+        leftover columns. The stash's budget stays the scheduler's number, and the
+        difference comes back through ``r9_apply``'s ``burst_uncommit``.
         """
-        slot, stash = state.pending[0]
+        slot, stash, took = state.pending[0]
         seq = getattr(scheduler_output, "vtl_runner_seq", 0)
         if stash.seq != seq:
             if stash.seq > seq:
@@ -2289,7 +2343,7 @@ def _install_update_from_output(scheduler_cls, m: dict):
             out = state.runner.commit(
                 slot, list(range(rows)), [stash.n] * rows, list(stash.slots),
                 list(stash.key), stash.max_model_len, 0, monotonic(), (),
-                stash.fold, stash.publish,
+                stash.fold, stash.publish, took,
             )
         except BaseException as exc:
             reraise_fatal(exc)
@@ -2304,9 +2358,12 @@ def _install_update_from_output(scheduler_cls, m: dict):
             # launch planned against (it finished at update(k-1), and schedule(k+1) may
             # already have given the slot away). decide() owns the step.
             return None
-        verdicts, record, published, exit_reason = out
+        verdicts, records, exit_reason = out
+        # `ran = 1` because the verdicts are already AGGREGATED over `took` launches -- see
+        # `runner_consume`'s `base`. `records` is empty when every packed launch published
+        # itself inline, which `runner_stash` makes a precondition of `took > 1`.
         return runner_mod._Done(
-            stash, list(verdicts), [] if record is None else [record],
+            stash, list(verdicts), list(records),
             "budget" if exit_reason == "ok" else exit_reason, 1,
         )
 
@@ -2387,6 +2444,17 @@ def _install_update_from_output(scheduler_cls, m: dict):
                 pack = False
                 continue
             slot = mirror.slot(request)
+            # Phase 2: the input thread may already have interned BOTH halves for this slot
+            # (`preprocess_add_request` hook, gated on VTL_RUST_PREREG). One crate read
+            # then stands in for `_pack_ok_clauses` + `register()` on a request's first
+            # decode step -- read only when a mirror set is actually cold, so a steady
+            # decode step pays nothing. `_vtl_preregistered == slot` is the Python-side
+            # signal; the crate's `None` (never registered, or the slot recycled since) is
+            # the full fallback below, unchanged.
+            meta = None
+            if (slot not in mirror._pack_ok or slot not in mirror._stops) and \
+                    getattr(request, "_vtl_preregistered", None) == slot:
+                meta = prereg_meta(rust, slot)
             if pack:
                 # R9: the six clauses are all request-immutable once true (see
                 # `RustMirror._pack_ok`'s docstring on why `prefill_stats` -- the one
@@ -2394,7 +2462,7 @@ def _install_update_from_output(scheduler_cls, m: dict):
                 # is a set lookup instead of six attribute reads every step.
                 if slot in mirror._pack_ok:
                     pass
-                elif _pack_ok_clauses(request):
+                elif _pack_ok_clauses(request) if meta is None else meta:
                     mirror._pack_ok.add(slot)
                 else:
                     # The record has no slot for any of these: a second client index, a
@@ -2406,7 +2474,9 @@ def _install_update_from_output(scheduler_cls, m: dict):
             # a fact only this module changes. register() overwrites, so a lost entry
             # (slot recycled -> discarded in mirror.drop) just re-registers.
             if slot not in mirror._stops:
-                if not register(rust, request, slot):
+                # `meta is not None` proves the crate holds this slot's StopTable entry:
+                # `set_request_meta` writes both halves or neither.
+                if meta is None and not register(rust, request, slot):
                     self._vtl_ufo_clean = False
                     pack = False
                     continue
@@ -2819,11 +2889,75 @@ def _install_update_from_output(scheduler_cls, m: dict):
         _install_preempt_hook(scheduler_cls)
         if TOK.live:
             _install_async_output()
+    if env_on("VTL_RUST_PREREG"):
+        _install_prereg()
     log.info(
         "rust_sched: UFO batched stop decision active "
         "(kick=%s, r8=%s, tokstore=%s, r9=%s, runner=%s)",
         spec, _r8[0], STORE, R9.live, RUNNER,
     )
+
+
+def _install_prereg() -> None:
+    """VTL_RUST_PREREG: register a request with the crate at ADD time, not at first decode.
+
+    ``EngineCoreProc.preprocess_add_request`` is the one chokepoint every arrival goes
+    through -- the shm input thread calls it (``shm_ipc.py``'s ``_run_input_thread``) and so
+    does the stock ZMQ one -- and it runs OFF the engine thread, so the six
+    ``_pack_ok_clauses`` attribute reads and ``register()``'s predicate chain stop being
+    GIL-held work on the first decode step of every request. The crossing itself releases
+    the GIL (``KvManager::set_request_meta``), so the input thread never parks on the crate
+    mutex while holding it.
+
+    EVERY failure is silent and per request: the attribute is left unset and ``decide()``'s
+    miss arm does exactly what it did before. The hook can therefore never cost a request,
+    only the shortcut -- which is why it does not honour ``VTL_RUST_SCHED_REQUIRE`` per
+    call; an install that cannot happen at all is logged and skipped here instead.
+
+    TEARDOWN. Interning at add time means the slot is held from arrival rather than from
+    first schedule. `Scheduler._free_request` -> `kv.free` -> `RustMirror.drop` ->
+    `rust.forget` returns it for every request the scheduler ever sees, aborts included.
+    ponytail: a request that dies between `preprocess_add_request` and `scheduler.add_request`
+    (only `EngineCore.add_request`'s own type/pooling raises, both of which `stop_params`
+    already refuses) would leak one slot; add a reaper if that path ever becomes reachable.
+    """
+    try:
+        from vllm.v1.engine.core import EngineCoreProc
+    except Exception:
+        log.exception("rust_sched: EngineCoreProc not importable; VTL_RUST_PREREG inert")
+        return
+    if already_patched(EngineCoreProc, "preprocess_add_request", patch="rust_sched_prereg"):
+        return
+    wrapped = EngineCoreProc.preprocess_add_request
+
+    def preprocess_add_request(self, request, *args, **kwargs):
+        out = wrapped(self, request, *args, **kwargs)
+        try:
+            # v0.25.0 returns `(Request, current_wave)`; take the request out of whatever
+            # shape this build uses rather than assuming either one.
+            req = out[0] if isinstance(out, tuple) else out
+            params = stop_params(req)
+            if params is not None:
+                rust = self.scheduler.kv_cache_manager._rust
+                # ONE crossing: interns the slot, the StopTable entry and the pack-ok bit.
+                req._vtl_preregistered = rust.set_request_meta(
+                    req.request_id, _pack_ok_clauses(req), *params
+                )
+        except BaseException as exc:
+            reraise_fatal(exc)
+            # Once per boot: a config where this always fails must not flood the log, and
+            # the cost of failing is only that `decide()` does the work itself.
+            if not getattr(preprocess_add_request, "_vtl_warned", False):
+                preprocess_add_request._vtl_warned = True
+                log.exception(
+                    "rust_sched: add-time registration failed; decide() will do it instead"
+                )
+        return out
+
+    EngineCoreProc.preprocess_add_request = mark_patched(
+        preprocess_add_request, wrapped, patch="rust_sched_prereg"
+    )
+    log.info("rust_sched: add-time request registration active (VTL_RUST_PREREG)")
 
 
 def _install_preempt_hook(scheduler_cls) -> None:
@@ -2982,7 +3116,12 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         if n < 2 and not one:
             return
         try:
-            batch_why = burst_blocked_batch(so, nstep_mod.MAX_BURST_REQS)
+            # Phase 4: the crate answered the scheduler-known half of this gate while it
+            # was building the decisions (`Decisions::burst_eligible`). `None` on any step
+            # the Rust loop did not produce, which is the full Python derivation.
+            batch_why = burst_blocked_batch(
+                so, nstep_mod.MAX_BURST_REQS, getattr(self, "_vtl_burst_eligible", None)
+            )
             if batch_why is not None:
                 skip_note(self, batch_why)
                 return
@@ -3131,6 +3270,13 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     # ignores it and keeps sending the full payload, which the apply
                     # block below still reads correctly.
                     "lean_decisions": bool(LEAN),
+                    # Phase 4: the cap `Decisions::burst_eligible` measures the batch
+                    # against. Read HERE, not at install time -- `_capture_burst_graphs`
+                    # rewrites `MAX_BURST_REQS` from the sizes that actually captured, and
+                    # capture runs inside `_initialize_kv_caches`, i.e. before the
+                    # Scheduler this closure belongs to exists. 0 = no burst on this boot,
+                    # which leaves the derivation in `burst_blocked_batch`.
+                    "burst_max_reqs": int(nstep_mod.MAX_BURST_REQS) if NSTEP else 0,
                 }
             )
             log.info(
@@ -3261,7 +3407,8 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         # they end up inside a `RustBlocks` that `SchedulerOutput` keeps across steps, and
         # the arena buffer is overwritten by the next step.
         if counts is not None:
-            n_run, n_adm, n_blk, n_len, n_pre, n_wait, grew, check_dict = counts
+            n_run, n_adm, n_blk, n_len, n_pre, n_wait, grew, check_dict, burst_ok = counts
+            self._vtl_burst_eligible = burst_ok
             if grew:
                 arena_bufs = core.arena_buffers()
             a_run, a_adm, a_blk, a_lens, a_pre, a_wait = arena_bufs
@@ -3309,6 +3456,9 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             lens = decisions["running_new_lens"]
             preempted = decisions["preempted"]
             waiting_order = decisions["waiting_order"]
+            # `.get`, not `[...]`: an older wheel has no such key and `None` is exactly the
+            # "let Python derive it" signal `burst_blocked_batch` reads.
+            self._vtl_burst_eligible = decisions.get("burst_eligible")
         # Phase C. The ring is only ever consulted on a step where nothing but decode
         # happened, so all the cheap counts have to be zero first; `ring_reuse` then
         # confirms the running set itself is byte-identical to the slot's.
@@ -3540,6 +3690,10 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     # Per-reason log de-duplication for the burst gate; class level so the first step
     # does not have to create it.
     scheduler_cls._vtl_burst_skips = set()
+    # Phase 4: the crate's per-step burst verdict. `None` = "no Rust decision for this
+    # step", which is what a bail (stock `schedule()`) leaves it at and what
+    # `burst_blocked_batch` reads as "derive it in Python".
+    scheduler_cls._vtl_burst_eligible = None
     scheduler_cls.schedule = mark_patched(schedule, wrapped)
 
 
@@ -4027,6 +4181,33 @@ def _self_check() -> None:
                {"has_structured_output_requests": True}):
         assert burst_blocked_batch(SO(**kw), 8) is not None, kw
 
+    # Phase 4: the crate's `Decisions::burst_eligible` STANDS IN for the four
+    # scheduler-known clauses -- and only those. Equivalence, case by case, against the
+    # Python derivation it replaces.
+    for kw in (
+        {},
+        {"scheduled_new_reqs": [object()]},
+        {"preempted_req_ids": {"a"}},
+        {"num_scheduled_tokens": {}},
+        {"num_scheduled_tokens": {"a": 1, "b": 2}},
+        {"num_scheduled_tokens": dict.fromkeys("abcdefghi", 1)},
+    ):
+        so = SO(**kw)
+        want = burst_blocked_batch(so, 8) is None
+        assert (burst_blocked_batch(so, 8, want) is None) is want, kw
+        # A `False` from the crate always refuses -- it is the authority on these clauses,
+        # so there is no Python arm left that could talk it back into a burst.
+        assert burst_blocked_batch(so, 8, False) is not None, kw
+    # The three clauses the crate CANNOT see still refuse, whatever it says.
+    for kw in ({"scheduled_spec_decode_tokens": {"a": [7]}},
+               {"scheduled_encoder_inputs": {"a": [0]}},
+               {"has_structured_output_requests": True},
+               {"new_block_ids_to_zero": [3]}):
+        assert burst_blocked_batch(SO(**kw), 8, True) is not None, kw
+    # `None` (an older wheel, or a step stock vLLM scheduled) is the full derivation.
+    assert burst_blocked_batch(SO(), 8, None) is None
+    assert burst_blocked_batch(SO(preempted_req_ids={"a"}), 8, None) is not None
+
     class SP:
         def __init__(self, **kw):
             self.temperature = 0.0
@@ -4227,6 +4408,103 @@ def _self_check() -> None:
     mirror._slots["ps1"] = pslot
     mirror.drop("ps1")
     assert pslot not in mirror._pack_ok
+
+    # ---- Phase 2: add-time preregistration -------------------------------------------
+    # EQUIVALENCE is the whole contract: what the input thread interns must be exactly what
+    # `register()` would have interned on the first decode step, or the runner's launch-time
+    # promise ("the crate can decide this slot's stop") rests on a check nobody ran.
+    class StopSP:
+        """The `SamplingParams` members `stop_params` reads -- a different set from the
+        burst gate's `SP` above, so it gets its own stand-in rather than a union."""
+
+        def __init__(self, **kw):
+            self.min_tokens = 0
+            self.eos_token_id = 2
+            self.stop_token_ids = ()
+            self.repetition_detection = None
+            self.__dict__.update(kw)
+
+    class StopReq:
+        def __init__(self, **kw):
+            self.sampling_params = StopSP()
+            self.pooling_params = None
+            self.structured_output_request = None
+            self.resumable = False
+            self.max_tokens = 16
+            self.__dict__.update(kw)
+
+    class FakeRustStops:
+        """Records what `register()` pushes, so the two paths can be diffed."""
+
+        def __init__(self):
+            self.calls = []
+
+        def set_stop_params(self, slot, *params):
+            self.calls.append((slot, params))
+
+    def _register(rust, request, slot) -> bool:
+        # `register()` itself lives in `_install_update_from_output`'s closure; this is its
+        # body verbatim, which is the point -- both are two lines over `stop_params`.
+        params = stop_params(request)
+        if params is None:
+            return False
+        rust.set_stop_params(slot, *params)
+        return True
+
+    for req_kw, sp_kw in (
+        ({}, {}),
+        ({}, {"min_tokens": 3}),
+        ({"max_tokens": 1}, {}),
+        ({}, {"stop_token_ids": [7, 8]}),
+    ):
+        sreq = StopReq(sampling_params=StopSP(**sp_kw), **req_kw)
+        fake = FakeRustStops()
+        assert _register(fake, sreq, 5) is True
+        # What the hook would hand `set_request_meta`, against what register() pushed.
+        assert stop_params(sreq) == fake.calls[0][1], (req_kw, sp_kw)
+
+    # Every refusal register() has, `stop_params` has -- so the hook simply does not call
+    # the crate for these and `decide()`'s miss arm sees no `_vtl_preregistered`.
+    for kw in (
+        {"sampling_params": None},
+        {"pooling_params": object()},
+        {"sampling_params": StopSP(repetition_detection=object())},
+        {"structured_output_request": object()},
+        {"resumable": True},
+        {"max_tokens": 0},
+        {"max_tokens": None},
+        {"max_tokens": 1.5},
+    ):
+        sreq = StopReq(**kw)
+        assert stop_params(sreq) is None, kw
+        assert _register(FakeRustStops(), sreq, 5) is False, kw
+
+    # eos_token_id crosses as an int or as None, never as anything else.
+    assert stop_params(StopReq(sampling_params=StopSP(eos_token_id=None)))[2] is None
+    assert stop_params(StopReq(sampling_params=StopSP(eos_token_id=2)))[2] == 2
+
+    # `prereg_meta` swallows an old wheel (no such method) into the full-fallback `None`.
+    class NoMeta:
+        pass
+
+    class YesMeta:
+        def request_meta(self, slot):
+            return slot == 3
+
+    assert prereg_meta(NoMeta(), 3) is None
+    assert prereg_meta(YesMeta(), 3) is True
+    assert prereg_meta(YesMeta(), 4) is False
+
+    # ...and the arm `decide()` takes off it: `meta` REPLACES the clause evaluation only
+    # when the request carries the matching slot, so a stale attribute cannot short-circuit
+    # a different slot's derivation.
+    preq = PSReq(prefill_stats=object())          # would evaluate to False
+    preq._vtl_preregistered = 11
+    for slot, want_meta in ((11, True), (12, False)):
+        used = (
+            getattr(preq, "_vtl_preregistered", None) == slot
+        )
+        assert used is want_meta, slot
 
     # `_r9_cache_hit_counts`: identity, the numpy gather, and the zero-count guard.
     import numpy as np

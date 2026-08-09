@@ -37,8 +37,11 @@ THE PER-STEP HANDSHAKE. Module globals, same lifetime story as ``BURST``:
     with everything the launch needs that only the scheduler knows (slot layout, the
     committed burst width, the publish hint). ``nstep_decode``'s ``sample_tokens`` takes it,
     matches it against the batch it is actually holding, and either launches or drops it.
-  * ``STATE.pending`` -- update mode: the FIFO of ``(ring slot, stash)`` for launches whose
-    ``update_from_output`` has not arrived yet. At most two, see below.
+  * ``STATE.pending`` -- update mode: the FIFO of ``(ring slot, stash, took)`` for launches
+    whose ``update_from_output`` has not arrived yet. At most two, see below. ``took`` is
+    what ``launch`` RETURNED, which is ``stash.steps`` unless the crate clamped itself to a
+    single launch (no continuation graph for this shape) -- the commit must commit what ran,
+    not what was committed for, and the scheduler reconciles the surplus.
   * ``STATE.done`` -- sample mode: the RESULT. Written by the launch, applied by
     ``rust_sched.update_from_output`` through the existing ``r9_apply`` residue loop.
   * ``STATE.inflight`` -- sample mode: scheduled steps not yet applied.
@@ -58,23 +61,26 @@ so ``sample(k)`` runs BEFORE step k-1 has been applied.
     self-checks and idles. Its one advantage is the multi-step residency loop
     (``VTL_RUST_RUNNER_STEPS`` > 1), which needs the whole burst chain inside one FFI call.
   * ``"update"`` (default, shipped) -- the crate's ``launch`` and ``commit`` split the step
-    in two. ``sample(k)`` only enqueues: ``cuGraphLaunch`` + the pre-planned D2H into the
-    free ring slot + an event record, no wait. The commit runs in ``update_from_output``, and
-    UPDATES are strictly ordered even though samples are not, so there is no ordering
-    hazard and no interlock -- the depth-2 overlap is preserved. Two pinned buffers is
-    exactly what the depth-2 queue needs; a third outstanding launch cannot exist, and if
-    one ever did the launch side simply declines and Python runs the step.
+    in two. ``sample(k)`` only enqueues: ``steps`` x ``cuGraphLaunch`` + ONE pre-planned D2H
+    into the free ring slot + an event record, no wait. The commit runs in
+    ``update_from_output``, and UPDATES are strictly ordered even though samples are not, so
+    there is no ordering hazard and no interlock -- the depth-2 overlap is preserved. Two
+    pinned buffers is exactly what the depth-2 queue needs; a third outstanding launch
+    cannot exist, and if one ever did the launch side simply declines and Python runs the
+    step.
 
     What is kept: ``cuGraphLaunch`` in place of torch's replay dispatch, the pre-planned
-    pinned D2H, and the ``decide()`` collapse at update time (event sync + gather +
-    ``step_pack_locked`` instead of the per-request Python loop and its numpy crossing).
-    What is given up: the multi-step loop, and ``AsyncOutput`` stays (its D2H is now
-    redundant with the ring's) -- which is also the property that makes every decline safe,
-    since a dropped launch just means Python's ``decide()`` commits the same tokens.
+    pinned D2H, the multi-step residency loop (``VTL_RUST_RUNNER_STEPS``, launch 1 = the
+    unroll graph, 2..k = the continuation graph), and the ``decide()`` collapse at update
+    time (one event sync + gather + ``step_pack_locked`` per launch instead of the
+    per-request Python loop and its numpy crossing). What is given up: ``AsyncOutput`` stays
+    (its D2H is now redundant with the ring's) -- which is also the property that makes
+    every decline safe, since a dropped launch just means Python's ``decide()`` commits the
+    same tokens.
 
 ``VTL_RUST_RUNNER``: "0" off, "1" on.
 ``VTL_RUST_RUNNER_COMMIT``: "update" (default) | "sample" (legacy interlocked path).
-``VTL_RUST_RUNNER_STEPS``: burst launches per FFI call. SAMPLE MODE ONLY.
+``VTL_RUST_RUNNER_STEPS``: burst launches per FFI call, in BOTH commit modes.
 ``VTL_RUST_RUNNER_REQUIRE``: "1" makes a refusal a BOOT FAILURE instead of a silent
 degrade -- see ``_State.refuse``.
 """
@@ -134,11 +140,15 @@ def require() -> bool:
 
 
 def max_steps() -> int:
-    """Phase 3's ceiling, SAMPLE MODE ONLY. 1 = one step per FFI call.
+    """The multi-step residency ceiling, in BOTH commit modes. 1 = one burst per step.
 
-    Update mode splits the step across two FFI calls and commits at update time, so there is
-    no residency loop for this to bound -- ``nstep_decode.apply`` pins it to 1 there, which
-    is also what keeps the continuation graphs (and their burst-graph memory) uncaptured.
+    Update mode splits the step across two FFI calls, but the launches themselves are all
+    enqueued by ``launch`` (back-to-back ``cuGraphLaunch``es on the captured stream, one
+    tail D2H) and gathered launch-by-launch by ``commit``, so the residency loop is exactly
+    as available there as in the legacy sample mode. This is only the CEILING: the crate
+    clamps itself to 1 where a shape has no continuation graph, ``runner_stash`` clamps to 1
+    without the inline shm publish, and ``runner_steps`` clamps to the align window's
+    headroom (and to 1 whenever the waiting queue is non-empty).
     """
     try:
         n = int(os.environ.get("VTL_RUST_RUNNER_STEPS", "8").strip() or 8)
@@ -193,7 +203,7 @@ class _State:
         self.inflight = 0       # sample mode: scheduled steps not yet applied
         self.engaged = 0        # launches taken this boot, for the once-in-a-while log
         self.update = True      # commit at UPDATE time (the default mode); set by `export`
-        self.pending = []       # update mode: FIFO of (ring slot, _Stash) not yet committed
+        self.pending = []       # update mode: FIFO of (ring slot, _Stash, took) uncommitted
         self.captured = None    # (model runner, BURST) stashed at capture, armed later
         self.refused = False    # PERMANENT stand-down (vs. merely not-yet-armed)
 
@@ -239,12 +249,12 @@ class _State:
         """The ring index no outstanding launch holds, or ``None`` when both are taken.
 
         THE OWNERSHIP RULE, in one place: a slot is owned from the moment its
-        ``(slot, stash)`` goes into ``pending`` until ``update_from_output`` pops it, and the
-        crate only ever indexes what it is handed. ``None`` is not an error -- the launch
-        site declines and Python runs the step, which is what happens whenever a third step
-        would otherwise be in flight.
+        ``(slot, stash, took)`` entry goes into ``pending`` until ``update_from_output`` pops
+        it, and the crate only ever indexes what it is handed. ``None`` is not an error --
+        the launch site declines and Python runs the step, which is what happens whenever a
+        third step would otherwise be in flight.
         """
-        used = [slot for slot, _ in self.pending]
+        used = [entry[0] for entry in self.pending]
         for slot in range(RING):
             if slot not in used:
                 return slot
@@ -648,7 +658,7 @@ def _self_check() -> None:
     stash = _Stash(("a",), (0,), (object(),), 4, 1, 32768, True, True, 7)
     s.step = stash
     s.done = _Done(stash, [(4, 0, -1)], [], "budget", 1)
-    s.pending = [(0, stash)]
+    s.pending = [(0, stash, 1)]
     logging.disable(logging.CRITICAL)  # the traceback below is expected; don't print it
     try:
         s.refuse("testing")
@@ -679,16 +689,43 @@ def _self_check() -> None:
     s = _State()
     assert s.update and s.pending == [], "update is the default mode"
     assert s.free_slot() == 0
-    s.pending.append((0, stash))
+    s.pending.append((0, stash, 1))
     assert s.free_slot() == 1
-    s.pending.append((1, stash))
+    s.pending.append((1, stash, 1))
     assert s.free_slot() is None, "a third launch has nowhere to land; decline it"
-    assert s.pending.pop(0) == (0, stash), "updates arrive in step order, so FIFO"
+    assert s.pending.pop(0) == (0, stash, 1), "updates arrive in step order, so FIFO"
     assert s.free_slot() == 0
     # ...and the slots are reused in whatever order they free, not round-robin: the head
     # popped is the only one that matters.
-    s.pending = [(0, stash)]
+    s.pending = [(0, stash, 1)]
     assert s.free_slot() == 1
+
+    # The pending entry carries what the LAUNCH returned, not what the scheduler committed:
+    # a shape with no continuation graph clamps the crate to one launch, and the commit must
+    # gather that many windows or it would append the previous step's leftover columns.
+    multi = _Stash(("a",), (0,), (object(),), 4, 8, 32768, True, True, 9)
+    s = _State()
+    s.pending.append((0, multi, 1))
+    slot, pending_stash, took = s.pending[0]
+    assert (slot, pending_stash.steps, took) == (0, 8, 1), \
+        "the clamp lives in `took`; `stash.steps` stays the COMMITTED budget"
+    # ...and the ring still frees on the entry's slot, whatever `took` says.
+    assert s.free_slot() == 1
+    s.pending.pop(0)
+    assert s.free_slot() == 0
+
+    # The aggregated verdict shape update-mode `commit` returns: ONE entry per batch row,
+    # already summed over the launches, so `runner_consume`'s `base = (ran - 1) * n` is 0.
+    verdicts = [(32, 0, -1), (14, 1, 99)]
+    done = _Done(multi, verdicts, [], "budget", 1)
+    assert done.ran == 1 and len(done.verdicts) == len(multi.slots) + 1
+    base = (done.ran - 1) * multi.n
+    assert base == 0, "aggregated verdicts must not be re-based by the launch count"
+    assert [base + acc for acc, _s, _r in done.verdicts] == [32, 14]
+    # A survivor of all 8 launches accepted the full budget; the stopped row did not, and
+    # THAT difference is what `r9_apply` hands back through `burst_uncommit`.
+    assert verdicts[0][0] == multi.n * multi.steps
+    assert multi.n * multi.steps - verdicts[1][0] == 18
 
     print("rust_runner self-check ok")
 

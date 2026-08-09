@@ -77,8 +77,6 @@ services:
     ports:
       - "8000:8000"
     environment:
-      VLLM_ATTENTION_BACKEND: FLASHINFER
-
       VLLM_PLUGINS: vtl
       VLLM_LOGGING_LEVEL: WARNING             # INFO does per-request log work on the hot path
       # `vllm.vtl` subtree only -- vtl/plugin.py gives it its own handler, so it does not
@@ -210,6 +208,17 @@ services:
       VTL_SHM_IPC_RUST_PUB: "1"          # the crate publishes the finished record from the
                                          #   engine thread, skipping a GIL hop. Falls back to
                                          #   the Python publisher if the channel cannot open.
+      VTL_SHM_IPC_RUST_SUB: "1"          # ...and the mirror image: the crate parks on the
+                                         #   request channel and splits the frame with the GIL
+                                         #   RELEASED. The python decoders, the ready
+                                         #   handshake and the ABORT dual-queue put are
+                                         #   unchanged; falls back to the iceoryx2-python loop
+                                         #   if the channel (or the `shm` feature) is missing.
+      VTL_SHM_IPC_LAZY_COPY: "1"         # `Request.__init__`'s prompt_token_ids.copy() hands
+                                         #   back a numpy view + an appended-output list
+                                         #   instead of building ~4400 PyLongs on the ingest
+                                         #   thread under the GIL. Needs SHM_IPC_RAW_ADD to
+                                         #   pay (a msgpack ADD has no u32 block to view).
 
       # ---- Rust scheduler core (vtl-sched) ---------------------------------------------
       # RUST makes the Rust manager authoritative; FULL also runs schedule() in Rust (SJF
@@ -285,21 +294,28 @@ services:
       VTL_RUST_RUNNER: "1"               # 0 = off (Python owns the step), 1 = Rust owns it
       VTL_RUST_RUNNER_COMMIT: "update"   # "update" = launch at sample time, commit at update
                                          #   time behind a pinned ring of 2. "sample" = legacy.
-      VTL_RUST_RUNNER_STEPS: "8"         # SAMPLE-MODE ONLY (update mode pins it to 1, which is
-                                         #   also what leaves the continuation graphs -- and
-                                         #   their burst-graph memory -- uncaptured). Max burst
-                                         #   launches Rust takes back-to-back before returning
-                                         #   to Python: launch 1 replays the unroll graph, 2..k
-                                         #   the continuation graph. The loop also exits on a
-                                         #   stop verdict, and the scheduler caps it at the
-                                         #   align window's headroom, so this is only the
-                                         #   ceiling. "1" = one burst per engine step.
+      VTL_RUST_RUNNER_STEPS: "8"         # Max burst launches Rust takes back-to-back before
+                                         #   returning to Python, in BOTH commit modes: launch
+                                         #   1 replays the unroll graph, 2..k the continuation
+                                         #   graph, and ONE tail D2H covers all k. This is only
+                                         #   the CEILING -- the crate clamps to 1 where a shape
+                                         #   captured no continuation graph, the stash clamps
+                                         #   to 1 without the inline shm publish, and the
+                                         #   scheduler clamps to the align window's headroom
+                                         #   (and to 1 while anything is waiting). "1" = one
+                                         #   burst per engine step. A/B this knob 1/4/8: it is
+                                         #   the only one of these that moves TPOT alone.
       # "1" DELIBERATELY, on this dev branch: 1 turns a silent runner refusal into a BOOT
       # FAILURE. A runner that armed and then quietly stood down measures the Python step
       # while looking like a win, which is the one thing an A/B arm must not do.
       # PRE-SUBMISSION: set to "0" -- same rationale as VTL_RUST_SCHED_REQUIRE (HANDOFF 1.4),
       # a hard-fail knob in the submitted artifact is a score-0 risk.
       VTL_RUST_RUNNER_REQUIRE: "1"
+      VTL_RUST_PREREG: "1"               # register a request with the crate at ADD time, on
+                                         #   the input thread (pack-ok bit + stop params in
+                                         #   one GIL-released crossing), instead of on its
+                                         #   first decode step. decide()'s miss arm still does
+                                         #   the full work for anything not preregistered.
       VTL_RUST_SCHED_TOKSTORE: "1"       # Rust owns each slot's output tokens, counters and
                                          #   block-hash chain. Needs R8 + VTL_RUST_HASHER.
       VTL_RUST_SCHED_R9: "1"             # collapse decide()/r8_apply's per-request Python loops

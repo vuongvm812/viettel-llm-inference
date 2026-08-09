@@ -178,6 +178,14 @@ class _PubCounters:
     queue item this thread finishes sending. `rust_sched.py`'s `decide()` only asks the
     crate to publish inline when the two agree -- otherwise an inline publish could
     overtake an item still in flight through the queue and reorder the wire stream.
+
+    STILL SINGLE-WRITER UNDER THE MULTI-STEP RUNNER, checked rather than assumed: a
+    `k`-launch burst publishes each launch's record inline from inside `Runner::commit`,
+    which runs on the engine thread inside `update_from_output` -- it touches neither
+    counter (an inline publish is precisely the case that never reaches `output_queue`, so
+    `bump_enqueued` is not called and this thread never sees the item). `enqueued` therefore
+    still has exactly one writer (the engine thread, once per queued step) and `published`
+    exactly one (the output thread). `AtomicU64` only if a second writer ever appears.
     """
 
     __slots__ = ("enqueued", "published")
@@ -641,10 +649,102 @@ class RawTokens(Sequence):
         # A FRESH list every call, not `self._list()` itself: `Request.__init__` extends
         # the result in place as `_all_token_ids`. Copying the cached list beats a second
         # C-level `tolist` when `__reduce__` (the mp pickle) also fires for this request.
+        #
+        # LAZY_COPY: hand back a list-LIKE that keeps the numpy view and grows a plain list
+        # beside it, so ~4400 PyLongs are never built on the ingest thread at all. See
+        # `_LazyAllTokens`.
+        if LAZY_COPY:
+            return _LazyAllTokens(self._arr)
         return list(self._list())
 
     def __reduce__(self):
         return (list, (self._list(),))
+
+
+#: ``VTL_SHM_IPC_LAZY_COPY``: resolved once in ``apply()``. Off => ``RawTokens.copy()``
+#: materializes exactly as it did before.
+LAZY_COPY = False
+
+
+class _LazyAllTokens:
+    """``Request._all_token_ids`` as (numpy prompt view + appended-output list).
+
+    THE COST THIS REMOVES. ``Request.__init__`` does ``prompt_token_ids.copy()``
+    (request.py:144) on the shm INGEST thread, with the GIL held, for every arriving
+    request -- ~4400 PyLongs on this trace. Nothing in the engine actually needs that list
+    as ints until the request is admitted, and the two consumers that read it before then
+    (`tok_store_init`'s boundary slice, the block hasher) read a handful of elements or the
+    `uint32` view directly.
+
+    THE PROTOCOL is what the verified consumers use, and no more: ``len`` / truthiness,
+    ``append`` / ``extend`` (`Request.append_output_token_ids`), int and slice
+    ``__getitem__`` -- including slices that SPAN the prompt/output boundary, which is what
+    `all_token_ids[hashed:]` is -- ``__iter__`` (the V2 runner's `stage_write`),
+    ``copy``/``index``/``__contains__`` (the `ConstantList` view forwards all three) and
+    ``__reduce__`` -> a plain list, so a pickled `NewRequestData` needs neither vtl nor a
+    numpy view of a buffer that lives in this process.
+
+    Deliberately NOT provided: ``__delitem__``. Only the resumable-session path deletes a
+    tail (`scheduler.py:1301`), and a resumable request never gets a `RawTokens` prompt in
+    the first place (`_run_input_thread` hands those a real list) -- so an AttributeError
+    there would be a loud, correct signal rather than a silent truncation.
+    """
+
+    __slots__ = ("_arr", "_out")
+
+    def __init__(self, arr):
+        self._arr = arr
+        self._out: list[int] = []
+
+    def __len__(self):
+        return len(self._arr) + len(self._out)
+
+    def append(self, token):
+        self._out.append(token)
+
+    def extend(self, tokens):
+        self._out.extend(tokens)
+
+    def __getitem__(self, index):
+        arr = self._arr
+        n = len(arr)
+        if isinstance(index, slice):
+            start, stop, step = index.indices(n + len(self._out))
+            if step != 1:
+                # Never seen on any consumer path; correctness over cleverness.
+                return self.copy()[index]
+            if stop <= n:
+                return arr[start:stop].tolist()
+            if start >= n:
+                return self._out[start - n:stop - n]
+            # The boundary-spanning case: `tok_store_init`'s `all_token_ids[hashed:]`.
+            head = arr[start:n].tolist()
+            head.extend(self._out[:stop - n])
+            return head
+        if index < 0:
+            index += n + len(self._out)
+        if index < 0:
+            raise IndexError("token index out of range")
+        # `int()`, not the numpy scalar: every caller of the int form treats it as a
+        # python int (dict keys, comparisons against token ids).
+        return int(arr[index]) if index < n else self._out[index - n]
+
+    def __iter__(self):
+        return iter(self.copy())
+
+    def __contains__(self, token):
+        return token in self.copy()
+
+    def index(self, token, *args):
+        return self.copy().index(token, *args)
+
+    def copy(self):
+        out = self._arr.tolist()
+        out.extend(self._out)
+        return out
+
+    def __reduce__(self):
+        return (list, (self.copy(),))
 
 
 def raw_add_split(record):
@@ -666,19 +766,58 @@ def raw_add_split(record):
     return ids, memoryview(record)[end:]
 
 
+def _open_rust_input(input_address: str, engine_index: int):
+    """Phase 3b: the crate's subscriber, or ``None`` to use the iceoryx2-python loop.
+
+    ``None`` on any refusal -- the flag is off, the wheel was built without the ``shm``
+    feature, or the channel would not open. Every one of those is a boot that still takes
+    requests, just with the framing split back under the GIL, so this logs once and degrades.
+    ``VTL_RUST_RUNNER_REQUIRE=1`` turns the degrade into a raise for the same reason it does
+    everywhere else: an arm that silently measured the Python path while looking fine is the
+    one outcome an A/B must not produce.
+    """
+    if not _env_flag("VTL_SHM_IPC_RUST_SUB"):
+        return None
+    why = None
+    try:
+        import vtl_sched
+
+        channel = getattr(vtl_sched, "InputChannel", None)
+        if channel is None:
+            why = "this vtl_sched wheel was built without the `shm` feature"
+        else:
+            return channel.open(input_address, engine_index)
+    except Exception as exc:
+        why = repr(exc)
+    log.warning("vtl shm_ipc: rust request subscriber unavailable (%s); using the "
+                "python loop", why)
+    if os.environ.get("VTL_RUST_RUNNER_REQUIRE", "").strip().lower() in _TRUTHY:
+        raise RuntimeError(
+            f"VTL_RUST_RUNNER_REQUIRE=1 but the rust request subscriber cannot open: {why}"
+        )
+    return None
+
+
 def _run_input_thread(engine, input_address: str, engine_index: int, ready: threading.Event):
     """Mirror of ``core.py`` ``process_input_sockets``' recv loop over the shm channel.
 
     Decoders are built exactly as upstream (core.py:1494-1497) and every decoded request goes
     through the *same* methods, so ADD preprocessing errors and the ABORT dual-queue put keep
     their upstream semantics.
+
+    TWO SUBSCRIBERS, ONE BODY (Phase 3b). ``VTL_SHM_IPC_RUST_SUB`` moves the receive+split
+    into the crate (``vtl_sched.InputChannel``), which parks and frames with the GIL
+    RELEASED; everything downstream of the split -- ``dispatch`` below -- is shared verbatim
+    with the iceoryx2-python arm, so there is one implementation of the semantics that
+    matter. ``ready.set()`` fires after whichever subscriber came up, which preserves the
+    load-bearing ordering: the stock body's first act is to send ``ready_payload``, and the
+    frontend only builds its publisher after that.
     """
-    import iceoryx2 as ix
     # Imported here, not on first raw ADD: a broken numpy must kill the channel at
     # startup (frontend sees 0 subscribers and demotes to ZMQ for good) rather than
     # drop already-committed ADD records one by one -- each such drop is a request the
     # client waits on forever.
-    import numpy  # noqa: F401
+    import numpy as np
 
     from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
     from vllm.v1.serial_utils import MsgpackDecoder
@@ -688,6 +827,42 @@ def _run_input_thread(engine, input_address: str, engine_index: int, ready: thre
         EngineCoreRequest, oob_tensor_provider=engine.tensor_ipc_receiver
     )
     generic_decoder = MsgpackDecoder(oob_tensor_provider=engine.tensor_ipc_receiver)
+
+    def dispatch(request_type, raw_ids, data_frames) -> None:
+        """upstream: core.py:1558-1587, everything PAST the frame split."""
+        if request_type == EngineCoreRequestType.ADD:
+            req = add_request_decoder.decode(data_frames)
+            if raw_ids is not None:
+                # A resumable session's prompt list gets `.extend`ed in place by the
+                # scheduler (`_update_request_as_session`), which the read-only facade
+                # cannot satisfy -- give those a real list.
+                req.prompt_token_ids = (
+                    raw_ids.tolist()
+                    if getattr(req, "resumable", False)
+                    else RawTokens(raw_ids)
+                )
+            try:
+                request = engine.preprocess_add_request(req)
+            except Exception:
+                engine._handle_request_preproc_error(req)
+                return
+        else:
+            request = generic_decoder.decode(data_frames)
+            if request_type == EngineCoreRequestType.ABORT:
+                # Aborts go to *both* queues, exactly as upstream: eager processing plus
+                # input-queue ordering so no request leaks. Idempotent in the scheduler.
+                engine.aborts_queue.put_nowait(request)
+        engine.input_queue.put_nowait((request_type, request))
+
+    channel = _open_rust_input(input_address, engine_index)
+    if channel is not None:
+        log.info("vtl shm_ipc: request channel ready (rust subscriber, engine %d)",
+                 engine_index)
+        ready.set()
+        _rust_input_loop(channel, dispatch, np, EngineCoreRequestType)
+        return
+
+    import iceoryx2 as ix
 
     node = ix.NodeBuilder.new().create(ix.ServiceType.Ipc)
     name = request_service(input_address, engine_index)
@@ -739,36 +914,58 @@ def _run_input_thread(engine, input_address: str, engine_index: int, ready: thre
                         raw_ids = None
                         request_type = EngineCoreRequestType(record[:1])
                         data_frames = [memoryview(record)[1:]]
-                    if request_type == EngineCoreRequestType.ADD:
-                        req = add_request_decoder.decode(data_frames)
-                        if raw_ids is not None:
-                            # A resumable session's prompt list gets `.extend`ed in place
-                            # by the scheduler (`_update_request_as_session`), which the
-                            # read-only facade cannot satisfy -- give those a real list.
-                            req.prompt_token_ids = (
-                                raw_ids.tolist()
-                                if getattr(req, "resumable", False)
-                                else RawTokens(raw_ids)
-                            )
-                        try:
-                            request = engine.preprocess_add_request(req)
-                        except Exception:
-                            engine._handle_request_preproc_error(req)
-                            continue
-                    else:
-                        request = generic_decoder.decode(data_frames)
-                        if request_type == EngineCoreRequestType.ABORT:
-                            # Aborts go to *both* queues, exactly as upstream: eager
-                            # processing plus input-queue ordering so no request leaks.
-                            # Idempotent in the scheduler.
-                            engine.aborts_queue.put_nowait(request)
-                    engine.input_queue.put_nowait((request_type, request))
+                    dispatch(request_type, raw_ids, data_frames)
                 except Exception:
                     # One bad record must not take the channel down with it -- upstream's
                     # process_input_sockets survives a malformed frame the same way, and
                     # killing the thread here would strand every record already confirmed
                     # delivered. Channel-level failures still break out below.
                     log.exception("vtl shm_ipc: dropping malformed request record")
+    except Exception:
+        log.exception("vtl shm_ipc: request thread died, frontend will fall back to ZMQ")
+
+
+def _rust_input_loop(channel, dispatch, np, EngineCoreRequestType) -> None:
+    """The ``VTL_SHM_IPC_RUST_SUB`` arm of ``_run_input_thread``'s loop.
+
+    ``channel.recv()`` parks, drains and splits inside the crate with the GIL released, and
+    hands back ``(tag, prompt_id_bytes | None, msgpack_tail)`` -- so nothing here does a
+    ``ctypes.string_at`` of the whole record or a ``struct.unpack_from`` of its header.
+
+    The two exception types ARE the two failure classes (``python.rs::InputChannel::recv``):
+    ``ValueError`` is one undecodable frame, ``RuntimeError`` (anything else) is the channel,
+    which falls out to the caller's demote-to-ZMQ handler. Same split the python arm gets
+    structurally from where its ``try`` blocks sit.
+
+    Taken as arguments rather than imported: the caller already resolved them, and this stays
+    a plain function the self-check can drive with stand-ins.
+    """
+    tag_raw_add = TAG_RAW_ADD[0]
+    try:
+        while True:
+            try:
+                kind, ids_bytes, tail = channel.recv()
+            except ValueError:
+                log.exception(
+                    "vtl shm_ipc: dropping undecodable raw ADD -- the frontend already "
+                    "committed it, this request WILL hang"
+                )
+                continue
+            try:
+                if kind == tag_raw_add:
+                    # `bytes` from the crate, so the u32 view is aligned (CPython's bytes
+                    # payload starts 16-byte aligned) -- which `vtl_sched.block_hashes_u32`
+                    # requires, since it reads it as `&[u32]` from Rust.
+                    raw_ids = np.frombuffer(ids_bytes, np.uint32)
+                    request_type = EngineCoreRequestType.ADD
+                else:
+                    raw_ids = None
+                    request_type = EngineCoreRequestType(bytes((kind,)))
+                dispatch(request_type, raw_ids, [tail])
+            except Exception:
+                # One bad record must not take the channel down with it; see the python
+                # arm's identical guard.
+                log.exception("vtl shm_ipc: dropping malformed request record")
     except Exception:
         log.exception("vtl shm_ipc: request thread died, frontend will fall back to ZMQ")
 
@@ -963,10 +1160,14 @@ def apply() -> None:
     EngineCoreProc.process_output_sockets = mark_patched(
         _process_output_sockets, EngineCoreProc.process_output_sockets
     )
-    global RAW_OUTPUT_PATH
+    global RAW_OUTPUT_PATH, LAZY_COPY
     RAW_OUTPUT_PATH = bool(_env_flag("VTL_SHM_IPC_RAW") and _RAW_ENABLED)
+    # Resolved once: `RawTokens.copy()` is on the ingest thread's hot path and a per-request
+    # getenv there would be the kind of cost this flag exists to remove.
+    LAZY_COPY = _env_flag("VTL_SHM_IPC_LAZY_COPY")
     log.info(
-        "vtl: shm_ipc installed (iceoryx2 data plane, raw=%s)", RAW_OUTPUT_PATH
+        "vtl: shm_ipc installed (iceoryx2 data plane, raw=%s, lazy_copy=%s)",
+        RAW_OUTPUT_PATH, LAZY_COPY,
     )
 
 
@@ -1265,6 +1466,155 @@ def _self_check() -> None:
     assert pickle.loads(pickle.dumps(toks)) == list(GOLDEN_RAW_ADD_TOKENS), (
         "pickle must yield a plain list -- the worker has no vtl and no shm buffer"
     )
+
+    # --- Phase 3a: the lazy `_all_token_ids` ----------------------------------------------
+    # The reference is a plain list built the way `Request` builds it, and EVERY assertion
+    # below is "the lazy object answers what the list answers" -- the only contract that
+    # matters, since it is substituted for one in `Request.__init__`.
+    global LAZY_COPY
+    saved_lazy = LAZY_COPY
+    try:
+        LAZY_COPY = True
+        assert isinstance(RawTokens(ids).copy(), _LazyAllTokens)
+        LAZY_COPY = False
+        assert isinstance(RawTokens(ids).copy(), list), "off => today's behaviour"
+    finally:
+        LAZY_COPY = saved_lazy
+
+    # A wider prompt, so a block-sized boundary slice is a real case and not a corner.
+    wide = np.arange(40, dtype=np.uint32)
+    lazy = _LazyAllTokens(wide)
+    ref = wide.tolist()
+    assert len(lazy) == len(ref) and bool(lazy)
+    assert not _LazyAllTokens(np.zeros(0, np.uint32))
+    lazy.append(100)
+    ref.append(100)
+    lazy.extend([101, 102])
+    ref.extend([101, 102])
+    assert len(lazy) == len(ref) == 43
+    # Ints, both signs, both sides of the boundary -- and PYTHON ints, not numpy scalars.
+    for i in list(range(-43, 43)):
+        assert lazy[i] == ref[i], i
+        assert type(lazy[i]) is int, i
+    for bad in (43, -44):
+        try:
+            lazy[bad]
+        except IndexError:
+            pass
+        else:
+            raise AssertionError(f"index {bad} must raise, not wrap")
+    # Slices, with the boundary-spanning ones (`tok_store_init`'s `all_token_ids[hashed:]`)
+    # first: 32 is the last hashed block boundary for a 40-token prompt at block 16... which
+    # is 32, so [32:] is exactly the case that spans into the appended output tokens.
+    for sl in (
+        slice(32, None), slice(None), slice(0, 40), slice(40, None), slice(38, 42),
+        slice(None, 10), slice(-5, None), slice(-50, 50), slice(20, 5),
+        slice(None, None, 2), slice(None, None, -1), slice(41, 41),
+    ):
+        assert lazy[sl] == ref[sl], sl
+        assert type(lazy[sl]) is list, sl
+    assert list(lazy) == ref and lazy.copy() == ref
+    # `copy()` hands out a FRESH list: `tok_materialize` extends `_all_token_ids` in place
+    # and must not be able to reach back into the object through a shared list.
+    c = lazy.copy()
+    c.append(999)
+    assert lazy.copy() == ref, "copy() must not alias"
+    assert 100 in lazy and 999 not in lazy
+    assert lazy.index(100) == 40 and lazy.index(0) == 0
+    assert pickle.loads(pickle.dumps(lazy)) == ref, "pickle must yield a plain list"
+    # The `ConstantList` wrap `Request.__init__` puts over it (`vllm/v1/utils.py:48`) is a
+    # pure forwarder; these are its four delegating members, verbatim.
+    class ConstantListLike:
+        def __init__(self, x):
+            self._x = x
+
+        def __len__(self):
+            return len(self._x)
+
+        def __getitem__(self, item):
+            return self._x[item]
+
+        def __iter__(self):
+            return iter(self._x)
+
+        def copy(self):
+            return self._x.copy()
+
+    view = ConstantListLike(lazy)
+    assert len(view) == len(ref) and view[32:] == ref[32:] and view.copy() == ref
+    assert list(view) == ref
+
+    # --- Phase 3b: the rust-subscriber arm of the input loop -------------------------------
+    # Driven with stand-ins, so it runs everywhere: what has to hold is the FRAME HANDLING
+    # (a raw ADD becomes a u32 view, a tagged frame becomes its enum member) and the two
+    # failure classes (a ValueError drops one record, anything else kills the thread).
+    class ReqType(bytes):
+        """`EngineCoreRequestType` stand-in: a bytes-valued enum, ADD == b'\\x00'."""
+
+    ReqType.ADD = ReqType(b"\x00")
+
+    raw_add = bytes.fromhex(GOLDEN_RAW_ADD)
+    ids_only = raw_add[_RAW_ADD_IDS_AT:_RAW_ADD_IDS_AT + 12]
+    tail_only = raw_add[_RAW_ADD_IDS_AT + 12:]
+
+    class FakeChannel:
+        def __init__(self, script):
+            self.script = list(script)
+
+        def recv(self):
+            if not self.script:
+                raise RuntimeError("channel closed")   # ends the loop, as a real one would
+            item = self.script.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+    seen = []
+    log.disabled = True  # the two drop paths log by design; keep the output clean
+    try:
+        _rust_input_loop(
+            FakeChannel([
+                (TAG_RAW_ADD[0], ids_only, tail_only),
+                ValueError("raw ADD version 2, this build speaks 1"),
+                (0x01, None, b"\x90"),
+            ]),
+            lambda rt, ids, frames: seen.append((rt, ids, frames)),
+            np,
+            ReqType,
+        )
+    finally:
+        log.disabled = False
+    assert len(seen) == 2, f"the ValueError frame must be dropped, not fatal: {seen}"
+    rt, ids_view, frames = seen[0]
+    assert rt is ReqType.ADD
+    assert tuple(ids_view.tolist()) == GOLDEN_RAW_ADD_TOKENS
+    assert ids_view.dtype == np.uint32 and ids_view.flags.aligned, (
+        "the crate's `bytes` must give an ALIGNED u32 view -- block_hashes_u32 reads it "
+        "as &[u32] from Rust, where an unaligned load is UB"
+    )
+    assert frames == [tail_only]
+    assert seen[1] == (ReqType(b"\x01"), None, [b"\x90"])
+    # ...and the same split the crate does is what `raw_add_split` produces, byte for byte.
+    py_ids, py_tail = raw_add_split(raw_add)
+    assert py_ids.tobytes() == ids_only and bytes(py_tail) == tail_only
+
+    # `_open_rust_input` is a pure refusal ladder off the env flag; the wheel probe below
+    # only runs where the extension is importable.
+    saved_sub = os.environ.pop("VTL_SHM_IPC_RUST_SUB", None)
+    try:
+        assert _open_rust_input("ipc:///tmp/none", 0) is None, "off => the python loop"
+    finally:
+        if saved_sub is not None:
+            os.environ["VTL_SHM_IPC_RUST_SUB"] = saved_sub
+    try:
+        import vtl_sched
+    except ImportError:
+        print("shm_ipc: InputChannel probe skipped (vtl_sched not importable here)")
+    else:
+        assert hasattr(vtl_sched, "HAS_SHM_INPUT")
+        assert hasattr(vtl_sched, "InputChannel") == vtl_sched.HAS_SHM_INPUT, (
+            "the class and the capability flag must agree, or the fallback probe lies"
+        )
 
     # --- service naming -------------------------------------------------------------------
     addr = GOLDEN_SEED_ADDRESS

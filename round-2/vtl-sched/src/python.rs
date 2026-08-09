@@ -351,6 +351,59 @@ impl KvManager {
         self.r().manager.stops.has(slot)
     }
 
+    /// Phase 2: ADD-TIME registration, both halves in one crossing. Interns `req_id`, sets
+    /// its `StopTable` entry (exactly what [`KvManager::set_stop_params`] would) and
+    /// records its pack-ok bit; returns the slot.
+    ///
+    /// WHY IT TAKES THE ID RATHER THAN A SLOT. The caller is `EngineCoreProc`'s INPUT
+    /// thread, not the engine thread, so `intern` + `set_stop_params` as two calls would
+    /// block on the crate mutex TWICE while holding the GIL -- and the engine thread's
+    /// GIL-free windows (a whole `schedule()`, a whole `commit()`) are exactly what it
+    /// would be waiting for. One call, GIL released, one lock acquisition: the input thread
+    /// parks without the GIL and the decode loop never waits on it.
+    ///
+    /// Refusals stay in Python (`rust_sched.py::stop_params` returns `None` and the hook
+    /// simply does not call this), so a request that reaches here is one the crate can
+    /// decide the stop for.
+    #[pyo3(signature = (req_id, pack_ok, min_tokens, max_tokens, eos_token_id,
+                        stop_token_ids))]
+    fn set_request_meta(
+        &self,
+        py: Python<'_>,
+        req_id: &str,
+        pack_ok: bool,
+        min_tokens: usize,
+        max_tokens: usize,
+        eos_token_id: Option<i64>,
+        stop_token_ids: Vec<i64>,
+    ) -> u32 {
+        let shared = self.shared.clone();
+        let name = req_id.to_string();
+        py.allow_threads(move || {
+            let mut sh = lock_shared(&shared);
+            // WRITE guard semantics: `intern` mutates the slot registry, which a pending
+            // speculation may have read through.
+            sh.invalidate();
+            sh.manager.set_request_meta(
+                &name,
+                pack_ok,
+                StopParams {
+                    min_tokens,
+                    max_tokens,
+                    eos_token_id,
+                    stop_token_ids: stop_token_ids.into_iter().collect(),
+                },
+            )
+        })
+    }
+
+    /// The pack-ok bit [`KvManager::set_request_meta`] interned for `slot`, or `None` if it
+    /// never was (or the slot has been recycled). Read once per request LIFETIME, on its
+    /// first decode step, in place of `decide()`'s six attribute reads plus `register()`.
+    fn request_meta(&self, slot: u32) -> Option<bool> {
+        self.r().manager.request_meta(slot)
+    }
+
     /// One step's stop decisions, plus the resident table's update-time delta (R6b).
     ///
     /// Flat in, flat out: request `i` owns `token_ids[cu_lens[i]..cu_lens[i + 1]]`, and
@@ -1008,11 +1061,16 @@ impl Arena {
     }
 }
 
-/// `(n_running, n_admitted, n_blocks, n_block_lens, n_preempted, n_waiting, grew, dict)`.
+/// `(n_running, n_admitted, n_blocks, n_block_lens, n_preempted, n_waiting, grew, dict,
+/// burst_eligible)`.
 ///
-/// The trailing dict is `None` unless the caller passed `check=true`, in which case it is
+/// The `dict` is `None` unless the caller passed `check=true`, in which case it is
 /// the PyDict marshalling of the SAME decisions -- the only way to compare the two
 /// marshalers without running `schedule()` twice (which would mutate state twice).
+///
+/// `burst_eligible` rides the tuple rather than a buffer (it is one bit, and the arena's
+/// buffers are all `i64` arrays) and therefore adds no FFI crossing: the tuple already
+/// crosses on every scheduled step.
 type ArenaCounts<'py> = (
     usize,
     usize,
@@ -1022,6 +1080,7 @@ type ArenaCounts<'py> = (
     usize,
     bool,
     Option<Bound<'py, PyDict>>,
+    bool,
 );
 
 impl Scheduler {
@@ -1095,6 +1154,7 @@ impl Scheduler {
             } else {
                 None
             },
+            d.burst_eligible,
         ))
     }
 
@@ -1207,6 +1267,9 @@ fn decisions_dict<'py>(py: Python<'py>, d: &Decisions) -> PyResult<Bound<'py, Py
     if !d.num_common_prefix_blocks.is_empty() {
         out.set_item("num_common_prefix_blocks", d.num_common_prefix_blocks.clone())?;
     }
+    // Always present, unlike the key above: `commit_burst` reads it as a plain bool and a
+    // missing key would be indistinguishable from "the crate says no".
+    out.set_item("burst_eligible", d.burst_eligible)?;
     Ok(out)
 }
 
@@ -1246,6 +1309,14 @@ impl Scheduler {
                 .map(|v| v.extract::<bool>())
                 .transpose()?
                 .unwrap_or(false),
+            // Optional for the same reason. 0 = "no burst was captured", which makes
+            // `Decisions::burst_eligible` permanently false and leaves the derivation
+            // where it was before this port -- in `burst_blocked_batch`.
+            burst_max_reqs: params
+                .get_item("burst_max_reqs")?
+                .map(|v| v.extract::<usize>())
+                .transpose()?
+                .unwrap_or(0),
         });
         Ok(())
     }
@@ -1584,6 +1655,65 @@ fn block_hash_with_group_id<'py>(
 }
 
 // ---------------------------------------------------------------------------------------
+// Phase 3b: the crate-owned request subscriber (`input.rs`).
+// ---------------------------------------------------------------------------------------
+
+/// The frontend -> engine request channel, driven from `shm_ipc.py`'s `vtl-shm-in` thread.
+///
+/// PULL MODEL, not a Rust-owned thread with Python callbacks: the Python loop already owns
+/// the decoders, the `preprocess_add_request` error path, the ABORT dual-queue put and the
+/// one-bad-record-survives rule, and `recv` releases the GIL for the park AND the split, so
+/// a callback shape would re-implement all of that for no additional GIL win.
+///
+/// Absent unless the wheel was built with the `shm` feature; `shm_ipc.py` probes with
+/// `getattr` and keeps its iceoryx2-python loop when it is missing.
+#[cfg(feature = "shm")]
+#[pyclass(module = "vtl_sched")]
+pub struct InputChannel {
+    inner: crate::input::InputChannel,
+}
+
+#[cfg(feature = "shm")]
+#[pymethods]
+impl InputChannel {
+    /// Open (or pair with) `vtl/req/<seed>/<engine_index>` + its `/ev` event service.
+    /// Raises on any failure -- the caller logs once and falls back to its Python loop
+    /// (or, under `VTL_RUST_RUNNER_REQUIRE`, lets the raise stand).
+    #[staticmethod]
+    fn open(input_address: &str, engine_index: u32) -> PyResult<InputChannel> {
+        crate::input::InputChannel::open(input_address, engine_index)
+            .map(|inner| InputChannel { inner })
+            .map_err(err)
+    }
+
+    /// The next record as `(tag, prompt_id_bytes_or_None, msgpack_tail)`. Blocks.
+    ///
+    /// Runs under `allow_threads`: this thread parks in iceoryx2's own primitive with the
+    /// GIL RELEASED, which is the whole point -- the engine's decode loop keeps running
+    /// while a request is in flight, and the record's framing split never contends for the
+    /// GIL the way `ctypes.string_at` + `struct.unpack_from` did.
+    ///
+    /// TWO FAILURE CLASSES, two exception types, matching what the Python arm already does
+    /// structurally: `ValueError` = this ONE frame could not be decoded, drop it and keep
+    /// the channel (the frontend committed that ADD on publish, so the drop is reported
+    /// loudly rather than absorbed); `RuntimeError` = the channel itself failed, so the
+    /// caller lets the thread die and the frontend demotes to ZMQ.
+    fn recv(&self, py: Python<'_>) -> PyResult<(u8, Option<Py<PyBytes>>, Py<PyBytes>)> {
+        let (tag, ids, tail) = py
+            .allow_threads(|| self.inner.recv_split())
+            .map_err(|e| match e {
+                crate::input::RecvError::Record(why) => PyValueError::new_err(why),
+                crate::input::RecvError::Channel(why) => PyRuntimeError::new_err(why),
+            })?;
+        Ok((
+            tag,
+            ids.map(|b| PyBytes::new_bound(py, &b).unbind()),
+            PyBytes::new_bound(py, &tail).unbind(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // The Rust steady-state model runner (round-2/RUST-RUNNER.md, phases 2-3).
 // ---------------------------------------------------------------------------------------
 
@@ -1823,16 +1953,29 @@ impl Runner {
         self.armed = false;
     }
 
-    /// UPDATE-TIME COMMIT, half 1: launch this step's graph and START its D2H. No event
+    /// UPDATE-TIME COMMIT, half 1: launch this step's graph(s) and START the D2H. No event
     /// sync, no commit -- see [`Runner::commit`].
     ///
-    /// This is the half that replaces `torch.cuda.CUDAGraph.replay()`: a direct
-    /// `cuGraphLaunch` plus the pre-planned `cuMemcpyDtoHAsync` into ring slot `slot`, both
+    /// This is the half that replaces `torch.cuda.CUDAGraph.replay()`: `steps` direct
+    /// `cuGraphLaunch`es plus ONE pre-planned `cuMemcpyDtoHAsync` into ring slot `slot`, all
     /// on the captured stream, then an event record so the commit has something to park on.
     /// Everything is enqueued and nothing is waited for, which is what keeps the depth-2
     /// async overlap the batch queue exists to buy.
     ///
-    /// `False` = declined, and the caller runs the Python step: not armed, no FULL graph for
+    /// MULTI-STEP RESIDENCY (`steps > 1`). Launch 1 replays the whole-burst graph, launches
+    /// 2..k the CONTINUATION graph -- the same two exec classes `run_steps` uses, and for the
+    /// same reason: relaunching the first exec would re-read hidden states nothing refreshed
+    /// and re-emit the token it already emitted. A shape with no continuation handle clamps
+    /// itself to ONE launch and says so in the return value; the caller commits what actually
+    /// ran and the scheduler reconciles the surplus it had committed (`burst_uncommit`).
+    ///
+    /// ONE D2H, AT THE TAIL. The continuation graph does not reset the device column
+    /// counter, so launch `i` fills accumulator columns `[i*width, (i+1)*width)` and all
+    /// `steps*width` columns are still live when the last launch retires. Copying the whole
+    /// accumulator once (tens of KB) is cheaper on an H200 than `steps` sub-window copies
+    /// would be, and it needs no driver symbol this module does not already load.
+    ///
+    /// `0` = declined, and the caller runs the Python step: not armed, no FULL graph for
     /// this shape, or a slot in the batch that cannot pack. The `runner_packable` pre-flight
     /// stays HERE as well as at commit time for the reason it was written: once the graph has
     /// run it has already fed its tokens back into the persistent input buffers, so declining
@@ -1840,9 +1983,12 @@ impl Runner {
     ///
     /// `slot` is the caller's ring index; it owns the accounting (see [`RING`]). An index out
     /// of range is a programming error and raises, not a decline.
+    ///
+    /// `steps`/`width` default so a plugin older than this wheel keeps its single-launch
+    /// behaviour instead of failing the call on an arity mismatch.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (slot, num_reqs, num_tokens, uniform_token_count, num_active_loras,
-                        slots))]
+                        slots, steps = 1, width = 1))]
     fn launch(
         &self,
         py: Python<'_>,
@@ -1852,17 +1998,21 @@ impl Runner {
         uniform_token_count: Option<u32>,
         num_active_loras: u32,
         slots: Vec<u32>,
-    ) -> PyResult<bool> {
-        if !self.armed {
-            return Ok(false);
+        steps: u32,
+        width: u32,
+    ) -> PyResult<u32> {
+        if !self.armed || steps == 0 || width == 0 {
+            return Ok(0);
         }
         let (pinned_ptr, pinned_len, event_u) = self.ring(slot)?;
-        let Some(exec) =
+        let Some((exec, cont)) =
             self.table
-                .launchable(num_reqs, num_tokens, uniform_token_count, num_active_loras)
+                .launchable_pair(num_reqs, num_tokens, uniform_token_count, num_active_loras)
         else {
-            return Ok(false);
+            return Ok(0);
         };
+        // No continuation graph for this shape: one launch, and the caller reconciles.
+        let steps = if cont == 0 { 1 } else { steps };
         let d = crate::gpu::live::driver().map_err(err)?;
         let shared = self.shared.clone();
         // Integers only across `allow_threads`, exactly as in `run_step`: raw pointers are
@@ -1872,7 +2022,7 @@ impl Runner {
         let (out_rows, out_cols) = (self.out_rows, self.out_cols);
         let expect_ctx = self.ctx;
 
-        py.allow_threads(move || -> Result<bool, String> {
+        py.allow_threads(move || -> Result<u32, String> {
             let stream = stream_u as *mut std::os::raw::c_void;
             let event = event_u as *mut std::os::raw::c_void;
             let mut ctx: *mut std::os::raw::c_void = std::ptr::null_mut();
@@ -1892,14 +2042,26 @@ impl Runner {
                     "accumulator is {bytes} bytes but the pinned buffer is {pinned_len}"
                 ));
             }
-            if !lock_shared(&shared).manager.runner_packable(&slots) {
-                return Ok(false);
+            // Every column this call will write has to exist BEFORE the first launch: the
+            // graphs write `[i*width, (i+1)*width)` with no bound check of their own.
+            if steps as usize * width as usize > out_cols {
+                return Err(format!(
+                    "{steps} launches of {width} tokens overrun the {out_cols}-column \
+                     accumulator"
+                ));
             }
-            // SAFETY: `exec` is a cudaGraphExec_t torch instantiated and never
-            // re-instantiates (verified at export); `stream` is its capture stream.
-            crate::gpu::live::check("cuGraphLaunch", unsafe {
-                (d.graph_launch)(exec as *mut std::os::raw::c_void, stream)
-            })?;
+            if !lock_shared(&shared).manager.runner_packable(&slots) {
+                return Ok(0);
+            }
+            for i in 0..steps {
+                // SAFETY: both handles are cudaGraphExec_t values torch instantiated and
+                // never re-instantiates (verified at export); `stream` is their capture
+                // stream, so launch i+1 cannot start before launch i has retired.
+                let this = if i == 0 { exec } else { cont };
+                crate::gpu::live::check("cuGraphLaunch", unsafe {
+                    (d.graph_launch)(this as *mut std::os::raw::c_void, stream)
+                })?;
+            }
             // SAFETY: both pointers live for the boot and the byte count was bounds-checked
             // against this slot's pinned allocation immediately above.
             crate::gpu::live::check("cuMemcpyDtoHAsync", unsafe {
@@ -1912,7 +2074,7 @@ impl Runner {
             })?;
             // SAFETY: this slot's event, created in arm() in this context.
             crate::gpu::live::check("cuEventRecord", unsafe { (d.event_record)(event, stream) })?;
-            Ok(true)
+            Ok(steps)
         })
         .map_err(err)
     }
@@ -1930,21 +2092,40 @@ impl Runner {
     /// step's tokens into the new occupant's store would be a wrong answer with nothing to
     /// crash. See [`crate::manager::Manager::runner_owns`].
     ///
+    /// `steps` is what [`Runner::launch`] RETURNED, not what the scheduler committed: a
+    /// shape with no continuation graph clamps itself to one launch, and committing a
+    /// launch that never ran would append the previous step's leftover columns.
+    ///
+    /// MULTI-STEP. Launch `i`'s tokens live `i * width` columns into the accumulator, so the
+    /// loop below re-gathers at a shifted offset and packs once per launch, all under ONE
+    /// event sync and ONE lock scope. A slot that stops at launch `j` is dropped from the
+    /// live set (see [`crate::update::merge_step_verdicts`]) so launches `j+1..` never
+    /// append its tokens -- the graphs already produced them, and appending them would make
+    /// the store and the worker disagree about that request's length.
+    ///
     /// Returns:
     ///   * `None` -- nothing was committed and nothing was mutated. The caller runs the
     ///     Python `decide()` for this step, which is a complete, correct commit: the worker
     ///     kept its `AsyncOutput`, so the same tokens are still on their way through it.
-    ///   * `(verdicts, record, published, "ok")` -- the normal commit, the same triple
-    ///     `update_step_pack_np` returns plus the marker.
-    ///   * `(verdicts, record, published, "unpacked...")` -- the step MUTATED state (the
+    ///   * `(verdicts, records, "ok")` -- the normal commit. `verdicts` is ONE AGGREGATED
+    ///     entry per batch row (`launches_before_the_stop * width + accepted`), so the
+    ///     caller applies it with `ran = 1` and its residue arithmetic degenerates to the
+    ///     single-step case it already had. `records` holds the R8 records that were NOT
+    ///     published inline, in launch order -- empty means every packed launch delivered
+    ///     itself, which is what `k > 1` requires (`update_from_output` can hand back only
+    ///     one record per engine index).
+    ///   * `(verdicts, records, "unpacked...")` -- some launch MUTATED state (the
     ///     resident-table delta and the stop decisions are applied) but could not be packed,
     ///     so its tokens never reached the store and `decide()` can no longer be run without
     ///     double-applying. Same contract as `run_steps`' `LoopExit::Unpacked`: the caller
-    ///     retires the batch and stands the runner down. `runner_owns` above makes it
-    ///     unreachable in every state the caller could have avoided.
+    ///     retires the batch and stands the runner down. The verdicts are the PARTIAL
+    ///     aggregate of the launches that did pack -- an empty list (or a fabricated
+    ///     `acc = 0`) would tell the caller the step produced nothing and hand the whole
+    ///     committed budget back. `runner_owns` above makes this arm unreachable in every
+    ///     state the caller could have avoided.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (slot, rows, counts, slots, names, max_model_len, engine_index,
-                        timestamp, finished, fold_cache, publish))]
+                        timestamp, finished, fold_cache, publish, steps = 1))]
     fn commit(
         &self,
         py: Python<'_>,
@@ -1959,7 +2140,8 @@ impl Runner {
         finished: Vec<String>,
         fold_cache: bool,
         publish: bool,
-    ) -> PyResult<Option<(Vec<(u32, u8, i64)>, Option<Py<PyBytes>>, bool, String)>> {
+        steps: u32,
+    ) -> PyResult<Option<(Vec<crate::update::FlatVerdict>, Vec<Py<PyBytes>>, String)>> {
         // No `armed` check: the launch already happened, so there is a copy in flight whose
         // event has to be waited on either way. The Python side drops its pending FIFO when
         // it stands the runner down, so a commit after a refusal never reaches here.
@@ -1972,6 +2154,19 @@ impl Runner {
                 names.len()
             )));
         }
+        if steps == 0 {
+            return Err(PyValueError::new_err(
+                "commit was asked for 0 launches; a launch that declined never reaches here",
+            ));
+        }
+        // The shared column window. Only launches after the first need it, so a batch
+        // `burst_width` refuses (ragged counts) is fatal for a multi-launch commit only --
+        // a single launch reads column offset 0 whatever the per-row counts are.
+        let width = if steps > 1 {
+            crate::gpu::burst_width(&counts).map_err(err)? as usize
+        } else {
+            0
+        };
         let (pinned_ptr, _pinned_len, event_u) = self.ring(slot)?;
         let d = crate::gpu::live::driver().map_err(err)?;
         let shared = self.shared.clone();
@@ -1992,7 +2187,9 @@ impl Runner {
                 );
             }
             // Park in the driver until this slot's copy has landed (BLOCKING_SYNC, never a
-            // spin). SAFETY: the event recorded behind that slot's D2H in `launch`.
+            // spin), ONCE for the whole burst -- `launch` recorded the event behind the
+            // single tail D2H, so every launch's columns are in the pinned buffer here.
+            // SAFETY: the event recorded behind that slot's D2H in `launch`.
             crate::gpu::live::check("cuEventSynchronize", unsafe {
                 (d.event_synchronize)(event)
             })?;
@@ -2002,48 +2199,139 @@ impl Runner {
             // event is precisely the "copy has completed" guarantee.
             let arr =
                 unsafe { std::slice::from_raw_parts(pinned_ptr as *const i64, out_rows * out_cols) };
-            // Column offset 0: one launch per ring slot, so there are no shifted windows to
-            // walk the way `run_steps`' multi-launch loop has.
-            let flat = crate::update::gather_sampled(arr, out_rows, out_cols, &rows, &counts)?;
             let mut sh = lock_shared(&shared);
             // Same order as `step_pack_locked`: roll back in-flight speculation FIRST, so
-            // the owns check below judges the real table, then keep the guard across the
-            // pack -- checking and packing under separate locks would let the SPEC thread
-            // (or any other FFI entry) change hands in between.
+            // the owns check below judges the real table, then keep the guard across every
+            // launch's pack -- checking and packing under separate locks would let the SPEC
+            // thread (or any other FFI entry) change hands in between. Checked ONCE: the
+            // guard is never dropped inside the loop, so no slot can change hands in it.
             sh.invalidate();
             if !sh.manager.runner_owns(&slots, &names) {
                 // Nothing mutated yet -- decline and let Python's `decide()` take the step.
                 return Ok(None);
             }
-            Ok(Some(step_pack_guarded(
-                &mut sh,
-                &slots,
-                &counts,
-                &flat,
-                max_model_len,
-                engine_index,
-                timestamp,
-                &finished,
-                fold_cache,
-                publish,
-            )))
+
+            let mut out = vec![
+                (0u32, crate::update::NOT_STOPPED, crate::update::NO_STOP_REASON);
+                rows.len()
+            ];
+            let mut live: Vec<usize> = (0..rows.len()).collect();
+            // The per-launch packed subsets. Identical to the full batch until a stop
+            // shrinks `live`, which is why they are rebuilt on demand rather than per step.
+            let (mut s_rows, mut s_counts, mut s_slots) =
+                (rows.clone(), counts.clone(), slots.clone());
+            let mut records: Vec<Vec<u8>> = Vec::new();
+            let mut unpacked: Option<String> = None;
+            // Launches whose pack LANDED. It is what decides whether a failure may be a
+            // raise: `runner_commit` answers a raise by running `decide()`, which is only
+            // still a correct commit while nothing has been applied.
+            let mut applied = 0usize;
+
+            for i in 0..steps as usize {
+                if live.is_empty() {
+                    // Every slot stopped at or before launch i-1. The remaining launches'
+                    // tokens stay in the accumulator and are never appended -- exactly the
+                    // masking this loop exists for, taken to its limit.
+                    break;
+                }
+                let flat = match crate::update::gather_sampled(
+                    &arr[i * width..],
+                    out_rows,
+                    out_cols,
+                    &s_rows,
+                    &s_counts,
+                ) {
+                    Ok(flat) => flat,
+                    // Nothing applied yet: raising is still safe and strictly gentler --
+                    // the caller runs `decide()` and no request is retired.
+                    Err(why) if applied == 0 => return Err(why),
+                    Err(why) => {
+                        unpacked = Some(why);
+                        break;
+                    }
+                };
+                match step_pack_guarded(
+                    &mut sh,
+                    &s_slots,
+                    &s_counts,
+                    &flat,
+                    max_model_len,
+                    engine_index,
+                    timestamp,
+                    &finished,
+                    fold_cache,
+                    publish,
+                ) {
+                    Ok((verdicts, rec, published)) => {
+                        if !published && rec.is_none() {
+                            // The pack REFUSED (`pack_inner -> Ok(false)`): `update_step`
+                            // already applied the stop decisions and the resident-table
+                            // delta, but `store_apply` never ran and no record exists for
+                            // the wire. Counting this as a landed launch would advance
+                            // Python's counters past a store that did not move -- and the
+                            // next iteration would pack against stale store counts. Same
+                            // divergence as a pack error: stop here and report the
+                            // aggregate of the launches that DID pack.
+                            unpacked = Some("pack refused".to_string());
+                            break;
+                        }
+                        applied += 1;
+                        if let Some(r) = rec {
+                            if !published {
+                                records.push(r);
+                            }
+                        }
+                        // Cannot fail by construction (`verdicts.len() == live.len()`, every
+                        // live row is a real batch row), but it is reported through the
+                        // `unpacked` marker rather than `?` for the same reason the pack
+                        // failure is: a pack has just landed, so a raise here would let
+                        // `decide()` append these tokens a second time.
+                        match crate::update::merge_step_verdicts(
+                            &mut live,
+                            &mut out,
+                            i as u32,
+                            width as u32,
+                            &verdicts,
+                        ) {
+                            Ok(true) => {
+                                s_rows = live.iter().map(|&r| rows[r]).collect();
+                                s_counts = live.iter().map(|&r| counts[r]).collect();
+                                s_slots = live.iter().map(|&r| slots[r]).collect();
+                            }
+                            Ok(false) => {}
+                            Err(why) => {
+                                unpacked = Some(why);
+                                break;
+                            }
+                        }
+                    }
+                    Err(why) => {
+                        // A failure INSIDE a pack cannot be handed back as a raise:
+                        // `pack_inner` applies the resident-table delta before it can fail,
+                        // so "run decide() instead" is no longer available. Stop here and
+                        // report the aggregate of the launches that DID pack.
+                        unpacked = Some(why);
+                        break;
+                    }
+                }
+            }
+            Ok(Some((out, records, unpacked)))
         });
 
-        let Some(packed) = outcome.map_err(err)? else {
+        let Some((verdicts, records, unpacked)) = outcome.map_err(err)? else {
             return Ok(None);
         };
-        Ok(Some(match packed {
-            Ok((verdicts, record, published)) => (
-                verdicts,
-                record.map(|r| PyBytes::new_bound(py, &r).unbind()),
-                published,
-                "ok".to_string(),
-            ),
-            // A failure INSIDE the commit cannot be handed back as a raise: `pack_inner`
-            // applies the resident-table delta before it can fail, so "run decide() instead"
-            // is no longer available. Report it as the unpacked marker, reason included.
-            Err(why) => (Vec::new(), None, false, format!("unpacked: {why}")),
-        }))
+        Ok(Some((
+            verdicts,
+            records
+                .into_iter()
+                .map(|r| PyBytes::new_bound(py, &r).unbind())
+                .collect(),
+            match unpacked {
+                None => "ok".to_string(),
+                Some(why) => format!("unpacked: {why}"),
+            },
+        )))
     }
 
     /// One steady-state decode step, entirely in Rust.
@@ -2473,6 +2761,10 @@ fn vtl_sched(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "cuda")]
     m.add_class::<Runner>()?;
     m.add("HAS_CUDA_RUNNER", cfg!(feature = "cuda"))?;
+    // Same shape: absent on a wheel without `shm`, and `shm_ipc.py` probes with getattr.
+    #[cfg(feature = "shm")]
+    m.add_class::<InputChannel>()?;
+    m.add("HAS_SHM_INPUT", cfg!(feature = "shm"))?;
     m.add_function(wrap_pyfunction!(none_hash_from_seed, m)?)?;
     m.add_function(wrap_pyfunction!(hash_block_tokens, m)?)?;
     m.add_function(wrap_pyfunction!(block_hashes, m)?)?;

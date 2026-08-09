@@ -55,6 +55,11 @@ pub struct Params {
     /// skip the `num_common_prefix_blocks` epilogue (compute AND marshal). Optional on
     /// the wire (`set_params` defaults it false), so an older plugin keeps working.
     pub lean_decisions: bool,
+    /// Largest batch an N-step burst was captured for (`nstep_decode.MAX_BURST_REQS`), or
+    /// 0 when the burst is off / the plugin is older than this wheel — which makes
+    /// [`Decisions::burst_eligible`] permanently false, i.e. Python re-derives it exactly
+    /// as it did before this port.
+    pub burst_max_reqs: usize,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -77,6 +82,19 @@ pub struct Decisions {
     /// Final `waiting`-queue order (slots) after the SJF reorder, front first.
     pub waiting_order: Vec<u32>,
     pub num_common_prefix_blocks: Vec<usize>,
+    /// May the step this decision describes carry an N-step burst, as far as the SCHEDULER
+    /// can tell? The conjuncts are exactly the ones `nstep_decode._publish_ready` used to
+    /// re-derive in numpy at sample(k) — no prefill in the batch, every scheduled count 1,
+    /// no preemption, batch within the captured burst sizes — and they belong here for a
+    /// reason beyond cost: `_publish_ready` was PREDICTING step k+1's batch from step k's,
+    /// while this is computed on the batch it actually describes.
+    ///
+    /// Spec/draft tokens need no clause of their own: a spec step schedules
+    /// `1 + num_draft` tokens for a running request, so the all-counts-are-1 test already
+    /// excludes it (and `rust_sched.py::schedule_supported` refuses spec decode outright).
+    /// What stays in Python is only what never crosses into the crate: encoder inputs,
+    /// structured output and `new_block_ids_to_zero`.
+    pub burst_eligible: bool,
 }
 
 impl Decisions {
@@ -88,6 +106,7 @@ impl Decisions {
         self.preempted.clear();
         self.waiting_order.clear();
         self.num_common_prefix_blocks.clear();
+        self.burst_eligible = false;
     }
 }
 
@@ -454,6 +473,19 @@ impl ScheduleCore {
             self.decisions.waiting_order.push(r.slot);
         }
 
+        // ---- 4. Burst eligibility (see `Decisions::burst_eligible`) --------
+        // Read off the decisions this loop just made, so it costs a handful of integer
+        // comparisons over a batch that peaks at 8 on the scored trace. `burst_max_reqs`
+        // of 0 (burst off, or a plugin that does not send the key) makes it permanently
+        // false, which is the "Python re-derives it" fallback.
+        let d = &mut self.decisions;
+        d.burst_eligible = params.burst_max_reqs > 0
+            && d.preempted.is_empty()
+            && d.scheduled_admitted.is_empty()
+            && !d.scheduled_running.is_empty()
+            && d.scheduled_running.len() <= params.burst_max_reqs
+            && d.scheduled_running.iter().all(|&(_, n)| n == 1);
+
         self.commit(kv, params);
         Ok(&self.decisions)
     }
@@ -570,6 +602,7 @@ mod tests {
             sjf_reorder: false,
             sjf_usage_tight: 0.90,
             lean_decisions: false,
+            burst_max_reqs: 0,
         }
     }
 
@@ -653,6 +686,112 @@ mod tests {
         assert_eq!(core.decisions.scheduled_running[0].0, running[0].slot);
         assert_eq!(core.decisions.preempted, vec![running[1].slot]);
         assert!(kv.num_free_blocks() >= 5, "the victim's blocks came back");
+    }
+
+    /// A pure decode batch: `n` running requests, one token each, nothing waiting.
+    fn decode_batch(kv: &mut Manager, n: u32) -> Vec<SchedReq> {
+        (0..n)
+            .map(|i| {
+                let slot = seed(kv, &format!("d{i}"), 64, i as u8 + 1);
+                let mut r = req(slot, 64);
+                r.num_computed_tokens = 64;
+                r.status = crate::manager::STATUS_RUNNING;
+                r.num_tokens = 65;
+                r.num_tokens_with_spec = 65;
+                r.is_prefill_chunk = false;
+                r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn burst_eligible_is_a_pure_one_token_decode_batch_within_the_cap() {
+        let mut kv = Manager::new(cfg(512)).unwrap();
+        let mut core = ScheduleCore::new();
+        let mut p = params();
+        p.burst_max_reqs = 8;
+        let running = decode_batch(&mut kv, 3);
+        core.schedule(&mut kv, &running, &[], &p).unwrap();
+        assert_eq!(core.decisions.scheduled_running.len(), 3);
+        assert!(core.decisions.burst_eligible);
+
+        // ...and 0 (burst off / an older plugin) is the "Python re-derives it" fallback.
+        p.burst_max_reqs = 0;
+        core.schedule(&mut kv, &running, &[], &p).unwrap();
+        assert!(!core.decisions.burst_eligible);
+    }
+
+    #[test]
+    fn burst_eligible_refuses_a_batch_wider_than_the_captured_sizes() {
+        let mut kv = Manager::new(cfg(512)).unwrap();
+        let mut core = ScheduleCore::new();
+        let mut p = params();
+        p.burst_max_reqs = 2;
+        let running = decode_batch(&mut kv, 3);
+        core.schedule(&mut kv, &running, &[], &p).unwrap();
+        assert!(!core.decisions.burst_eligible, "3 > the cap of 2");
+        p.burst_max_reqs = 3;
+        core.schedule(&mut kv, &running, &[], &p).unwrap();
+        assert!(core.decisions.burst_eligible, "exactly at the cap is fine");
+    }
+
+    #[test]
+    fn burst_eligible_refuses_an_admission_a_prefill_chunk_and_an_empty_step() {
+        let mut kv = Manager::new(cfg(512)).unwrap();
+        let mut core = ScheduleCore::new();
+        let mut p = params();
+        p.burst_max_reqs = 8;
+
+        // Nothing scheduled at all: there is no step to burst.
+        core.schedule(&mut kv, &[], &[], &p).unwrap();
+        assert!(!core.decisions.burst_eligible);
+
+        // A waiting admission -- the prefill the burst must not delay.
+        let w = seed(&mut kv, "w", 64, 9);
+        core.schedule(&mut kv, &[], &[req(w, 64)], &p).unwrap();
+        assert_eq!(core.decisions.scheduled_admitted.len(), 1);
+        assert!(!core.decisions.burst_eligible);
+
+        // A running request still finishing its prefill schedules > 1 token.
+        let mut chunk = decode_batch(&mut kv, 1);
+        chunk[0].num_computed_tokens = 32;
+        chunk[0].num_tokens = 64;
+        chunk[0].num_tokens_with_spec = 64;
+        chunk[0].is_prefill_chunk = true;
+        core.schedule(&mut kv, &chunk, &[], &p).unwrap();
+        assert_eq!(core.decisions.scheduled_running[0].1, 32);
+        assert!(!core.decisions.burst_eligible);
+    }
+
+    #[test]
+    fn burst_eligible_refuses_a_step_that_preempted() {
+        // Same 12-usable-block squeeze as `preempts_from_the_tail_when_kv_is_exhausted`:
+        // the surviving request IS a 1-token decode, but the victim has to be re-admitted
+        // and a burst would delay that by N-1 iterations.
+        let mut kv = Manager::new(cfg(13)).unwrap();
+        let mut core = ScheduleCore::new();
+        let mut p = params();
+        p.burst_max_reqs = 8;
+        let a = seed(&mut kv, "a", 64, 1);
+        let b = seed(&mut kv, "b", 64, 2);
+        core.schedule(&mut kv, &[], &[req(a, 64), req(b, 64)], &p)
+            .unwrap();
+        let running: Vec<SchedReq> = [a, b]
+            .iter()
+            .map(|&s| {
+                let mut r = req(s, 64);
+                r.num_computed_tokens = 64;
+                r.status = crate::manager::STATUS_RUNNING;
+                r.num_tokens = 65;
+                r.num_tokens_with_spec = 65;
+                r.is_prefill_chunk = false;
+                r
+            })
+            .collect();
+        core.schedule(&mut kv, &running, &[], &p).unwrap();
+        assert_eq!(core.decisions.scheduled_running.len(), 1);
+        assert!(!core.decisions.preempted.is_empty());
+        assert!(!core.decisions.burst_eligible);
     }
 
     #[test]

@@ -108,6 +108,22 @@ pub struct Manager {
     /// slot interning does, so `forget` drops both halves of a request in one place.
     pub stops: crate::update::StopTable,
 
+    /// Phase 2: slot -> "the R8 record has a field for everything this request needs"
+    /// (`rust_sched.py::_pack_ok_clauses`), interned at request-ADD time on the input
+    /// thread instead of re-derived on the request's first decode step under the GIL.
+    ///
+    /// NOT in the resident table, deliberately: that table is JOURNALED, so a speculative
+    /// schedule would have to undo an entry an add-time write put there — and the two have
+    /// nothing to do with each other (this is a property of the request, not of a
+    /// scheduling step). It lives beside `stops`/`tokens` for the reason those do: `forget`
+    /// is the one place a request's every half is dropped, and a recycled slot must not
+    /// inherit the dead request's answer.
+    ///
+    /// A map rather than a set: `Some(false)` ("registered, not packable") and `None`
+    /// ("never registered") route the Python reader to different arms — cache the answer
+    /// vs. do the full derivation.
+    pack_ok: FxHashMap<u32, bool>,
+
     /// R8: reused buffer for the raw shm output record. Lives here (not in a local) so a
     /// step packs into last step's allocation.
     pub raw: crate::update::RawPacker,
@@ -204,6 +220,7 @@ impl Manager {
             reqs: FxHashMap::default(),
             stats: PrefixCacheStats::default(),
             stops: Default::default(),
+            pack_ok: FxHashMap::default(),
             raw: Default::default(),
             tokens: crate::tokens::TokenStore::new(cfg.hash_block_size),
             tok_cu: Vec::with_capacity(16),
@@ -269,12 +286,37 @@ impl Manager {
             }
             self.hit_len.remove(&id);
             self.stops.forget(id);
+            // Phase 2: same reason as `stops` -- a recycled slot must not answer with the
+            // dead request's pack-ok bit, which would let `decide()` skip a derivation the
+            // new occupant never had run for it.
+            self.pack_ok.remove(&id);
             // Port-2: the token store is slot-keyed too, so a recycled slot must not
             // inherit the dead request's counters, tail or output tokens.
             self.tokens.forget(id);
             self.table_clear(id);
             self.free_slots.push(id);
         }
+    }
+
+    /// Phase 2: intern this request's whole add-time registration in one shot -- the slot,
+    /// its stop params and its pack-ok bit. Returns the slot, which is the same one
+    /// `RustMirror.slot()` will resolve later (`intern` is idempotent per request id).
+    pub fn set_request_meta(
+        &mut self,
+        name: &str,
+        pack_ok: bool,
+        params: crate::update::StopParams,
+    ) -> u32 {
+        let slot = self.intern(name);
+        self.stops.set(slot, params);
+        self.pack_ok.insert(slot, pack_ok);
+        slot
+    }
+
+    /// The pack-ok bit for a slot, or `None` when this slot was never preregistered (or has
+    /// been recycled since). `None` is the caller's signal to do the Python derivation.
+    pub fn request_meta(&self, slot: u32) -> Option<bool> {
+        self.pack_ok.get(&slot).copied()
     }
 
     // ---- R6b: the resident request table ----------------------------------
@@ -1771,6 +1813,29 @@ mod tests {
         assert!(m.runner_packable(&[b]), "packable says yes to the NEW request");
         assert!(!m.runner_owns(&[b], &names), "...but it is not the one we launched for");
         assert!(!m.runner_owns(&[b], &[]), "arity mismatches are a decline, not a panic");
+    }
+
+    #[test]
+    fn add_time_registration_interns_both_halves_and_dies_with_the_request() {
+        let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+        assert_eq!(m.request_meta(0), None, "nothing is registered yet");
+
+        let a = m.set_request_meta("req-a", true, stop_params());
+        assert_eq!(m.request_meta(a), Some(true));
+        assert!(m.stops.has(a), "one call must set BOTH halves");
+        // Idempotent per request id: `RustMirror.slot()` must resolve the same slot later.
+        assert_eq!(m.intern("req-a"), a);
+        assert_eq!(m.set_request_meta("req-a", false, stop_params()), a);
+        assert_eq!(m.request_meta(a), Some(false), "a re-register overwrites");
+
+        // `forget` is the one teardown chokepoint: a recycled slot must answer `None`, not
+        // the dead request's bit -- otherwise `decide()` would skip a derivation the new
+        // occupant never had run for it.
+        m.forget("req-a");
+        assert_eq!(m.request_meta(a), None);
+        let b = m.intern("req-b");
+        assert_eq!(b, a, "the slot is recycled -- that is the hazard being tested");
+        assert_eq!(m.request_meta(b), None);
     }
 
     #[test]
