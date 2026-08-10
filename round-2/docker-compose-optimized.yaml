@@ -1,0 +1,24 @@
+# LOCAL-DEV override. Stacks ON TOP of docker-compose.yaml -- it is NOT standalone.
+#
+# This file used to be a 150-line copy of docker-compose.yaml whose env block was
+# byte-identical, differing only in the image tag. Every tuning change had to be made twice,
+# and the submission compose could silently drift from the one we actually benchmarked.
+# Compose merges `-f` files left-to-right, so it now carries ONLY the difference.
+#
+# Usage (see COMPOSE_FILES in the root Makefile):
+#   docker compose -f docker-compose.yaml -f docker-compose-optimized.yaml \
+#                  -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml up
+services:
+  model:
+    # The submission compose pins an immutable @sha256: digest. Locally we want whatever
+    # `make build` just produced, so point at the mutable :dev tag instead. (When the
+    # localtest overlay is also stacked its `build:` takes over and this is just the tag
+    # the built image gets.)
+    image: unseenablefuture/awesome-badger:dev
+    # environment:
+      # Percent of L2 a context may reserve for persisting accesses -- the driver-side knob
+      # behind cudaLimitPersistingL2CacheSize, and the only one that works under MPS. Paired
+      # with VTL_L2_PERSIST=1 (vtl/patches/l2_persist.py); pointless unless that patch's boot
+      # probe reports a nonzero maxPersistingL2CacheSize, which CUDA documents as always 0
+      # under MIG. Harmless when ignored.
+      # CUDA_DEVICE_DEFAULT_PERSISTING_L2_CACHE_PERCENTAGE_LIMIT: "25"

@@ -1,0 +1,77 @@
+--- a/src/mock-engine/src/lib.rs
++++ b/src/mock-engine/src/lib.rs
+@@ -31,6 +31,13 @@
+     #[arg(long, default_value_t = 1)]
+     pub output_token_chunk_size: usize,
+ 
++    /// Delay per decode step, in milliseconds. 0 (default) keeps the old
++    /// as-fast-as-possible behavior. Set to ~the target TPOT (e.g. 4) so the
++    /// frontend's streaming/detokenize loop is exercised at production cadence
++    /// during PGO training instead of at memory speed.
++    #[arg(long, default_value_t = 0)]
++    pub decode_step_delay_ms: u64,
++
+     /// Random token IDs are sampled uniformly from 0..vocab_size.
+     #[arg(long, default_value_t = 32_000)]
+     pub vocab_size: u32,
+--- a/src/mock-engine/src/engine.rs
++++ b/src/mock-engine/src/engine.rs
+@@ -1,6 +1,6 @@
+ use std::collections::{BTreeMap, BTreeSet, HashMap};
+ use std::hash::{Hash as _, Hasher as _};
+-use std::time::{SystemTime, UNIX_EPOCH};
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
+ 
+ use anyhow::{Result, anyhow};
+ use rand::rngs::StdRng;
+@@ -373,6 +373,18 @@
+                 })
+             })
+             .collect()
++    }
++}
++
++/// Pace one decode step. With `delay_ms == 0` this just yields to the scheduler
++/// (original as-fast-as-possible behavior); otherwise it sleeps ~one decode-step
++/// latency so the frontend's streaming loop is profiled at production cadence.
++/// Takes a plain `u64` (not `&Engine`) so it borrows nothing across the select.
++async fn step_pacer(delay_ms: u64) {
++    if delay_ms == 0 {
++        yield_now().await;
++    } else {
++        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+     }
+ }
+ 
+@@ -385,6 +397,8 @@
+     output_tx: mpsc::Sender<EngineOutput>,
+     shutdown: CancellationToken,
+ ) -> Result<()> {
++    // ponytail: paces decode only, not prefill/TTFT — the streaming loop is the hot path.
++    let decode_step_delay_ms = opt.decode_step_delay_ms;
+     let mut engine = Engine {
+         engine_index,
+         opt,
+@@ -402,9 +416,9 @@
+                 engine.handle_input(input)?
+             }
+ 
+-            // If there are active requests, step them once after yielding to the scheduler to
+-            // avoid blocking the engine loop while still making steady progress on request outputs.
+-            _ = yield_now(), if !engine.active_requests.is_empty() => {
++            // If there are active requests, step them once after pacing the scheduler so the
++            // engine loop makes steady progress without blocking (see `step_pacer`).
++            _ = step_pacer(decode_step_delay_ms), if !engine.active_requests.is_empty() => {
+                 engine.step()
+             }
+         };
+--- a/src/mock-engine/src/tests.rs
++++ b/src/mock-engine/src/tests.rs
+@@ -54,6 +54,7 @@
+             vocab_size: 32_000,
+             seed: 0,
+             log_requests: false,
++            decode_step_delay_ms: 0,
+         },
+         shutdown.clone(),
+     ));

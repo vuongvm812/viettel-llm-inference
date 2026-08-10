@@ -1,0 +1,32 @@
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -735,4 +735,28 @@
+     args = parser.parse_args()
+     validate_parsed_serve_args(args)
+ 
+-    uvloop.run(run_server(args))
++    # vtl: compose pins `python -m ...api_server` (can't switch to `vllm serve`),
++    # so mirror ServeSubcommand.cmd's dispatch here. Unconditional on purpose: we
++    # ship one frontend. This is NOT a Rust-only path -- run_multi_api_server
++    # branches internally on VLLM_RUST_FRONTEND_PATH and starts an
++    # APIServerProcessManager when it is unset, so the `else` arm that used to sit
++    # here was a second copy of a fallback vLLM already has. Only the HTTP frontend
++    # changes; EngineCore/executor/workers (and every engine-side vtl patch) are
++    # identical either way.
++    from vllm.entrypoints.cli.serve import run_multi_api_server
++
++    # The Rust frontend's --args-json requires `model_tag` (the `vllm serve`
++    # positional, the only serde-required field in SharedRuntimeArgs). Our
++    # command uses --model, which leaves the positional unset, so mirror it
++    # across for jsonify_non_default_args to emit.
++    if getattr(args, "model_tag", None) is None:
++        args.model_tag = args.model
++    # The Rust frontend hard-rejects frontend-only args it hasn't implemented
++    # (the UnsupportedArgs set in the vllm-rs cli). `--uvicorn-log-level` is
++    # one -- meaningless to Rust (no uvicorn) -- so reset it to the parser
++    # default here to drop it from --args-json. Add any further such args the
++    # command grows.
++    args.uvicorn_log_level = parser.get_default("uvicorn_log_level")
++    if getattr(args, "api_server_count", None) is None:
++        args.api_server_count = 1
++    run_multi_api_server(args)

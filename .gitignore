@@ -46,6 +46,8 @@ model/
 flashinfer-competition-codebase/
 vllm/
 flash-attention/
+xinfer/
+mistral.rs/
 
 *.pem
 .env
