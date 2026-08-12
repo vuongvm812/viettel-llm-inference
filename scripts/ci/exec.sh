@@ -9,6 +9,9 @@
 #
 #   VTL_EXEC=local                      # default -- runner and GPU are the same box (Case 1)
 #   VTL_EXEC=ssh VTL_GPU_HOST=u@vps     # runner is elsewhere (Case 2)
+#   VTL_SSH_OPTS='-i /ssh/key -p 22'    # optional; reaches BOTH ssh and rsync. The jump runner
+#                                       # is a container whose key is a bind mount at a fixed
+#                                       # path, so default-key lookup cannot be assumed.
 #
 # NOT `DOCKER_HOST=ssh://...`, which looks cheaper and is a trap: `make test-kernel` bind-mounts
 # $(PWD)/$(ROUND)/bench and docker-compose.localtest.yaml mounts ../hf-model. With a remote daemon
@@ -28,6 +31,10 @@ case "$VTL_EXEC" in
   ssh)
     : "${VTL_GPU_HOST:?VTL_EXEC=ssh needs VTL_GPU_HOST (user@host)}"
     REMOTE_DIR="${VTL_REMOTE_DIR:-/opt/vtl-ci}"
+    # BatchMode so a missing/rejected key fails fast instead of hanging a CI job on a password
+    # prompt nobody will ever see. VTL_SSH_OPTS is word-split on purpose (it is a list of flags).
+    # shellcheck disable=SC2206
+    SSH_CMD=(ssh -o BatchMode=yes ${VTL_SSH_OPTS:-})
     # rsync --include patterns for the pull-back, matched against the whole tree. NOT bare globs:
     # `make bench` runs under `cd $(ROUND) &&`, so its JSON lands in round-2/, and a flat
     # `rsync host:.../bench-*.json ./` would both miss it and flatten the path if it hit.
@@ -37,21 +44,26 @@ case "$VTL_EXEC" in
     # hf-model is excluded: it is the model mount and is staged on the GPU box already, not
     # something to push across a venue LAN.
     echo "exec: rsync -> ${VTL_GPU_HOST}:${REMOTE_DIR}"
-    rsync -az --delete \
+    rsync -az --delete -e "${SSH_CMD[*]}" \
       --exclude '.git' \
       --exclude 'hf-model' \
       --exclude 'bench-*.json' \
       ./ "${VTL_GPU_HOST}:${REMOTE_DIR}/"
 
     echo "exec: run on ${VTL_GPU_HOST}"
+    [ $# -ge 1 ] || { echo "exec: no command given" >&2; exit 2; }
     # Quote each argument so `make bench TARGET=http://...` and friends survive the extra shell.
     # printf %q is bash-only, which is why this script declares bash.
-    remote_cmd="cd $(printf '%q' "$REMOTE_DIR")"
+    # The `&&` after cd is LOAD-BEARING: without it the command becomes an extra argument to cd
+    # itself -- which modern bash rejects ("too many arguments", every remote command fails) and
+    # bash 3.2 silently IGNORES, i.e. cd succeeds, the real command never runs, and rc is 0.
+    # Caught live: an exec.sh test run on macOS reported success for a command that never ran.
+    remote_cmd="cd $(printf '%q' "$REMOTE_DIR") &&"
     for arg in "$@"; do remote_cmd+=" $(printf '%q' "$arg")"; done
     # rc is captured rather than propagated by `set -e` so the artifact pull still happens on a
     # failed bench -- a failing run's JSON is exactly what someone needs to read.
     rc=0
-    ssh -o BatchMode=yes "$VTL_GPU_HOST" "bash -lc $(printf '%q' "$remote_cmd")" || rc=$?
+    "${SSH_CMD[@]}" "$VTL_GPU_HOST" "bash -lc $(printf '%q' "$remote_cmd")" || rc=$?
 
     echo "exec: rsync <- artifacts"
     # --include='*/' + --exclude='*' walks every directory but transfers only the named patterns,
@@ -59,7 +71,7 @@ case "$VTL_EXEC" in
     # --prune-empty-dirs keeps the traversal from creating the whole empty tree locally.
     includes=()
     for pat in $ARTIFACTS; do includes+=(--include="$pat"); done
-    rsync -az --prune-empty-dirs \
+    rsync -az --prune-empty-dirs -e "${SSH_CMD[*]}" \
       --include='*/' "${includes[@]}" --exclude='*' \
       "${VTL_GPU_HOST}:${REMOTE_DIR}/" ./ || true
 

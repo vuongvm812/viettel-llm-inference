@@ -7,13 +7,25 @@ scoped to the venue network.
 ## The picture
 
 The laptop runs the runner and coordinates; the VPS runs every GPU command. The transport shim
-rsyncs the round directory out, runs the command on the VPS, and rsyncs artifacts back — so the
-workflows are byte-identical to Case 1 and only two environment variables differ.
+rsyncs the repo out, runs the command on the VPS, and rsyncs artifacts back — so the workflows are
+byte-identical to Case 1. The transport variables live on the **runner**, not in the workflow:
+registering the jump runner *is* choosing this topology.
 
 ```
 remote teammate ──► GitHub ──► runner on laptop ──ssh──► VPS ──► H200
                                     (sealed nightly)
 ```
+
+Setup commands: [`bootstrap.md`](bootstrap.md).
+
+## Where this case lives in the repo
+
+Additive, like Case 1: `.github/runner/jump/docker-compose.runner.yaml` (the laptop runner — sets
+`VTL_EXEC=ssh` + `VTL_GPU_HOST` + the key mount as container env, which job steps inherit) and the
+ssh branch of `scripts/ci/exec.sh`. The workflow is the same `vps-gpu.yml`; it deliberately sets no
+transport env so the runner's decides. Both runners register the same `h200,sm90,gpu` labels — the
+label names the GPU the work targets, so the `gpu-h200` concurrency lock stays one-per-GPU and
+failover between the two topologies is just "start the other runner".
 
 ## What this means for the team
 
@@ -31,9 +43,10 @@ not technical:
 
 ## Shape of the work
 
-**Day 0** — same probes and baseline as Case 1, plus: SSH key on the runner (no passphrase prompt),
-the two transport variables, and a smoke test that the rsync round-trip actually returns artifacts.
-Budget ~20 minutes more than Case 1.
+**Day 0** — same probes and baseline as Case 1, plus: a passphrase-less deploy key at
+`.github/runner/jump/key` (gitignored, `chmod 600`), `VTL_GPU_HOST` when bringing the runner up,
+and the smoke test in the compose header proving the hop from inside the container before any
+dispatch. Budget ~20 minutes more than Case 1.
 
 **Days 1–2** — GPU work is bounded by the working day. Front-load the long arms; keep the last hour
 for the seal ritual rather than for one more bench that will not finish.

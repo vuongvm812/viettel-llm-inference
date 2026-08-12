@@ -47,6 +47,8 @@ rounds — a gate that is red on an abandoned round is a gate nobody reads.
 | Setup cost | ~20 min | ~40 min |
 
 Decide on day 0 with one command: `ssh <vps> curl -sS -o /dev/null -w '%{http_code}' https://api.github.com`.
+Then follow [`bootstrap.md`](bootstrap.md) — the command-level runbook for standing up either case
+and dispatching the first chain.
 
 Everything else — GitHub blocked, no internet at all, the GPU disappearing — is covered briefly in
 [contingencies](contingencies.md). Those are real but unlikely, and none of them changes what we

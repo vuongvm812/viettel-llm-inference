@@ -25,6 +25,8 @@ The runner living **outside the seal** is the second reason. Long sweeps, profil
 overnight A/B arms are possible here and nowhere else. Given a 3-day contest, the two sealed nights
 are roughly 40% of the wall clock; being able to use them is a material advantage, not a convenience.
 
+Setup commands: [`bootstrap.md`](bootstrap.md).
+
 ## Where this case lives in the repo
 
 VPS CI is additive, never a modification of the dev-box CI: `.github/workflows/vps-gpu.yml` (the

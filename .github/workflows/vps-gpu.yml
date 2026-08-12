@@ -61,9 +61,12 @@ jobs:
     timeout-minutes: 150
     env:
       ROUND: ${{ inputs.round }}
-      # Case 1 (runner and GPU on the same box) -- exec.sh is a passthrough. Case 2 sets
-      # VTL_EXEC=ssh + VTL_GPU_HOST here and nothing else in this file changes.
-      VTL_EXEC: local
+      # NO VTL_EXEC here, deliberately -- workflow env would SHADOW the runner's environment.
+      # The transport comes from whichever runner picked the job up: the VPS runner
+      # (.github/runner/vps/) sets nothing and exec.sh defaults to `local`; the laptop jump
+      # runner (.github/runner/jump/) exports VTL_EXEC=ssh + VTL_GPU_HOST + VTL_SSH_OPTS as
+      # container env, which job steps inherit. Registering the runner IS choosing the topology;
+      # this file is byte-identical in both cases.
 
     steps:
       - uses: actions/checkout@v4
