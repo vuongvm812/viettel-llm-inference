@@ -19,21 +19,18 @@ name: viettel-llm-ci-jump
 # morning goes to benches nobody is waiting for. `restart: unless-stopped` makes it rejoin on
 # power-up without anyone remembering to start it.
 #
-# DAY-0 SMOKE TEST, before any dispatch -- prove the hop from INSIDE the container:
+# DAY-0 SMOKE TEST, before any dispatch -- from INSIDE the container, prove the tools exist and
+# the hop works:
 #   docker compose -f docker-compose.runner.yaml exec runner \
-#     env VTL_EXEC=ssh VTL_GPU_HOST=<user@vps> VTL_SSH_OPTS='-i /ssh/key -o StrictHostKeyChecking=accept-new' \
-#     ssh -o BatchMode=yes -i /ssh/key <user@vps> true
+#     bash -lc 'command -v rsync ssh python3 && ssh -o BatchMode=yes -i /ssh/key <user@vps> true'
 services:
   runner:
-    # The stock image is not guaranteed to ship the three things the jump path needs ON the
-    # runner itself: rsync + ssh for exec.sh's transport, python3 for the stdlib-only
-    # bench/_ci_report.py report step. Everything heavier runs on the VPS.
-    build:
-      dockerfile_inline: |
-        FROM myoung34/github-runner:ubuntu-22.04
-        RUN apt-get update && apt-get install -y --no-install-recommends \
-              rsync openssh-client python3 \
-            && rm -rf /var/lib/apt/lists/*
+    # Stock image, no derived build. The three things the jump path needs ON the runner itself --
+    # rsync + ssh for exec.sh's transport, python3 for the stdlib-only bench/_ci_report.py report
+    # step -- all ship in this image (upstream build/config.json: rsync + openssh-client under
+    # network-tools, python3 under python). The tag is rolling, which is why the smoke test above
+    # checks `command -v` rather than trusting it. Everything heavier runs on the VPS.
+    image: myoung34/github-runner:ubuntu-22.04
     restart: unless-stopped
     volumes:
       # Dedicated deploy key for the VPS hop, NOT a ~/.ssh mount (container uid mismatches make

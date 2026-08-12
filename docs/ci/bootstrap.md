@@ -47,11 +47,12 @@ VTL_GPU_HOST=user@vps VTL_SSH_KEY=./key GH_PAT=<PAT> \
 
 # prove the hop from INSIDE the container before any dispatch:
 docker compose -f docker-compose.runner.yaml exec runner \
-  ssh -o BatchMode=yes -i /ssh/key user@vps true && echo hop-ok
+  bash -lc 'command -v rsync ssh python3 && ssh -o BatchMode=yes -i /ssh/key user@vps true' \
+  && echo hop-ok
 ```
 
-The laptop clone needs nothing else — the runner container carries its own `rsync`/`ssh`/`python3`
-(built into the image by the compose), and every GPU command runs on the VPS.
+The laptop clone needs nothing else — the stock runner image already ships `rsync`/`ssh`/`python3`
+(the smoke test verifies, since the tag is rolling), and every GPU command runs on the VPS.
 
 ## Dispatch (identical in both cases)
 
