@@ -1,8 +1,29 @@
 # CI bench overlay — no build, no resource cap. Pin the image and mount the model.
-# Stack behind docker-compose-optimized.yaml:
-#   CI_IMAGE=...@sha256:... docker compose -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml up -d --wait
+# Stack behind docker-compose.yaml AND docker-compose-optimized.yaml -- the base file is what
+# carries the entrypoint, serve flags, env and healthcheck, and it also pins the compose project
+# name that `make verify` reads logs from. Omitting it yields a container that starts and never
+# serves, under a project nothing else can find:
+#   CI_IMAGE=...@sha256:... docker compose -f docker-compose.yaml \
+#     -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml up -d --wait
 services:
   model:
     image: ${CI_IMAGE:-unseenablefuture/awesome-badger:dev}
     volumes:
       - ../hf-model:/model:ro
+    environment:
+      # BENCH-ONLY, and the opposite of what the submission wants.
+      #
+      # vtl-sched covers exactly two KV cache-spec kinds (full attention, mamba) and hands back to
+      # stock vLLM for anything else; rust_runner has its own independent refusal path. Either one
+      # self-disabling looks IDENTICAL, in every latency number, to a component that ran and did
+      # not help -- so a whole afternoon can go into tuning something that was never running.
+      #
+      # The submission sets VTL_RUST_SCHED_REQUIRE=0 on purpose (docker-compose.yaml): there,
+      # serving-but-slower beats not serving at all. In a bench the tradeoff inverts -- a boot
+      # failure is a clear signal, a silently-stock run is a lie. HANDOFF 1.4: "Set it in every
+      # bench and CI run."
+      #
+      # Interpolation is fine in THIS file: it is a CI overlay and is never submitted. The
+      # literals-only rule applies to docker-compose.yaml alone.
+      VTL_RUST_SCHED_REQUIRE: "1"
+      VTL_RUST_RUNNER_REQUIRE: "1"

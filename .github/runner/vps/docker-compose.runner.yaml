@@ -1,0 +1,32 @@
+name: viettel-llm-ci-vps
+
+# Self-hosted runner for the CONTEST VPS (H200). Lives beside, and never touches, the rtx3060
+# runner compose one directory up -- the dev-box CI keeps working exactly as it does today, and
+# everything VPS-shaped is additive: this file, .github/workflows/vps-*.yml, scripts/ci/.
+#
+# Outbound long-poll only -- no inbound ports, no port-forwarding. That is the sentence that gets
+# a venue firewall exception approved.
+#
+#   GH_PAT=... docker compose -f docker-compose.runner.yaml up -d
+#
+# The vps-* workflows take a `runner_label` input (default h200) and serialize on a gpu-<label>
+# concurrency group, so one job runs on this box at a time. Keep the labels honest: a job
+# dispatched at `h200` that lands on some other card produces numbers nobody can use.
+services:
+  runner:
+    image: myoung34/github-runner:ubuntu-22.04
+    # unless-stopped, not on-failure: if the box is power-cycled overnight the runner has to
+    # rejoin on its own, without anyone remembering to start it.
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REPO_URL: https://github.com/vuongvm812/viettel-llm-inference
+      ACCESS_TOKEN: ${GH_PAT}
+      RUNNER_SCOPE: repo
+      # Non-ephemeral on purpose: jobs reuse the docker layer cache and the ~10GB vLLM base
+      # between runs. A fresh runner per job would re-pull everything every time, which on a
+      # venue network costs far more than the isolation is worth.
+      EPHEMERAL: 0
+      LABELS: h200,sm90,gpu
+      DOCKER_HOST: unix:///var/run/docker.sock

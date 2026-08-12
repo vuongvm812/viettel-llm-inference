@@ -25,6 +25,13 @@ The runner living **outside the seal** is the second reason. Long sweeps, profil
 overnight A/B arms are possible here and nowhere else. Given a 3-day contest, the two sealed nights
 are roughly 40% of the wall clock; being able to use them is a material advantage, not a convenience.
 
+## Where this case lives in the repo
+
+VPS CI is additive, never a modification of the dev-box CI: `.github/workflows/vps-gpu.yml` (the
+build → test → bench chain, dispatched via `make ci-gpu`), `.github/runner/vps/` (the runner
+compose, labels `h200,sm90,gpu`), and `scripts/ci/` (the transport shim and bench preflight). The
+legacy `build-push` / `bench` / `bootstrap` workflows stay pinned to the rtx3060 and untouched.
+
 ## Shape of the work
 
 **Day 0** — register the runner on the VPS with labels derived from the hardware probe, so a MIG

@@ -77,12 +77,21 @@ TRACE ?= data/input/trace-round2.jsonl
 COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
 DC := docker compose $(COMPOSE_FILES)
 
-# CI bench lifecycle (remote runner). No build step — image is the pinned digest from ci-build.
+# CI bench lifecycle (remote runner). No build step — image is the pinned digest from ci-build,
+# or :dev when the runner built it itself (Case 1: build and bench are the same box).
 IMAGE_DIGEST ?=
-CIBENCH_COMPOSE := -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
+# docker-compose.yaml MUST lead. docker-compose-optimized.yaml says so in its own header -- it is
+# an overlay carrying only the :dev image tag, NOT a standalone stack. Without the base file the
+# service comes up with no entrypoint, no serve flags, no env and no healthcheck (so `--wait`
+# returns on a container that never became a server), AND under a different compose project name
+# -- the base pins `name: viettel-llm-optimized`, while an overlay-only stack takes its name from
+# the directory. `make verify` uses $(DC), which does include the base, so it would then read the
+# logs of a project that does not exist and report a dead server.
+# Deliberately NOT localtest/cpucap: no `build:` (the image is already here) and no resource cap.
+CIBENCH_COMPOSE := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: check stats build up down warm push bench sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show
+.PHONY: check stats build up down warm push bench sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap ci-gpu host-tune host-tune-reset host-tune-show
 
 ## Host-level latency tuning for the DEV/BENCH box. NOT part of any submission -- the judge
 ## runs `docker compose up` on their host and none of these knobs are reachable from a
@@ -468,6 +477,12 @@ profile:
 # --- CI (remote build on self-hosted runner) -----------------------------------------------
 CI_WORKFLOW ?= build-push.yml
 CI_REPO ?= $(shell git remote get-url origin | sed 's|.*github.com[:/]\(.*\)\.git|\1|')
+# Which self-hosted runner `ci-gpu` dispatches at. Only the vps-* workflows take this input --
+# the legacy build-push/bench/bootstrap workflows stay pinned to the rtx3060 dev box, untouched.
+# The vps-gpu workflow serializes on a `gpu-<label>` concurrency group, one job per box at a time.
+#   h200      the contest VPS          rtx3060   rehearse the same chain on the dev box
+# Keep it honest: a job dispatched at `h200` that lands on sm_86 produces unusable numbers.
+RUNNER_LABEL ?= h200
 
 ## Trigger remote CI build, stream logs, print digest. Exits non-zero on CI failure.
 ##   make ci-build                           # default ROUND, archs=9.0+PTX
@@ -532,7 +547,30 @@ ci-bench:
 	@sleep 6
 	@id=$$(gh run list -R $(CI_REPO) -w bench.yml --limit 1 --json databaseId -q '.[0].databaseId'); \
 	echo "=== Run $$id ==="; \
-	gh run watch $$id -R $(CI_REPO) --exit-status || true
+	gh run watch $$id -R $(CI_REPO) --exit-status
+	@# No `|| true` here. It used to swallow the exit status, so a bench that failed on the
+	@# runner reported success locally -- the one outcome this target exists to tell you about.
+
+## Trigger the full remote chain: build -> test -> bench in ONE dispatch
+## (.github/workflows/vps-gpu.yml -- the VPS-scoped CI; the legacy workflows are untouched).
+## CUDA_ARCHS is REQUIRED by the workflow and has no default there on purpose: nvcc otherwise
+## probes the GPU-less build host and guesses, and a wrong arch does not degrade -- it dies at the
+## first kernel launch with cudaErrorNoKernelImageForDevice.
+##    make ci-gpu CUDA_ARCHS='9.0+PTX'                          # H200, full chain
+##    make ci-gpu CUDA_ARCHS='8.6;9.0+PTX' RUNNER_LABEL=rtx3060 # rehearse on the dev box, fat binary
+##    make ci-gpu CUDA_ARCHS='9.0+PTX' STAGES=bench             # bench only
+STAGES ?= build,test,bench
+ci-gpu:
+	gh workflow run vps-gpu.yml -R $(CI_REPO) \
+	  -f round=$(ROUND) \
+	  -f runner_label=$(RUNNER_LABEL) \
+	  -f stages='$(STAGES)' \
+	  -f cuda_archs='$(CUDA_ARCHS)' \
+	  $(if $(IMAGE_DIGEST),-f image_digest='$(IMAGE_DIGEST)')
+	@sleep 6
+	@id=$$(gh run list -R $(CI_REPO) -w vps-gpu.yml --limit 1 --json databaseId -q '.[0].databaseId'); \
+	echo "=== Run $$id ==="; \
+	gh run watch $$id -R $(CI_REPO) --exit-status
 
 ## Trigger remote bootstrap smoke test — starts server, checks health, stops.
 ##    make ci-bootstrap                                        # test :dev
