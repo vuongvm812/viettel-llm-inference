@@ -13,7 +13,7 @@
 # (`vllm.model_executor.models.registry`) before assuming it loads. The fp8 _C ops +
 # _C_stable_libtorch registration our override depends on are verified against tag v0.25.0.
 # Tree-spec deployment: override to the forked base (stock v0.25.0 + vtl source patches) built by
-# Dockerfile.vllm-fork, e.g. --build-arg VLLM_IMAGE=unseenablefuture/vllm-fork:v0.25.0-tree@sha256:...
+# Dockerfile.vllm-fork, e.g. --build-arg VLLM_IMAGE=traitimbanggia/slowleveling:v0.25.0-tree@sha256:...
 # The forked patches are behavior-neutral for the width-1 chain path, so the default stock base is
 # fine until the width>1 tree verify is enabled on-box (see vtl/vllm_patches/INTEGRATION.md).
 ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.0

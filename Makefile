@@ -21,7 +21,10 @@ endif
 # Optional -- a round without a round.mk just takes the defaults.
 -include $(ROUND)/round.mk
 
-IMAGE ?= unseenablefuture/awesome-badger
+# traitimbanggia, not unseenablefuture: the old account belongs to the REMOTE teammate, and
+# round 2 is pushed from the venue where nobody holds those credentials. Public repo -- the
+# judge pulls the submission pin anonymously. Frozen rounds keep their old-account digest pins.
+IMAGE ?= traitimbanggia/yasuoadc
 TAG ?= dev
 TARGET ?= http://localhost:8000
 # The H200 box is amd64 and the vLLM base image is multi-arch. Never let the build
@@ -45,8 +48,11 @@ VLLM_STOCK ?= vllm/vllm-openai:v0.25.0
 # and a re-pin here, or `make up` silently serves the old fork -- which looks exactly like
 # success. `make verify` is the check: the "fusion replaced N patterns" count drops back to its
 # pre-hoist value instead of covering the conv layers.
-VLLM_FORK_IMAGE ?= unseenablefuture/vllm-fork
-VLLM_FORK_TAG ?= v0.25.0-tree@sha256:a41d4237784a2970339623a7acfb800d09eb7a57c0a0ffe36545f4b9bf5ee0a9
+VLLM_FORK_IMAGE ?= traitimbanggia/slowleveling
+# latest@a44447ac is a byte-identical mirror of the old unseenablefuture/vllm-fork
+# v0.25.0-tree@a41d4237 pin (all 38 layer digests verified equal; only the manifest digest
+# changed, as re-pushing re-serializes it). Account move, not a content change.
+VLLM_FORK_TAG ?= latest@sha256:a44447acf529bb7c5a48ee454bd36bebfb4f727f92e13c80c25ffecb5dec7dc4
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)

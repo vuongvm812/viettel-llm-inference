@@ -7,7 +7,7 @@
 #     -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml up -d --wait
 services:
   model:
-    image: ${CI_IMAGE:-unseenablefuture/awesome-badger:dev}
+    image: ${CI_IMAGE:-traitimbanggia/yasuoadc:dev}
     volumes:
       - ../hf-model:/model:ro
     environment:

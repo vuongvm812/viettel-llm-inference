@@ -15,6 +15,12 @@ Ours to check on day 0:
   `python3 -m venv` or `pip --break-system-packages` for
   `pip install -r round-2/bench/requirements.txt`.
 - Model weights staged (organizers: `/data/models/<model>`, read-only).
+- `docker login -u traitimbanggia` — round-2 images live under the on-site team's account
+  (`traitimbanggia/yasuoadc`, fork `traitimbanggia/slowleveling`), NOT the remote teammate's
+  `unseenablefuture`, precisely so pushes work at the venue. Login on **whichever host runs
+  `make push` / `make vllm-fork PUSH=1`** — the VPS in both cases (in Case 2 the push runs there
+  over ssh; login state is per-host, so logging in on the laptop does nothing). Pulls need no
+  login: both repos must stay **public**, because the judge pulls the submission pin anonymously.
 
 ## Case 1 — runner on the VPS
 
