@@ -60,6 +60,10 @@ docker compose -f docker-compose.runner.yaml exec runner \
 The laptop clone needs nothing else — the stock runner image already ships `rsync`/`ssh`/`python3`
 (the smoke test verifies, since the tag is rolling), and every GPU command runs on the VPS.
 
+Builds never require a GPU box: `cloud-build.yml` runs `make push` (or the fork build) on
+GitHub-hosted runners with the Docker Hub secrets — the digest lands in the run summary. It is
+the *only* submission-build path in [Case 3](case-3-console-only.md), and a free fallback here.
+
 ## Dispatch (identical in both cases)
 
 ```bash

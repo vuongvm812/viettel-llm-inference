@@ -50,9 +50,15 @@ Decide on day 0 with one command: `ssh <vps> curl -sS -o /dev/null -w '%{http_co
 Then follow [`bootstrap.md`](bootstrap.md) — the command-level runbook for standing up either case
 and dispatching the first chain.
 
-Everything else — GitHub blocked, no internet at all, the GPU disappearing — is covered briefly in
-[contingencies](contingencies.md). Those are real but unlikely, and none of them changes what we
-build; they only change where it runs.
+**If there is no SSH at all** — only a browser console that accepts paste but forbids copy-out —
+that is [Case 3](case-3-console-only.md). Its first move is probing an *egress ladder*: git-only
+egress still yields near-CI through a polling runner; true zero-egress drops to paste-in /
+transcribe-out, with the submission image built by `cloud-build.yml` on GitHub-hosted runners
+(no GPU box involved — also the build fallback for Cases 1/2).
+
+Everything else — GitHub blocked from the laptop too, the GPU disappearing — is covered briefly
+in [contingencies](contingencies.md). Those are real but unlikely, and none of them changes what
+we build; they only change where it runs.
 
 ## The three-day shape
 

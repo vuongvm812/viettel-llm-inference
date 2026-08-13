@@ -3,6 +3,9 @@
 Real but unlikely. None of these changes *what* we build — only where it runs. Kept short on
 purpose; if one happens, the work is mostly already done.
 
+> These cover the laptop/GitHub side. The VPS-side degraded modes — no SSH, console-only access,
+> partial egress — are [Case 3](case-3-console-only.md), which has its own ladder and tooling.
+
 ## GitHub unreachable
 
 **First, five minutes of cheap moves.** Most "GitHub is blocked" turns out to be narrower than it

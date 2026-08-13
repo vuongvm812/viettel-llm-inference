@@ -1,0 +1,88 @@
+name: Cloud Build
+
+# Build and push the round image on GITHUB-HOSTED runners -- no GPU box involved. Compiling
+# needs nvcc, not a GPU, and ubuntu-latest is x86_64, so this works from anywhere by anyone
+# with repo write access (including the remote teammate).
+#
+# Why it exists: in the console-only case (docs/ci/case-3-console-only.md) the VPS can build
+# only for itself -- no egress means no push, and a submission is a registry digest the judge
+# pulls. This workflow is the only way to mint one there. In Cases 1/2 it is the build fallback
+# that frees the GPU from ~20-minute compile jobs.
+#
+# Prerequisites (repo Settings -> Secrets and variables -> Actions):
+#   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN   -- the traitimbanggia account (write scope)
+#
+# No concurrency group on purpose: this touches no GPU, so parallel builds are merely wasteful,
+# never corrupting.
+
+on:
+  workflow_dispatch:
+    inputs:
+      workdir:
+        description: 'Round directory'
+        required: true
+        default: 'round-2'
+        type: string
+      cuda_archs:
+        # Required with no default for the same reason as vps-gpu.yml: nvcc on this GPU-less
+        # host will probe, guess, and produce an image that dies at first kernel launch.
+        description: 'CUDA archs for nvcc, e.g. 9.0+PTX'
+        required: true
+        type: string
+      build_fork:
+        description: 'Build the vLLM fork base instead of the main image'
+        required: false
+        default: false
+        type: boolean
+      fork_tag:
+        # A plain tag: the Makefile default VLLM_FORK_TAG carries an @sha256 suffix (a pull
+        # pin), which is invalid as a build tag. The digest to re-pin gets printed at the end.
+        description: 'Tag for the fork push (plain, no digest)'
+        required: false
+        default: 'v0.25.0-tree'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      # The hosted runner ships ~30GB of toolchains we never touch; the vLLM base alone is
+      # ~10GB compressed and multiples of that unpacked. Reclaim first or die at 95%.
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h / | tail -1
+
+      - name: Docker Hub login
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      # `make push` is buildx --push: layers stream to the registry, which also keeps peak
+      # local disk lower than build-then-push. It ends by printing the manifest digest.
+      - name: Build and push (main image)
+        if: ${{ !inputs.build_fork }}
+        run: |
+          make push ROUND='${{ inputs.workdir }}' CUDA_ARCHS='${{ inputs.cuda_archs }}' | tee /tmp/push.log
+          {
+            echo "### Cloud build — \`${{ inputs.workdir }}\` @ \`${{ github.sha }}\`"
+            echo '```'
+            echo "pin in ${{ inputs.workdir }}/docker-compose.yaml:"
+            grep -oE 'sha256:[0-9a-f]{64}' /tmp/push.log | tail -1 | sed 's|^|image: '"$(grep -oP '^IMAGE\s*\?=\s*\K\S+' Makefile)"'@|'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build and push (fork base)
+        if: ${{ inputs.build_fork }}
+        run: |
+          make vllm-fork ROUND='${{ inputs.workdir }}' CUDA_ARCHS='${{ inputs.cuda_archs }}' \
+            VLLM_FORK_TAG='${{ inputs.fork_tag }}' PUSH=1 | tee /tmp/push.log
+          {
+            echo "### Cloud fork build — \`${{ inputs.fork_tag }}\` @ \`${{ github.sha }}\`"
+            echo '```'
+            echo "pin as VLLM_FORK_TAG in ${{ inputs.workdir }}/round.mk:"
+            grep -oE 'sha256:[0-9a-f]{64}' /tmp/push.log | tail -1 | sed "s|^|${{ inputs.fork_tag }}@|"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
