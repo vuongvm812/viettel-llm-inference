@@ -367,7 +367,10 @@ services:
       # while looking like a win, which is the one thing an A/B arm must not do.
       # PRE-SUBMISSION: set to "0" -- same rationale as VTL_RUST_SCHED_REQUIRE (HANDOFF 1.4),
       # a hard-fail knob in the submitted artifact is a score-0 risk.
-      VTL_RUST_RUNNER_REQUIRE: "1"
+      # FIXED (code-review): was "1" on this dev branch, which is correct for local A/B but
+      # causes a guaranteed boot failure (score 0) when the Rust runner cannot engage
+      # (e.g. when VTL_RUST_SCHED_FULL falls back due to --speculative-config). Must be "0" in submit.
+      VTL_RUST_RUNNER_REQUIRE: "0"
       VTL_RUST_PREREG: "1"               # register a request with the crate at ADD time, on
                                          #   the input thread (pack-ok bit + stop params in
                                          #   one GIL-released crossing), instead of on its
