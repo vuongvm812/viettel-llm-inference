@@ -82,7 +82,7 @@ IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: check stats build up down warm push bench sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show
+.PHONY: check stats build up down warm push bench sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show model-fetch model-fetch-meta vllm-src
 
 ## Host-level latency tuning for the DEV/BENCH box. NOT part of any submission -- the judge
 ## runs `docker compose up` on their host and none of these knobs are reachable from a
@@ -96,6 +96,33 @@ host-tune-reset:
 	sudo scripts/host-tune.sh reset
 host-tune-show:
 	@scripts/host-tune.sh show
+
+## Per-host setup: model weights + pristine vLLM source. Both land at repo root (gitignored:
+## /hf-model/ and vllm/) so rounds share one copy; the compose overlays bind-mount hf-model/
+## at /model and PGO_HFMODEL defaults to it.
+##
+## model-fetch is for the GPU host ONLY -- the round-2 checkpoint (Qwen3.5-122B-A10B-FP8) is
+## 127.2 GB / 39 shards and the script refuses to start without 140 GB free. model-fetch-meta
+## grabs just the ~25 MB of config/tokenizer JSONs, which is all that trace building, planning
+## and the PGO frontend boot need -- it runs anywhere. Resumable; override MODEL_ID /
+## HF_MODEL_DIR / HF_MAX_WORKERS in the environment (see scripts/fetch-model.sh).
+model-fetch:
+	scripts/fetch-model.sh
+model-fetch-meta:
+	scripts/fetch-model.sh --meta-only
+
+## Pristine vLLM v0.25.0 source tree at repo-root vllm/ (gitignored). This is the REFERENCE
+## tree that $(ROUND)/vtl/vllm_patches/gen.sh diffs against (its V025=... path) when
+## regenerating patches -- never edit it, never build from it; the runnable engine is the
+## $(VLLM_STOCK) image. Idempotent: re-running verifies the checkout matches the v0.25.0 tag.
+vllm-src:
+	@if [ -d vllm/.git ]; then \
+	  tag=$$(git -C vllm describe --tags --exact-match 2>/dev/null || git -C vllm rev-parse --short HEAD); \
+	  if [ "$$tag" = "v0.25.0" ]; then echo "vllm/ already present at v0.25.0 -- nothing to do"; \
+	  else echo "WARN vllm/ exists but is at '$$tag', not v0.25.0 -- remove it and re-run"; exit 1; fi; \
+	else \
+	  git clone --depth 1 --branch v0.25.0 https://github.com/vllm-project/vllm vllm; \
+	fi
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
