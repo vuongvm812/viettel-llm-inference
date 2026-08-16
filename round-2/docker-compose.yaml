@@ -78,7 +78,10 @@ services:
       # drafter (Qwen3_5MoeMTP, registered stock in v0.25.0); greedy tree acceptance rides
       # the existing rejection_sampler.patch. Sweep num_speculative_tokens 1/2/3 on the box;
       # A/B against the N-step burst (both own the decode loop). Costs ~2.6 GB of weights.
-      - '--speculative-config={"method": "qwen3_5_mtp", "num_speculative_tokens": 2}'
+      # COMMENTED OUT: schedule_supported() refuses spec_decode > 0, which silently disables
+      # VTL_RUST_SCHED_FULL, the N-step burst, and the Rust runner. Choosing the Rust stack.
+      # Re-enable and zero VTL_RUST_SCHED_FULL/VTL_RUST_RUNNER/VTL_NSTEP to A/B MTP instead.
+      # - '--speculative-config={"method": "qwen3_5_mtp", "num_speculative_tokens": 2}'
       - --disable-log-stats # per-request log work is inside the judged TTFT/TPOT
       - --uvicorn-log-level=warning
       # enable_qk_norm_rope_fusion: stock v0.25.0 pass fusing per-head QK RMSNorm + RoPE for
