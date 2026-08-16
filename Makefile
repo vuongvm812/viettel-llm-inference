@@ -143,6 +143,22 @@ check:
 	@# grep-guarded as well as -f guarded: round-1.1 ships this file WITHOUT a --self-check half.
 	$(IN) if [ -f bench/test_gdn_gated_rmsnorm.py ] && grep -q -- --self-check bench/test_gdn_gated_rmsnorm.py; then \
 	  PYTHONPATH=. python3 bench/test_gdn_gated_rmsnorm.py --self-check; fi
+	@# The two NVRTC production consumers (round-2+): group-128 block quant, and the fused
+	@# GDN decode step. Pure half here -- kernel<->patch define agreement, cubin cache-key
+	@# distinctness, the engage predicate, and that the patch imports and stays OFF without
+	@# vLLM. The parity halves need a GPU and run under `make test-kernel`.
+	$(IN) if [ -f bench/test_nvrtc_block_quant.py ]; then \
+	  PYTHONPATH=. python3 bench/test_nvrtc_block_quant.py --self-check; fi
+	$(IN) if [ -f bench/test_gdn_decode_step.py ]; then \
+	  PYTHONPATH=. python3 bench/test_gdn_decode_step.py --self-check; fi
+	@# The int4 track (round-2+): the fp8-block -> int4 requant of the dense layers, and the
+	@# MoE decode grouped-GEMV. Pure half here -- the double-quantization error bound in numpy,
+	@# the (token, slot) bookkeeping, and cubin cache-key distinctness across the int4/fp8
+	@# weight arms. The kernel parity halves need a GPU and run under `make test-kernel`.
+	$(IN) if [ -f bench/test_w4a8_from_fp8.py ]; then \
+	  PYTHONPATH=. python3 bench/test_w4a8_from_fp8.py --self-check; fi
+	$(IN) if [ -f bench/test_moe_decode.py ]; then \
+	  PYTHONPATH=. python3 bench/test_moe_decode.py --self-check; fi
 	$(IN) python3 bench/trace_stats.py --self-check
 	$(IN) python3 bench/metrics.py
 	$(IN) python3 bench/sweep_report.py --selfcheck

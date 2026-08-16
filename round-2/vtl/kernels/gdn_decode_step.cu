@@ -48,12 +48,19 @@
 //
 // FP32 STATE MATH IS PINNED WITH __fmul_rn/__fadd_rn: Triton emits separate mul + add
 // (mul feeds a tl.sum tree or an elementwise add), never an FMA, and nvcc's default
-// contraction would silently fuse ours. No fast-math anywhere -- expf/logf/sqrtf are the
-// same libdevice-precision calls tl.exp/tl.log/tl.sqrt lower to. The ONLY tolerated
-// divergence is fp32 REDUCTION ORDER (l2norm sum and the two length-DK dots): Triton
-// tree-reduces 128 lanes, we do a per-lane 4-chain + 32-lane shuffle tree. That moves
-// results by O(1 ulp fp32); bench/test_gdn_decode_step.py bounds it against the real
-// Triton pair (state fp32: rtol 1e-4 / atol 1e-5; out bf16: rtol/atol 1e-2 ~ 2 bf16 ulp).
+// contraction would silently fuse ours. No fast-math anywhere. TWO divergences are
+// tolerated, and only two:
+//   1. fp32 REDUCTION ORDER (the l2norm sums and the two length-DK dots). Triton
+//      tree-reduces 128 lanes; we do a per-lane 4-chain + a 32-lane shuffle tree.
+//   2. TRANSCENDENTAL LOWERING. expf/logf/sqrtf here vs whatever tl.exp/tl.log/tl.sqrt
+//      lower to for the installed Triton (libdevice __nv_expf, or an ex2.approx
+//      expansion). Both are <= ~2 ulp fp32. NOTE: FLA_USE_FAST_OPS=1 swaps Triton onto
+//      tldevice.fast_expf/fast_logf (fla/ops/op.py) -- still inside the same bound, but
+//      the parity test asserts against whatever the installed stack actually runs.
+// Both move results by O(1 ulp fp32); bench/test_gdn_decode_step.py bounds it against the
+// real Triton pair (state fp32: rtol 1e-4 / atol 1e-5; out bf16: rtol/atol 1e-2 ~ 2 bf16
+// ulp). Everything else -- the bf16 narrowings, the softplus branch, the beta round-trip,
+// the true-vs-fused multiply-add order -- is replicated exactly.
 //
 // One global write the pair does that we DELIBERATELY SKIP: causal_conv1d_update writes
 // the conv output back over mixed_qkv in place. Nothing reads it afterwards on this path
@@ -98,6 +105,11 @@ static_assert(THREADS == DK, "one thread per q/k channel: THREADS must equal DK"
 static_assert(THREADS == DV, "one thread per v channel per head slice");
 static_assert(THREADS % 32 == 0, "whole warps");
 static_assert(DV % WARPS == 0, "state rows must split evenly across warps");
+// Phase 3 gives every lane of a warp exactly four k/q channels (`s_k[lane*4 + 0..3]`) and
+// closes the dot with a full-warp xor ladder, so the length-DK dot is 32 lanes x 4. DK=128
+// is therefore a hard constraint of this port, not just an alignment one -- at DK=256 the
+// ladder would silently reduce only the first 128 channels.
+static_assert(DK == 128, "phase 3 assumes DK == 32 lanes x float4; port it before changing");
 static_assert(DK % 4 == 0, "float4 state rows");
 static_assert(HV % HK == 0, "grouped value heads");
 static_assert(GPB <= THREADS, "gating computed by the first GPB threads");
@@ -177,7 +189,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) gdn_decode_step(
     const float* __restrict__ dt_bias,             // [HV] fp32 (wrapper upcasts if needed)
     float* __restrict__ ssm_state,                 // [lines, HV, DV, DK], token stride given
     __nv_bfloat16* __restrict__ out,               // [T, 1, HV, DV] contiguous
-    const int* __restrict__ state_indices,         // [T] int32
+    const int* __restrict__ state_indices,         // [T] int32, stride indices_stride
     const float scale,                             // head_k_dim ** -0.5
     const long long qkv_stride,
     const long long a_stride,
@@ -187,7 +199,12 @@ extern "C" __global__ void __launch_bounds__(THREADS) gdn_decode_step(
     const long long cs_tok_stride,
     const long long w_dim_stride,
     const long long w_width_stride,
-    const long long state_tok_stride) {
+    const long long state_tok_stride,
+    // NOT 1 in general: in the eager/piecewise path the metadata builder hands both stock
+    // kernels `block_table_tensor[:, 0]`, whose stride is the block table's ROW stride.
+    // (Only the full-cudagraph path copies it into a contiguous buffer.) Both Triton
+    // kernels take this stride as an argument for exactly this reason.
+    const long long indices_stride) {
     const int i_h = blockIdx.x;        // key head
     const long long n = blockIdx.y;    // token (== sequence: non-spec decode, 1 tok/seq)
     const int tid = threadIdx.x;
@@ -198,7 +215,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) gdn_decode_step(
     __shared__ float s_red[WARPS];
     __shared__ float s_expg[GPB], s_beta[GPB];
 
-    const long long state_idx = (long long)state_indices[n];
+    const long long state_idx = (long long)state_indices[n * indices_stride];
     if (state_idx <= 0) {
         // NULL_BLOCK_ID: the recurrent kernel zeroes the output rows and returns; the
         // conv kernel skips entirely. Nothing else may be touched.

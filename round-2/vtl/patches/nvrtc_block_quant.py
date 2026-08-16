@@ -151,12 +151,20 @@ def _eager_rms(result, input, weight, scale, epsilon, scale_ub, residual,
         amax = torch.minimum(amax, scale_ub.float())
     s = torch.clamp(amax / FP8_MAX, min=MIN_SCALE)
     q = torch.clamp(g / s.unsqueeze(-1), -FP8_MAX, FP8_MAX).to(result.dtype)
-    result.view(tokens, groups * group_size).copy_(q.view(tokens, -1))
-    if scale.dim() == 2 and scale.shape[0] >= tokens and scale.shape[1] == groups:
-        # Indexed writes respect the (possibly transposed) strides.
-        scale[:tokens, :groups].copy_(s)
+    result.reshape(tokens, groups * group_size).copy_(q.view(tokens, -1))
+
+    # Scale layout, through stock's LINEAR indices rather than through the tensor's own
+    # shape. `scale` is passed as [num_tokens, groups] OR [groups, num_tokens], possibly
+    # row-padded, and stock's kernel does not read its shape at all -- it writes
+    # `blockIdx.x * num_groups + g` or `g * scale_rows + blockIdx.x` off the base pointer.
+    # as_strided reproduces exactly those offsets and nothing else.
+    outer = int(scale.stride(1)) if scale.dim() >= 2 else 1
+    if is_scale_transposed:
+        outer = max(outer, 1)
+        rows = -(-tokens // outer) * outer   # scale_rows, verbatim from the stock kernel
+        scale.as_strided((groups, rows), (rows, 1))[:, :tokens] = s.t()
     else:
-        scale.reshape(-1)[: tokens * groups] = s.reshape(-1)
+        scale.as_strided((tokens, groups), (groups, 1))[...] = s
 
 
 def _eager_gq(input, output_q, output_s, group_size, eps, fp8_min, fp8_max,
@@ -174,12 +182,18 @@ def _eager_gq(input, output_q, output_s, group_size, eps, fp8_min, fp8_max,
         y_s = torch.exp2(torch.ceil(torch.log2(y_s.abs().clamp_min(1e-10))))
     q = (x / y_s.unsqueeze(-1)).clamp(fp8_min, fp8_max).to(output_q.dtype)
     output_q.reshape(-1, group_size).copy_(q)
+
+    # Same story as _eager_rms: stock addresses output_s by group id, not by shape.
+    # row-major -> base[gid]; col-major -> base[col * scale_stride + row] with
+    # row = gid / output_s.size(1), col = gid % output_s.size(1).
     num_groups = x.shape[0]
-    gcols = output_s.shape[1] if output_s.dim() == 2 else 0
-    if gcols and num_groups % gcols == 0:
-        output_s[: num_groups // gcols, :gcols].copy_(y_s.view(-1, gcols))
+    snum_rows = int(output_s.size(1)) if output_s.dim() >= 2 else num_groups
+    if output_s.dim() >= 2 and output_s.stride(0) < output_s.stride(1) and snum_rows > 0:
+        nrows = -(-num_groups // snum_rows)
+        view = output_s.as_strided((nrows, snum_rows), (1, int(output_s.stride(1))))
+        view[...] = y_s[: nrows * snum_rows].view(nrows, snum_rows)
     else:
-        output_s.reshape(-1)[:num_groups] = y_s
+        output_s.as_strided((num_groups,), (1,))[...] = y_s
 
 
 # --------------------------------------------------------------------------------------
@@ -193,6 +207,10 @@ def _rms_impl(result, input, weight, scale, epsilon, scale_ub, residual,
 
     launchers = _state["launchers"]
     hidden = _state["hidden"]
+    # Overriding the CUDA key removes stock's STD_TORCH_CHECKs along with its kernel, so
+    # everything they guaranteed downstream -- contiguous out/residual, a [hidden] weight,
+    # a viewable row stride -- has to be re-checked here or a caller outside the envelope
+    # would corrupt memory rather than fall back.
     ok = (
         launchers is not None
         and input.dtype == torch.bfloat16
@@ -201,11 +219,24 @@ def _rms_impl(result, input, weight, scale, epsilon, scale_ub, residual,
         and int(group_size) == _state["group"]
         and input.stride(-1) == 1
         and scale.dtype == torch.float32
-        and (residual is None or residual.dtype == torch.bfloat16)
+        and result.is_contiguous()
+        and weight.dtype == torch.bfloat16
+        and weight.numel() == hidden
+        and weight.is_contiguous()
+        and (residual is None or (residual.dtype == torch.bfloat16
+                                  and residual.is_contiguous()
+                                  and residual.numel() == input.numel()))
     )
     in_stride = 0
     if ok:
-        in_stride = input.reshape(-1, hidden).stride(0)
+        try:
+            # .view, not .reshape: reshape would silently COPY a non-viewable input and
+            # hand back a stride belonging to a temporary we do not launch on. This is
+            # exactly what stock's torch::stable::view(input, {-1, hidden}) does.
+            in_stride = input.view(-1, hidden).stride(0)
+        except Exception:
+            ok = False
+    if ok:
         ok = in_stride % VEC == 0   # 16-byte alignment of every token row
     if not ok:
         _warn_once("rms_eager", "vtl: %s call outside compiled envelope; eager fallback",
