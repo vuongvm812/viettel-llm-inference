@@ -103,25 +103,22 @@ __device__ constexpr float kFp8Max = 448.0f;
 // Same floor as rms_norm_quant.cu: an all-zero group must quantize with a finite scale.
 __device__ constexpr float kMinScale = 1.0f / (448.0f * 512.0f);
 
-// 16-byte fragments. 16 fp8 bytes = 16 elements; one uint4 = 32 packed int4 elements.
-// A UNION, not a struct: `__ldg` is only declared for the built-in vector types, so the load
-// has to name uint4 and the fp8 view has to alias it. (`__ldg(const FP8x16*)` does not exist
-// and is a compile error, not a slow path.)
-union __align__(16) Frag16 {
-    uint4 b;
-    __nv_fp8_e4m3 v[16];
-};
+// Aligned fp8 fragments, same shape as rms_norm_quant.cu's Vec8. The explicit alignment is
+// what makes the reinterpret_casts below legal: a bare `__nv_fp8_e4m3 x[16]` local is only
+// 1-byte aligned, so casting it to uint4* would be a misaligned access on the stack.
+struct __align__(16) FP8x16 { __nv_fp8_e4m3 v[16]; };
+struct __align__(8) FP8x8 { __nv_fp8_e4m3 v[8]; };
 
-// 8 fp8 bytes: the store granularity of moe_int4_to_fp8. Same reason for the union -- an
-// `__nv_fp8_e4m3 x[8]` local is only 1-byte aligned, so casting it to uint2* is a misaligned
-// store on the stack.
-union __align__(8) Frag8 {
-    uint2 b;
-    __nv_fp8_e4m3 v[8];
-};
-
+// `__ldg` is declared only for the built-in vector types, so a 16-byte read-only load has to
+// name uint4 -- `__ldg(const FP8x16*)` does not exist, and it is a compile error rather than
+// a slow path. The caller reinterprets the returned uint4, which is 16-byte aligned.
 __device__ __forceinline__ uint4 ldg16(const void* __restrict__ p) {
     return __ldg(reinterpret_cast<const uint4*>(p));
+}
+
+__device__ __forceinline__ FP8x16 ldg_fp8x16(const void* __restrict__ p) {
+    const uint4 raw = ldg16(p);
+    return *reinterpret_cast<const FP8x16*>(&raw);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -172,14 +169,12 @@ __device__ __forceinline__ float warp_dot(
         const int c = i * 32 + lane;
         if (kChunks % 32 == 0 || c < kChunks) {
             const int k0 = c * 32;
-            Frag16 a0, a1;
-            a0.b = ldg16(act + k0);
-            a1.b = ldg16(act + k0 + 16);
+            const FP8x16 a0 = ldg_fp8x16(act + k0);
+            const FP8x16 a1 = ldg_fp8x16(act + k0 + 16);
             float partial = 0.0f;
 #if WEIGHT_FP8
-            Frag16 w0, w1;
-            w0.b = ldg16(w_row + (long long)k0);
-            w1.b = ldg16(w_row + (long long)k0 + 16);
+            const FP8x16 w0 = ldg_fp8x16(w_row + (long long)k0);
+            const FP8x16 w1 = ldg_fp8x16(w_row + (long long)k0 + 16);
 #pragma unroll
             for (int j = 0; j < 16; ++j) {
                 partial += float(w0.v[j]) * float(a0.v[j]);
@@ -407,7 +402,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) moe_int4_to_fp8(
         const unsigned int wbits = qrow[j];
         const int k0 = j * 8;
         const float ratio = gs[k0 / GROUP] / bs[k0 / 128];
-        Frag8 outv;
+        FP8x8 outv;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const int qv = ((int)(wbits << (28 - 4 * i))) >> 28;
@@ -415,6 +410,6 @@ extern "C" __global__ void __launch_bounds__(THREADS) moe_int4_to_fp8(
             outv.v[i] = __nv_fp8_e4m3(f);
         }
         // 8 fp8 bytes = one uint2 store; rowlen % 8 == 0 keeps it aligned.
-        reinterpret_cast<uint2*>(drow)[j] = outv.b;
+        reinterpret_cast<uint2*>(drow)[j] = *reinterpret_cast<const uint2*>(&outv);
     }
 }

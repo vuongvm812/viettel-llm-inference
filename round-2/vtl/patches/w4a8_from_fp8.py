@@ -29,7 +29,12 @@ LinearBase, we substitute a method that:
 
 WHAT IS DELIBERATELY OUT OF SCOPE. FusedMoE expert weights do not come through
 ``get_quant_method``-for-LinearBase at all (they get ``Fp8MoEMethod``); they are handled by
-[[moe_decode_gemv]]. ``mlp.gate`` and ``shared_expert_gate`` are built with
+[[moe_decode_gemv]]. The two int4 tracks share the NIBBLE CONVENTION and nothing else:
+both bottom out in ``quant_w4a8.pack_int4_rows`` (nibble i of word j is element 8j+i along
+the reduction dim) and both use vLLM's asymmetric signed-int4 group scale, but this path then
+runs ``cutlass_encode_and_reorder_int4b`` to get CUTLASS's mixed-input tile order, while the
+MoE GEMV stops at the packed int32 because a GEMV wants plain rows. Do not feed one path's
+tensors to the other's kernel. ``mlp.gate`` and ``shared_expert_gate`` are built with
 ``quant_config=None`` and never reach Fp8Config -- they stay bf16. Layers the checkpoint
 itself excludes from fp8 (lm_head, embeddings, conv1d, in_proj_a/b, gates) come back from the
 stock config as unquantized methods and are passed through untouched.

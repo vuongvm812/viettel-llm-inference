@@ -231,8 +231,6 @@ def test_dequant_matches_the_block_definition(n, k):
 def test_requant_stays_within_one_int4_step_of_the_fp8_weight(n, k):
     """The nesting claim, on device: because the [128,128] block scale is constant across an
     int4 group, requantizing from fp8 can only cost the int4 rounding itself."""
-    from vtl.patches import quant_w4a8
-
     wq, scale, deq = _fake_fp8_block_weight(n, k, seed=1)
     del wq, scale
     # quant_w4a8 groups along K after transposing to [K, N]; mirror that here.

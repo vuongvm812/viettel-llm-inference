@@ -121,6 +121,22 @@ services:
       VTL_ENABLE_L2_PERSIST: "1"                # L2 persisting-access window for the KV block
       VTL_ENABLE_PROFILER: "0"                  # OFF in the submission;
                                                 #   docker-compose.profile.yaml overrides to 1
+      # -- Qwen3.5 (GDN hybrid + 256-expert MoE) kernel patches. All shipped ENABLED (user
+      # decision); every one degrades per-op to AOT/stock on any mismatch or NVRTC failure,
+      # so a gate here can change speed but not correctness of the boot. A/B by zeroing one.
+      VTL_ENABLE_GDN_KERNELS: "1"               # RMSNormGated -> group-128-fp8-quant fusion for
+                                                #   the 36 GDN layers (the fusion AITER has on
+                                                #   ROCm and stock CUDA lacks). Grep make verify
+                                                #   for "Replaced N patterns", N>0.
+      VTL_ENABLE_GDN_PREFILL_BACKEND: "1"       # installs the env pin below (auto = stock choice)
+      VTL_ENABLE_NVRTC_BLOCK_QUANT: "1"         # NVRTC re-spec of stock block-quant ops at
+                                                #   -DHIDDEN=3072 -DGROUP=128. Needs VTL_NVRTC=1.
+      VTL_ENABLE_GDN_DECODE_STEP: "1"           # fused conv1d+delta-rule decode step, one launch
+                                                #   per GDN layer; non-spec decode only.
+                                                #   Needs VTL_NVRTC=1.
+      VTL_ENABLE_W4A8_FROM_FP8: "1"             # extend vtl_w4a8 to fp8-block checkpoints
+      VTL_ENABLE_MOE_DECODE_GEMV: "1"           # grouped-GEMV MoE decode at M<=MAX_M.
+                                                #   Needs VTL_NVRTC=1.
 
       # ---- Knobs whose defaults live in code -------------------------------------------
       VTL_GIL_SWITCH_INTERVAL: "0.0002"  # sys.setswitchinterval, seconds. 0 = interpreter default
@@ -209,6 +225,33 @@ services:
                                          #   (132 SMs), not a MIG slice -- the query is correct;
                                          #   set only if the "cutlass sm_count=N" boot line
                                          #   disagrees with the hardware.
+
+      # ---- Qwen3.5 GDN + MoE kernel knobs ----------------------------------------------
+      VTL_GDN_RMSNORM_FUSION: "1"        # 1 = torch.compile fusion pattern; 0 = eager
+                                         #   RMSNormGated.forward monkeypatch (A/B lever;
+                                         #   mutually exclusive arms of the same kernel)
+      VTL_GDN_PREFILL_BACKEND: "auto"    # auto|triton|flashinfer|cutedsl. auto = wrapper not
+                                         #   installed, stock resolver decides. Pin per-arm in
+                                         #   bench A/Bs; flashinfer vs triton is the sweep that
+                                         #   matters at this trace's ~3k-token prefills.
+      # int4-from-fp8 requant (dense LinearBase layers). QUALITY-GATED: double quantization
+      # (fp8 -> int4 RTN group-128). Nesting property bounds the added error (block scale is
+      # constant across each int4 group), but bench/eval_quality.py on the H200 is the ship
+      # gate -- ladder: fp8 MoE arm first, then dense int4, then MoE int4.
+      VTL_W4A8_FROM_FP8: "1"
+      VTL_W4A8_FROM_FP8_IGNORE: ""       # layer-name substrings kept on stock fp8
+      # MoE decode grouped-GEMV. fp8 arm is the memory-neutral default: stock fused_moe keeps
+      # serving prefill/large-M (this trace is 11:1 prefill:decode), our GEMV takes M<=MAX_M
+      # decode. int4 arm halves expert reads but only pays with FREE_FP8=1 (else both copies
+      # resident = OOM at 116 GB of experts); that pair is the experiment, not the default.
+      VTL_MOE_GEMV_WEIGHTS: "fp8"        # fp8 | int4
+      VTL_MOE_GEMV_MAX_M: "16"           # decode band; larger M falls through to stock
+      VTL_MOE_GEMV_THREADS: "256"
+      VTL_MOE_GEMV_CHUNK: "64"           # (token,slot) chunk per launch wave
+      VTL_MOE_GEMV_FREE_FP8: "0"         # 1 = drop fp8 expert copies after int4 pack (frees
+                                         #   ~58 GB, removes the stock prefill path -- only
+                                         #   with VTL_MOE_GEMV_WEIGHTS=int4, measured first)
+      VTL_MOE_GEMV_PACK_CHUNK: "4"       # experts packed per host chunk during int4 arming
       VTL_ENABLE_MEGAKERNEL_PROBE: 1     # read-only go/no-go probe. Launches nothing, allocates
                                          #   nothing; two device-attribute queries at load.
 

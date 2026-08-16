@@ -538,10 +538,9 @@ def _arm_layer(layer) -> None:
         # accounting, the load summary, weight-reload checks) skip plain tensors. Same
         # reasoning as quant_w4a8's weight_packed. requires_grad=False is what lets an int32
         # tensor be a Parameter at all.
-        layer.register_parameter("vtl_w13_int4", torch.nn.Parameter(w13_q, requires_grad=False))
-        layer.register_parameter("vtl_w13_int4_scale", torch.nn.Parameter(w13_gs, requires_grad=False))
-        layer.register_parameter("vtl_w2_int4", torch.nn.Parameter(w2_q, requires_grad=False))
-        layer.register_parameter("vtl_w2_int4_scale", torch.nn.Parameter(w2_gs, requires_grad=False))
+        for name, tensor in (("vtl_w13_int4", w13_q), ("vtl_w13_int4_scale", w13_gs),
+                             ("vtl_w2_int4", w2_q), ("vtl_w2_int4_scale", w2_gs)):
+            layer.register_parameter(name, torch.nn.Parameter(tensor, requires_grad=False))
         armed.w13, armed.w13_scale = w13_q, w13_gs
         armed.w2, armed.w2_scale = w2_q, w2_gs
         if free_fp8():
@@ -730,10 +729,17 @@ def apply() -> None:
     if not already_patched(Fp8MoEMethod, "apply", patch="moe_decode_gemv"):
         original_apply = Fp8MoEMethod.apply
 
-        def moe_apply(self, layer, x, topk_weights, topk_ids, shared_experts,
-                      shared_experts_input):
+        def moe_apply(self, layer, x, topk_weights, topk_ids, shared_experts=None,
+                      shared_experts_input=None, **kwargs):
+            # **kwargs is a VERSION GUARD, not convenience: RoutedExperts.forward_modular
+            # calls this all-keyword, so a vLLM release that adds one more argument would
+            # otherwise TypeError inside the engine. An argument we do not understand means
+            # we do not understand the call, so we hand it straight back to stock.
             global _engaged_calls, _declined_calls
             armed = getattr(layer, "_vtl_moe_gemv", None)
+            if kwargs:
+                return original_apply(self, layer, x, topk_weights, topk_ids, shared_experts,
+                                      shared_experts_input, **kwargs)
             try:
                 # NOTE ON CUDA-GRAPH CAPTURE: every NVRTC compile happened at load
                 # (_arm_layer), so nothing here can stall a capture. The per-chunk tensors
@@ -750,6 +756,14 @@ def apply() -> None:
                                           shared_experts, shared_experts_input)
                 out = _run(armed, x, topk_weights, topk_ids)
                 _engaged_calls += 1
+                if _engaged_calls == 1:
+                    # The load summary runs BEFORE any forward, so "armed" is not proof the
+                    # kernel ever ran. This line is. One INFO, once per process, off the
+                    # steady-state path -- `make verify` greps for it.
+                    log.info(
+                        "vtl: moe_decode_gemv ENGAGED (weights=%s, M=%d, K=%d, N=%d, topk=%d)",
+                        armed.weights, x.shape[0], armed.k, armed.n, armed.topk,
+                    )
                 return out
             except Exception as exc:
                 _declined_calls += 1
@@ -835,8 +849,10 @@ def _self_check() -> None:
                            (E, K // 128, N // 128))
     assert ok == (E, K, N), ok
     assert "3-D" in validate_geometry((E, 2 * N), (E, K, N), (E, 16, 24), (E, 24, 8))
-    assert "expert counts" in validate_geometry((E, 2 * N, K), (E - 1, K, N), (E, 16, 24), (E, 24, 8))
-    assert "hidden size" in validate_geometry((E, 2 * N, K), (E, K + 128, N), (E, 16, 24), (E, 24, 8))
+    assert "expert counts" in validate_geometry((E, 2 * N, K), (E - 1, K, N),
+                                                (E, 16, 24), (E, 24, 8))
+    assert "hidden size" in validate_geometry((E, 2 * N, K), (E, K + 128, N),
+                                              (E, 16, 24), (E, 24, 8))
     assert "stacked" in validate_geometry((E, N, K), (E, K, N), (E, 8, 24), (E, 24, 8))
     assert "multiples" in validate_geometry((E, 2 * 100, K), (E, K, 100), (E, 1, 24), (E, 24, 1))
     # The DeepGEMM/Marlin case: weights are fine, the scale grid is not what we expect.
