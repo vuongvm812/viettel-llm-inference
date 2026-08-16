@@ -3,20 +3,24 @@ name: viettel-llm-optimized
 # Registry-only deploy: this compose + a pushed image. No build context, no local mounts --
 # the judge host provides the model at /model and scrapes :8000.
 #
-# ==================== FILL IN BEFORE SUBMITTING ====================
-# Pinned to LFM2.5-1.2B-Instruct (round-1.2's model) so the branch boots against something
-# real. The CODE is model-agnostic; four serve literals are not, and each must be revisited
-# when round-2's model is announced:
-#   1. --served-model-name   must match bench/build_trace_round2.py --model-name and the
-#                            "model" field of data/input/trace-round2.jsonl, or every
-#                            replayed request 404s.
-#   2. --max-model-len       must equal the model's native context (config.json
-#                            max_position_embeddings). A tighter cap truncates the judge's
-#                            long-context probe -> flagged as cheating.
-#   3. --quantization        vtl_w4a8 was validated against LFM2.5, not this round's model.
-#                            Re-run bench/eval_quality.py; revert to vtl_fp8 if poor.
-#   4. --mamba_cache_mode    DELETE the line if the final model is dense -- passing it to a
-#                            model without mamba caching fails at startup.
+# ==================== ROUND-2 MODEL: Qwen/Qwen3.5-122B-A10B-FP8 ====================
+# The four model-specific serve literals are FILLED IN for this round's announced model
+# (see reference/qwen3_5-122b/MODEL.md for the geometry and memory math):
+#   1. --served-model-name   Qwen3.5-122B-A10B-FP8, matching bench/build_trace_round2.py
+#                            --model-name. `round2-model` stays a live alias for any trace
+#                            not yet regenerated with the real name.
+#   2. --max-model-len       262144 = config.json max_position_embeddings. A tighter cap
+#                            truncates the judge's long-context probe -> flagged as cheating.
+#   3. quantization          The checkpoint is ALREADY fp8 block-quant (weight_block_size
+#                            [128,128], dynamic group-128 activations) and loads via stock
+#                            auto-detect with NO --quantization flag. The W4A8 track
+#                            (VTL_W4A8_FROM_FP8, int4 requant of the fp8 experts) rides on
+#                            top and is quality-gated by bench/eval_quality.py on the H200.
+#   4. --mamba_cache_mode    KEPT: 36 of 48 layers are GDN linear-attention (MambaSpec).
+#
+# Memory on 1x H200 141 GB is the binding constraint: ~124 GB weights loaded (vision tower
+# skipped via --limit-mm-per-prompt) + ~154 MB GDN state per sequence. Hence
+# max-num-seqs=32 and gpu-memory-utilization=0.95; sweep both on the box (MODEL.md).
 #
 # NO SHELL-VARIABLE INTERPOLATION ANYWHERE IN THIS FILE. It is submitted as-is and an unset
 # variable is a boot failure, i.e. score 0. Literals only.
@@ -40,12 +44,14 @@ services:
       # `body.model`. Without the alias every replayed request 404s. Drop the alias once the
       # trace is regenerated with the real name.
       - --served-model-name #Don't change this to vllm-server -- see header
-      - LFM2.5-1.2B-Instruct
+      - Qwen3.5-122B-A10B-FP8
       - round2-model
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
-      - --max-model-len=32768 # must equal the model's native context -- see header item 2
-      - --gpu-memory-utilization=0.90
+      - --max-model-len=262144 # must equal the model's native context -- see header item 2
+      # 0.95, not 0.90: ~124 GB of loaded weights on a 141 GB H200 leave nothing for the
+      # GDN state pool at 0.90. Sweep 0.93/0.95/0.97 on the box before trusting.
+      - --gpu-memory-utilization=0.95
       - --tensor-parallel-size=1
       # Executor backend deliberately UNSET -> UniProcExecutor at TP=1. `mp` splits
       # EngineCore and the GPU worker into separate processes, which silently kills three
@@ -53,27 +59,32 @@ services:
       # because each is a module global written in one process and read in the other. The
       # cost of `uni` is VTL_SCHED_SO_RING, which self-refuses without `mp`.
       - --enable-prefix-caching
-      # REQUIRED by the pinned hybrid model; DELETE for a dense one (startup failure
-      # otherwise). Nothing else changes: decode_fastpath accepts an empty mamba builder
-      # list and the crate only demands `align` for Mamba-kind groups.
+      # REQUIRED by this hybrid model (36/48 layers are GDN -> MambaSpec); DELETE only for
+      # a dense model (startup failure otherwise).
       - --mamba_cache_mode=align
       - --enable-chunked-prefill
-      - --max-num-seqs=70 # peak trace concurrency ~6; a small cap shrinks the cudagraph
-                          # capture set + VRAM. Sweep with bench/replay.py.
+      - --max-num-seqs=32 # peak trace concurrency ~6; each resident seq also pins ~154 MB
+                          # of fp32 GDN state, so 70 (10.8 GB) does not fit next to 124 GB
+                          # of weights. Sweep 16/24/32 with bench/replay.py.
       - --max-num-batched-tokens=8192 # small prefill chunks keep a new turn's ~4k prefill
                           # from spiking in-flight decode ITL; TTFT has slack.
-      # int4 weights (group-128, RTN at load) + fp8-e4m3 per-token activations via the SM90
-      # CUTLASS w4a8 kernel; falls back to vtl_fp8 per-layer on any rejected shape.
-      # NOT VALIDATED FOR THIS ROUND'S MODEL -- A/B both speed and accuracy before trusting
-      # it (bench/eval_quality.py is the gate). See vtl/patches/quant_w4a8.py.
-      - --quantization=vtl_w4a8
+      # NO --quantization flag: the checkpoint carries its own fp8 block-quant config and
+      # stock vLLM auto-detects it. The vtl W4A8 track (int4 requant of the fp8 experts)
+      # is layered on via VTL_W4A8_FROM_FP8 / VTL_ENABLE_MOE_DECODE_GEMV below and degrades
+      # to the stock fp8 path per-layer; bench/eval_quality.py is the accuracy gate.
       - --kv-cache-dtype=fp8_e4m3
-      # DO NOT enable --speculative-config. It is output-identical at temperature 0 and was
-      # the biggest TPOT lever on paper, but a submission carrying it was flagged as
-      # cheating. The cost of tripping that detector is the whole submission.
+      # MTP speculative decoding: PERMITTED for round-2 (user-confirmed 2026-08-16; the
+      # round-1.2 "cheating" ban does not carry over). The checkpoint ships a 1-layer MTP
+      # drafter (Qwen3_5MoeMTP, registered stock in v0.25.0); greedy tree acceptance rides
+      # the existing rejection_sampler.patch. Sweep num_speculative_tokens 1/2/3 on the box;
+      # A/B against the N-step burst (both own the decode loop). Costs ~2.6 GB of weights.
+      - '--speculative-config={"method": "qwen3_5_mtp", "num_speculative_tokens": 2}'
       - --disable-log-stats # per-request log work is inside the judged TTFT/TPOT
       - --uvicorn-log-level=warning
-      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
+      # enable_qk_norm_rope_fusion: stock v0.25.0 pass fusing per-head QK RMSNorm + RoPE for
+      # the 12 full-attention layers. Verify at boot it matches interleaved-mrope +
+      # partial_rotary_factor 0.25 ("Replaced N patterns", N>0); it self-disables if not.
+      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true, "enable_qk_norm_rope_fusion": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
     ports:
       - "8000:8000"
     environment:
@@ -114,10 +125,14 @@ services:
       # ---- Knobs whose defaults live in code -------------------------------------------
       VTL_GIL_SWITCH_INTERVAL: "0.0002"  # sys.setswitchinterval, seconds. 0 = interpreter default
       VTL_SILU_MUL_FUSION: "1"           # 0 = keep SiLU*mul and the quant as separate kernels
-      VTL_STEP0_EOS_ID: "7"              # token id banned on step 0; comma-separate for several.
-                                         #   MODEL-SPECIFIC: this is LFM2.5's eos_token_id
+      VTL_STEP0_EOS_ID: "248044"         # token id banned on step 0; comma-separate for several.
+                                         #   MODEL-SPECIFIC: Qwen3.5's eos_token_id (config.json)
       VTL_SCHED_LEAN_CHECK: "0"          # 1 = dual-run Phase A and diff. Debug arm, costs a step
-      VTL_NVRTC: "0"                     # runtime NVRTC kernel compile; nvrtc-dev.yaml opts in
+      # "1": NVRTC kernels are shipped ENABLED for this round (user decision). Every NVRTC
+      # consumer degrades per-op to AOT/stock when compile fails, so this cannot crash the
+      # boot; the judge-boot JIT cost is amortized by `make warm` baking the cubin cache
+      # into /opt/vtl/cache/nvrtc. nvrtc-dev.yaml still overlays the 15s dev loop.
+      VTL_NVRTC: "1"
       # "0" DELIBERATELY. 1 turns a silent Rust-scheduler refusal into a BOOT FAILURE, which
       # is what you want in bench/CI (a refusal otherwise measures stock vLLM while looking
       # fine) and NOT what you want on the judge box, where a refusal should degrade to the
@@ -180,21 +195,20 @@ services:
                                          #   server. Driven by `make sweep-schedule`.
       # v2 schedules (Stream-K / cluster / small-tile arms). Empty = off, stock kernel
       # everywhere. MODEL-SPECIFIC: the "n<out>k<in>" key encodes this model's hidden size, so
-      # it resolves to no key on a different geometry (silent, not fatal). Boot once and read
-      # the "w4a8 observed shape keys" log line to get the real keys.
-      VTL_W4A8_SCHEDULE_V2: "n3072k2048=128x16_1x1x1_sk"
+      # it resolves to no key on a different geometry (silent, not fatal). CLEARED: the old
+      # keys encoded LFM2.5's 2048-hidden geometry; Qwen3.5's dense layers are 3072-hidden.
+      # Boot once, read the "w4a8 observed shape keys" log line, then `make sweep-schedule`
+      # to re-derive keys on the full (non-MIG) H200.
+      VTL_W4A8_SCHEDULE_V2: ""
       VTL_W4A8_V2_MTHRESH: "16"          # decode band upper bound; 0 = always stock kernel
-      # Prefill band, M in (MTHRESH, PREFILL_MAX]. The ONLY place cluster multicast of the
-      # WEIGHTS does anything: CUTLASS multicasts operand A along the cluster's N dim, which
-      # tiles TOKENS -- at decode's single token tile no cluster shape can share a weight byte.
-      # A TTFT play, and the ERS gradient values 1ms TPOT at ~23x 1ms TTFT, so it ranks last.
-      # Revert = MAX back to "0" (band closed, stock heuristic).
-      VTL_W4A8_SCHEDULE_V2_PREFILL: "128x128_1x2x1_pf"
-      VTL_W4A8_V2_PREFILL_MAX: "1024"
-      VTL_W4A8_SM_COUNT: ""              # empty = query the device. Set ONLY if the boot line
-                                         #   "cutlass sm_count=N" reports the physical H200's 132
-                                         #   rather than the MIG slice's ~16 -- every persistent
-                                         #   grid is sized from that number.
+      # Prefill band, M in (MTHRESH, PREFILL_MAX]. Band closed until schedules are re-swept
+      # for this model's geometry (see above); "0" = stock heuristic.
+      VTL_W4A8_SCHEDULE_V2_PREFILL: ""
+      VTL_W4A8_V2_PREFILL_MAX: "0"
+      VTL_W4A8_SM_COUNT: ""              # empty = query the device. Round-2 runs the FULL H200
+                                         #   (132 SMs), not a MIG slice -- the query is correct;
+                                         #   set only if the "cutlass sm_count=N" boot line
+                                         #   disagrees with the hardware.
       VTL_ENABLE_MEGAKERNEL_PROBE: 1     # read-only go/no-go probe. Launches nothing, allocates
                                          #   nothing; two device-attribute queries at load.
 
