@@ -1,93 +1,94 @@
-# Round-2 CI + collaboration — the plan
+# Round-2 workflow — build in the cloud, run on the VM
 
-## The situation
+The organizers' access rules (`../../round-2/H200-server-README.md`) leave exactly one workable
+shape. This is it. There is no menu of cases: earlier drafts planned four topologies, and the
+published rules ruled out three.
 
-Three days on-site. Three people, one of whom is remote with GitHub access only. One H200 VPS whose
-shape (MIG 1g.18gb slice or full card) and served model are both unknown until the day. The on-site
-machine is sealed each evening and unsealed the next morning. Venue network is unknown.
+## What the rules force
 
-Two variables drive everything, and only one of them is under our control:
+| Rule (§ of the access doc) | Consequence |
+|---|---|
+| §3 SSH is **interactive terminal only** — no `scp`/`rsync`, no `ssh host "cmd"`, no `-L/-D/-R` | No remote-exec automation into the VM. Long-running work lives in `tmux`, started by hand. |
+| §5/§7 no direct internet; egress is the proxy `10.10.1.126:3128` (apt, pip, npm, conda, **docker pull**) + a submission API | A self-hosted Actions runner on the VM cannot reach the Actions endpoints. **CI does not run on the VM.** |
+| §4 web IDE (VS Code + JupyterLab) over `/srv/contest-workspace` | The sanctioned two-way file channel: drag-drop up, editor download. |
 
-- **Where the CI runner can live** — on the VPS, or on the on-site laptop acting as a jump host.
-  This is the thing we cannot decide until day 0, so the design must not care.
-- **What the model and GPU turn out to be** — decides roughly half the tuning surface, and is
-  discoverable in the first hour with the right tooling in place.
+One more constraint comes from our own Dockerfile: its fetches from `sh.rustup.rs`, `crates.io`,
+the CUTLASS tarball and `archive.ubuntu.com` are all **deliberately non-fatal**. Behind a
+whitelist proxy a VM build therefore does not fail — it silently produces a gutted image (no Rust
+scheduler wheel, no `vtl._C_w4a8`, possibly glibc malloc) that benches worse for reasons nobody
+would trace back to the network. **So the VM never builds. It pulls.**
 
-## What we build
+## The workflow
 
-One idea carries the whole plan: **CI logic lives in scripts and Make targets, not in workflow
-YAML, and every GPU command goes through a single transport shim.** The consequence is that the two
-cases below differ by two environment variables, and a move to GitLab is a change of *where CI runs*
-rather than a rewrite.
+```
+laptop / remote teammate            GitHub-hosted runner            contest VM (H200)
+  push code ──────────────────────► cloud-build.yml                  ssh teamNN  (interactive)
+                                    make push (full internet)        tmux session
+                                    digest ──► step summary           │
+  re-pin digest, commit ◄──────────────────────────────────────────── docker pull   (proxy)
+                                                                      make ci-up / make verify
+                                                                      preflight.sh / make bench
+  results committed ◄──── web IDE download (or git push if allowed) ◄─ bench-*.json
+                                                                      │
+                                                    scoring ◄───────── airace endpoint --task llm
+```
 
-Concretely, four pieces:
+- **Build:** `cloud-build.yml` on GitHub-hosted runners — full internet, so the image is
+  full-fat. Compiling needs nvcc, not a GPU. Anyone with repo write access can dispatch it.
+- **Ship:** `docker pull` the pinned digest through the proxy — explicitly supported by §5.
+- **Run:** `make ci-up` → `make verify` → `scripts/ci/preflight.sh` → `make bench`, in `tmux`.
+- **Iterate fast** on plugin-only edits without a cloud round-trip: `round-2/Dockerfile.console`
+  rebuilds `FROM` the pulled image with **no network at all**. Full-fat except `vtl._C_w4a8`,
+  whose CUTLASS headers were deleted after the original build.
+- **Results out:** download `bench-*.json` via the web IDE (or `git push` if github.com turns out
+  to be whitelisted), then commit them from the laptop.
 
-1. **A transport shim** (`scripts/ci/exec.sh`) — runs a command locally, or rsyncs to the VPS and
-   runs it there. This is what absorbs the runner-location uncertainty.
-2. **Probes** — hardware (`hw-profile`) and model (`model-probe`), so day 0 answers "what box is
-   this, what model is this, what will silently not work" in minutes rather than by discovery.
-3. **A chain, not a pipeline** — one manual dispatch runs build → test → bench → profile end to end.
-   Triggers stay manual: there is one shared GPU, and auto-triggering would produce benchmark
-   numbers taken while another job was running.
-4. **A committed results ledger** — every bench appends a row on a `results` branch. This is the
-   only way the remote teammate sees whether anything helped.
+Setup commands: [`bootstrap.md`](bootstrap.md). Pre-contest work: [`00-blockers.md`](00-blockers.md).
 
-**Scope: `round-2` only.** `round-1.1` and `round-1.2` are frozen and CI does not target them.
-`ROUND=` stays parameterized so an older round can be run by hand, but nothing in CI fans out over
-rounds — a gate that is red on an abandoned round is a gate nobody reads.
+## Who does what
 
-## The two cases we plan for
+**On-site** holds the only VM access: SSH key + web IDE password. They run the loop, and they are
+the only ones who can see a number the moment it exists.
 
-| | [Case 1 — runner on the VPS](case-1-vps-runner.md) | [Case 2 — laptop as jump host](case-2-laptop-jumphost.md) |
-|---|---|---|
-| Precondition | VPS reaches github.com | Only the laptop does |
-| Runner sits | Outside the seal | **Inside** the seal |
-| Overnight work | Possible | Not possible |
-| Remote teammate | Fully first-class | First-class, but dispatches queue overnight |
-| Setup cost | ~20 min | ~40 min |
+**The remote teammate has no VM access at all.** That is a deliberate constraint, not an
+oversight, and it shapes two habits:
 
-Decide on day 0 with one command: `ssh <vps> curl -sS -o /dev/null -w '%{http_code}' https://api.github.com`.
-Then follow [`bootstrap.md`](bootstrap.md) — the command-level runbook for standing up either case
-and dispatching the first chain.
+- Every bench result gets **committed** — a number that only ever appeared on someone's terminal
+  does not exist for half the team.
+- Their work is the GitHub side, which needs no VM: dispatching `cloud-build.yml`, reviewing PRs,
+  the `vtl-sched` Rust crate (its tests are stdlib-only), the bench tooling, and analysis of
+  committed results.
 
-**If there is no SSH at all** — only a browser console that accepts paste but forbids copy-out —
-that is [Case 3](case-3-console-only.md). Its first move is probing an *egress ladder*: git-only
-egress still yields near-CI through a polling runner; true zero-egress drops to paste-in /
-transcribe-out, with the submission image built by `cloud-build.yml` on GitHub-hosted runners
-(no GPU box involved — also the build fallback for Cases 1/2).
+## Day 0, in order
 
-Everything else — GitHub blocked from the laptop too, the GPU disappearing — is covered briefly
-in [contingencies](contingencies.md). Those are real but unlikely, and none of them changes what
-we build; they only change where it runs.
+1. **Probe the proxy whitelist** — it decides how code reaches the VM:
+   `git ls-remote https://github.com/vuongvm812/viettel-llm-inference HEAD` (git in → use git;
+   fails → use the web IDE) and `docker pull hello-world` (must work per §5).
+2. Confirm the pinned image pulls: `docker pull traitimbanggia/yasuoadc@sha256:42cfc1ae…`.
+3. Stand up the loop and get a **baseline ERS committed** in the first hour — everything after is
+   a delta against it.
 
-## The three-day shape
+## Submission is an endpoint, not an image
 
-**Day 0 (first hour)** — probe hardware, probe model, register the runner, set the four serve
-literals, get a scored baseline into the ledger. Everything after is a delta against that baseline;
-without it the first day's work is unfalsifiable.
+Round 2 does not submit an artifact (`../../round-2/submission-CLI-README.md`). We run the server
+on our own VM and register its address with the `airace` CLI, which is pre-authenticated on the
+box:
 
-**Days 1–2** — optimize against the ledger. On-site owns anything needing the GPU; the remote
-teammate owns the CPU-bound surfaces — the cheap gate, the ledger and reporting, the GitLab
-standby, and `vtl-sched` (its tests are stdlib-only, so the whole crate is workable from a laptop).
+```bash
+airace endpoint --task llm --url http://<internal-VM-IP>:8000
+```
 
-**Day 3** — freeze early. `make warm`, re-pin the digest, `compose-lint`, final bench. The
-submission is a compose file pinned by digest; a build that fails scores zero, so the last day is
-for validation, not for landing changes.
+The judge then calls that endpoint **from another machine**. Three consequences that change how we
+work, not just how we submit:
 
-**Every evening** — the machine is sealed. Push everything, tag, and write a `STATE.md` for the
-remote teammate; across a sealed night it is the only handoff they get.
+- **The server must survive the grading run.** It dies mid-scoring, that attempt is a zero. So the
+  server lives in `tmux`, and nobody touches the GPU while grading is in flight — the same
+  discipline `preflight.sh` enforces for benches, now with a score attached.
+- **Attempts are a finite resource.** Every registration consumes one, *including* one that points
+  at a dead or malformed URL. Verify with `curl` before registering, every time.
+- **The URL format is unforgiving**: `http://` required, internal VM IP (never `localhost` — the
+  judge is on a different host), no trailing slash, no path. Our compose already binds
+  `--host=0.0.0.0` and publishes `8000:8000`, which is what makes this reachable.
 
-**Every morning** — re-probe the hardware *before* anything else. A reboot can reset MIG geometry,
-and a changed SM count silently invalidates every tile schedule pinned the day before.
-
-## Before travelling
-
-[`00-blockers.md`](00-blockers.md) — two items. One means round-2 is currently running against stock
-vLLM; one is a test that would tell us now, on hardware we already have, whether the model-agnostic
-claim actually holds.
-
-## Source of truth
-
-`round-2/HANDOFF.md` is authoritative for the stack. Its §3 is already a written "adding a model"
-procedure and its §5 already names what is unverified. This plan automates and asserts §3 — it does
-not restate it.
+The image digest still matters, just not to the judge: it is how *we* get a reproducible,
+full-fat server onto the VM. `airace list` shows scores without leaving the box.

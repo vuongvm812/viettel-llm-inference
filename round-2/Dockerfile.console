@@ -1,7 +1,8 @@
-# Offline plugin rebuild for the console-only case (docs/ci/case-3-console-only.md, rungs 0-1):
-# the VPS has the pinned image pre-pulled but NO egress, and source changes arrive by paste or
-# git. This builds FROM that pinned image and reinstalls the vtl plugin from the local source --
-# nvcc and torch are already inside, so the build needs ZERO network.
+# Fast inner loop on the contest VM (docs/ci/README.md): the box has the pinned image pulled but
+# no direct internet, and a normal `make build` there would silently degrade -- its rustup /
+# crates.io / CUTLASS / apt fetches are all best-effort. This builds FROM the pulled image and
+# reinstalls the vtl plugin from local source instead: nvcc and torch are already inside, so the
+# build needs ZERO network, and a plugin-only edit skips the ~20-minute cloud round-trip.
 #
 #   docker build --network=none -f Dockerfile.console -t traitimbanggia/yasuoadc:console .
 #   (run from round-2/; --network=none is not just hygiene, it PROVES the build is venue-safe)

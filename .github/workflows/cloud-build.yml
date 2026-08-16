@@ -4,10 +4,10 @@ name: Cloud Build
 # needs nvcc, not a GPU, and ubuntu-latest is x86_64, so this works from anywhere by anyone
 # with repo write access (including the remote teammate).
 #
-# Why it exists: in the console-only case (docs/ci/case-3-console-only.md) the VPS can build
-# only for itself -- no egress means no push, and a submission is a registry digest the judge
-# pulls. This workflow is the only way to mint one there. In Cases 1/2 it is the build fallback
-# that frees the GPU from ~20-minute compile jobs.
+# Why it exists (docs/ci/README.md): the contest VM has no direct internet, only a whitelist
+# proxy, and every network fetch in round-2/Dockerfile is deliberately non-fatal -- so building
+# there does not fail, it silently produces a gutted image (no Rust scheduler wheel, no
+# vtl._C_w4a8). This is the ONLY build path for the contest; the VM just pulls the digest.
 #
 # Prerequisites (repo Settings -> Secrets and variables -> Actions):
 #   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN   -- the traitimbanggia account (write scope)
@@ -24,8 +24,9 @@ on:
         default: 'round-2'
         type: string
       cuda_archs:
-        # Required with no default for the same reason as vps-gpu.yml: nvcc on this GPU-less
-        # host will probe, guess, and produce an image that dies at first kernel launch.
+        # Required with no default on purpose (HANDOFF 4.1): nvcc on this GPU-less host would
+        # otherwise probe, guess, and produce an image that dies at the first kernel launch with
+        # cudaErrorNoKernelImageForDevice -- a wrong arch does not degrade gracefully.
         description: 'CUDA archs for nvcc, e.g. 9.0+PTX'
         required: true
         type: string

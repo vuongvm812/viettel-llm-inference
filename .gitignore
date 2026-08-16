@@ -51,5 +51,3 @@ mistral.rs/
 
 *.pem
 .env
-# jump-runner deploy key (mounted into the runner container; see .github/runner/jump/)
-.github/runner/jump/key

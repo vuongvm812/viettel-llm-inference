@@ -1,88 +1,135 @@
 # Bootstrap runbook
 
-Command-level setup for both CI cases. Decide the case first (decision tree in
-[`README.md`](README.md)): can the **VPS** reach github.com → Case 1; only the **laptop** can →
-Case 2. Everything downstream — workflow, dispatch, labels — is identical between them; only the
-runner you start differs.
+Command-level setup for the one workflow ([`README.md`](README.md)). Commands come from the
+organizers' access doc (`../../round-2/H200-server-README.md`); replace `teamNN` throughout.
 
-## VPS host prerequisites (both cases)
+## 1. Laptop — SSH access
 
-Organizer-provided per the server spec: Docker + Compose v2, NVIDIA Container Toolkit, driver.
-Ours to check on day 0:
-
-- `python3` + `aiohttp` on the host python — `make bench` runs `bench/replay.py` on the VPS host
-  (Case 2 over ssh; Case 1's caveat below). Ubuntu 24.04 is PEP 668 externally-managed, so
-  `python3 -m venv` or `pip --break-system-packages` for
-  `pip install -r round-2/bench/requirements.txt`.
-- Model weights staged (organizers: `/data/models/<model>`, read-only).
-- `docker login -u traitimbanggia` — round-2 images live under the on-site team's account
-  (`traitimbanggia/yasuoadc`, fork `traitimbanggia/slowleveling`), NOT the remote teammate's
-  `unseenablefuture`, precisely so pushes work at the venue. Login on **whichever host runs
-  `make push` / `make vllm-fork PUSH=1`** — the VPS in both cases (in Case 2 the push runs there
-  over ssh; login state is per-host, so logging in on the laptop does nothing). Pulls need no
-  login: both repos must stay **public**, because the judge pulls the submission pin anonymously.
-
-## Case 1 — runner on the VPS
+Put the BTC-issued private key in place and add the ProxyJump stanza (§2 of the access doc):
 
 ```bash
-# on the VPS
-git clone git@github.com:vuongvm812/viettel-llm-inference.git && cd viettel-llm-inference
-ln -s /data/models/<model> hf-model      # feeds the ../hf-model:/model:ro mount in the overlays
-cd .github/runner/vps
-GH_PAT=<PAT-with-repo-scope> docker compose -f docker-compose.runner.yaml up -d
+cp teamNN ~/.ssh/teamNN && chmod 600 ~/.ssh/teamNN
 ```
 
-Confirm the runner shows **Idle** under repo Settings → Actions → Runners (labels
-`h200,sm90,gpu`).
+```
+Host contest-gw-teamNN
+    HostName 171.226.125.255
+    User teamNN
+    IdentityFile ~/.ssh/teamNN
+    IdentitiesOnly yes
 
-## Case 2 — laptop jump host
+Host teamNN
+    HostName <internal VM IP from BTC>
+    User teamNN
+    IdentityFile ~/.ssh/teamNN
+    IdentitiesOnly yes
+    ProxyJump contest-gw-teamNN
+    RequestTTY yes
+```
+
+Then `ssh teamNN`. That interactive terminal is the only shell channel — `scp`, `rsync`,
+`ssh teamNN "cmd"` and port forwarding are all rejected by design.
+
+## 2. VM — probe the proxy whitelist first
+
+This decides how code reaches the box, so do it before anything else:
 
 ```bash
-# once: deploy key + VPS prep
-ssh-keygen -t ed25519 -N '' -f .github/runner/jump/key    # gitignored; keep chmod 600
-ssh-copy-id -i .github/runner/jump/key.pub user@vps
-ssh user@vps 'sudo mkdir -p /opt/vtl-ci && sudo chown $USER /opt/vtl-ci && \
-              ln -s /data/models/<model> /opt/hf-model'
-# /opt/hf-model, not inside /opt/vtl-ci: exec.sh rsyncs the repo to /opt/vtl-ci, and the
-# overlays' ../hf-model mount resolves to its SIBLING. rsync --delete never touches it.
-
-# on the laptop
-cd .github/runner/jump
-VTL_GPU_HOST=user@vps VTL_SSH_KEY=./key GH_PAT=<PAT> \
-  docker compose -f docker-compose.runner.yaml up -d
-
-# prove the hop from INSIDE the container before any dispatch:
-docker compose -f docker-compose.runner.yaml exec runner \
-  bash -lc 'command -v rsync ssh python3 && ssh -o BatchMode=yes -i /ssh/key user@vps true' \
-  && echo hop-ok
+docker pull hello-world                                                   # must work (§5)
+git ls-remote https://github.com/vuongvm812/viettel-llm-inference HEAD     # git in, or web IDE
 ```
 
-The laptop clone needs nothing else — the stock runner image already ships `rsync`/`ssh`/`python3`
-(the smoke test verifies, since the tag is rolling), and every GPU command runs on the VPS.
-
-Builds never require a GPU box: `cloud-build.yml` runs `make push` (or the fork build) on
-GitHub-hosted runners with the Docker Hub secrets — the digest lands in the run summary. It is
-the *only* submission-build path in [Case 3](case-3-console-only.md), and a free fallback here.
-
-## Dispatch (identical in both cases)
+Most tools already read the proxy. For any that miss it:
 
 ```bash
-make ci-gpu CUDA_ARCHS='9.0+PTX'                           # full build -> test -> bench chain
-make ci-gpu CUDA_ARCHS='9.0+PTX' STAGES=bench              # bench only
-make ci-gpu CUDA_ARCHS='8.6;9.0+PTX' RUNNER_LABEL=rtx3060  # rehearse on the dev box, fat binary
+export HTTP_PROXY=http://10.10.1.126:3128 HTTPS_PROXY=http://10.10.1.126:3128
+export NO_PROXY=localhost,127.0.0.1
 ```
 
-Or from the Actions tab: workflow **VPS GPU**, fill `cuda_archs` (it is required on purpose — a
-wrong arch does not degrade, it dies at first kernel launch). Both runners answer the same `h200`
-label, so whichever is online takes the job and the `gpu-h200` concurrency group keeps it to one
-job per GPU. If both cases' runners are somehow up at once, that is fine — either produces a
-correct run.
+## 3. VM — workspace and code
 
-## Known gap — Case 1 bench stage
+Work in `/srv/contest-workspace`: it is the tree the web IDE edits, so the terminal and the
+browser see the same files.
 
-In Case 1 the bench runs *inside* the runner container, which sits on its own bridge network:
-`localhost:8000` does not reach the model server published on the VPS host, and the stock runner
-image lacks `aiohttp`. (Pre-existing — the legacy `bench.yml` has the same problem on the
-rtx3060.) Fix when it bites: `network_mode: host` plus a `dockerfile_inline`
-`pip install aiohttp` in `.github/runner/vps/docker-compose.runner.yaml`. Case 2 is immune — its
-bench runs on the VPS host itself, where `localhost` is correct.
+```bash
+cd /srv/contest-workspace
+git clone https://github.com/vuongvm812/viettel-llm-inference .   # or: drag-drop via the web IDE
+ln -s /data/models/<model> hf-model    # feeds the ../hf-model:/model:ro mount in the overlays
+pip install -r round-2/bench/requirements.txt   # aiohttp for bench/replay.py (proxy handles it)
+```
+
+Ubuntu 24.04 is PEP 668 externally-managed — use `python3 -m venv` or
+`pip --break-system-packages`.
+
+## 4. VM — everything long-running goes in tmux
+
+The SSH session will drop, and anything started bare dies with it.
+
+```bash
+tmux new -s vtl          # detach: Ctrl-b d      reattach: tmux attach -t vtl
+```
+
+## 5. VM — the loop
+
+```bash
+docker pull traitimbanggia/yasuoadc@sha256:<digest>          # image comes from cloud-build.yml
+make ci-up   ROUND=round-2 IMAGE_DIGEST=sha256:<digest>      # pinned image, no build
+make verify  ROUND=round-2                                   # plugin loaded? quant registered?
+scripts/ci/preflight.sh round-2                              # GPU idle, no stray stack, flags on
+make bench   ROUND=round-2 TARGET=http://localhost:8000
+python3 round-2/bench/_ci_report.py                          # ERS table + ::VTL_BENCH:: line
+make ci-down ROUND=round-2
+```
+
+`preflight.sh` is not ceremony: two people on one GPU means a bench can run while someone else
+holds the card, and that number is wrong in a way nothing else catches.
+
+**Fast inner loop** for plugin-only edits — no network, no cloud round-trip:
+
+```bash
+cd round-2 && docker build --network=none -f Dockerfile.console -t yasuoadc:console .
+make ci-up ROUND=round-2 IMAGE_DIGEST= TAG=console
+```
+
+## 6. Getting results out
+
+Open the web IDE (`https://code.teamNN.171.226.125.255.nip.io/`, Basic Auth `teamNN` + the BTC
+password), download `round-2/bench-*.json`, and commit them from the laptop. If the day-0 probe
+showed git working, `git push` from the VM instead.
+
+Either way the results get committed: the remote teammate has no VM access, so an uncommitted
+number is invisible to half the team.
+
+## 7. Submitting — register the endpoint
+
+Round 2 scores a **running server**, not an artifact (`../../round-2/submission-CLI-README.md`).
+`airace` is pre-authenticated on the VM; it refuses to run anywhere else (`IP_MISMATCH`).
+
+```bash
+airace status                       # must print OUR team name before anything else
+ip -4 addr show | grep 10.10        # the internal IP the judge will call
+curl -s http://10.10.1.107:8000/v1/models   # MUST return before you register
+airace endpoint --task llm --url http://10.10.1.107:8000
+airace list                         # status + score, without leaving the box
+```
+
+The `curl` is not optional. **Every registration consumes one of a small number of attempts, even
+if the URL is dead or malformed**, and the format is strict:
+
+| | |
+|---|---|
+| ✅ `http://10.10.1.107:8000` | internal IP, no trailing slash, no path |
+| ❌ `http://10.10.1.107:8000/` | trailing slash |
+| ❌ `http://127.0.0.1:8000` | the judge calls from another host |
+| ❌ `10.10.1.107:8000` | missing scheme |
+
+The server must stay up for the entire grading run — dying mid-scoring scores that attempt zero.
+Keep it in `tmux`, and treat grading like a bench: nobody else touches the GPU while it is in
+flight.
+
+## 8. Building a new image
+
+Never on the VM — its build would silently degrade (see [`README.md`](README.md)). Dispatch
+**Cloud Build** from the Actions tab (or `gh workflow run cloud-build.yml`) with
+`cuda_archs=9.0+PTX`; the digest lands in the run summary. Re-pin it in
+`round-2/docker-compose.yaml`, commit, then `docker pull` it on the VM.
