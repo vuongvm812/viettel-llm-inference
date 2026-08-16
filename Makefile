@@ -137,6 +137,12 @@ check:
 	@# NVRTC harness (round-2+). The pure half only -- cache keys, gating, arg packing.
 	@# The compile+numerics half is bench/test_nvrtc.py under `make test-kernel` (needs a GPU).
 	$(IN) if [ -f vtl/nvrtc.py ]; then PYTHONPATH=. python3 bench/test_nvrtc.py --self-check; fi
+	@# GDN gated-RMSNorm harness (rounds that ship the GDN kernels). Same split: the pure half
+	@# (NVRTC define/cache-key contract, the two quant oracles' shape+eps contracts) here, the
+	@# kernel parity half under `make test-kernel`.
+	@# grep-guarded as well as -f guarded: round-1.1 ships this file WITHOUT a --self-check half.
+	$(IN) if [ -f bench/test_gdn_gated_rmsnorm.py ] && grep -q -- --self-check bench/test_gdn_gated_rmsnorm.py; then \
+	  PYTHONPATH=. python3 bench/test_gdn_gated_rmsnorm.py --self-check; fi
 	$(IN) python3 bench/trace_stats.py --self-check
 	$(IN) python3 bench/metrics.py
 	$(IN) python3 bench/sweep_report.py --selfcheck

@@ -118,7 +118,7 @@ def _scale_shape(num_tokens: int, hidden: int, group: int = GROUP) -> tuple[int,
 
 _lib = None            # keep the torch.library.Library alive (GC would deregister the op)
 _fake_registered = False
-_tiers: dict = {}      # (dv, hv, is_silu, w_fp32, dtype) -> ("nvrtc", launch) | ("aot"|"stock", None)
+_tiers: dict = {}      # (dv, hv, is_silu, w_fp32, dtype) -> ("nvrtc", launch) | (tier, None)
 
 
 def _resolve_tier(input, weight, num_heads, gate_is_silu):  # noqa: ANN001

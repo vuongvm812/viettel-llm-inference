@@ -29,8 +29,13 @@
 // own miss-under-miss does not already cover; __ldg/__restrict__ mark the streams read-only.
 //
 // A fifth entry, moe_int4_to_fp8, expands the int4-packed experts back into fp8 (against the
-// ORIGINAL [128,128] block scales) so that prefill / big-M batches can fall through to the
+// ORIGINAL [128,128] block scales) so that prefill / big-M batches could fall through to the
 // stock fused_moe kernel after the int4 arm has freed the checkpoint's fp8 expert weights.
+// RESERVED: vtl/patches/moe_decode_gemv.py does NOT call it today (with the fp8 originals
+// freed, big-M runs the GEMV in token chunks instead -- correct, and slow, which is why
+// VTL_MOE_GEMV_FREE_FP8 defaults to 0). It is kept here because it is the only shape of a
+// real prefill answer for the int4 arm, and bench/test_moe_decode.py checks its numerics so
+// it cannot rot between now and being wired up.
 //
 // WEIGHT LAYOUTS (defined here, packed by vtl/patches/moe_decode_gemv.py -- NOT the CUTLASS
 // tile-interleaved layout quant_w4a8 uses for dense layers; a GEMV wants plain rows):
@@ -90,13 +95,34 @@ static_assert(K % 32 == 0 && N % 32 == 0, "32-element chunks must tile the reduc
 static_assert((THREADS & (THREADS - 1)) == 0, "THREADS must be a power of two");
 static_assert(THREADS >= 32 && THREADS <= 1024, "THREADS out of range");
 static_assert(GROUP % WARPS == 0, "each warp must get a whole number of output rows");
+// One requant group per block, carried by the first GROUP threads: block_absmax reduces over
+// THREADS lanes, so a block narrower than the group would silently drop the tail.
+static_assert(THREADS >= GROUP, "THREADS must be >= GROUP (one requant group per block)");
 
 __device__ constexpr float kFp8Max = 448.0f;
 // Same floor as rms_norm_quant.cu: an all-zero group must quantize with a finite scale.
 __device__ constexpr float kMinScale = 1.0f / (448.0f * 512.0f);
 
 // 16-byte fragments. 16 fp8 bytes = 16 elements; one uint4 = 32 packed int4 elements.
-struct __align__(16) FP8x16 { __nv_fp8_e4m3 v[16]; };
+// A UNION, not a struct: `__ldg` is only declared for the built-in vector types, so the load
+// has to name uint4 and the fp8 view has to alias it. (`__ldg(const FP8x16*)` does not exist
+// and is a compile error, not a slow path.)
+union __align__(16) Frag16 {
+    uint4 b;
+    __nv_fp8_e4m3 v[16];
+};
+
+// 8 fp8 bytes: the store granularity of moe_int4_to_fp8. Same reason for the union -- an
+// `__nv_fp8_e4m3 x[8]` local is only 1-byte aligned, so casting it to uint2* is a misaligned
+// store on the stack.
+union __align__(8) Frag8 {
+    uint2 b;
+    __nv_fp8_e4m3 v[8];
+};
+
+__device__ __forceinline__ uint4 ldg16(const void* __restrict__ p) {
+    return __ldg(reinterpret_cast<const uint4*>(p));
+}
 
 // ---------------------------------------------------------------------------------------
 // Block-wide absmax over THREADS lanes (inactive lanes pass 0, the identity for absmax).
@@ -146,22 +172,21 @@ __device__ __forceinline__ float warp_dot(
         const int c = i * 32 + lane;
         if (kChunks % 32 == 0 || c < kChunks) {
             const int k0 = c * 32;
-            const FP8x16 a0 = *reinterpret_cast<const FP8x16*>(act + k0);
-            const FP8x16 a1 = *reinterpret_cast<const FP8x16*>(act + k0 + 16);
+            Frag16 a0, a1;
+            a0.b = ldg16(act + k0);
+            a1.b = ldg16(act + k0 + 16);
             float partial = 0.0f;
 #if WEIGHT_FP8
-            const FP8x16 w0 =
-                __ldg(reinterpret_cast<const FP8x16*>(w_row + (long long)k0));
-            const FP8x16 w1 =
-                __ldg(reinterpret_cast<const FP8x16*>(w_row + (long long)k0 + 16));
+            Frag16 w0, w1;
+            w0.b = ldg16(w_row + (long long)k0);
+            w1.b = ldg16(w_row + (long long)k0 + 16);
 #pragma unroll
             for (int j = 0; j < 16; ++j) {
                 partial += float(w0.v[j]) * float(a0.v[j]);
                 partial += float(w1.v[j]) * float(a1.v[j]);
             }
 #else
-            const uint4 wbits =
-                __ldg(reinterpret_cast<const uint4*>(w_row + (long long)k0 / 2));
+            const uint4 wbits = ldg16(w_row + (long long)k0 / 2);
             const unsigned int words[4] = {wbits.x, wbits.y, wbits.z, wbits.w};
 #pragma unroll
             for (int w = 0; w < 4; ++w) {
@@ -382,14 +407,14 @@ extern "C" __global__ void __launch_bounds__(THREADS) moe_int4_to_fp8(
         const unsigned int wbits = qrow[j];
         const int k0 = j * 8;
         const float ratio = gs[k0 / GROUP] / bs[k0 / 128];
-        __nv_fp8_e4m3 outv[8];
+        Frag8 outv;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const int qv = ((int)(wbits << (28 - 4 * i))) >> 28;
             const float f = fminf(fmaxf((float)qv * ratio, -kFp8Max), kFp8Max);
-            outv[i] = __nv_fp8_e4m3(f);
+            outv.v[i] = __nv_fp8_e4m3(f);
         }
         // 8 fp8 bytes = one uint2 store; rowlen % 8 == 0 keeps it aligned.
-        reinterpret_cast<uint2*>(drow)[j] = *reinterpret_cast<uint2*>(&outv[0]);
+        reinterpret_cast<uint2*>(drow)[j] = outv.b;
     }
 }

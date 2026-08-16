@@ -56,6 +56,14 @@ requires_gpu = pytest.mark.skipif(
     reason="needs torch + CUDA; gated_rmsnorm is a vtl-only op (no stock kernel)",
 )
 
+# Parametrize argument lists are evaluated at IMPORT time, so they must not name a torch
+# dtype directly: `make check` imports this module on a bare host (no torch) to run
+# --self-check, and `torch.bfloat16` there is an AttributeError before any test is skipped.
+# Empty lists are the torchless spelling -- pytest collects zero cases, `requires_gpu`
+# would have skipped them anyway.
+DTYPES = [torch.bfloat16, torch.float16, torch.float32] if torch is not None else []
+W_DTYPES = [torch.float32, None] if torch is not None else []
+
 EPS = 1e-6
 FP8_MAX = 448.0
 MIN_SCALE = 1.0 / (FP8_MAX * 512.0)  # per-TOKEN entry only
@@ -110,7 +118,6 @@ def reference_group_quant(x, gate, weight, H, is_silu=True, eps=EPS):
 def reference_token_quant(x, gate, weight, H, is_silu=True, eps=EPS):
     """Round-1.1 compat entry: per-head norm (fp32, NOT re-narrowed -- the kernel keeps the
     normed row in registers), per-TOKEN amax, min-scale clamp."""
-    normed_f32 = x.float()
     xf = x.float()
     var = xf.pow(2).mean(-1, keepdim=True)
     normed_f32 = ((xf * torch.rsqrt(var + eps)) * weight.float()) * _act(gate.float(), is_silu)
@@ -182,7 +189,7 @@ def _weight(D, dtype, w_dtype):
 
 @requires_gpu
 @pytest.mark.parametrize("is_silu", [True, False])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("num_rows", [1, 16, 4096])
 @pytest.mark.parametrize("D", [128, 64, 100])  # 128 = model head dim; 100 = odd width
 def test_norm_matches_reference(is_silu, dtype, num_rows, D):
@@ -198,7 +205,7 @@ def test_norm_matches_reference(is_silu, dtype, num_rows, D):
 
 
 @requires_gpu
-@pytest.mark.parametrize("w_dtype", [torch.float32, None])  # None = model (input) dtype
+@pytest.mark.parametrize("w_dtype", W_DTYPES)  # None = model (input) dtype
 def test_norm_accepts_model_dtype_weight(w_dtype):
     """v0.25.0 creates the weight in the model dtype (bf16 here), not fp32."""
     torch.manual_seed(0)
@@ -339,14 +346,16 @@ def test_python_ladder_op_matches_aot():
     the bit-matching NVRTC kernel; VTL_NVRTC unset here, so AOT)."""
     from vtl.patches import gdn_kernels
 
-    gdn_kernels._register_op()
     torch.manual_seed(4)
     H, D = MODEL_H, MODEL_D
     x = torch.randn(7 * H, D, dtype=torch.bfloat16, device="cuda")
     gate = torch.randn(7 * H, D, dtype=torch.bfloat16, device="cuda")
     weight = _weight(D, torch.bfloat16, None)
 
+    # AOT first: it imports vtl._C, whose TORCH_LIBRARY(vllm_cuda) must define the namespace
+    # before _register_op() opens a FRAGMENT on it.
     aot_q, aot_s = run_group_quant(x, gate, weight, H)
+    gdn_kernels._register_op()
     got_q = torch.empty_like(aot_q)
     got_s = torch.empty_like(aot_s)
     torch.ops.vllm_cuda.gdn_gated_rmsnorm_group_quant(
