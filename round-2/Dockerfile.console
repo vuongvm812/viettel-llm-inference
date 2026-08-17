@@ -1,0 +1,38 @@
+# Fast inner loop on the contest VM (docs/ci/README.md): the box has the pinned image pulled but
+# no direct internet, and a normal `make build` there would silently degrade -- its rustup /
+# crates.io / CUTLASS / apt fetches are all best-effort. This builds FROM the pulled image and
+# reinstalls the vtl plugin from local source instead: nvcc and torch are already inside, so the
+# build needs ZERO network, and a plugin-only edit skips the ~20-minute cloud round-trip.
+#
+#   docker build --network=none -f Dockerfile.console -t traitimbanggia/yasuoadc:console .
+#   (run from round-2/; --network=none is not just hygiene, it PROVES the build is venue-safe)
+#
+# What a console rebuild keeps vs the full image:
+#   KEEPS  vtl._C (csrc rebuilt by nvcc in-image), every vtl/patches/*.py, vtl/kernels/*.cu for
+#          NVRTC, and the vtl-sched wheel already installed in the base.
+#   LOSES  vtl._C_w4a8 -- the CUTLASS headers were fetched at the original build and deleted in
+#          the same layer, so the sm_90a extension cannot rebuild offline. VTL_W4A8_SCHEDULE_V2
+#          goes inert; the stock W4A8 kernel serves. Degraded, loud in `make verify`, correct.
+#
+# NOT the submission image. The judge pulls a registry digest, and this box cannot push; the
+# canonical build for submission is .github/workflows/cloud-build.yml on the same commit.
+ARG BASE=traitimbanggia/yasuoadc@sha256:42cfc1ae0ca98280df1c008196af21fd389c163ecf260577488a5a642eb7dfbc
+FROM ${BASE}
+
+# No GPU is visible during `docker build`, so nvcc must be told the arch instead of probing --
+# and a wrong arch does not degrade, it dies at first launch (HANDOFF 4.1).
+ARG CUDA_ARCHS="9.0+PTX"
+ARG MAX_JOBS=4
+
+COPY . /src
+
+# --no-deps + --no-build-isolation: use the image's torch/setuptools, touch PyPI never.
+# The entry-point assert is the same one the main Dockerfile uses: a plugin that pip-installed
+# but did not register loads as stock vLLM and looks exactly like success.
+RUN TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
+      pip install --no-cache-dir --no-build-isolation --no-deps /src \
+ && python3 -c "from importlib.metadata import entry_points; \
+eps = {e.name: e.value for e in entry_points(group='vllm.general_plugins')}; \
+assert eps.get('vtl') == 'vtl.plugin:register', f'vtl entry point missing: {eps}'; \
+print('vtl entry point ok')" \
+ && python3 -c "import vtl.patches, vtl.plugin; print('vtl imports ok')"

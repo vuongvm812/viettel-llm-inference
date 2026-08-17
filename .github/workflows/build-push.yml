@@ -46,7 +46,7 @@ jobs:
         run: |
           VLLM_FORK_IMAGE=$(grep -oP '^VLLM_FORK_IMAGE\s*\?=\s*\K\S+' Makefile | head -1)
           VLLM_FORK_TAG=$(grep -oP '^VLLM_FORK_TAG\s*\?=\s*\K\S+' Makefile | head -1)
-          [ -z "$VLLM_FORK_IMAGE" ] && VLLM_FORK_IMAGE="unseenablefuture/vllm-fork"
+          [ -z "$VLLM_FORK_IMAGE" ] && VLLM_FORK_IMAGE="traitimbanggia/slowleveling"
           DIGEST=$(docker buildx imagetools inspect "${VLLM_FORK_IMAGE}:${VLLM_FORK_TAG}" --format '{{.Manifest.Digest}}')
           echo "::VTL_DIGEST::${VLLM_FORK_IMAGE}:${VLLM_FORK_TAG}@sha256:${DIGEST}"
 
@@ -54,6 +54,6 @@ jobs:
         if: ${{ success() && !inputs.build_fork }}
         run: |
           IMAGE=$(grep -oP '^IMAGE\s*\?=\s*\K\S+' Makefile | head -1)
-          [ -z "$IMAGE" ] && IMAGE="unseenablefuture/awesome-badger"
+          [ -z "$IMAGE" ] && IMAGE="traitimbanggia/yasuoadc"
           DIGEST=$(docker buildx imagetools inspect "${IMAGE}:dev" --format '{{.Manifest.Digest}}')
           echo "::VTL_DIGEST::${IMAGE}@sha256:${DIGEST}"
