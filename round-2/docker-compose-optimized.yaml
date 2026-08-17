@@ -14,7 +14,7 @@ services:
     # `make build` just produced, so point at the mutable :dev tag instead. (When the
     # localtest overlay is also stacked its `build:` takes over and this is just the tag
     # the built image gets.)
-    image: unseenablefuture/awesome-badger:dev
+    image: traitimbanggia/yasuoadc:dev
     # environment:
       # Percent of L2 a context may reserve for persisting accesses -- the driver-side knob
       # behind cudaLimitPersistingL2CacheSize, and the only one that works under MPS. Paired
