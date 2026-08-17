@@ -46,8 +46,23 @@ _MODULES: tuple[str, ...] = (
     "nvrtc_block_quant",
     # Fused greedy argmax over the vocab, -DVOCAB-specialized. Fills the seams the forked V2
     # sampler and nstep_decode already have (torch.ops.vllm_cuda.greedy_argmax_i64 and
-    # nstep's `_ARGMAX`); registers nothing unless the compile succeeds, so both stay on
-    # torch.argmax otherwise. Needs VTL_NVRTC=1.
+    # nstep's `_ARGMAX`); registers nothing unless the compile succeeds AND a boot parity
+    # gate matches torch.argmax bit for bit, so both stay on torch.argmax otherwise. Needs
+    # VTL_NVRTC=1.
+    #
+    # ITS POSITION IN THIS TUPLE IS NOT LOAD-BEARING. The nstep rebind goes through
+    # `sys.modules["vtl.patches.nstep_decode"]` at MODEL LOAD, long after every module here
+    # has been imported, so it does not matter whether nstep_decode appears above or below.
+    # The real constraint is a runtime one this list cannot express: the rebind must happen
+    # before `capture_model()`, i.e. BaseModelLoader.load_model must run before the burst
+    # graphs are captured -- which it does, unconditionally.
+    #
+    # It does add ANOTHER wrapper on `BaseModelLoader.load_model` -- the fourth of the eight
+    # this package stacks there, in apply order: quant_w4a8, w4a8_from_fp8,
+    # nvrtc_block_quant, greedy_argmax, gdn_decode_step, moe_decode_gemv, l2_persist,
+    # megakernel_probe. They NEST rather than conflict (`already_patched`/`mark_patched`
+    # keep the stack sound and each swallows its own failure), but the ordering note on
+    # l2_persist at the bottom of this list applies to every one of them.
     "greedy_argmax",
     # Fused GDN decode step (conv1d update + gating delta rule, one NVRTC launch per layer,
     # pure non-spec decode only; spec/MTP and prefill fall through to stock Triton).

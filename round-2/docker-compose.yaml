@@ -148,10 +148,13 @@ services:
       # grouped-GEMV MoE decode at M<=MAX_M.
       #   Needs VTL_NVRTC=1.
       VTL_ENABLE_GREEDY_ARGMAX: "1"
-      # fused argmax over the 248320-wide vocab, one
-      #   launch, straight into nstep's persistent
-      #   token buffer. Registers nothing unless the
-      #   compile succeeds. Needs VTL_NVRTC=1.
+      # fused argmax over the 248320-wide vocab: three
+      #   tiny launches (reset/partial/finalize), straight
+      #   into nstep's persistent token buffer. Registers
+      #   nothing unless the compile succeeds AND a boot
+      #   parity gate matches torch.argmax bit for bit on
+      #   adversarial rows. Needs VTL_NVRTC=1. Knobs:
+      #   VTL_GREEDY_ARGMAX_{THREADS,SPLIT} below.
 
       # ---- Knobs whose defaults live in code -------------------------------------------
       VTL_GIL_SWITCH_INTERVAL: "0.0002" # sys.setswitchinterval, seconds. 0 = interpreter default
@@ -180,14 +183,14 @@ services:
       VLLM_USE_V2_MODEL_RUNNER: "1"
       VTL_V2_GREEDY_FASTPATH: "1" # argmax short-circuit for provably-greedy batches
       VTL_V2_GREEDY_ARGMAX_KERNEL: "1"
-      # let the fast path resolve the fused argmax. A
-      #   three-rung ladder, resolved ONCE on the first
-      #   greedy step: torch.ops.vllm_cuda.greedy_argmax_i64
-      #   (registered by VTL_ENABLE_GREEDY_ARGMAX above,
-      #   only after its NVRTC compile succeeded) ->
-      #   logits.argmax(dim=-1) when the op is absent.
-      #   Set to 0 to A/B the fork against torch.argmax
-      #   with the kernel still built for nstep.
+      # let the fast path resolve the fused argmax. TWO
+      #   rungs, resolved ONCE on the first greedy step:
+      #   torch.ops.vllm_cuda.greedy_argmax_i64 (registered
+      #   by VTL_ENABLE_GREEDY_ARGMAX above, and only after
+      #   its NVRTC compile AND its boot parity gate both
+      #   passed) -> logits.argmax(dim=-1) when the op is
+      #   absent. Set to 0 to A/B the fork against
+      #   torch.argmax with the kernel still built for nstep.
       VTL_V2_FUSED_POSTPROCESS: "1" # skip the dead num_accepted scatter when no spec-decode
       VTL_V2_FORCE_CUTLASS_FP8: "1"
       # force fp8 layers off Marlin (its stable-ABI
@@ -284,6 +287,16 @@ services:
                               #   so decode M never exceeds 5 -- a tighter band claims
                               #   fewer batches the GEMV was not measured on.
       VTL_MOE_GEMV_THREADS: "256"
+      # Fused greedy argmax (VTL_ENABLE_GREEDY_ARGMAX above). Pinned here rather than left
+      # to the code default so a sweep is a compose edit and the served value is visible.
+      VTL_GREEDY_ARGMAX_THREADS: "256" # partial-kernel block width; whole warps, <=1024
+      VTL_GREEDY_ARGMAX_SPLIT: "16"
+      # row slices per row = the partial kernel's gridDim.x.
+      #   1 is one CTA per row, which at batch<=5 uses 5 of
+      #   132 SMs and is ~5x slower than torch; 16 puts 80
+      #   CTAs on the same reduction. Sweep it with
+      #   VTL_BENCH=1 bench/test_greedy_argmax.py -- the
+      #   right value depends on VOCAB and on rows in flight.
       VTL_MOE_GEMV_CHUNK: "64" # (token,slot) chunk per launch wave
       VTL_MOE_GEMV_FREE_FP8: "0"
       # 1 = drop fp8 expert copies after int4 pack (frees

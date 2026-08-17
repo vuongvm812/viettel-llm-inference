@@ -240,7 +240,17 @@ def pack_args(*args):
     guessing wrong silently misaligns every argument after it.
 
     The ctypes objects are kept alive on the returned array: if they were temporaries the
-    array would hold dangling pointers by the time the kernel launches.
+    array would hold dangling pointers by the time the kernel launches. They also stay put,
+    so a caller that packs ONCE at arm time and then only writes ``arr._vtl_holders[i].value``
+    per launch keeps a valid void** array forever -- which is what the hot callers do.
+
+    ``addressof``, NOT ``cast(pointer(h), c_void_p)``. The two produce the same integer (the
+    self-check asserts exactly that, below), but the cast form builds a POINTER type object
+    and a c_void_p per argument and was measured at ~5.7 us per call on a 3-argument pack --
+    the single most expensive line on the greedy-argmax token pick. addressof is one C call
+    returning an int: ~1.7 us for the same pack, i.e. ~3.5x, and every NVRTC consumer in the
+    tree gets it. (A caller on a per-token path should still pack once and mutate; see the
+    holders note above. That is another ~10x on top.)
     """
     import ctypes
 
@@ -255,9 +265,7 @@ def pack_args(*args):
             holders.append(kinds[kind](value))
         else:
             holders.append(ctypes.c_void_p(int(a)))
-    arr = (ctypes.c_void_p * len(holders))(
-        *[ctypes.cast(ctypes.pointer(h), ctypes.c_void_p) for h in holders]
-    )
+    arr = (ctypes.c_void_p * len(holders))(*[ctypes.addressof(h) for h in holders])
     arr._vtl_holders = holders  # keep-alive; see docstring
     return arr
 
@@ -343,8 +351,13 @@ def _self_check() -> None:
         os.environ.pop("VTL_NVRTC_SRC", None)
     assert source_dir().name == "kernels", source_dir()
 
-    # -- the shipped kernels must actually be readable from the installed package --
-    for name in ("rms_norm_quant", "greedy_argmax"):
+    # -- EVERY shipped kernel must be readable from the installed package. A glob, not a
+    #    hand-maintained name list: the list drifts silently (a new .cu is simply never
+    #    checked, and a packaging bug that drops it shows up as a boot-time compile failure
+    #    instead of here), while the glob grows itself. --
+    packaged = sorted(p.stem for p in (Path(__file__).parent / "kernels").glob("*.cu"))
+    assert packaged, "vtl/kernels/ ships no .cu at all"
+    for name in packaged:
         assert load_source(name), f"vtl/kernels/{name}.cu missing from the package"
 
     os.environ["VTL_NVRTC_CACHE"] = "/tmp/x"

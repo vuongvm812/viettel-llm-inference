@@ -153,6 +153,14 @@ def _argmax_out(logits, out) -> None:
 # load, which is BEFORE _capture_burst_graphs runs, so whatever is bound here is what the
 # burst graphs capture -- and therefore what the Rust runner replays). Unbound, it is
 # exactly the torch.argmax it replaced.
+#
+# WHAT THE REBIND COSTS, stated here because it is invisible at the call sites:
+# `_graph_matches_eager` below stops being a parity check the moment this is rebound. Both
+# of its arms call whatever `_ARGMAX` is, so after a rebind it compares the fused kernel
+# against ITSELF. That is fine -- it was only ever a pointer-staleness smoke test -- but it
+# means NOTHING IN THIS MODULE holds a fused argmax to torch.argmax. That job belongs to
+# greedy_argmax's boot parity gate (which runs, and can refuse, BEFORE it rebinds anything)
+# and to bench/test_greedy_argmax.py.
 _ARGMAX = _argmax_out
 
 
@@ -522,7 +530,9 @@ def _graph_matches_eager(runner, b: _Burst, graph, eager, rows: int, what: str,
     same snapshot, so a second-launch divergence shows up in ``tok``/``accum``.
 
     NOT a proof of runtime correctness (the dummy batch has no padded rows and no stale
-    block tables); it is a smoke test for the pointer-staleness class specifically.
+    block tables), and NOT a parity check on the token pick: both arms call ``_ARGMAX``, so
+    once greedy_argmax has rebound it this compares the fused kernel against itself. It is a
+    smoke test for the pointer-staleness class specifically, and nothing else.
     """
     import torch
 
