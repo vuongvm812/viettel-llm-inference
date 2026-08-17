@@ -12,11 +12,20 @@ are separated by MoE blocks on the sequential trunk. **Per-layer is the only sha
 
 ## 1. What is actually left to win
 
-After the Phase-B epilogue fusion folds the gated RMSNorm + group-128 quant into
-`gdn_decode_step`'s tail, one GDN layer is four launches — `in_proj_qkvz` (fp8 block GEMM,
-62.9 MB of weights), `in_proj_ba` (bf16, 0.79 MB), `gdn_decode_step` (NVRTC; conv + delta rule +
-epilogue), `out_proj` (fp8 block GEMM, 25.2 MB). 4 × 36 = **144 launches per decode step**; a
-per-layer megakernel makes it 36. Per layer at the served `--max-num-seqs=5` (M=5) that moves
+One GDN layer is five launches — `in_proj_qkvz` (fp8 block GEMM, 62.9 MB of weights),
+`in_proj_ba` (bf16, 0.79 MB), `gdn_decode_step` (NVRTC; conv + delta rule), the gated
+RMSNorm + group-128 quant, and `out_proj` (fp8 block GEMM, 25.2 MB).
+
+> The Phase-B epilogue fusion, which folded the norm+quant into `gdn_decode_step`'s tail and
+> would have made this four, was **reverted on 2026-08-17** — see
+> [`gdn-epilogue-fusion.md`](gdn-epilogue-fusion.md) for the four soundness findings in its
+> producer/consumer handshake and the measurement that made it net-negative (~0.25 ms/step of
+> host time to save ~0.8 µs/step of HBM). The right form of that optimization is the
+> out_proj-seam variant described there, which a per-layer megakernel would subsume entirely.
+> Counts below are the pre-fusion (current) five-launch shape.
+
+That is 5 × 36 = **180 launches per decode step**; a per-layer megakernel makes it 36.
+Per layer at the served `--max-num-seqs=5` (M=5) that moves
 **89.0 MB of weights** (batch-independent) plus **43.4 MB of fp32 state** (4.34 MB/seq, read and
 written exactly once, §2) — both irreducible — against **~0.63 MB of intermediates**, which is
 everything a megakernel could keep on chip.
@@ -24,8 +33,8 @@ everything a megakernel could keep on chip.
 **That is the finding.** Intermediate HBM traffic is **0.5%** of the layer's 133 MB. The argument
 that carried the LFM2.5 megakernel — three round trips of the activations — does not carry here,
 because this model's projections are 20–60× wider than its activations. The residual prize is
-**launch and tail overhead only**: 108 launches/step removed, at a measured inter-kernel gap of
-*g*. At a plausible g ≈ 1 µs that is **~0.11 ms of TPOT**, and under the round-2 scoring band
+**launch and tail overhead only**: 144 launches/step removed, at a measured inter-kernel gap of
+*g*. At a plausible g ≈ 1 µs that is **~0.14 ms of TPOT**, and under the round-2 scoring band
 (`RUST-RUNNER.md` §6: TPOT ≤ ~0.011 ERS/ms) **~0.0012 ERS**. Against a GDN-stack floor of
 133 MB × 36 / 4.8 TB/s ≈ **1.0 ms/step**, this is a ~10% shave on a term that is itself a
 fraction of the step.
@@ -68,9 +77,11 @@ precisely our reason: *"Not to beat CUTLASS at GEMM — to be callable from insi
 kernel."* Carrying over verbatim: `w4a8_gemv_row`'s skeleton — one warp per output row, the
 **token loop inside the weight load** (token-outer would stream 62.9 MB eight times), `acc[m]`
 unrolled over a compile-time `kMaxM` so accumulators stay register-indexed, a shuffle ladder
-closing the row; `kMaxM = 8`, which Phase A's `[1,2,4,8]` capture set makes exactly the padded
-ceiling rather than a guess; **N-split, not split-K**, so no inter-block reduction and no extra
-barrier per GEMV phase; and the `K > kWarpK` loop we need at K = 3072 and K = 8192.
+closing the row; `kMaxM = 8`, which compose's `[1,2,4,5,8]` capture set makes exactly the
+padded ceiling rather than a guess (the FULL *decode* rungs are {1,2,4,5} — 8 is a
+prefill-only bucket, so M = 5 is the shape to tune for); **N-split, not split-K**, so no
+inter-block reduction and no extra barrier per GEMV phase; and the `K > kWarpK` loop we need
+at K = 3072 and K = 8192.
 
 What changes:
 
@@ -116,7 +127,7 @@ ordering, not kernel identity — so the megakernel is invisible to it **provide
 succeeds**. Test the other direction: a capture failure demotes `nstep_decode` down the
 `VTL_NSTEP_MODE` ladder to eager and silently costs far more than the fusion ever paid. Boot with
 `VTL_NSTEP_MODE=graph` and assert the "captured N burst body graph(s)" line still reports sizes
-`[1, 2, 4, 8]`.
+`[1, 2, 4, 5]` (the FULL decode subset of compose's `[1,2,4,5,8]`).
 
 ## 5. Staged build plan
 
@@ -152,7 +163,7 @@ again* — the real number is `cudaOccupancyMaxActiveBlocksPerMultiprocessor` on
 kernel, and it can only be lower.
 
 **The deciding number is not the probe's.** Run nsys on a steady decode step, read the mean
-inter-kernel gap across the GDN chain, and build only if all three hold: (1) gap × 108
+inter-kernel gap across the GDN chain, and build only if all three hold: (1) gap × 144
 launches/step ≥ **0.15 ms** (≈ 0.0017 ERS at the round-2 TPOT band) — below that, Stages 1–2
 capture most of it for a fraction of the risk; (2) Stage 1's GEMV is at or under the stock
 block-fp8 GEMM at M ≤ 8; (3) the finished kernel's occupancy query clears `kMinBlocks` *with* the

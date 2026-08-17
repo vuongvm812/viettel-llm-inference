@@ -164,6 +164,11 @@ RUN set -eux; \
 # A build that fails scores ZERO; a binary with merely PGO-grade layout scores slightly less.
 # There is no env gate and no build arg: BOLT is attempted on every PGO build, and the log
 # line is the record of which way it went.
+#
+# COST: BOLT adds roughly 5-12 min to a `make vllm-fork VLLM_RS_PGO=1` build (apt fetch of the
+# toolchain, one -instrument pass, the instrumented replay -- which is slower than pgo_train's
+# because the instrumentation runtime counts every block -- then merge-fdata + the optimize
+# pass). It is build-host time only; it does not touch the plain `make build` path at all.
 # ------------------------------------------------------------------------------
 FROM rust-builder AS rust-builder-pgo
 ARG PGO_MODEL
@@ -238,7 +243,9 @@ resolve_tools() {
       */llvm-bolt-*) v="${b##*llvm-bolt-}"; [ -x "$d/merge-fdata-$v" ] && m="$d/merge-fdata-$v" ;;
     esac
     [ -x "$m" ] || continue
-    printf 'LLVM_BOLT=%s\nMERGE_FDATA=%s\n' "$b" "$m" > "$ENVFILE"
+    # %q, not %s: this file is `.`-sourced by the next RUN block, so an unquoted path with a
+    # space or a shell metacharacter would be word-split (or worse, executed) there.
+    printf 'LLVM_BOLT=%q\nMERGE_FDATA=%q\n' "$b" "$m" > "$ENVFILE"
     echo "BOLT: tools = $b + $m"
     "$b" --version 2>&1 | head -2 | sed 's/^/BOLT:   /'
     return 0
@@ -274,19 +281,27 @@ fi
 if [ ! -f "$ENVFILE" ]; then
   CODENAME=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
   echo "BOLT: no BOLT in the distro repos, trying apt.llvm.org (${CODENAME:-unknown codename})"
+  # The key goes to /etc/apt/keyrings and the deb line is scoped to it with [signed-by=...],
+  # rather than dropping it in trusted.gpg.d -- a key in trusted.gpg.d is trusted for EVERY
+  # repository apt knows about (the CUDA and deadsnakes repos included), which is a much
+  # broader grant than "let LLVM sign LLVM packages". Both the key and the list are removed in
+  # the cleanup below, so nothing about this fallback outlives the step.
+  mkdir -p /etc/apt/keyrings
   if [ -n "$CODENAME" ] \
      && curl -fsSL --retry 3 --retry-delay 3 https://apt.llvm.org/llvm-snapshot.gpg.key \
-          -o /etc/apt/trusted.gpg.d/vtl-apt-llvm.asc; then
-    for v in 18 17 19; do
-      echo "deb http://apt.llvm.org/$CODENAME/ llvm-toolchain-$CODENAME-$v main" \
+          -o /etc/apt/keyrings/vtl-llvm.asc; then
+    # Newest first: BOLT's block-reordering heuristics improved a lot across LLVM 16..20.
+    for v in 19 18 17; do
+      echo "deb [signed-by=/etc/apt/keyrings/vtl-llvm.asc] http://apt.llvm.org/$CODENAME/ llvm-toolchain-$CODENAME-$v main" \
         > /etc/apt/sources.list.d/vtl-llvm.list
       apt-get update -o APT::Get::List-Cleanup=0 </dev/null >/dev/null 2>&1 || true
       apt-get install -y --no-install-recommends "bolt-$v" </dev/null >/dev/null 2>&1 || continue
       echo "BOLT: installed bolt-$v from apt.llvm.org ($CODENAME)"
       resolve_tools && break
     done
-    rm -f /etc/apt/sources.list.d/vtl-llvm.list
+    rm -f /etc/apt/sources.list.d/vtl-llvm.list /etc/apt/keyrings/vtl-llvm.asc
   else
+    rm -f /etc/apt/keyrings/vtl-llvm.asc
     echo "BOLT: apt.llvm.org unreachable (key fetch failed)"
   fi
 fi
@@ -469,14 +484,28 @@ fdata_sz=$(wc -c < "$MERGED")
 echo "BOLT: merged $count profile(s) -> ${fdata_sz}B of fdata"
 
 # Three flag sets, best first. BOLT's option names drift across LLVM releases (cdsort landed
-# in 17, -icf became an enum later, split-all-cold has been folded into --split-strategy), and
-# the version we get is whatever the build host's apt offered — so a rejected flag degrades to
-# a plainer layout pass instead of dropping BOLT altogether.
+# in 17, -icf became an enum later), and the version we get is whatever the build host's apt
+# offered — so a rejected flag degrades to a plainer layout pass instead of dropping BOLT
+# altogether.
+#
+# NO -split-functions / -split-all-cold, in ANY of the three sets. Function splitting acts on
+# the profile's verdict about what is cold, and THIS profile is a lie about the production hot
+# path: the training replay above drives the frontend against the MOCK ENGINE over ZMQ,
+# because there is no GPU (and no EngineCore) inside a docker build. The shipped configuration
+# runs the frontend<->EngineCore hop over shm_ipc/iceoryx2 instead (see
+# vtl/vllm_patches/rust-frontend/shm_ipc.patch), so every shm_ipc symbol collects exactly ZERO
+# samples here and splitting would exile the real hot path into .text.cold — an i-cache layout
+# strictly worse than no BOLT at all, which is the one outcome the fail-soft doctrine above
+# cannot detect (the binary still runs, still passes --help, and is simply slower).
+# Block reordering, function reordering and ICF are all profile-guided too, but they only
+# REORDER what the profile saw and leave unsampled code where the linker put it, so an
+# incomplete profile costs an unrealized win rather than an anti-optimization. Restore
+# splitting only if/when the BOLT training run drives the shm_ipc transport.
 opt_ok=
 for oflags in \
-    "-reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -icf=1" \
-    "-reorder-blocks=cache+ -reorder-functions=hfsort+ -split-functions -split-all-cold -icf=safe" \
-    "-reorder-blocks=ext-tsp -split-functions"; do
+    "-reorder-blocks=ext-tsp -reorder-functions=cdsort -icf=1" \
+    "-reorder-blocks=cache+ -reorder-functions=hfsort+ -icf=safe" \
+    "-reorder-blocks=ext-tsp"; do
   if "$LLVM_BOLT" "$PGO_BIN" -o "$WORK/vllm-rs.bolt" -data="$MERGED" $oflags -dyno-stats \
        > "$WORK/optimize.log" 2>&1; then
     opt_ok=1
@@ -497,16 +526,60 @@ chmod +x "$WORK/vllm-rs.bolt"
 in_sz=$(stat -c %s "$PGO_BIN")
 out_sz=$(stat -c %s "$WORK/vllm-rs.bolt")
 [ "$out_sz" -ge $(( in_sz / 2 )) ] || skip "bolted binary is ${out_sz}B vs ${in_sz}B in (<0.5x -- BOLT emitted a stub)"
-[ "$out_sz" -le $(( in_sz * 3 )) ] || skip "bolted binary is ${out_sz}B vs ${in_sz}B in (>3x -- not a plausible split-functions layout)"
+[ "$out_sz" -le $(( in_sz * 3 )) ] || skip "bolted binary is ${out_sz}B vs ${in_sz}B in (>3x -- not a plausible re-layout)"
 
+# The backup is the ONLY copy of the PGO binary once the install below overwrites $PGO_BIN,
+# so a silently-failed `cp` (full /tmp, ENOSPC) would turn the restore path into a no-op that
+# leaves a broken binary in place. Verify it exists and is non-empty BEFORE overwriting.
 cp -f "$PGO_BIN" "$WORK/vllm-rs.pgo"
+[ -s "$WORK/vllm-rs.pgo" ] || skip "could not back up the PGO binary to $WORK/vllm-rs.pgo -- refusing to overwrite it with the bolted one"
 install -m0755 "$WORK/vllm-rs.bolt" "$PGO_BIN"
 if ! "$PGO_BIN" --help >/dev/null 2>&1; then
-  install -m0755 "$WORK/vllm-rs.pgo" "$PGO_BIN"
+  # And the restore itself must be checked: a failed restore here ships a binary that already
+  # failed its smoke, which is a build that scores zero. Fail the build loudly instead.
+  if ! install -m0755 "$WORK/vllm-rs.pgo" "$PGO_BIN"; then
+    echo "BOLT: FATAL -- the bolted binary failed its smoke AND the PGO binary could not be restored to $PGO_BIN"
+    cleanup
+    exit 1
+  fi
+  "$PGO_BIN" --help >/dev/null 2>&1 || { echo "BOLT: FATAL -- restored PGO binary does not run"; cleanup; exit 1; }
   skip "the installed bolted binary failed its smoke -- restored the PGO binary"
 fi
 
-grep -E 'BOLT-INFO: .*(execution profile|split [0-9]+ function|functions were overwritten)' \
+# The --emit-relocs shim above kept the input relocations so llvm-bolt could rewrite the
+# binary. They are build-time-only: .rela.text is not a SHF_ALLOC section, nothing maps or
+# reads it at runtime, and it is typically 20-50 MB on this fat-LTO binary. Strip exactly that
+# section from the SHIPPED artifact -- never .rela.dyn/.rela.plt, which the dynamic loader
+# does read. Best-effort: no llvm-strip, or a strip that produces something that fails the
+# smoke, and we keep the fat-but-correct binary.
+# Same three shapes resolve_tools looked for: <llvm-dir>/bin/llvm-strip, a versioned
+# /usr/bin/llvm-strip-NN next to a versioned llvm-bolt-NN, and a plain llvm-strip on PATH.
+BOLT_DIR=$(dirname "$LLVM_BOLT")
+STRIP="$BOLT_DIR/llvm-strip"
+case "$LLVM_BOLT" in
+  */llvm-bolt-*) [ -x "$STRIP" ] || STRIP="$BOLT_DIR/llvm-strip-${LLVM_BOLT##*llvm-bolt-}" ;;
+esac
+[ -x "$STRIP" ] || STRIP=$(command -v llvm-strip 2>/dev/null || true)
+if [ -n "${STRIP:-}" ] && [ -x "$STRIP" ]; then
+  pre_sz=$(stat -c %s "$PGO_BIN")
+  if "$STRIP" -R .rela.text "$PGO_BIN" -o "$WORK/vllm-rs.stripped" >"$WORK/strip.log" 2>&1 \
+     && [ -s "$WORK/vllm-rs.stripped" ]; then
+    chmod +x "$WORK/vllm-rs.stripped"
+    if "$WORK/vllm-rs.stripped" --help >/dev/null 2>&1; then
+      install -m0755 "$WORK/vllm-rs.stripped" "$PGO_BIN"
+      echo "BOLT: stripped .rela.text -- ${pre_sz}B -> $(stat -c %s "$PGO_BIN")B"
+    else
+      echo "BOLT: .rela.text strip produced a binary that fails --help; keeping the unstripped one"
+    fi
+  else
+    echo "BOLT: llvm-strip -R .rela.text failed; keeping the unstripped binary"
+  fi
+else
+  echo "BOLT: no llvm-strip available; .rela.text stays in the shipped binary"
+fi
+
+# No 'split N functions' line to look for any more -- splitting is deliberately off (above).
+grep -E 'BOLT-INFO: .*(execution profile|ICF folded|functions were overwritten)' \
      "$WORK/optimize.log" 2>/dev/null | head -3 | sed 's/^/BOLT:   /'
 dyno=$(sed -n '/dynostats after all optimizations/,$p' "$WORK/optimize.log" 2>/dev/null \
        | grep -m1 -i 'executed instructions' | sed 's/^[[:space:]]*//; s/[[:space:]][[:space:]]*/ /g')

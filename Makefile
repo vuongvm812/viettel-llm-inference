@@ -119,7 +119,7 @@ IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: pgo-hfmodel-ctx check stats build up down warm push bench bench-aiperf sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show model-fetch model-fetch-meta vllm-src
+.PHONY: pgo-hfmodel-ctx check stats build up down warm push bench bench-aiperf sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show host-tune-cpuset model-fetch model-fetch-meta vllm-src
 
 ## Host-level latency tuning for the DEV/BENCH box. NOT part of any submission -- the judge
 ## runs `docker compose up` on their host and none of these knobs are reachable from a
@@ -133,6 +133,10 @@ host-tune-reset:
 	sudo scripts/host-tune.sh reset
 host-tune-show:
 	@scripts/host-tune.sh show
+## Read-only: print the GPU-local `cpuset:` line to paste into round-2/docker-compose.yaml.
+## Keep OMP_NUM_THREADS/MKL_NUM_THREADS/TOKIO_WORKER_THREADS <= the size of the list it prints.
+host-tune-cpuset:
+	@scripts/host-tune.sh cpuset
 
 ## Per-host setup: model weights + pristine vLLM source. Both land at repo root (gitignored:
 ## /hf-model/ and vllm/) so rounds share one copy; the compose overlays bind-mount hf-model/
@@ -215,6 +219,20 @@ check:
 	@# Formula half runs anywhere; the live-allocator half needs CUDA and skips off-box
 	@# (it runs for real under `make test-kernel`, which pytest-globs bench/test_*.py).
 	$(IN) if [ -f bench/test_kv_alignment.py ]; then python3 bench/test_kv_alignment.py; fi
+	@# compose <-> registry gate parity (round-2+): every VTL_ENABLE_* pin in docker-compose.yaml
+	@# equals the patch's `@register_patch(default=)`, with a two-name forced-on exception list.
+	@# This is the check that keeps the compose registry-gates header from becoming a lie.
+	$(IN) if [ -f bench/test_compose_gates.py ]; then \
+	  PYTHONPATH=. python3 bench/test_compose_gates.py --self-check; fi
+	@# Cheap syntax insurance for the shell we ship but cannot exercise here: the host tuner,
+	@# and the two BOLT heredocs inside Dockerfile.vllm-fork (extracted between their markers --
+	@# they only run on a `make vllm-fork VLLM_RS_PGO=1`, which is far too slow to be a check).
+	$(IN) if [ -f ../scripts/host-tune.sh ]; then bash -n ../scripts/host-tune.sh && echo "bash -n scripts/host-tune.sh: ok"; fi
+	@# grep-guarded as well as -f guarded: earlier rounds ship a Dockerfile.vllm-fork with no
+	@# BOLT stage at all, and a missing marker is an ERROR (not a skip) in the checker on
+	@# purpose -- that is what stops it from silently going quiet if the block is renamed.
+	$(IN) if [ -f Dockerfile.vllm-fork ] && grep -q "<<'BOLT_TOOLS'" Dockerfile.vllm-fork; then \
+	  python3 ../scripts/check_dockerfile_heredocs.py Dockerfile.vllm-fork BOLT_TOOLS BOLT_RUN; fi
 	$(IN) python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
 
 # No compose, no server, no model: the kernel tests just need the image and a GPU.

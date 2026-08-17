@@ -31,12 +31,18 @@ Env (all optional):
   VTL_WARMUP_SENTINEL=/tmp/vtl_warm.done            one-shot guard
   VTL_WARMUP_POST_TIMEOUT=20                         seconds per request; keep < compose healthcheck timeout
   VTL_WARMUP_CONCURRENCY=8                          burst width after line 0; 1 = sequential (A/B control)
+                                                    (the CODE default; the shipped compose pins 5)
   VTL_DISABLE_WARMUP=0                              1 = pure healthcheck, no priming
 
 SHAPE COVERAGE, AND WHY LINE 0 IS SERIAL. A sequential replay only ever presents the engine with
-batch-of-1 decode steps, so the cudagraph replay buffers for capture sizes 2/4/8 -- and the
-multi-sequence kernels behind them -- stay cold until the judge's first burst pays for them, which
-lands squarely in wave-1 TTFT. Firing the remaining lines concurrently warms exactly those shapes.
+batch-of-1 decode steps, so the cudagraph replay buffers for the multi-row capture sizes -- and
+the multi-sequence kernels behind them -- stay cold until the judge's first burst pays for them,
+which lands squarely in wave-1 TTFT. Firing the remaining lines concurrently warms exactly those
+shapes. The 8 above is only this script's FALLBACK default; the shipped compose pins
+VTL_WARMUP_CONCURRENCY=5, which is deliberate -- --max-num-seqs=5 caps a decode batch at 5 rows,
+and compose's cudagraph_capture_sizes now include 5, so a width-5 burst warms the FULL decode
+graph and the nstep burst rung the judged steady state actually replays (a width-8 burst would
+just queue three of those requests behind the first five).
 Line 0 still goes first and alone: the whole point of the prime is that the large shared system
 prefix is in the KV cache before anything races for it, and starting the burst alongside line 0
 recreates the duplicate-prefill serialization this script exists to avoid.

@@ -4,7 +4,9 @@
 #   sudo scripts/host-tune.sh apply     # or: make host-tune
 #   sudo scripts/host-tune.sh reset     # or: make host-tune-reset
 #   scripts/host-tune.sh show           # read-only, no root needed
-#   scripts/host-tune.sh --cpuset       # read-only: print the GPU-local `cpuset:` compose line
+#   scripts/host-tune.sh cpuset         # or: make host-tune-cpuset
+#                                       #   read-only: print the GPU-local `cpuset:` compose line
+#                                       #   (`--cpuset` is kept as an alias for older muscle memory)
 #
 # WHY THIS EXISTS, AND WHY IT IS NOT AN OPTIMIZATION. None of this makes the submitted
 # container faster -- the judge runs `docker compose up` on their own host and none of these
@@ -161,7 +163,7 @@ show() {
   echo "== State"
   if [ -f "$STATE" ]; then log "saved state" "$STATE"; else log "saved state" "(none -- not applied)"; fi
   echo "== NUMA"
-  log "gpu-local cpuset" "run '$0 --cpuset' for the compose line"
+  log "gpu-local cpuset" "run '$0 cpuset' for the compose line"
 }
 
 # --- apply --------------------------------------------------------------------------------
@@ -303,5 +305,5 @@ case "${1:-show}" in
   reset) reset ;;
   show)  show ;;
   cpuset|--cpuset) cpuset ;;
-  *) echo "usage: $0 {apply|reset|show|--cpuset}" >&2; exit 2 ;;
+  *) echo "usage: $0 {apply|reset|show|cpuset}   (--cpuset is an alias for cpuset)" >&2; exit 2 ;;
 esac

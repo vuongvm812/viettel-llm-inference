@@ -112,17 +112,15 @@ log = logging.getLogger("vllm.vtl.nstep")
 
 # Decode cudagraph sizes worth a burst graph, and therefore the largest batch a burst is
 # ever committed for. Beyond 8 concurrent generations the trace does not go (the scored
-# replay peaks at 8), and each extra size is another captured graph at boot. The trace sim
-# says 17% of tokens decode at batch 3/5/6; adding those sizes HERE AND to compose's
-# cudagraph_capture_sizes would lift graph coverage 82%->99%, but stock FULL graphs at
-# never-before-captured sizes carry unvalidated-path risk and wait for a run that can
-# afford to fail (see the compose comment).
+# replay peaks at 8), and each extra size is another captured graph at boot.
 #
 # This is only the SEED value: `_capture_burst_graphs` overwrites both names with whatever
-# FULL decode sizes the cudagraph manager actually captured. Since 2026-08-17 compose asks
-# for exactly [1,2,4,8] (16/32 dropped -- unreachable under --max-num-seqs=5), so the seed
-# and the outcome now coincide.
-BURST_SIZES = (1, 2, 4, 8)
+# FULL decode sizes the cudagraph manager actually captured. Compose asks for
+# [1,2,4,5,8]; a FULL *decode* descriptor needs num_tokens == num_reqs <= max_num_reqs = 5,
+# so the outcome is {1,2,4,5} -- 8 is a PIECEWISE/prefill bucket only and never seeds a
+# rung. 5 was added on 2026-08-17 precisely because it is the steady-state decode width
+# and had no FULL graph (and therefore no burst rung) before.
+BURST_SIZES = (1, 2, 4, 5, 8)
 MAX_BURST_REQS = BURST_SIZES[-1]
 
 
@@ -636,8 +634,9 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
         # Every captured FULL decode size gets a graph, not just the BURST_SIZES seed: with
         # `b.rows` masking the feedback there is no reason to skip a size the manager already
         # captured. Historically compose asked for [1,2,4,8,16,32] and 16/32 fell back to the
-        # eager loop; compose now asks for [1,2,4,8] only, so this loop and the seed agree --
-        # but the code stays size-agnostic, so widening compose again needs no edit here.
+        # eager loop; compose now asks for [1,2,4,5,8], of which {1,2,4,5} survive the
+        # `num_tokens == num_reqs <= max_num_reqs` filter above and become rungs. The code
+        # stays size-agnostic, so widening compose again needs no edit here.
         # LoRA graphs stay out -- the burst has no LoRA story.
         if desc.num_active_loras:
             continue
@@ -763,8 +762,9 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
         return
     # BURST_SIZES is now an OUTCOME, not a filter: whatever FULL decode sizes the manager
     # captured are the sizes a burst can ride. Published back to the module because
-    # `rust_sched.py:3088` reads `MAX_BURST_REQS` to gate its commit, and `_publish_ready`
-    # reads it per step -- both would otherwise still be capped at the old hardcoded 8.
+    # `rust_sched.py:3123` (`commit_burst`) reads `MAX_BURST_REQS` to gate its commit, and
+    # `_publish_ready` reads it per step -- both would otherwise still be capped at the
+    # seed's 8.
     global BURST_SIZES, MAX_BURST_REQS
     BURST_SIZES = tuple(sorted(b.graphs))
     MAX_BURST_REQS = BURST_SIZES[-1]

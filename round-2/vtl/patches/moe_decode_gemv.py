@@ -792,6 +792,23 @@ def apply() -> None:
 
 
 def _self_check() -> None:
+    from vtl.registry import PATCH_REGISTRY, is_enabled
+
+    patch = next(p for p in PATCH_REGISTRY if p.name == "moe_decode_gemv")
+    # Enabled by default per project decision (2026-08-17), matching the shipped compose.
+    # The safety story is the ladder, not the gate: NVRTC compile -> stock fused_moe, the
+    # geometry envelope in `validate_geometry` -> stock fused_moe, and the M <= MAX_M decode
+    # band -> stock fused_moe for every batch above it. The shipped `fp8` weight arm also
+    # keeps the stock expert tensors resident, so nothing is unloaded and the fallback is
+    # always available at any point in the run.
+    assert patch.default is True, "shipped ENABLED; NVRTC->geometry->M-band->stock is the safety net"
+    assert is_enabled(patch) is True
+    os.environ["VTL_ENABLE_MOE_DECODE_GEMV"] = "0"
+    assert is_enabled(patch) is False, "the gate must still be able to turn it off"
+    os.environ["VTL_ENABLE_MOE_DECODE_GEMV"] = "1"
+    assert is_enabled(patch) is True
+    os.environ.pop("VTL_ENABLE_MOE_DECODE_GEMV")
+
     # -- weight arm parsing: fp8 unless int4 is asked for, by name --
     assert parse_weights(None) == "fp8"
     assert parse_weights("") == "fp8"

@@ -184,53 +184,9 @@ def _stock_group_quant(result, scale, input, gate, weight, epsilon, gate_is_silu
     scale.copy_(s)
 
 
-def _decode_step_epilogue(result, scale, input, weight, num_heads) -> bool:  # noqa: ANN001
-    """Tier 0: the GDN decode step already produced this exact result, fused into its own
-    launch. Returns True if it satisfied the call.
-
-    TWO-SIDED HANDSHAKE with ``vtl/patches/gdn_decode_step.py`` (see its module docstring):
-    reaching this function AT ALL is the proof that patch needs that this op -- rather than
-    stock RMSNormGated + a separate quant -- is what consumes the core output for the layer
-    owning ``weight``, so ``note_epilogue_consumer`` is called unconditionally and BEFORE
-    the claim lookup. Only then may the decode step stop writing bf16 ``core_attn_out``.
-
-    ``take_epilogue`` matches on ``input.data_ptr()``, which is the core-output buffer
-    itself (``_output_projection`` reaches us through a reshape VIEW of it), and pops the
-    claim so it can never be applied twice. A miss is the ordinary case on prefill, spec
-    and any batch the decode step did not claim, and costs one dict lookup.
-
-    The residual ``copy_`` is the staged fp8 landing in the buffer inductor allocated inside
-    the graph -- that buffer does not exist yet when the opaque core op runs, so it cannot
-    be the kernel's destination. It replaces the full norm+quant kernel, not an existing
-    copy: what is gone is the [T, H*D] bf16 write and its matching read.
-    """
-    try:
-        from vtl.patches import gdn_decode_step as decode_step
-    except Exception:
-        return False
-    try:
-        decode_step.note_epilogue_consumer(weight.data_ptr())
-        staged = decode_step.take_epilogue(input, num_heads)
-        if staged is None:
-            return False
-        fp8, scales = staged
-        if tuple(fp8.shape) != tuple(result.shape) or tuple(scales.shape) != tuple(scale.shape):
-            return False
-        result.copy_(fp8)
-        scale.copy_(scales)
-        return True
-    except Exception as exc:
-        log.warning("vtl: gdn decode-step epilogue handoff failed (%r); running the full "
-                    "norm+quant for this call", exc)
-        return False
-
-
 def _group_quant_impl(result, scale, input, gate, weight, epsilon, num_heads, gate_is_silu):  # noqa: ANN001
     """CUDA impl of vllm_cuda::gdn_gated_rmsnorm_group_quant -- the tier ladder."""
     import torch
-
-    if _decode_step_epilogue(result, scale, input, weight, num_heads):
-        return
 
     tier, launch = _resolve_tier(input, weight, num_heads, gate_is_silu)
 

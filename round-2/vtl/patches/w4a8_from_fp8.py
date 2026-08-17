@@ -374,6 +374,23 @@ def apply() -> None:
 
 
 def _self_check() -> None:
+    from vtl.registry import PATCH_REGISTRY, is_enabled
+
+    patch = next(p for p in PATCH_REGISTRY if p.name == "w4a8_from_fp8")
+    # Enabled by default per project decision (2026-08-17), matching the shipped compose.
+    # The safety story is the ladder, not the gate: the wrapped `get_quant_method` degrades
+    # PER LAYER -- a layer whose block layout `validate_block_layout` rejects, whose name is
+    # in VTL_W4A8_FROM_FP8_IGNORE, or that raises anywhere in the requant keeps the stock
+    # fp8 method it would have had. And `runtime_enabled()` (VTL_W4A8_FROM_FP8) is a second,
+    # independent switch below this one, so the gate is not the only way to stand it down.
+    assert patch.default is True, "shipped ENABLED; the per-layer degrade to stock fp8 is the safety net"
+    assert is_enabled(patch) is True
+    os.environ["VTL_ENABLE_W4A8_FROM_FP8"] = "0"
+    assert is_enabled(patch) is False, "the gate must still be able to turn it off"
+    os.environ["VTL_ENABLE_W4A8_FROM_FP8"] = "1"
+    assert is_enabled(patch) is True
+    os.environ.pop("VTL_ENABLE_W4A8_FROM_FP8")
+
     # Runtime gate: default ON (the registry gate is the master switch), explicit off works.
     assert runtime_enabled(None) is True
     assert runtime_enabled("") is True
