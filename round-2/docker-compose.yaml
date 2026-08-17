@@ -187,7 +187,7 @@ services:
       # Prefill band, M in (MTHRESH, PREFILL_MAX]. The ONLY place cluster multicast of the
       # WEIGHTS does anything: CUTLASS multicasts operand A along the cluster's N dim, which
       # tiles TOKENS -- at decode's single token tile no cluster shape can share a weight byte.
-      # A TTFT play, and the ERS gradient values 1ms TPOT at ~23x 1ms TTFT, so it ranks last.
+      # A TTFT play, and the ERS gradient values 1ms TPOT at ~63x 1ms TTFT, so it ranks last.
       # Revert = MAX back to "0" (band closed, stock heuristic).
       VTL_W4A8_SCHEDULE_V2_PREFILL: "128x128_1x2x1_pf"
       VTL_W4A8_V2_PREFILL_MAX: "1024"

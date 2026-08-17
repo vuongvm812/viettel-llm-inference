@@ -77,6 +77,19 @@ PGO_TARGET_CPU ?= native
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
 IN := cd $(ROUND) &&
 TRACE ?= data/input/trace-round2.jsonl
+# Grading-fidelity bench (round-2): NVIDIA aiperf's AgentX MVP scenario, mirroring the BTC's
+# published invocation. Concurrency/context/dataset are the BTC's confirmed values; the seed is
+# hidden on their side, so ours defaults to 0 and should be swept to bound seed sensitivity.
+AIPERF ?= aiperf
+AIPERF_SEED ?= 0
+AIPERF_DURATION ?= 900
+AIPERF_CONCURRENCY ?= 5
+AIPERF_DATASET ?= semianalysis_cc_traces_weka_062126
+# The stable alias from docker-compose.yaml's --served-model-name, so the same command works
+# regardless of which real model the compose currently pins.
+AIPERF_MODEL ?= round2-model
+AIPERF_LIMIT ?=# set to N for a smoke run (--num-dataset-entries N; scenario docs: smoke only)
+AIPERF_ART ?= bench-aiperf
 # docker-compose.yaml is the SUBMISSION artifact and the single source of truth for every
 # serve flag and env var; the three overlays only carry their differences (dev image tag,
 # local build+mount, judge-box resource caps). Order matters -- later -f wins.
@@ -97,7 +110,7 @@ IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: check stats build up down warm push bench sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show
+.PHONY: check stats build up down warm push bench bench-aiperf sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show
 
 ## Host-level latency tuning for the DEV/BENCH box. NOT part of any submission -- the judge
 ## runs `docker compose up` on their host and none of these knobs are reachable from a
@@ -128,6 +141,8 @@ check:
 	$(IN) python3 bench/trace_stats.py --self-check
 	$(IN) python3 bench/metrics.py
 	$(IN) python3 bench/sweep_report.py --selfcheck
+	@# aiperf -> repo-schema converter. Parses files only, so it runs off-box without aiperf.
+	$(IN) if [ -f bench/aiperf_adapter.py ]; then python3 bench/aiperf_adapter.py --selfcheck; fi
 	$(IN) python3 bench/eval_quality.py --self-check
 	$(IN) python3 bench/profile_trace.py --self-check
 	@# if-form, not `[ -f x ] && cmd || true`: that swallows the script's OWN failure as well as
@@ -334,6 +349,28 @@ bench:
 	  python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
 	    --closed-loop $$n --out bench-closed-$$n.json; \
 	done
+
+## Grading-fidelity bench (round-2, H200 only): replays the SemiAnalysis Weka corpus of real
+## Claude Code sessions via aiperf's AgentX MVP scenario -- the workload the BTC actually
+## grades with -- then converts the artifacts into the repo schema and prints the ERS report.
+## Install: pip install -r round-2/bench/requirements-aiperf.txt (heavy; dataset auto-downloads
+## from HF on first run). Smoke: make bench-aiperf AIPERF_LIMIT=8 AIPERF_DURATION=120.
+## Two things are confirmed-at-first-run and may need adjusting: (a) the scenario preset may
+## already own some of the explicit flags below (if aiperf rejects one as a duplicate/conflict,
+## drop the explicit copy here and note which); (b) the artifact-dir layout -- the adapter
+## searches recursively, so a flat layout also works.
+bench-aiperf:
+	$(IN) $(AIPERF) profile --scenario inferencex-agentx-mvp \
+	  --model $(AIPERF_MODEL) --url $(TARGET) --endpoint-type chat \
+	  --public-dataset $(AIPERF_DATASET) \
+	  --concurrency $(AIPERF_CONCURRENCY) --max-context-length 204800 \
+	  --benchmark-duration $(AIPERF_DURATION) --random-seed $(AIPERF_SEED) \
+	  --streaming --extra-inputs ignore_eos:true --cache-bust first_turn_prefix \
+	  --system-idle-gap-cap-seconds 10 --use-server-token-count \
+	  $(if $(AIPERF_LIMIT),--num-dataset-entries $(AIPERF_LIMIT)) \
+	  --artifact-dir $(AIPERF_ART)
+	$(IN) python3 bench/aiperf_adapter.py --artifact-dir $(AIPERF_ART) --out bench-aiperf.json
+	$(IN) python3 bench/_ci_report.py
 
 ## Sweep the CUTLASS W4A8 tile/cluster schedule (needs the GPU). The kernel's own heuristic
 ## (w4a8_mm_entry.cu:341-372) keys ONLY on M/N/K and is blind to SM count -- it was tuned on a

@@ -166,7 +166,10 @@ boot + prefill only, matching the frontier-audit endgame note.
 
 ## 6. Sizing and order
 
-TPOT is worth ~0.05 ERS/ms and the A/B floor needs ≥0.22 ms/knob. Phase 0 is a compose line
+Under the round-2 scoring band (F/C_tpot = 8/100 ms) TPOT is worth at most ~0.011 ERS/ms — an
+order of magnitude below the round-1 figure this document was sized against, so the same
+0.22 ms/knob A/B floor now gates only ~0.002 ERS; re-derive the per-knob thresholds before
+committing effort. Phase 0 is a compose line
 and plausibly the single biggest TPOT lever currently available (it re-enables three shipped
 optimizations at once). Phases 1–2 are the actual runner (~1–2 days + ~1–2 weeks incl.
 parity); Phase 3 is polish (~1 week). Do not start Phase 1 until Phase 0's uni A/B confirms

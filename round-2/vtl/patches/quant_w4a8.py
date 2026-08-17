@@ -209,7 +209,7 @@ VALID_SCHEDULES_V2 = frozenset({
 # and raster order. At decode there is exactly one token tile, so both are provable no-ops there;
 # at m ~ 512 with TileN=128 there are four, and both become real.
 #
-# Worth stating plainly: this is a TTFT play, and the ERS gradient values 1 ms of TPOT at ~23x
+# Worth stating plainly: this is a TTFT play, and the ERS gradient values 1 ms of TPOT at ~63x
 # 1 ms of TTFT. It is here because the effect is large (the stock raster heuristic optimizes
 # reuse of the activation, which is nearly free, over the weights, which are the whole cost),
 # not because it outranks the decode arms.
