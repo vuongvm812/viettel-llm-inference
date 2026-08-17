@@ -2,13 +2,15 @@
 # check=skip=FromPlatformFlagConstDisallowed
 #
 # Forked vLLM base image = stock v0.25.0 + vtl's tree-spec Python source patches
-# + an optimized (optionally PGO) rebuild of the Rust frontend binary `vllm-rs`.
+# + an optimized (optionally PGO + post-link BOLT) rebuild of the Rust frontend
+# binary `vllm-rs`.
 #
 # The Python patches remain a CHEAP overlay (the compiled _C*.so / CUDA kernels in
 # the base are untouched — no from-source engine build). The `rust-builder` stage
 # additionally compiles `vllm-rs` from the local vllm/rust/ workspace with the
 # tuned release profile (Cargo.toml: fat LTO, codegen-units=1), and — when
-# --build-arg VLLM_RS_PGO=1 — profile-guided optimization. The result replaces the
+# --build-arg VLLM_RS_PGO=1 — profile-guided optimization followed by an llvm-bolt
+# post-link pass (code layout, on top of PGO). The result replaces the
 # stock `vllm-rs` shipped in the base. The main round-2 Dockerfile sets ARG
 # VLLM_IMAGE to the image this produces and inherits the optimized binary, so it
 # needs no COPY of its own.
@@ -18,7 +20,7 @@
 #
 # Build + push (see Makefile target `vllm-fork`):
 #   make vllm-fork                 # plain optimized rebuild
-#   make vllm-fork VLLM_RS_PGO=1   # + PGO training run (CPU-only, uses the mock engine)
+#   make vllm-fork VLLM_RS_PGO=1   # + PGO training run (CPU-only, uses the mock engine) + BOLT
 #   make vllm-fork PUSH=1          # build + push, then pin the main image by @sha256:<digest>
 #
 # The patches under vtl/vllm_patches/v0.25.0/ are generated from the local
@@ -140,22 +142,378 @@ RUN set -eux; \
     /out/vllm-rs --help >/dev/null
 
 # ------------------------------------------------------------------------------
-# Stage 1b: PGO build. Only built when RUST_BUILDER=rust-builder-pgo (VLLM_RS_PGO=1),
-# so plain/CI builds never require the hf-model context or a network model.
+# Stage 1b: PGO build + llvm-bolt post-link pass. Only built when
+# RUST_BUILDER=rust-builder-pgo (VLLM_RS_PGO=1), so plain/CI builds never require the
+# hf-model context, a network model, or any of the BOLT machinery below.
 # The CPU-only training run (pgo_train.sh) drives the frontend + mock engine and
 # replays the round-2 trace; the served tokenizer is the local hf-model mounted at
 # /model (weights ignored — the mock fakes the forward pass).
+#
+# BOLT (Binary Optimization and Layout Tool) is a SECOND, complementary layer on top of
+# PGO: PGO steers inlining/branch weights inside the compiler, BOLT re-lays out the
+# already-linked binary — hot basic blocks contiguous, cold ones split into a separate
+# text section, functions ordered by call affinity, identical code folded. On a fat-LTO
+# PGO'd, front-end-bound server binary that is typically a low single-digit percentage of CPU
+# time back (fewer iTLB/i-cache misses), NOT a headline win — the `BOLT:` lines in the build
+# log (dyno-stats delta) are the record of what it actually bought on this binary.
+#
+# FAILURE DOCTRINE (same split as round-2/Dockerfile's jemalloc/iceoryx2/cuda-python steps):
+# every BOLT step is FAIL-SOFT. llvm-bolt is a build-host toolchain dependency fetched over
+# apt — if it is unavailable, refuses the binary, or produces something that does not pass
+# its smoke, the stage logs `BOLT: skipped -- <reason>` and ships the PGO binary unchanged.
+# A build that fails scores ZERO; a binary with merely PGO-grade layout scores slightly less.
+# There is no env gate and no build arg: BOLT is attempted on every PGO build, and the log
+# line is the record of which way it went.
 # ------------------------------------------------------------------------------
 FROM rust-builder AS rust-builder-pgo
 ARG PGO_MODEL
 ARG PGO_TARGET_CPU
 ENV PGO_MODEL=${PGO_MODEL} PGO_TARGET_CPU=${PGO_TARGET_CPU}
 WORKDIR /src/rust
+
+# BOLT PREREQUISITE: relocations must survive the link. llvm-bolt rewrites the binary at the
+# basic-block level, which it can only do when the linker kept the input relocations
+# (`ld --emit-relocs`); without them it refuses with "input binary is not a valid ELF
+# executable as it lacks relocations". The natural home for `-Clink-arg=-Wl,--emit-relocs` is
+# the RUSTFLAGS of the final optimized build — but that string is assembled INSIDE
+# vtl/pgo_train.sh as an inline `RUSTFLAGS="-Cprofile-use=... $CPU" cargo build ...`
+# assignment, which overrides any RUSTFLAGS the environment offers, so this Dockerfile cannot
+# inject a flag through it. Cargo's per-target LINKER setting is a SEPARATE knob that RUSTFLAGS
+# does not override, so the flag rides in on a one-line cc shim instead. Same effect, same
+# scope (every link in this stage: mock engine, instrumented build, final PGO build), and it
+# costs binary size only — relocations sit in non-loaded sections, no runtime effect.
+#
+# The shim is probe-tested here rather than trusted: an `ld` that rejects --emit-relocs would
+# otherwise break the (fatal) PGO build below. If the probe fails, the shim rewrites itself as a
+# plain passthrough — the PGO build proceeds exactly as before and the BOLT step further down
+# skips on its missing-.rela.text check.
+RUN set -eu; \
+    SHIM=/usr/local/bin/vtl-cc-emit-relocs; \
+    printf '%s\n' '#!/bin/sh' '# rustc linker shim -- keep relocations so llvm-bolt can rewrite the binary.' 'exec cc "$@" -Wl,--emit-relocs' > "$SHIM"; \
+    chmod +x "$SHIM"; \
+    printf '%s\n' 'extern int puts(const char *s);' 'int main(void) { return puts("relocs probe"); }' > /tmp/relocs-probe.c; \
+    if "$SHIM" /tmp/relocs-probe.c -o /tmp/relocs-probe 2>/tmp/relocs-probe.log \
+       && readelf -S /tmp/relocs-probe | grep -q '\.rela\.text'; then \
+      echo "BOLT: linker shim active -- vllm-rs links with -Wl,--emit-relocs"; \
+    else \
+      printf '%s\n' '#!/bin/sh' 'exec cc "$@"' > "$SHIM"; \
+      echo "BOLT: linker shim disabled, --emit-relocs probe failed -- $(tr '\n' ' ' < /tmp/relocs-probe.log 2>/dev/null | cut -c1-200)"; \
+      echo "BOLT: the PGO build is unaffected; the BOLT step will skip on missing relocations"; \
+    fi; \
+    rm -f /tmp/relocs-probe.c /tmp/relocs-probe
+# Applies to the host triple too (cargo is never given --target here) — this stage is
+# amd64-only by way of the `FROM --platform=linux/amd64` base.
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/local/bin/vtl-cc-emit-relocs
+
 RUN --mount=type=bind,from=hfmodel,target=/model \
     set -eux; \
     bash /src/pgo_train.sh; \
     cp /src/rust/target/release/vllm-rs /out/vllm-rs; \
     /out/vllm-rs --help >/dev/null
+
+# BOLT step 1/2 — toolchain. llvm-bolt + merge-fdata, BUILDER STAGE ONLY (nothing from this
+# layer reaches the served image; the final stage copies exactly one file, /out/vllm-rs).
+# Distro packages first (`bolt-NN` / `llvm-NN-tools`, newest first — BOLT's block reordering
+# heuristics improved a lot across LLVM 16..20), then apt.llvm.org as a fallback for bases
+# whose repos carry no BOLT at all (Ubuntu 22.04 jammy is one). Deliberately never the
+# unversioned `bolt` package: on Ubuntu that name is the Thunderbolt device daemon.
+# -o Dir::Etc::sourceparts=- for the distro pass skips the CUDA/deadsnakes repos in
+# sources.list.d for the same reason every other apt step here does (intermittently mid-sync);
+# the apt.llvm.org pass has to read sources.list.d (that is where its own list lands), so its
+# update is allowed to fail without failing the step.
+# Install failure of any kind => no /tmp/bolt-tools.env => the next step skips BOLT entirely.
+RUN <<'BOLT_TOOLS' bash
+set -u
+export DEBIAN_FRONTEND=noninteractive
+ENVFILE=/tmp/bolt-tools.env
+rm -f "$ENVFILE"
+
+resolve_tools() {
+  local b d m v
+  for b in /usr/lib/llvm-*/bin/llvm-bolt /usr/bin/llvm-bolt /usr/bin/llvm-bolt-*; do
+    [ -x "$b" ] || continue
+    d=$(dirname "$b")
+    m="$d/merge-fdata"
+    case "$b" in
+      */llvm-bolt-*) v="${b##*llvm-bolt-}"; [ -x "$d/merge-fdata-$v" ] && m="$d/merge-fdata-$v" ;;
+    esac
+    [ -x "$m" ] || continue
+    printf 'LLVM_BOLT=%s\nMERGE_FDATA=%s\n' "$b" "$m" > "$ENVFILE"
+    echo "BOLT: tools = $b + $m"
+    "$b" --version 2>&1 | head -2 | sed 's/^/BOLT:   /'
+    return 0
+  done
+  return 1
+}
+
+if resolve_tools; then
+  echo "BOLT: llvm-bolt already present, no install needed"
+  exit 0
+fi
+
+apt_ok=
+for attempt in 1 2 3; do
+  if apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 </dev/null >/dev/null 2>&1; then
+    apt_ok=1
+    break
+  fi
+  echo "BOLT: apt-get update attempt $attempt failed"
+  sleep 5
+done
+
+if [ -n "$apt_ok" ]; then
+  for pkg in bolt-20 bolt-19 bolt-18 bolt-17 bolt-16 llvm-20-tools llvm-19-tools llvm-18-tools llvm-17-tools llvm-16-tools; do
+    apt-get install -y --no-install-recommends "$pkg" </dev/null >/dev/null 2>&1 || continue
+    echo "BOLT: installed $pkg from the distro repos"
+    resolve_tools && break
+  done
+else
+  echo "BOLT: distro apt unreachable"
+fi
+
+if [ ! -f "$ENVFILE" ]; then
+  CODENAME=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
+  echo "BOLT: no BOLT in the distro repos, trying apt.llvm.org (${CODENAME:-unknown codename})"
+  if [ -n "$CODENAME" ] \
+     && curl -fsSL --retry 3 --retry-delay 3 https://apt.llvm.org/llvm-snapshot.gpg.key \
+          -o /etc/apt/trusted.gpg.d/vtl-apt-llvm.asc; then
+    for v in 18 17 19; do
+      echo "deb http://apt.llvm.org/$CODENAME/ llvm-toolchain-$CODENAME-$v main" \
+        > /etc/apt/sources.list.d/vtl-llvm.list
+      apt-get update -o APT::Get::List-Cleanup=0 </dev/null >/dev/null 2>&1 || true
+      apt-get install -y --no-install-recommends "bolt-$v" </dev/null >/dev/null 2>&1 || continue
+      echo "BOLT: installed bolt-$v from apt.llvm.org ($CODENAME)"
+      resolve_tools && break
+    done
+    rm -f /etc/apt/sources.list.d/vtl-llvm.list
+  else
+    echo "BOLT: apt.llvm.org unreachable (key fetch failed)"
+  fi
+fi
+
+rm -rf /var/lib/apt/lists/*
+if [ -f "$ENVFILE" ]; then
+  echo "BOLT: toolchain ready"
+else
+  echo "BOLT: skipped -- no llvm-bolt/merge-fdata available (distro repos and apt.llvm.org both came up empty); the PGO binary ships as-is"
+fi
+exit 0
+BOLT_TOOLS
+
+# BOLT step 2/2 — instrument, re-run the SAME training replay pgo_train.sh uses, merge, optimize.
+# One RUN block on purpose: the instrumented binary, its fdata and the merged profile are pure
+# scratch and are removed in this same layer, so the stage grows by nothing but the rewritten
+# /out/vllm-rs.
+#
+# Instrumentation mode, not perf/LBR mode: `perf record -e cycles:u -j any,u` needs
+# PMU/LBR access that does not exist inside a docker build (no CAP_PERFMON, virtualized PMU),
+# so BOLT's own instrumentation runtime collects the profile instead. It costs a slower
+# training run — which is fine, the replay is a fixed corpus, not a benchmark measurement.
+#
+# The training traffic is pgo_train.sh's exact recipe (same trace corpus with `body.model`
+# pinned to the served tokenizer, same frontend-only `serve` + mock engine pairing, same
+# closed-loop 8, same mock pacing/vocab defaults) so BOLT's layout is trained on the same
+# workload PGO was. It is inlined here rather than invoked through pgo_train.sh because that
+# script is a full build-train-rebuild pipeline: running it again would redo two cargo builds
+# to reach the replay in the middle of it.
+#
+# The `--help` smoke intentionally runs BEFORE the profile directory is cleared: an fdata file
+# from a `--help` run would tell BOLT the whole serving path is cold and produce a layout worse
+# than no BOLT at all — the same trap pgo_train.sh's `serve-*.profraw` gate exists to avoid.
+RUN --mount=type=bind,from=hfmodel,target=/model <<'BOLT_RUN' bash
+set -u
+PGO_BIN=/out/vllm-rs
+BIN=/src/rust/target/release
+WORK=/tmp/bolt
+FDATA=$WORK/fdata
+TRACE=$WORK/train.jsonl
+MODEL="${PGO_MODEL:-/model}"
+HANDSHAKE_PORT=29560
+HTTP_PORT=8010
+FRONTEND_LOG=$WORK/frontend.log
+
+cleanup() { rm -rf "$WORK"; }
+skip() { echo "BOLT: skipped -- $*"; cleanup; exit 0; }
+
+[ -f /tmp/bolt-tools.env ] || skip "llvm-bolt not installed (see the BOLT: lines above)"
+. /tmp/bolt-tools.env
+[ -x "${LLVM_BOLT:-}" ] && [ -x "${MERGE_FDATA:-}" ] || skip "llvm-bolt/merge-fdata vanished after install"
+[ -x "$BIN/vllm-mock-engine" ] || skip "no mock engine binary -- cannot replay training traffic"
+[ -s /src/trace-round2.jsonl ] || skip "no training trace at /src/trace-round2.jsonl"
+
+rm -rf "$WORK"
+mkdir -p "$FDATA"
+
+readelf -S "$PGO_BIN" | grep -q '\.rela\.text' \
+  || skip "the PGO binary has no .rela.text -- the -Wl,--emit-relocs linker shim did not take effect, and BOLT cannot rewrite a binary without relocations"
+
+echo "== [bolt 1/5] instrument the PGO binary"
+inst_ok=
+for flags in \
+    "--instrumentation-file-append-pid --instrumentation-sleep-time=10 --instrumentation-no-counters-clear" \
+    "--instrumentation-file-append-pid" \
+    ""; do
+  if "$LLVM_BOLT" "$PGO_BIN" -instrument \
+       --instrumentation-file="$FDATA/vllm-rs.fdata" $flags \
+       -o "$WORK/vllm-rs.inst" > "$WORK/instrument.log" 2>&1; then
+    inst_ok=1
+    echo "BOLT: instrumented with [${flags:-defaults}]"
+    break
+  fi
+  echo "BOLT: -instrument with [${flags:-defaults}] failed, trying a simpler flag set"
+done
+if [ -z "$inst_ok" ]; then
+  tail -20 "$WORK/instrument.log" 2>/dev/null
+  skip "llvm-bolt -instrument failed (log above)"
+fi
+chmod +x "$WORK/vllm-rs.inst"
+"$WORK/vllm-rs.inst" --help >/dev/null 2>&1 || skip "the instrumented binary does not run"
+rm -f "$FDATA"/*
+
+echo "== [bolt 2/5] prepare the training trace (same corpus + model pin as pgo_train.sh)"
+python3 -c 'import json, sys
+model, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+n = 0
+with open(src) as f, open(dst, "w") as out:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        rec.setdefault("body", {})["model"] = model
+        out.write(json.dumps(rec) + "\n")
+        n += 1
+print("prepared %d training requests" % n)' "$MODEL" /src/trace-round2.jsonl "$TRACE" \
+  || skip "could not prepare the training trace"
+[ -s "$TRACE" ] || skip "prepared training trace is empty"
+
+echo "== [bolt 3/5] boot the instrumented frontend + mock engine and replay"
+export RUST_BACKTRACE=1
+"$WORK/vllm-rs.inst" serve "$MODEL" \
+    --data-parallel-size 1 --data-parallel-size-local 0 \
+    --handshake-port "$HANDSHAKE_PORT" --host 127.0.0.1 --port "$HTTP_PORT" \
+    > "$FRONTEND_LOG" 2>&1 </dev/null &
+FRONTEND_PID=$!
+"$BIN/vllm-mock-engine" --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" \
+    --decode-step-delay-ms "${PGO_DECODE_STEP_DELAY_MS:-16}" \
+    --output-token-chunk-size "${PGO_OUTPUT_TOKEN_CHUNK:-4}" \
+    --vocab-size "${PGO_VOCAB_SIZE:-248320}" \
+    > "$WORK/mock.log" 2>&1 </dev/null &
+MOCK_PID=$!
+
+healthy=
+for i in $(seq 1 180); do
+  if curl -fsS "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null 2>&1; then
+    healthy=1
+    echo "BOLT: instrumented frontend healthy after ${i}s"
+    break
+  fi
+  kill -0 "$FRONTEND_PID" 2>/dev/null || break
+  sleep 1
+done
+if [ -z "$healthy" ]; then
+  tail -30 "$FRONTEND_LOG" 2>/dev/null
+  kill -9 "$FRONTEND_PID" "$MOCK_PID" 2>/dev/null
+  skip "the instrumented frontend never became healthy (log above)"
+fi
+
+python3 -c 'import aiohttp' 2>/dev/null || pip install --no-cache-dir -q aiohttp </dev/null
+( cd /src/bench && python3 replay.py \
+    --target "http://127.0.0.1:${HTTP_PORT}" \
+    --trace "$TRACE" \
+    --closed-loop 8 \
+    --out "$WORK/replay.json" ) > "$WORK/replay.log" 2>&1
+replay_rc=$?
+
+# SIGINT is what lets the instrumented frontend dump its counters on the way out (same flush
+# path pgo_train.sh relies on). BOUNDED, unlike pgo_train.sh's bare `wait`: a process that
+# ignores INT would otherwise hang the docker build forever, which is a far worse failure than
+# shipping the PGO binary. The escalation to TERM/KILL still leaves us the periodic
+# --instrumentation-sleep-time dump to merge, and if there is none the fdata gate below skips.
+kill -INT "$FRONTEND_PID" 2>/dev/null
+for i in $(seq 1 60); do
+  kill -0 "$FRONTEND_PID" 2>/dev/null || break
+  sleep 1
+done
+if kill -0 "$FRONTEND_PID" 2>/dev/null; then
+  echo "BOLT: the instrumented frontend outlived SIGINT, escalating to TERM/KILL"
+  kill -TERM "$FRONTEND_PID" 2>/dev/null
+  sleep 5
+  kill -9 "$FRONTEND_PID" 2>/dev/null
+fi
+wait "$FRONTEND_PID" 2>/dev/null
+kill "$MOCK_PID" 2>/dev/null
+sleep 1
+kill -9 "$MOCK_PID" 2>/dev/null
+wait "$MOCK_PID" 2>/dev/null
+if [ "$replay_rc" -ne 0 ]; then
+  tail -20 "$WORK/replay.log" 2>/dev/null
+  skip "the training replay failed (rc=$replay_rc, log above)"
+fi
+
+echo "== [bolt 4/5] merge fdata + optimize"
+count=$(find "$FDATA" -type f -size +0c | wc -l)
+[ "$count" -gt 0 ] || { tail -20 "$FRONTEND_LOG" 2>/dev/null; skip "the instrumented run produced no fdata (counters never flushed)"; }
+MERGED=$WORK/merged.fdata
+if [ "$count" -eq 1 ]; then
+  cp "$(find "$FDATA" -type f -size +0c | head -1)" "$MERGED"
+else
+  find "$FDATA" -type f -size +0c -print0 | xargs -0 "$MERGE_FDATA" > "$MERGED" 2>"$WORK/merge.log"
+  if [ ! -s "$MERGED" ]; then
+    find "$FDATA" -type f -size +0c -print0 | xargs -0 "$MERGE_FDATA" -o "$MERGED" >>"$WORK/merge.log" 2>&1
+  fi
+fi
+[ -s "$MERGED" ] || { tail -10 "$WORK/merge.log" 2>/dev/null; skip "merge-fdata produced nothing from $count profile(s)"; }
+fdata_sz=$(wc -c < "$MERGED")
+[ "$fdata_sz" -gt 1024 ] || skip "merged fdata is only ${fdata_sz}B -- the replay never exercised the serving path"
+echo "BOLT: merged $count profile(s) -> ${fdata_sz}B of fdata"
+
+# Three flag sets, best first. BOLT's option names drift across LLVM releases (cdsort landed
+# in 17, -icf became an enum later, split-all-cold has been folded into --split-strategy), and
+# the version we get is whatever the build host's apt offered — so a rejected flag degrades to
+# a plainer layout pass instead of dropping BOLT altogether.
+opt_ok=
+for oflags in \
+    "-reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -icf=1" \
+    "-reorder-blocks=cache+ -reorder-functions=hfsort+ -split-functions -split-all-cold -icf=safe" \
+    "-reorder-blocks=ext-tsp -split-functions"; do
+  if "$LLVM_BOLT" "$PGO_BIN" -o "$WORK/vllm-rs.bolt" -data="$MERGED" $oflags -dyno-stats \
+       > "$WORK/optimize.log" 2>&1; then
+    opt_ok=1
+    echo "BOLT: optimized with [$oflags]"
+    break
+  fi
+  echo "BOLT: optimization with [$oflags] failed, trying a plainer flag set"
+done
+if [ -z "$opt_ok" ]; then
+  tail -20 "$WORK/optimize.log" 2>/dev/null
+  skip "llvm-bolt optimization failed (log above)"
+fi
+
+echo "== [bolt 5/5] sanity-gate and adopt"
+[ -s "$WORK/vllm-rs.bolt" ] || skip "llvm-bolt wrote no output binary"
+chmod +x "$WORK/vllm-rs.bolt"
+"$WORK/vllm-rs.bolt" --help >/dev/null 2>&1 || skip "the bolted binary fails the stage's --help smoke"
+in_sz=$(stat -c %s "$PGO_BIN")
+out_sz=$(stat -c %s "$WORK/vllm-rs.bolt")
+[ "$out_sz" -ge $(( in_sz / 2 )) ] || skip "bolted binary is ${out_sz}B vs ${in_sz}B in (<0.5x -- BOLT emitted a stub)"
+[ "$out_sz" -le $(( in_sz * 3 )) ] || skip "bolted binary is ${out_sz}B vs ${in_sz}B in (>3x -- not a plausible split-functions layout)"
+
+cp -f "$PGO_BIN" "$WORK/vllm-rs.pgo"
+install -m0755 "$WORK/vllm-rs.bolt" "$PGO_BIN"
+if ! "$PGO_BIN" --help >/dev/null 2>&1; then
+  install -m0755 "$WORK/vllm-rs.pgo" "$PGO_BIN"
+  skip "the installed bolted binary failed its smoke -- restored the PGO binary"
+fi
+
+grep -E 'BOLT-INFO: .*(execution profile|split [0-9]+ function|functions were overwritten)' \
+     "$WORK/optimize.log" 2>/dev/null | head -3 | sed 's/^/BOLT:   /'
+dyno=$(sed -n '/dynostats after all optimizations/,$p' "$WORK/optimize.log" 2>/dev/null \
+       | grep -m1 -i 'executed instructions' | sed 's/^[[:space:]]*//; s/[[:space:]][[:space:]]*/ /g')
+[ -n "$dyno" ] || dyno="dyno-stats unavailable"
+echo "BOLT: applied ($dyno) -- ${in_sz}B -> ${out_sz}B"
+cleanup
+BOLT_RUN
 
 # Alias the selected builder. `FROM ${ARG}` expands reliably (COPY --from=${ARG}
 # does not), and only the selected stage lands in the final target's build graph —
