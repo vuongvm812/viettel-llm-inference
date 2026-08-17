@@ -33,6 +33,29 @@ WHAT IS COMPARED, AND WHY THE TOLERANCES ARE WHAT THEY ARE
   it in place; the fused kernel keeps that intermediate in shared memory and never writes
   it, because nothing on this path reads it afterwards. The oracle therefore runs against
   a clone -- if it did not, the second stock kernel would read our (untouched) input.
+
+THE FUSED EPILOGUE (-DFUSED_EPILOGUE=1) IS HELD TO A STRICTER STANDARD THAN THE CORE, and
+the two halves are tested against different oracles on purpose:
+
+  vs the STANDALONE KERNEL   BIT-EXACT (``torch.equal`` on the fp8 codes AND the fp32
+                             scales). ``vtl/kernels/gated_rmsnorm_group_quant.cu`` is what
+                             runs today, and bench/test_gdn_gated_rmsnorm.py's oracles
+                             describe ITS math; if the fused epilogue drifted by even one
+                             code those oracles would stop covering the production path.
+                             The comparison is run on IDENTICAL inputs -- the unfused
+                             build's own bf16 output, fed to the standalone kernel -- so
+                             the only thing under test is the epilogue.
+  vs the CHAINED ORACLE      (stock Triton pair -> RMSNormGated reference -> group-quant
+                             reference) fp8 codes within one e4m3 step, and under 1% of
+                             codes differing at all. Bit-exactness is NOT available here
+                             and asking for it would be wrong: the core's two documented
+                             fp32 divergences from Triton (reduction order, transcendental
+                             lowering) move `o` by ~1 ulp fp32, which can flip a code that
+                             sits on an e4m3 rounding boundary. One step bounds the flip;
+                             the 1% fraction is what separates rounding noise from a
+                             systematic error (a wrong scale layout or a dropped gate flips
+                             tens of percent). Same two bounds bench/test_gdn_gated_rmsnorm
+                             .py uses for the same reason.
 """
 
 from __future__ import annotations
@@ -92,6 +115,16 @@ SMALL_GEOM = (DK, DV, 2, 8, CONV)
 STATE_RTOL, STATE_ATOL = 1e-4, 1e-5   # fp32 ssm state; see the module docstring
 OUT_RTOL, OUT_ATOL = 1e-2, 1e-2       # bf16 output, ~2 ulp
 
+# Fused epilogue. FP8_RTOL is one e4m3 mantissa step (3 bits -> 2**-3 = 0.125, plus slack
+# for the binade edge); FP8_ATOL is one subnormal step at the quantized magnitude scale.
+# FP8_MISMATCH_FRAC separates reduction-order noise from a systematic error -- both bounds
+# are lifted from bench/test_gdn_gated_rmsnorm.py::_assert_fp8_equivalent.
+FP8_RTOL, FP8_ATOL = 0.13, 2.0 ** -9
+FP8_MISMATCH_FRAC = 1e-2
+NORM_EPS = 1e-6                       # RMSNormGated eps on this model
+GROUP = 128
+FP8_MAX = 448.0
+
 
 # --------------------------------------------------------------------------------------
 # fakes: just enough of the layer + metadata for the patch's own _plan() to run
@@ -103,12 +136,24 @@ class _FakeConv1d:
         self.bias = bias
 
 
+class _FakeNorm:
+    """vLLM's RMSNormGated, reduced to the four attributes _norm_params() reads."""
+
+    def __init__(self, weight, eps=NORM_EPS, activation="silu"):
+        self.weight = weight
+        self.eps = eps
+        self.activation = activation
+        self.norm_before_gate = True
+        self.group_size = None
+
+
 class _FakeLayer:
     """Only the attributes _plan() actually reads. Wrong on purpose: nothing else exists,
     so a _plan() that starts depending on more of the layer fails here rather than in
     production."""
 
-    def __init__(self, geom, kv_cache, conv1d, A_log, dt_bias, activation="silu"):
+    def __init__(self, geom, kv_cache, conv1d, A_log, dt_bias, activation="silu",
+                 norm=None):
         dk, dv, hk, hv, conv = geom
         self.head_k_dim, self.head_v_dim = dk, dv
         self.num_k_heads, self.num_v_heads = hk, hv
@@ -119,6 +164,8 @@ class _FakeLayer:
         self.conv1d = conv1d
         self.A_log = A_log
         self.dt_bias = dt_bias
+        self.norm = norm
+        self.gqa_interleaved_layout = False
 
 
 class _FakeMeta:
@@ -131,16 +178,33 @@ class _FakeMeta:
         self.non_spec_state_indices_tensor = idx
 
 
-def _arm_state(geom):
-    """Compile the shipped kernel for `geom` and arm the patch, or skip with the reason."""
+def _compile(geom, defines):
     src = nvrtc.load_source(patch.KERNEL)
     assert src, "vtl/kernels/gdn_decode_step.cu must ship with the package"
-    built = nvrtc.build_cubin(src, patch.KERNEL, patch._defines(geom))
+    built = nvrtc.build_cubin(src, patch.KERNEL, defines)
     if built is None:
         pytest.skip("NVRTC unavailable (no cuda-python / no driver) -- stock pair stands")
-    patch._state.update(geom=geom, launcher=nvrtc._load_cubin(built[0], patch.KERNEL),
-                        installed=True, armed=True)
+    return nvrtc._load_cubin(built[0], patch.KERNEL)
+
+
+def _arm_state(geom):
+    """Compile the shipped kernel for `geom` and arm the patch, or skip with the reason.
+
+    Leaves the FUSED launcher unarmed: the unfused tests must exercise the unfused path.
+    """
+    patch._claims.clear()
+    patch.EPILOGUE_CONSUMERS.clear()
+    patch._state.update(geom=geom, launcher=_compile(geom, patch._defines(geom)),
+                        launcher_fused=None, installed=True, armed=True)
     return patch._state["launcher"]
+
+
+def _arm_fused(geom, is_silu=True, w_fp32=False):
+    """Arm BOTH launchers, as _arm_epilogue does on the box."""
+    _arm_state(geom)
+    defines = patch._fused_defines(geom, is_silu, w_fp32)
+    patch._state["launcher_fused"] = _compile(geom, defines)
+    return patch._state["launcher_fused"]
 
 
 # --------------------------------------------------------------------------------------
@@ -159,9 +223,11 @@ def _stock_pair():
     return causal_conv1d_update, fused_recurrent_gated_delta_rule_packed_decode
 
 
-def _make_inputs(geom, tokens, dev, seed, layout="DS", idx_stride=1, has_bias=False):
+def _make_inputs(geom, tokens, dev, seed, layout="DS", idx_stride=1, has_bias=False,
+                 with_gate=False, w_dtype=torch.bfloat16):
     dk, dv, hk, hv, conv = geom
     conv_dim = patch._conv_dim(geom)
+    hidden = hv * dv
     g = torch.Generator(device=dev).manual_seed(seed)
 
     def rnd(*shape, dtype=torch.bfloat16, scale=1.0):
@@ -181,7 +247,17 @@ def _make_inputs(geom, tokens, dev, seed, layout="DS", idx_stride=1, has_bias=Fa
 
     ssm_state = (torch.randn(lines, hv, dv, dk, generator=g, device=dev,
                              dtype=torch.float32) * 0.1)
-    mixed_qkv = rnd(tokens, conv_dim)
+    if with_gate:
+        # EXACTLY the production provenance: forward_cuda splits ONE projection buffer into
+        # mixed_qkv and z, so mixed_qkv is a strided view and z is the columns after it.
+        # A contiguous stand-in would never exercise _z_ptr's stride recovery.
+        qkvz = rnd(tokens, conv_dim + hidden)
+        mixed_qkv, z = qkvz.split([conv_dim, hidden], dim=-1)
+        z[0].zero_()               # a zero gate row
+        z[1].fill_(20.0)           # a saturated one
+    else:
+        qkvz, z = None, None
+        mixed_qkv = rnd(tokens, conv_dim)
     a = rnd(tokens, hv, scale=0.5)
     b = rnd(tokens, hv)
     # A in [0.1, 1] so exp(g) lands in ~[0.5, 0.93]: a decay that neither freezes the
@@ -202,7 +278,8 @@ def _make_inputs(geom, tokens, dev, seed, layout="DS", idx_stride=1, has_bias=Fa
 
     return dict(conv_state=conv_state, ssm_state=ssm_state, mixed_qkv=mixed_qkv,
                 a=a, b=b, A_log=A_log, dt_bias=dt_bias, conv_w=conv_w,
-                conv_bias=conv_bias, idx=idx, conv_dim=conv_dim)
+                conv_bias=conv_bias, idx=idx, conv_dim=conv_dim, qkvz=qkvz, z=z,
+                hidden=hidden, norm_w=rnd(dv, dtype=w_dtype))
 
 
 def _run_stock(geom, t, dev, tensors):
@@ -241,36 +318,63 @@ def _run_stock(geom, t, dev, tensors):
     return conv_state, ssm_state, out.squeeze(1)
 
 
-def _run_fused(geom, t, dev, tensors):
-    """Plan + launch through the PATCH's own code path, on the original tensors."""
+def _make_layer(geom, tensors, with_norm=False):
+    """A _FakeLayer wired to the fixture, with kv_cache[0] in whatever layout the installed
+    vLLM's ``is_conv_state_dim_first()`` says _plan() will transpose back to ours."""
     dk, dv, hk, hv, conv = geom
-    launcher = _arm_state(geom)
-
     conv_dim = tensors["conv_dim"]
-    weight = tensors["conv_w"].view(conv_dim, 1, conv)   # vLLM's unsqueezed conv1d weight
     try:
         from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
     except Exception as exc:  # pragma: no cover
         pytest.skip(f"vLLM mamba_utils unimportable ({exc!r})")
-    # _plan() rebuilds the (.., dim, state_len) view from kv_cache[0] exactly as the stock
-    # method does, so hand it a kv_cache[0] the current layout setting maps back to ours.
     ds_view = tensors["conv_state"]
     kv0 = ds_view if is_conv_state_dim_first() else ds_view.transpose(-1, -2)
-
-    layer = _FakeLayer(
+    return _FakeLayer(
         geom,
         (kv0, tensors["ssm_state"]),
-        _FakeConv1d(weight, tensors["conv_bias"]),
+        _FakeConv1d(tensors["conv_w"].view(conv_dim, 1, conv), tensors["conv_bias"]),
         tensors["A_log"],
         tensors["dt_bias"],
+        norm=_FakeNorm(tensors["norm_w"]) if with_norm else None,
     )
+
+
+def _attach_epilogue(layer, geom, rows, tensors, consumer=True):
+    """What _arm_epilogue() attaches on the box: staging buffers + the consumer handshake."""
+    dk, dv, hk, hv, conv = geom
+    hidden = hv * dv
+    dev = tensors["norm_w"].device
+    layer._vtl_gdn_epilogue = {
+        "mode": None,
+        "weight_ptr": tensors["norm_w"].data_ptr(),
+        "w_ptr": tensors["norm_w"].data_ptr(),
+        "eps": NORM_EPS,
+        "is_silu": True,
+        "rows": rows,
+        "hidden": hidden,
+        "fp8": torch.zeros(rows, hidden, dtype=torch.float8_e4m3fn, device=dev),
+        "scales": torch.zeros(rows, hv, dtype=torch.float32, device=dev),
+        "views": {},
+    }
+    patch.EPILOGUE_CONSUMERS.clear()
+    if consumer:
+        patch.note_epilogue_consumer(tensors["norm_w"].data_ptr())
+    return layer._vtl_gdn_epilogue
+
+
+def _run_fused(geom, t, dev, tensors):
+    """Plan + launch through the PATCH's own code path, on the original tensors."""
+    dk, dv, hk, hv, conv = geom
+    launcher = _arm_state(geom)
+    layer = _make_layer(geom, tensors)
     out = torch.zeros(t, hv, dv, dtype=torch.bfloat16, device=dev)
     plan = patch._plan(layer, tensors["mixed_qkv"], tensors["b"], tensors["a"], out,
                        _FakeMeta(t, tensors["idx"]))
     assert plan is not None, "the fast path must engage on a pure non-spec decode batch"
-    grid, block, args = plan
+    grid, block, args, chosen, claim = plan
     assert grid == (hk, t, 1) and block == (dk, 1, 1), (grid, block)
-    launcher(grid=grid, block=block, args=args)
+    assert chosen is launcher and claim is None, "no epilogue armed -> the unfused launcher"
+    chosen(grid=grid, block=block, args=args)
     torch.cuda.synchronize()
     return tensors["conv_state"], tensors["ssm_state"], out
 
@@ -389,6 +493,222 @@ def test_plan_declines_anything_that_is_not_a_pure_non_spec_decode(field, value)
     layer.head_v_dim = dv * 2
     assert patch._plan(layer, tensors["mixed_qkv"], tensors["b"], tensors["a"], out, md) \
         is None, "a foreign geometry must fall through"
+
+
+# --------------------------------------------------------------------------------------
+# GPU half: the fused epilogue
+# --------------------------------------------------------------------------------------
+
+def _reference_epilogue(x, z, weight, is_silu=True, eps=NORM_EPS):
+    """RMSNormGated.forward_static -> reshape [T, H*D] -> per_token_group_fp8_quant.
+
+    Byte for byte the composition bench/test_gdn_gated_rmsnorm.py::reference_group_quant
+    and gdn_kernels._stock_group_quant use, including the double rounding at the op
+    boundary, the 1e-10 amax FLOOR (not a min-scale clamp) and the /448 scale.
+    """
+    xf = x.float()
+    zf = z.float()
+    var = xf.pow(2).mean(-1, keepdim=True)
+    y = (xf * torch.rsqrt(var + eps)) * weight.float()
+    act = zf * torch.sigmoid(zf) if is_silu else torch.sigmoid(zf)
+    yq = (y * act).to(x.dtype).float()
+    amax = yq.abs().amax(-1).clamp(min=1e-10)
+    scale = amax / FP8_MAX
+    q = torch.clamp(yq / scale.unsqueeze(-1), -FP8_MAX, FP8_MAX)
+    return q.reshape(x.shape[0], -1).to(torch.float8_e4m3fn), scale
+
+
+def _run_fused_epilogue(geom, t, dev, tensors, rows=None, is_silu=True):
+    """Plan + launch the FUSED variant through the patch, and consume the claim the way
+    gdn_kernels' op does. Returns (fp8, scales, out_buffer)."""
+    dk, dv, hk, hv, conv = geom
+    fused = _arm_fused(geom, is_silu=is_silu)
+    layer = _make_layer(geom, tensors, with_norm=True)
+    _attach_epilogue(layer, geom, rows or t, tensors)
+
+    out = torch.zeros(t, hv, dv, dtype=torch.bfloat16, device=dev)
+    plan = patch._plan(layer, tensors["mixed_qkv"], tensors["b"], tensors["a"], out,
+                       _FakeMeta(t, tensors["idx"]))
+    assert plan is not None, "the fused path must engage once every input is resolvable"
+    grid, block, args, chosen, claim = plan
+    assert chosen is fused, "the fused launcher must be the one chosen"
+    assert claim is not None and claim[0] == out.data_ptr()
+    chosen(grid=grid, block=block, args=args)
+    patch._publish_claim(*claim)
+
+    # ...and the consumer side, verbatim: a reshape VIEW of core_attn_out is what the op
+    # is handed, so the pointer identity has to survive it.
+    staged = patch.take_epilogue(out.reshape(-1, dv), hv)
+    assert staged is not None, "the claim must be consumable through the reshape view"
+    torch.cuda.synchronize()
+    return staged[0], staged[1], out
+
+
+def _assert_fp8_close(got_q, exp_q, got_s, exp_s):
+    torch.testing.assert_close(got_q.float(), exp_q.float(), rtol=FP8_RTOL, atol=FP8_ATOL)
+    frac = (got_q.view(torch.uint8) != exp_q.view(torch.uint8)).float().mean().item()
+    assert frac < FP8_MISMATCH_FRAC, \
+        f"{frac:.2%} of fp8 codes differ -- systematic, not reduction noise"
+    torch.testing.assert_close(got_s, exp_s, rtol=1e-3, atol=0.0)
+
+
+@requires_gpu
+@pytest.mark.parametrize("tokens", [1, 3, 8])
+def test_fused_epilogue_bitmatches_the_standalone_norm_quant_kernel(tokens):
+    """THE parity requirement: identical inputs, identical bytes.
+
+    The unfused build's bf16 output is fed to ``vtl/kernels/gated_rmsnorm_group_quant.cu``
+    -- the kernel that runs today -- and the fused build must reproduce its fp8 codes and
+    fp32 scales exactly. That is what keeps bench/test_gdn_gated_rmsnorm.py's oracles a
+    description of the production path after the fusion.
+    """
+    dev, t = "cuda", tokens
+    geom = SMALL_GEOM
+    dk, dv, hk, hv, conv = geom
+    tensors = _make_inputs(geom, t, dev, seed=60 + t, with_gate=True)
+
+    # unfused core -> bf16 out. Same inputs, CLONED state, so the fused run below starts
+    # from the same place rather than from this run's leftovers.
+    plain = dict(tensors)
+    plain["conv_state"] = tensors["conv_state"].clone()
+    plain["ssm_state"] = tensors["ssm_state"].clone()
+    _arm_state(geom)
+    layer = _make_layer(geom, plain)
+    out = torch.zeros(t, hv, dv, dtype=torch.bfloat16, device=dev)
+    grid, block, args, chosen, claim = patch._plan(
+        layer, plain["mixed_qkv"], plain["b"], plain["a"], out, _FakeMeta(t, plain["idx"]))
+    chosen(grid=grid, block=block, args=args)
+    torch.cuda.synchronize()
+
+    exp_q, exp_s = _run_standalone_norm_quant(out, tensors["z"].reshape(t, hv, dv),
+                                              tensors["norm_w"], hv)
+    got_q, got_s, _ = _run_fused_epilogue(geom, t, dev, tensors)
+
+    assert torch.equal(got_q.view(torch.uint8), exp_q.view(torch.uint8)), \
+        "the fused epilogue must be BIT-IDENTICAL to the standalone kernel it replaces"
+    assert torch.equal(got_s, exp_s), "group scales must be bit-identical too"
+
+
+def _run_standalone_norm_quant(x, z, weight, hv):
+    """vtl/kernels/gated_rmsnorm_group_quant.cu on [T, HV, DV] inputs, via its own patch's
+    define/grid helpers -- so a drift between the two kernels' defines shows up here."""
+    from vtl.patches import gdn_kernels
+
+    dv = weight.numel()
+    t = x.shape[0]
+    rows = t * hv
+    defines = gdn_kernels._nvrtc_defines(dv, hv, True, weight.dtype == torch.float32)
+    built = nvrtc.build_cubin(nvrtc.load_source("gated_rmsnorm_group_quant"),
+                              "gated_rmsnorm_group_quant", defines)
+    if built is None:  # pragma: no cover
+        pytest.skip("NVRTC unavailable -- cannot build the standalone twin")
+    launch = nvrtc._load_cubin(built[0], "gated_rmsnorm_group_quant")
+    q = torch.zeros(t, hv * dv, dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.zeros(t, hv, dtype=torch.float32, device=x.device)
+    launch(
+        grid=gdn_kernels._nvrtc_grid(rows, dv),
+        block=(gdn_kernels.NVRTC_THREADS, 1, 1),
+        args=nvrtc.pack_args(
+            q.data_ptr(), s.data_ptr(), x.contiguous().data_ptr(), z.contiguous().data_ptr(),
+            weight.data_ptr(), ("l", s.stride(0)), ("l", s.stride(1)), ("l", rows),
+            ("f", NORM_EPS),
+        ),
+    )
+    torch.cuda.synchronize()
+    return q, s
+
+
+@requires_gpu
+@pytest.mark.parametrize("geom", [SMALL_GEOM, PROD_GEOM])
+def test_fused_epilogue_matches_the_chained_stock_oracle(geom):
+    """stock Triton pair -> RMSNormGated reference -> group-quant reference, end to end.
+
+    The tolerance (not bit-exactness) is the core's, not the epilogue's -- see the module
+    docstring. The previous test is what pins the epilogue itself.
+    """
+    dev, t = "cuda", 4
+    dk, dv, hk, hv, conv = geom
+    tensors = _make_inputs(geom, t, dev, seed=71, with_gate=True)
+    ref_cs, ref_ss, ref_out = _run_stock(geom, t, dev, tensors)
+    exp_q, exp_s = _reference_epilogue(ref_out, tensors["z"].reshape(t, hv, dv),
+                                       tensors["norm_w"])
+    got_q, got_s, out = _run_fused_epilogue(geom, t, dev, tensors)
+
+    _assert_fp8_close(got_q, exp_q, got_s, exp_s)
+    # The state is still the core's business and still bounded the same way.
+    assert torch.equal(tensors["conv_state"].view(torch.uint8), ref_cs.view(torch.uint8))
+    assert torch.allclose(tensors["ssm_state"], ref_ss, rtol=STATE_RTOL, atol=STATE_ATOL)
+    # ...and the bf16 core output is NOT written by the fused build. That is the traffic the
+    # fusion removes, so leaving it written would mean the fusion did not happen.
+    assert (out.float() == 0).all(), "the fused build must not write core_attn_out"
+
+
+@requires_gpu
+def test_fused_epilogue_quantizes_null_rows_like_the_stock_chain():
+    """A padded cudagraph row (NULL_BLOCK_ID) has a zero core output, and the stock chain
+    still norms and quantizes it: amax floors at 1e-10, the scale is 1e-10/448 and every
+    code is 0. Short-circuiting the row would write whatever the buffer held."""
+    dev, t = "cuda", 3
+    geom = SMALL_GEOM
+    dk, dv, hk, hv, conv = geom
+    tensors = _make_inputs(geom, t, dev, seed=81, with_gate=True)
+    got_q, got_s, _ = _run_fused_epilogue(geom, t, dev, tensors)
+    null = (tensors["idx"] == NULL_BLOCK_ID).nonzero().flatten()
+    assert null.numel() > 0
+    assert (got_q[null].float() == 0).all(), "a null row's codes must all be zero"
+    torch.testing.assert_close(
+        got_s[null], torch.full_like(got_s[null], 1e-10 / FP8_MAX), rtol=1e-6, atol=0.0)
+
+
+@requires_gpu
+def test_fused_epilogue_declines_when_the_gate_is_not_recoverable():
+    """A contiguous ``mixed_qkv`` is not the split view ``forward_cuda`` produces, so there
+    is no z behind it. The patch must fall back to the unfused launcher rather than read
+    whatever follows the buffer -- and having done so, must stay latched there."""
+    dev, t = "cuda", 3
+    geom = SMALL_GEOM
+    dk, dv, hk, hv, conv = geom
+    tensors = _make_inputs(geom, t, dev, seed=91, with_gate=False)
+    _arm_fused(geom)
+    layer = _make_layer(geom, tensors, with_norm=True)
+    epi = _attach_epilogue(layer, geom, t, tensors)
+    out = torch.zeros(t, hv, dv, dtype=torch.bfloat16, device=dev)
+    grid, block, args, chosen, claim = patch._plan(
+        layer, tensors["mixed_qkv"], tensors["b"], tensors["a"], out,
+        _FakeMeta(t, tensors["idx"]))
+    assert chosen is patch._state["launcher"] and claim is None
+    assert epi["mode"] == "plain", "the decision must latch, not be re-taken every step"
+    # ...and the unfused launcher it fell back to still writes the bf16 output.
+    chosen(grid=grid, block=block, args=args)
+    torch.cuda.synchronize()
+    assert not (out.float() == 0).all()
+
+
+@requires_gpu
+@pytest.mark.parametrize("case", ["no-consumer", "staging-rows", "out-rows"])
+def test_fused_epilogue_claim_conditions(case):
+    """Each reason the bf16 write may NOT be dropped, checked against real tensors."""
+    dev, t = "cuda", 3
+    geom = SMALL_GEOM
+    dk, dv, hk, hv, conv = geom
+    tensors = _make_inputs(geom, t, dev, seed=101, with_gate=True)
+    _arm_fused(geom)
+    layer = _make_layer(geom, tensors, with_norm=True)
+    rows = t
+    consumer = True
+    if case == "no-consumer":
+        consumer = False           # gdn_kernels' op never ran for this layer
+    elif case == "staging-rows":
+        rows = t - 1               # the batch is wider than the staging buffers
+    _attach_epilogue(layer, geom, rows, tensors, consumer=consumer)
+
+    n_out = t + 1 if case == "out-rows" else t   # padded rows the consumer would also norm
+    out = torch.zeros(n_out, hv, dv, dtype=torch.bfloat16, device=dev)
+    plan = patch._plan(layer, tensors["mixed_qkv"], tensors["b"], tensors["a"], out,
+                       _FakeMeta(t, tensors["idx"]))
+    assert plan is not None, "control: the unfused fast path must still engage"
+    assert plan[3] is patch._state["launcher"], f"{case} must not take the fused launcher"
+    assert plan[4] is None and not patch._claims, f"{case} must publish no claim"
 
 
 # --------------------------------------------------------------------------------------

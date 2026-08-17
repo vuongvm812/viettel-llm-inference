@@ -66,14 +66,69 @@
 // the conv output back over mixed_qkv in place. Nothing reads it afterwards on this path
 // (it feeds only kernel 2, which we fused), so the fast path leaves mixed_qkv untouched.
 //
+// ---------------------------------------------------------------------------------------
+// FUSED_EPILOGUE=1: the gated-RMSNorm + group-128 fp8 quant stage, folded in
+// ---------------------------------------------------------------------------------------
+// With -DFUSED_EPILOGUE=1 this kernel does not stop at `o`. It continues into the stage the
+// decode path otherwise runs as a SECOND launch chain per layer -- RMSNormGated (per value
+// head, over DV) followed by the per-(token, 128-group) fp8 quant that out_proj's block-fp8
+// GEMM consumes -- and writes fp8 codes + fp32 scales instead of the bf16 `o`.
+//
+// WHY THE FUSION IS CLEAN: 8192 / 128 == 64 == HV. The quant group size (128, this
+// checkpoint's kFp8Dynamic128Sym) equals head_v_dim, so ONE VALUE HEAD IS EXACTLY ONE QUANT
+// GROUP AND ONE NORM ROW. The [T, HV, DV] core output flattens to [T, HV*DV] with head hv
+// owning columns [hv*DV, (hv+1)*DV) -- precisely group hv. No group ever straddles two
+// heads, so a block that owns GPB whole value heads owns GPB whole norm rows and GPB whole
+// quant groups, and the epilogue needs no cross-block communication at all.
+//
+// NUMERICS ARE vtl/kernels/gated_rmsnorm_group_quant.cu's, OPERATION FOR OPERATION -- same
+// 16-lane sub-group per row, same in-lane 8-wide accumulation order, same xor offsets, same
+// double rounding at the RMSNormGated->quant op boundary, same eps floor / /448 scale / true
+// division / clamp order / hardware pair converter. That is a hard requirement, not a
+// preference: bench/test_gdn_gated_rmsnorm.py's oracles describe the standalone kernel's
+// math, and the fused epilogue must stay inside the same description or those oracles stop
+// covering the production path. bench/test_gdn_decode_step.py asserts the two BIT-MATCH.
+//
+//   x    = f32(bf16(o))                      <- the bf16 core_attn_out the unfused pair
+//                                               round-trips; staged in shared memory here,
+//                                               so the value is identical but the HBM
+//                                               write+read is gone
+//   ss   = sum_d x^2   (8 per lane, in order; then a 4-step xor tree over 16 lanes)
+//   rstd = rsqrtf(ss / DV + eps)
+//   y    = ((x * rstd) * f32(w[d])) * act(f32(z[d]))          act = silu or sigmoid
+//   yq   = f32(bf16(y))                      <- RMSNormGated returns bf16; quant re-reads it
+//   s    = max(1e-10, max_group|yq|) / 448   <- NO min-scale clamp; the amax is floored
+//   code = fp8_e4m3(fminf(fmaxf(yq / s, -448), 448))          TRUE division, stock clamp
+//                                                             order (NaN -> -448)
+//   scales[token * ss_tok + hv * ss_grp] = s                  one scale per (token, head)
+//
+// The bf16 `out` argument stays in the signature (same position) but is NOT written by the
+// fused build -- eliminating that [T, HV*DV] write and the epilogue's matching read is the
+// whole point. vtl/patches/gdn_decode_step.py only launches this variant when it has proven
+// the sole reader of `out` on this path takes the fp8/scales instead.
+//
+// NULL ROWS STILL RUN THE EPILOGUE. A NULL_BLOCK_ID row's core output is zero, and the
+// unfused chain still norms+quants that zero row: x=0 gives y=0 for any finite z, amax
+// floors to 1e-10 and every code is 0. The fused build reproduces that by staging zeros and
+// running the SAME expression rather than short-circuiting, so a padded cudagraph row lands
+// on the same bytes the stock chain would have written.
+//
 // Required defines (vtl/patches/gdn_decode_step.py supplies them from the loaded layer):
-//   DK=128 DV=128 HK=16 HV=64 CONV=4 THREADS=128
+//   DK=128 DV=128 HK=16 HV=64 CONV=4 THREADS=128 FUSED_EPILOGUE=0
+//   ...and for the fused build, additionally: FUSED_EPILOGUE=1 GROUP=128 IS_SILU=0|1
+//                                             W_FP32=0|1
 // Block: (THREADS, 1, 1). The fp32 [DV, DK] state tiles (64 KB each, HV/HK of them per
 // block) stream through registers one row per warp iteration, 16B (float4) accesses;
 // q/k/v staged in shared memory. H200: HK*T blocks (96 at trace-peak decode concurrency
 // ~6) -- HBM-bound on the 4 MB/seq state, which is read+written exactly once.
 
 #include <cuda_bf16.h>
+#ifndef FUSED_EPILOGUE
+#define FUSED_EPILOGUE 0
+#endif
+#if FUSED_EPILOGUE
+#include <cuda_fp8.h>
+#endif
 
 #ifndef DK
 #error "NVRTC: -DDK=<head_k_dim> is required"
@@ -116,6 +171,137 @@ static_assert(GPB <= THREADS, "gating computed by the first GPB threads");
 
 __device__ constexpr float kL2Eps = 1e-6f;              // fused_recurrent l2norm epsilon
 __device__ constexpr float kSoftplusThreshold = 20.0f;  // SOFTPLUS_THRESHOLD in the wrapper
+
+#if FUSED_EPILOGUE
+// ---------------------------------------------------------------------------------------
+// The gated-norm + group-quant epilogue. Every line below is the corresponding line of
+// vtl/kernels/gated_rmsnorm_group_quant.cu; the only difference is where `x` comes from
+// (shared memory here, a bf16 HBM row there) and it is the same fp32 value either way.
+// ---------------------------------------------------------------------------------------
+#ifndef GROUP
+#define GROUP DV
+#endif
+#ifndef IS_SILU
+#define IS_SILU 1
+#endif
+#ifndef W_FP32
+#define W_FP32 0
+#endif
+
+#define EVEC 8                  // 16-byte bf16 loads for z, 8-byte fp8 stores for the codes
+#define ELANES (DV / EVEC)      // lanes per (token, head) row == per quant group == 16
+
+static_assert(GROUP == DV, "one quant group per head: GROUP must equal DV (8192/128 == HV)");
+static_assert(DV % EVEC == 0, "DV must be a multiple of 8 for the vectorized epilogue");
+static_assert(ELANES >= 2 && ELANES <= 32 && (ELANES & (ELANES - 1)) == 0,
+              "sub-group reduction needs a power-of-two lane count within one warp");
+// The block runs its GPB heads' epilogues side by side, one 16-lane sub-group each, so the
+// sub-groups must fit the block. GPB=4, ELANES=16 -> 64 of 128 threads at the production
+// geometry; warps 2..3 sit out, and no shuffle mask ever names them.
+static_assert(GPB * ELANES <= THREADS, "epilogue sub-groups must fit one block");
+static_assert(THREADS % 32 == 0 && (GPB * ELANES) % ELANES == 0, "whole sub-groups");
+
+__device__ constexpr float kFp8Max = 448.0f;
+__device__ constexpr float kGroupQuantEps = 1e-10f;  // stock per_token_group_fp8_quant eps
+
+#if W_FP32
+typedef float norm_weight_t;
+__device__ __forceinline__ float nw2f(norm_weight_t w) { return w; }
+#else
+typedef __nv_bfloat16 norm_weight_t;
+__device__ __forceinline__ float nw2f(norm_weight_t w) { return __bfloat162float(w); }
+#endif
+
+struct __align__(16) EVec8 { __nv_bfloat16 v[EVEC]; };            // one 16-byte z load
+struct __align__(8) EFp8Vec8 { __nv_fp8x2_storage_t pair[EVEC / 2]; };  // one 8-byte store
+
+// act(z): silu (z*sigmoid(z)) or sigmoid(z), in fp32 -- matches RMSNormGated.forward_static.
+__device__ __forceinline__ float gdn_gate_act(float z) {
+    const float s = 1.0f / (1.0f + expf(-z));
+#if IS_SILU
+    return z * s;
+#else
+    return s;
+#endif
+}
+
+// Stock group-quant clamp order (fminf(fmaxf(v, lo), hi)); NaN maps to lo, as stock does.
+__device__ __forceinline__ float gdn_group_quant_clamp(float v) {
+    return fminf(fmaxf(v, -kFp8Max), kFp8Max);
+}
+
+// One (token, key-head) block's worth of epilogue: GPB rows, GPB groups, GPB scales.
+// `s_o` holds this block's GPB head outputs ALREADY ROUNDED THROUGH BF16 -- i.e. exactly
+// the values the unfused chain would have read back out of core_attn_out.
+__device__ __forceinline__ void gdn_norm_quant_epilogue(
+    const float* __restrict__ s_o,                // [GPB * DV] fp32, bf16-rounded
+    const __nv_bfloat16* __restrict__ z,          // [T, HV*DV] gate, row stride z_stride
+    const norm_weight_t* __restrict__ norm_w,     // [DV]
+    __nv_fp8_e4m3* __restrict__ out_q,            // [T, HV*DV], row stride oq_stride
+    float* __restrict__ scales,                   // strides (ss_tok, ss_grp) in ELEMENTS
+    long long n, int i_h, int tid, float norm_eps,
+    long long z_stride, long long oq_stride, long long ss_tok, long long ss_grp) {
+    if (tid >= GPB * ELANES) return;   // whole warps sit out; they are in no shuffle mask
+    const int sub = tid / ELANES;      // head within this block
+    const int lane = tid % ELANES;     // lane within the row
+    const int lane_in_warp = tid & 31;
+#if ELANES == 32
+    const unsigned mask = 0xffffffffu;
+#else
+    const unsigned mask = ((1u << ELANES) - 1u) << (lane_in_warp & ~(ELANES - 1));
+#endif
+    const int idx = lane * EVEC;
+    const int i_hv = i_h * GPB + sub;
+
+    float xf[EVEC], zf[EVEC];
+    {
+        const EVec8 vz = *reinterpret_cast<const EVec8*>(
+            z + n * z_stride + (long long)i_hv * DV + idx);
+#pragma unroll
+        for (int j = 0; j < EVEC; ++j) {
+            xf[j] = s_o[sub * DV + idx + j];
+            zf[j] = __bfloat162float(vz.v[j]);
+        }
+    }
+
+    // --- sum(x^2) over the row, sub-group shuffle reduce (order fixed by the twin) ---
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < EVEC; ++j) ss += xf[j] * xf[j];
+#pragma unroll
+    for (int off_ = ELANES / 2; off_ > 0; off_ >>= 1) ss += __shfl_xor_sync(mask, ss, off_);
+    const float rstd = rsqrtf(ss / DV + norm_eps);
+
+    // --- y = ((x*rstd)*w)*act(z) in fp32; narrow ONCE to bf16; widen for the quant ---
+    float yq[EVEC];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < EVEC; ++j) {
+        const float y = ((xf[j] * rstd) * nw2f(norm_w[idx + j])) * gdn_gate_act(zf[j]);
+        yq[j] = __bfloat162float(__float2bfloat16(y));  // the RMSNormGated -> quant boundary
+        amax = fmaxf(amax, fabsf(yq[j]));
+    }
+#pragma unroll
+    for (int off_ = ELANES / 2; off_ > 0; off_ >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(mask, amax, off_));
+
+    // --- per-group scale, stock numerics: eps floor, /448, NO min-scale clamp ---
+    amax = fmaxf(amax, kGroupQuantEps);
+    const float y_s = amax / kFp8Max;
+    if (lane == 0) scales[n * ss_tok + (long long)i_hv * ss_grp] = y_s;
+
+    // --- quantize: TRUE division (stock divides), stock clamp order, hw pair converter ---
+    EFp8Vec8 vout;
+#pragma unroll
+    for (int j = 0; j < EVEC; j += 2) {
+        float2 v;
+        v.x = gdn_group_quant_clamp(yq[j] / y_s);
+        v.y = gdn_group_quant_clamp(yq[j + 1] / y_s);
+        vout.pair[j >> 1] = __nv_cvt_float2_to_fp8x2(v, __NV_SATFINITE, __NV_E4M3);
+    }
+    *reinterpret_cast<EFp8Vec8*>(out_q + n * oq_stride + (long long)i_hv * DV + idx) = vout;
+}
+#endif  // FUSED_EPILOGUE
 
 // One channel of the depthwise conv update, Triton rounding replicated (see header).
 // Returns the fp32 value of the bf16-rounded conv output and rotates the channel's state.
@@ -204,7 +390,21 @@ extern "C" __global__ void __launch_bounds__(THREADS) gdn_decode_step(
     // kernels `block_table_tensor[:, 0]`, whose stride is the block table's ROW stride.
     // (Only the full-cudagraph path copies it into a contiguous buffer.) Both Triton
     // kernels take this stride as an argument for exactly this reason.
-    const long long indices_stride) {
+    const long long indices_stride
+#if FUSED_EPILOGUE
+    // --- the fused epilogue's tail, appended so the two builds share a prefix ---
+    ,
+    const __nv_bfloat16* __restrict__ z,        // [T, HV*DV] gate, row stride z_stride
+    const norm_weight_t* __restrict__ norm_w,   // [DV] RMSNormGated weight
+    __nv_fp8_e4m3* __restrict__ out_q,          // [T, HV*DV] fp8 codes, stride oq_stride
+    float* __restrict__ scales,                 // [T, HV] fp32, strides (ss_tok, ss_grp)
+    const float norm_eps,
+    const long long z_stride,
+    const long long oq_stride,
+    const long long ss_tok,
+    const long long ss_grp
+#endif
+    ) {
     const int i_h = blockIdx.x;        // key head
     const long long n = blockIdx.y;    // token (== sequence: non-spec decode, 1 tok/seq)
     const int tid = threadIdx.x;
@@ -214,16 +414,32 @@ extern "C" __global__ void __launch_bounds__(THREADS) gdn_decode_step(
     __shared__ float s_v[GPB * DV];
     __shared__ float s_red[WARPS];
     __shared__ float s_expg[GPB], s_beta[GPB];
+#if FUSED_EPILOGUE
+    // The core output, staged bf16-rounded so the epilogue reads exactly what the unfused
+    // chain would have read back out of core_attn_out. GPB*DV floats = 2 KB at GPB=4.
+    __shared__ float s_o[GPB * DV];
+#endif
 
     const long long state_idx = (long long)state_indices[n * indices_stride];
     if (state_idx <= 0) {
         // NULL_BLOCK_ID: the recurrent kernel zeroes the output rows and returns; the
-        // conv kernel skips entirely. Nothing else may be touched.
+        // conv kernel skips entirely. Nothing else may be touched. `state_idx` depends only
+        // on blockIdx.y, so this branch is uniform across the block and the __syncthreads
+        // in the fused arm is legal.
+#if FUSED_EPILOGUE
+        // The zero row still has to be normed and quantized -- see the header. THREADS==DV.
+#pragma unroll
+        for (int j = 0; j < GPB; ++j) s_o[j * DV + tid] = 0.0f;
+        __syncthreads();
+        gdn_norm_quant_epilogue(s_o, z, norm_w, out_q, scales, n, i_h, tid, norm_eps,
+                                z_stride, oq_stride, ss_tok, ss_grp);
+#else
 #pragma unroll
         for (int j = 0; j < GPB; ++j) {
             const long long o_base = (n * HV + (long long)i_h * GPB + j) * (long long)DV;
             out[o_base + tid] = __float2bfloat16(0.0f);
         }
+#endif
         return;
     }
 
@@ -286,7 +502,9 @@ extern "C" __global__ void __launch_bounds__(THREADS) gdn_decode_step(
         const float beta = s_beta[j];
         float* const h_head =
             ssm_state + state_idx * state_tok_stride + (long long)i_hv * DV * DK;
+#if !FUSED_EPILOGUE
         const long long o_base = (n * HV + i_hv) * (long long)DV;
+#endif
 
         for (int r = 0; r < ROWS_PER_WARP; ++r) {
             const int v = warp * ROWS_PER_WARP + r;
@@ -322,7 +540,19 @@ extern "C" __global__ void __launch_bounds__(THREADS) gdn_decode_step(
                 o = __fadd_rn(o, __shfl_xor_sync(0xffffffffu, o, off));
 
             *row = h;   // state written back in place, fp32
+#if FUSED_EPILOGUE
+            // Staged, not stored: the bf16 narrowing still happens here (it is part of the
+            // op boundary the epilogue's oracle describes), but it never reaches HBM.
+            if (lane == 0) s_o[j * DV + v] = __bfloat162float(__float2bfloat16(o));
+#else
             if (lane == 0) out[o_base + v] = __float2bfloat16(o);
+#endif
         }
     }
+
+#if FUSED_EPILOGUE
+    __syncthreads();   // every warp's rows of s_o must be visible to the epilogue lanes
+    gdn_norm_quant_epilogue(s_o, z, norm_w, out_q, scales, n, i_h, tid, norm_eps,
+                            z_stride, oq_stride, ss_tok, ss_grp);
+#endif
 }
