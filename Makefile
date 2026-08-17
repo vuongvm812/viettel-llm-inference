@@ -74,12 +74,13 @@ PGO_MODEL ?= /model
 PGO_HFMODEL ?= /home/team17/Qwen3.5-122B-A10B-FP8
 # Staged metadata-only build context (recreated on every PGO build; gitignored).
 PGO_HFMODEL_CTX ?= ../.pgo-hfmodel-ctx
-# -Ctarget-cpu for the vllm-rs binary (plain AND PGO builds). Default native: full host
-# codegen (AVX-512 on an H200 host CPU). Bakes in the BUILD box's ISA — build on the deploy
-# CPU (the H200) for the full win; an older build box (Mac under Rosetta ≈ AVX2) yields a
-# portable subset that still runs on H200. For an emulated build, override PGO_TARGET_CPU=
-# x86-64-v3 or empty (a native/AVX2 instrumented binary can crash the PGO training replay).
-PGO_TARGET_CPU ?= native
+# -Ctarget-cpu for the vllm-rs binary (plain AND PGO builds). Default sapphirerapids: the
+# round-2 deploy host is a Xeon Platinum 8558 (Emerald Rapids; sapphirerapids is the newest
+# LLVM target that ISA fully covers — AVX-512 + AMX). Pinning the target instead of `native`
+# means the same optimized binary comes out of ANY build box, including an emulated one.
+# For an emulated build that must stay portable, override PGO_TARGET_CPU=x86-64-v3 or empty
+# (a too-new instrumented binary can crash the PGO training replay on an older build CPU).
+PGO_TARGET_CPU ?= sapphirerapids
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.

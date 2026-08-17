@@ -183,31 +183,29 @@ services:
       # ---- CPU / threading -------------------------------------------------------------
       # vLLM only pins torch's thread count in the MULTIPROC executor path, which TP=1 never
       # takes. A cgroup quota does not change hardware_concurrency(), so torch would size its
-      # pools to the HOST's core count inside our 3-core budget.
-      OMP_NUM_THREADS: "3"
-      MKL_NUM_THREADS: "3"
-      OMP_WAIT_POLICY: "PASSIVE"
-      # ACTIVE lets a spinning libgomp worker steal a third
-      #   of the host budget from the decode loop
-      OMP_PROC_BIND: "close" # keep the 3 OMP threads on the cores they started on:
-      OMP_PLACES: "cores" #   every migration is a cold L1/L2
+      # pools to the HOST's full core count. Round-2 host: Xeon Platinum 8558, 22 cores
+      # allocated (was 3 vCPU on the round-1.2 MIG box -- every pin below was re-based).
+      OMP_NUM_THREADS: "8"
+      MKL_NUM_THREADS: "8"
+      OMP_WAIT_POLICY: "PASSIVE"         # ACTIVE lets a spinning libgomp worker steal a third
+                                         #   of the host budget from the decode loop
+      OMP_PROC_BIND: "close"             # keep the OMP threads on the cores they started on:
+      OMP_PLACES: "cores"                #   every migration is a cold L1/L2
 
       # ---- Rust frontend ---------------------------------------------------------------
       VLLM_USE_RUST_FRONTEND: "1"
-      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "60"
-      # multi-turn gaps tail out past 30s; 60 races a slow
-      #   turn's connection reuse less than the 30s default
-      TOKIO_WORKER_THREADS: "3"
-      # HTTP runtime only. MUST be a positive int -- empty
-      #   or 0 panics vllm-rs at boot
-      # vllm-rs starts two more runtimes that ignore TOKIO_WORKER_THREADS. Pinned to 2:
-      # JUDGE-SWEPT, not hypothesized -- full submissions at 1/2/3 scored 71.5 / 72.5 / 72.1.
-      # Do not re-derive from theory.
-      VLLM_RS_ZMQ_WORKER_THREADS: "2"
-      VLLM_RS_REQUEST_WORKER_THREADS: "2"
-      VLLM_RS_DISABLE_HTTP_TRACE: "1"
-      # drop the per-request axum TraceLayer span.
-      #   0 restores it (and rejected-request log visibility)
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "60" # multi-turn gaps tail out past 30s; 60 races a slow
+                                         #   turn's connection reuse less than the 30s default
+      TOKIO_WORKER_THREADS: "6"          # HTTP runtime only. MUST be a positive int -- empty
+                                         #   or 0 panics vllm-rs at boot. 6 for the 22-core
+                                         #   host (70 conversations stream SSE per-token).
+      # vllm-rs starts two more runtimes that ignore TOKIO_WORKER_THREADS. The old pin of 2
+      # was judge-swept ON THE 3-vCPU MIG BOX and does not carry over; 4 is the 22-core
+      # starting point -- re-sweep {2,4} with make bench before submission.
+      VLLM_RS_ZMQ_WORKER_THREADS: "4"
+      VLLM_RS_REQUEST_WORKER_THREADS: "4"
+      VLLM_RS_DISABLE_HTTP_TRACE: "1"    # drop the per-request axum TraceLayer span.
+                                         #   0 restores it (and rejected-request log visibility)
 
       # ---- Quantization ----------------------------------------------------------------
       VTL_W4A8_IGNORE: ""
@@ -460,25 +458,27 @@ services:
       #   metric would otherwise score it N x worse. (fork patch)
 
       # ---- L2 / misc -------------------------------------------------------------------
-      # The boot probe runs regardless (read-only). Expect 0: the CUDA docs say the L2
-      # set-aside is disabled under MIG. The window itself is a no-op while the probe reads 0.
+      # The boot probe runs regardless (read-only). Round-2 runs the FULL H200 (not a MIG
+      # slice), so the L2 set-aside is REAL here -- expect the probe to report nonzero, and
+      # the persisting window actually engages. Sweep 24/48 MiB; H200 L2 is 60 MB total.
       VTL_L2_PERSIST: 1
-      VTL_L2_PERSIST_BYTES: "25165824" # 24 MiB request, clamped to the device max
-      VTL_L2_HIT_RATIO: "0.6" # fraction of window lines marked persisting
-      VTL_KERNEL_SYNC: 0 # DEBUG only: cudaStreamSynchronize per kernel (slow)
-      VTL_DISABLE_WARMUP: 0 # 1 = pure /health check, skip system-prefix priming
-    # ---- A/B CANDIDATES: left OFF on purpose. Turn ONE on, run `make bench` with >=3
-    # boots per arm, keep it only if the delta clears that run's reported noise floor.
-    #
-    # CUDA_DEVICE_MAX_CONNECTIONS: "1"
-    #   Fewer hardware work queues = less per-launch overhead, but it SERIALIZES independent
-    #   streams and so fights VTL_STREAM_PER_TOKEN. A/B the pair, not each alone.
-    # CUDA_MODULE_LOADING: "EAGER"
-    #   Moves per-module load cost onto boot, which the health-gated warm-up already hides.
-    #   Costs boot time and VRAM for modules never used.
-    # PYTHONMALLOC: "malloc"
-    #   Routes CPython's allocator through jemalloc (already LD_PRELOADed). Can cut
-    #   fragmentation, or lose to pymalloc's free lists on the decode path. Genuinely 50/50.
+      VTL_L2_PERSIST_BYTES: "50331648"       # 48 MiB request, clamped to the device max
+      VTL_L2_HIT_RATIO: "0.6"                # fraction of window lines marked persisting
+      VTL_KERNEL_SYNC: 0                     # DEBUG only: cudaStreamSynchronize per kernel (slow)
+      VTL_DISABLE_WARMUP: 0                  # 1 = pure /health check, skip system-prefix priming
+
+      # ---- A/B CANDIDATES: left OFF on purpose. Turn ONE on, run `make bench` with >=3
+      # boots per arm, keep it only if the delta clears that run's reported noise floor.
+      #
+      # CUDA_DEVICE_MAX_CONNECTIONS: "1"
+      #   Fewer hardware work queues = less per-launch overhead, but it SERIALIZES independent
+      #   streams and so fights VTL_STREAM_PER_TOKEN. A/B the pair, not each alone.
+      # CUDA_MODULE_LOADING: "EAGER"
+      #   Moves per-module load cost onto boot, which the health-gated warm-up already hides.
+      #   Costs boot time and VRAM for modules never used.
+      # PYTHONMALLOC: "malloc"
+      #   Routes CPython's allocator through jemalloc (already LD_PRELOADed). Can cut
+      #   fragmentation, or lose to pymalloc's free lists on the decode path. Genuinely 50/50.
     shm_size: "2g" # tmpfs counts against the 8GB cgroup; TP=1 needs little
     # seccomp/apparmor: Docker's default profile puts a BPF filter in front of every syscall.
     # The decode loop is syscall-heavy (futex, epoll, shm reads per step), so that filter is
