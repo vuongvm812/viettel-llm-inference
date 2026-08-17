@@ -77,10 +77,10 @@ Three things make the fusion possible anyway:
     single ``cuLaunchKernel`` stays capturable and bakes into nstep's burst graphs exactly
     as the unfused one does.
 
-NOT APPLIED TWICE, AND NEVER APPLIED ZERO TIMES. The fused kernel does not write bf16
-``core_attn_out`` at all -- dropping that [T, HV*DV] write and the epilogue's matching read
-is the point -- so it may only run when the single downstream reader is known to take the
-fp8 instead. That is an explicit two-sided handshake with ``gdn_kernels``:
+NOT APPLIED TWICE, AND NEVER APPLIED ZERO TIMES. The fused kernel stops writing bf16
+``core_attn_out`` -- dropping that [T, HV*DV] write and the epilogue's matching read is the
+point -- so it may only do so when the single downstream reader is known to take the fp8
+instead. That is an explicit two-sided handshake with ``gdn_kernels``:
 
   * ``gdn_kernels``' fused op calls ``note_epilogue_consumer(norm_weight.data_ptr())`` on
     every invocation. Reaching that line PROVES, for that specific layer, that the fused
@@ -90,9 +90,23 @@ fp8 instead. That is an explicit two-sided handshake with ``gdn_kernels``:
   * a claiming launch then publishes ``(core_attn_out.data_ptr()) -> (fp8, scales)``, and
     the same op consumes it by pointer identity instead of re-running the norm+quant.
 
-The decision is LATCHED PER LAYER on the first call. That is a correctness requirement, not
-a cache: a cudagraph bakes whichever pair of decisions was live at capture, and a later flip
-would leave a replay reading a ``core_attn_out`` nobody writes any more.
+Reaching that op is necessary but not sufficient -- a copy inserted between the core op and
+the norm (functionalization, a non-view reshape, a future refactor) would break the pointer
+identity, and the failure mode of guessing wrong is SILENT: zeros in, zeros out. So the
+per-layer decision is a three-state latch that makes the system prove the handoff to itself:
+
+    None -> "probe"   the fused kernel runs with ``out`` NON-NULL: it writes fp8 AND bf16,
+                      a strict superset of the unfused build. Correct whichever path the
+                      downstream actually takes, and the claim's fate is observable.
+         -> "fused"   after PROBE_CONSUMES claims were actually consumed: ``out = nullptr``,
+                      and the write is finally gone.
+         -> "plain"   a published claim was still outstanding when the next one arrived
+                      (nobody is consuming), or an input stopped resolving. Permanent.
+
+"plain" is permanent and "fused" is only ever reached forward, because a cudagraph bakes
+whichever pair of decisions was live at capture: a later probe->fused flip is harmless (the
+graph that baked the full norm+quant also baked the bf16 write that feeds it), but a
+plain->fused flip would leave a replay reading a ``core_attn_out`` nobody writes any more.
 
 RESIDUAL COST, STATED HONESTLY. The consumer still does a ``copy_`` of the staged fp8 into
 the buffer inductor allocated inside the graph, because that buffer does not exist yet when
@@ -128,6 +142,11 @@ GROUP = 128          # kFp8Dynamic128Sym, this checkpoint's activation quant gro
 EVEC = 8             # bf16 per 16-byte z load in the epilogue; mirrors the .cu
 FP8_MAX = 448.0
 GROUP_QUANT_EPS = 1e-10
+# Claims that must be observably CONSUMED before the fused path stops writing bf16
+# core_attn_out. Two, not one: one consume could be a coincidence of a recycled pointer;
+# two come from two independent steps. Each probe step is already fully correct, so the only
+# cost of a higher number is keeping the write a little longer.
+PROBE_CONSUMES = 2
 # Tokens the per-layer staging buffers serve. A wider batch simply does not claim the fused
 # path (it takes the unfused one), so this is a memory cap, not a correctness bound:
 # rows * HV*DV bytes of fp8 + rows * HV * 4 B of scales, per layer. 256 rows at the
@@ -211,24 +230,29 @@ def take_epilogue(input, num_heads: int):  # noqa: ANN001
         entry = _claims.pop(int(input.data_ptr()), None)
         if entry is None:
             return None
-        rows, hidden, fp8, scales = entry
+        rows, hidden, fp8, scales, epi = entry
         heads = int(num_heads)
         if heads <= 0 or int(input.shape[0]) != rows * heads:
             return None
         if int(input.shape[-1]) * heads != hidden:
             return None
+        if epi is not None:
+            # The handoff landed. This is the ONLY evidence that lets the layer stop
+            # writing bf16 core_attn_out -- see the three-state latch in the docstring.
+            epi["consumed"] = epi.get("consumed", 0) + 1
+            epi["pending"] = False
         return fp8, scales
     except Exception:  # pragma: no cover
         return None
 
 
-def _publish_claim(ptr: int, rows: int, hidden: int, fp8, scales) -> None:  # noqa: ANN001
+def _publish_claim(ptr: int, rows: int, hidden: int, fp8, scales, epi=None) -> None:  # noqa: ANN001
     if len(_claims) >= _MAX_CLAIMS:
         # Only reachable if the consumer's Python stopped running (piecewise replay) AND the
         # output buffers stopped repeating. Drop the book rather than grow it; the worst
         # case is one step of full norm+quant.
         _claims.clear()
-    _claims[int(ptr)] = (int(rows), int(hidden), fp8, scales)
+    _claims[int(ptr)] = (int(rows), int(hidden), fp8, scales, epi)
 
 
 # --------------------------------------------------------------------------------------
@@ -547,7 +571,9 @@ def _plan(layer, mixed_qkv, b, a, core_attn_out, attn_metadata):  # noqa: ANN001
         a_log.data_ptr(),
         dt_bias.data_ptr(),
         ssm_state.data_ptr(),
-        core_attn_out.data_ptr(),
+        # NULL only once the fused handoff has been observed working: until then the fused
+        # build writes bf16 too, so it is a strict superset of the unfused one.
+        0 if (fused is not None and not fused[2]) else core_attn_out.data_ptr(),
         idx.data_ptr(),
         ("f", float(dk) ** -0.5),          # scale, as the stock call site computes it
         ("l", mixed_qkv.stride(0)),
@@ -564,26 +590,43 @@ def _plan(layer, mixed_qkv, b, a, core_attn_out, attn_metadata):  # noqa: ANN001
         *(fused[0] if fused is not None else ()),
     )
     launcher = _state["launcher"] if fused is None else _state["launcher_fused"]
+    claim = fused[1] if fused is not None else None
     # One block per KEY head, not per value head: the q/k conv channels and their rotating
     # conv state are shared by the HV/HK sibling value heads, and sibling blocks have no
     # way to order their state rotation against each other. See the .cu header.
-    return (hk, tokens, 1), (dk, 1, 1), args, launcher, (fused[1] if fused else None)
+    return (hk, tokens, 1), (dk, 1, 1), args, launcher, claim
 
 
 def _fused_plan(layer, mixed_qkv, core_attn_out, geom, conv_dim, tokens):  # noqa: ANN001
-    """``(extra_args_tuple, claim)`` if this call may take the FUSED launcher, else None.
+    """``(extra_args, claim, write_bf16)`` if this call may take the FUSED launcher, else None.
 
-    Every condition here is a reason the bf16 ``core_attn_out`` write may not be dropped.
-    The per-layer decision is LATCHED on the first call (``epi["mode"]``): a cudagraph bakes
-    whichever variant was live at capture, so flipping later would leave a replay reading a
-    buffer nobody writes. After the latch this still re-validates the per-call envelope --
-    an eager step that falls outside it takes the unfused launcher, which writes
-    ``core_attn_out`` normally and lets the consumer's own Python run the full norm+quant.
+    ``write_bf16`` is the probe state: True means ``out`` is still passed non-null, so the
+    launch is a strict superset of the unfused one and correct no matter which way the
+    downstream goes. It only turns False once PROBE_CONSUMES claims were actually consumed.
+
+    Every other condition here is a reason the fused launcher may not run at all. The
+    per-layer state machine only ever moves forward (see the module docstring); this still
+    re-validates the per-call envelope on every step, and an eager step that falls outside
+    it takes the unfused launcher, which writes ``core_attn_out`` normally and lets the
+    consumer's own Python run the full norm+quant.
     """
     epi = _epilogue_for(layer)
     if epi is None or _state["launcher_fused"] is None:
         return None
-    if epi.get("mode") == "plain":
+    mode = epi.get("mode")
+    if mode == "plain":
+        return None
+    if mode == "probe" and epi.get("pending"):
+        # The claim we published last time is still sitting in the book: whatever consumes
+        # this layer's core output is NOT gdn_kernels' op after all (a copy between the two,
+        # a pattern that stopped matching, a replayed graph). Every probe step so far wrote
+        # bf16 as well, so nothing is wrong -- but the write can never be dropped now.
+        epi["mode"] = "plain"
+        epi["pending"] = False
+        _warn_once("fused:unconsumed",
+                   "vtl: gdn_decode_step: a fused-epilogue claim went unconsumed; the "
+                   "norm+quant stage is not reading our fp8, so the decode step stays "
+                   "unfused for the rest of the run")
         return None
 
     dk, dv, hk, hv, _ = geom
@@ -606,7 +649,10 @@ def _fused_plan(layer, mixed_qkv, core_attn_out, geom, conv_dim, tokens):  # noq
         if z is None:
             reason = "gate-unresolvable"
     if reason is not None:
-        if epi.get("mode") is None:
+        if mode is None:
+            # Latched on the FIRST call, and only towards "plain": the consumer registers
+            # during the profile run, well before any decode, so a miss here means the
+            # fusion genuinely is not there rather than that we asked too early.
             epi["mode"] = "plain"
             _warn_once("fused:" + reason,
                        "vtl: gdn_decode_step: fused epilogue not claimed (%s); the decode "
@@ -614,7 +660,18 @@ def _fused_plan(layer, mixed_qkv, core_attn_out, geom, conv_dim, tokens):  # noq
         return None
 
     z_ptr, z_stride = z
-    epi["mode"] = "fused"
+    # None -> probe (bf16 still written); probe -> fused once the handoff has been observed
+    # PROBE_CONSUMES times. Never backwards, and never straight to "fused".
+    if mode is None:
+        mode = "probe"
+        epi["consumed"] = 0
+    if mode == "probe" and int(epi.get("consumed", 0)) >= PROBE_CONSUMES:
+        mode = "fused"
+        log.info("vtl: gdn_decode_step: fused epilogue handoff confirmed (%d consumed); "
+                 "dropping the bf16 core_attn_out write", epi["consumed"])
+    epi["mode"] = mode
+    write_bf16 = mode == "probe"
+    epi["pending"] = write_bf16
     fp8, scales = epi["fp8"], epi["scales"]
     # Row views memoized per token count: slicing allocates no device memory, but building
     # two TensorImpls per layer per step is pure overhead on a path that repeats a handful
@@ -633,8 +690,8 @@ def _fused_plan(layer, mixed_qkv, core_attn_out, geom, conv_dim, tokens):  # noq
         ("l", scales.stride(0)),     # ss_tok
         ("l", scales.stride(1)),     # ss_grp
     )
-    claim = (core_attn_out.data_ptr(), tokens, hidden, views[0], views[1])
-    return extra, claim
+    claim = (core_attn_out.data_ptr(), tokens, hidden, views[0], views[1], epi)
+    return extra, claim, write_bf16
 
 
 # --------------------------------------------------------------------------------------
@@ -672,7 +729,7 @@ def _staging_rows(vllm_config) -> int:  # noqa: ANN001
     return min(rows, MAX_STAGING_TOKENS)
 
 
-def _reference_epilogue(x, z, weight, eps, is_silu, heads):  # noqa: ANN001
+def _reference_epilogue(x, z, weight, eps, is_silu):  # noqa: ANN001
     """RMSNormGated.forward_static -> reshape -> per_token_group_fp8_quant, in torch.
 
     The oracle side of the boot parity gate, and the SAME composition
@@ -733,11 +790,16 @@ def _gate_inputs(geom, tokens, eps, w_dtype, device):  # noqa: ANN001
     )
 
 
-def _gate_common_args(geom, t, device):  # noqa: ANN001
-    """The prefix both variants take, built from a ``_gate_inputs`` fixture."""
+def _gate_common_args(geom):  # noqa: ANN001
+    """The argument prefix both variants take, built from a ``_gate_inputs`` fixture.
+
+    Deliberately hand-packed rather than routed through ``_plan``: the gate has to be able
+    to launch the fused build BEFORE any layer is allowed to claim it, and ``_plan`` will
+    not hand out the fused launcher until that has happened.
+    """
     from vtl import nvrtc
 
-    dk, dv, hk, hv, conv = geom
+    dk = geom[0]
 
     def build(fx, conv_state, ssm_state, out_ptr, extra=()):
         return nvrtc.pack_args(
@@ -784,7 +846,7 @@ def _boot_parity_ok(geom, eps, is_silu, w_dtype) -> bool:  # noqa: ANN001
     hidden = hv * dv
     device = torch.cuda.current_device()
     fx = _gate_inputs(geom, t, eps, w_dtype, f"cuda:{device}")
-    build = _gate_common_args(geom, t, device)
+    build = _gate_common_args(geom)
 
     # -- 1/2: unfused build + reference epilogue, vs the fused build --
     cs_a, ss_a = fx["conv_state"].clone(), fx["ssm_state"].clone()
@@ -795,9 +857,14 @@ def _boot_parity_ok(geom, eps, is_silu, w_dtype) -> bool:  # noqa: ANN001
     cs_b, ss_b = fx["conv_state"].clone(), fx["ssm_state"].clone()
     q = torch.zeros(t, hidden, dtype=torch.float8_e4m3fn, device=f"cuda:{device}")
     s = torch.zeros(t, hv, dtype=torch.float32, device=f"cuda:{device}")
+    # `out` NON-NULL here on purpose: the gate exercises PROBE mode, which is what the very
+    # first serving steps run, and it lets the bf16 half be checked against the unfused
+    # build's in the same shot. The nullable half is one predicated store away and is
+    # covered by bench/test_gdn_decode_step.py on a GPU.
+    probe = torch.zeros(t, hv, dv, dtype=torch.bfloat16, device=f"cuda:{device}")
     _state["launcher_fused"](
         grid=(hk, t, 1), block=(dk, 1, 1),
-        args=build(fx, cs_b, ss_b, 0, extra=(
+        args=build(fx, cs_b, ss_b, probe.data_ptr(), extra=(
             fx["z"].data_ptr(), fx["norm_w"].data_ptr(), q.data_ptr(), s.data_ptr(),
             ("f", float(eps)), ("l", fx["mixed_qkv"].stride(0)), ("l", hidden),
             ("l", s.stride(0)), ("l", s.stride(1)))),
@@ -805,13 +872,15 @@ def _boot_parity_ok(geom, eps, is_silu, w_dtype) -> bool:  # noqa: ANN001
     torch.cuda.synchronize()
 
     if not (torch.equal(cs_a.view(torch.uint8), cs_b.view(torch.uint8))
-            and torch.equal(ss_a, ss_b)):
+            and torch.equal(ss_a, ss_b)
+            and torch.equal(out.view(torch.uint8), probe.view(torch.uint8))):
         log.error("vtl: gdn_decode_step FUSED BOOT PARITY FAILED: the fused build moved the "
-                  "conv/ssm state relative to the unfused one; unfused path stands")
+                  "conv/ssm state or the probe-mode bf16 output relative to the unfused "
+                  "one; unfused path stands")
         return False
 
     q_ref, s_ref = _reference_epilogue(out, fx["z"].reshape(t, hv, dv), fx["norm_w"],
-                                       float(eps), is_silu, hv)
+                                       float(eps), is_silu)
     if not torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)):
         bad = int((q.view(torch.uint8) != q_ref.view(torch.uint8)).sum())
         log.error("vtl: gdn_decode_step FUSED BOOT PARITY FAILED: %d/%d fp8 codes differ "
@@ -827,13 +896,23 @@ def _boot_parity_ok(geom, eps, is_silu, w_dtype) -> bool:  # noqa: ANN001
     chained = _chained_triton_reference(geom, fx, t, float(eps), is_silu)
     if chained is not None:
         q_t, s_t = chained
-        dq = (q.float() - q_t.float()).abs()
-        step = (s_t.repeat_interleave(dv, dim=-1) if s_t.dim() == 2 else s_t)
+        # NOT bit-exact, and asking for it would be wrong: the core's two documented fp32
+        # divergences from Triton move `o` by ~1 ulp, which can flip a code sitting on an
+        # e4m3 rounding boundary. One e4m3 mantissa step bounds the flip; the 1% fraction
+        # is what separates that noise from a systematic error. Same pair of bounds
+        # bench/test_gdn_gated_rmsnorm.py uses, for the same reason.
         frac = float((q.view(torch.uint8) != q_t.view(torch.uint8)).float().mean())
-        if frac > 1e-2 or float((dq > 2.0 * step.abs().max()).float().mean()) > 1e-2:
+        close = torch.allclose(q.float(), q_t.float(), rtol=0.13, atol=2.0 ** -9)
+        if frac > 1e-2 or not close:
             log.error("vtl: gdn_decode_step FUSED BOOT PARITY FAILED against the stock "
                       "Triton pair chained with the reference epilogue (%.2f%% of codes "
-                      "differ); unfused path stands", 100.0 * frac)
+                      "differ, within-one-step=%s); unfused path stands",
+                      100.0 * frac, close)
+            return False
+        if not torch.allclose(s, s_t, rtol=1e-3, atol=0.0):
+            log.error("vtl: gdn_decode_step FUSED BOOT PARITY FAILED: group scales drift "
+                      "from the chained stock oracle by %r; unfused path stands",
+                      float((s - s_t).abs().max()))
             return False
     return True
 
@@ -869,7 +948,7 @@ def _chained_triton_reference(geom, fx, t, eps, is_silu):  # noqa: ANN001
         )
         torch.cuda.synchronize()
         return _reference_epilogue(out.squeeze(1), fx["z"].reshape(t, hv, dv),
-                                   fx["norm_w"], eps, is_silu, hv)
+                                   fx["norm_w"], eps, is_silu)
     except Exception as exc:
         log.info("vtl: gdn_decode_step: chained Triton oracle raised (%r); the fused boot "
                  "gate runs without it", exc)
@@ -941,7 +1020,9 @@ def _arm_epilogue(layers, geom, rows) -> int:  # noqa: ANN001
         # Persistent, allocated ONCE: the decode path (which may BE a cudagraph capture)
         # must not allocate, and the addresses must be stable across replays.
         layer._vtl_gdn_epilogue = {
-            "mode": None,                       # latched to "fused"/"plain" on first call
+            "mode": None,                       # None -> probe -> fused | plain
+            "consumed": 0,                      # claims gdn_kernels' op actually took
+            "pending": False,                   # a published claim not yet taken
             "weight_ptr": weight.data_ptr(),
             "w_ptr": weight.data_ptr(),
             "eps": float(l_eps),
@@ -1234,6 +1315,140 @@ def _self_check() -> None:
     _publish_claim(0x1000, 4, 8192, "FP8", "SCALES")
     assert take_epilogue(_T(0x1000, (256, 128)), 0) is None, "a nonsense head count declines"
     _claims.clear()
+
+    # -- a consumed claim is the ONLY thing that credits the probe counter, and only a
+    #    successful take does it --
+    epi = {"consumed": 0, "pending": True}
+    _publish_claim(0x1000, 4, 8192, "FP8", "SCALES", epi)
+    assert take_epilogue(_T(0x1000, (128, 128)), 64) is None
+    assert epi == {"consumed": 0, "pending": True}, "a refused take must credit nothing"
+    _publish_claim(0x1000, 4, 8192, "FP8", "SCALES", epi)
+    assert take_epilogue(_T(0x1000, (256, 128)), 64) == ("FP8", "SCALES")
+    assert epi == {"consumed": 1, "pending": False}
+    _claims.clear()
+
+    # -- the three-state latch. Driven through _fused_plan with fakes so the transitions
+    #    are pinned without a GPU: probe first (bf16 STILL written), fused only after
+    #    PROBE_CONSUMES observed handoffs, and plain the moment one goes unconsumed. --
+    class _FakeQkv:
+        """A stand-in for the split view: stride(0) == conv_dim + hidden is what identifies
+        the projection buffer, and the storage must actually reach that far."""
+
+        def __init__(self, ptr, stride0, tokens, nbytes):
+            self._ptr, self._s0, self._n, self._bytes = ptr, stride0, tokens, nbytes
+
+        def element_size(self):
+            return 2
+
+        def stride(self, d):
+            return self._s0 if d == 0 else 1
+
+        def storage_offset(self):
+            return 0
+
+        def data_ptr(self):
+            return self._ptr
+
+        def untyped_storage(self):
+            return type("S", (), {"nbytes": lambda _s: self._bytes})()
+
+    class _FakeOut:
+        def __init__(self, rows, ptr=0x9000):
+            self._rows, self._ptr = rows, ptr
+
+        def size(self, d):
+            return self._rows
+
+        def data_ptr(self):
+            return self._ptr
+
+    class _FakeStage:
+        def __init__(self, ptr):
+            self._ptr = ptr
+
+        def data_ptr(self):
+            return self._ptr
+
+        def stride(self, d):
+            return (64, 1)[d]
+
+        def __getitem__(self, k):
+            return self
+
+    conv_dim, hidden, tok = 12288, 8192, 4
+    qkv = _FakeQkv(0x2000, conv_dim + hidden, tok, (conv_dim + hidden) * tok * 2)
+
+    WEIGHT_PTR = 0xC0FFEE
+
+    def _fresh_layer(rows=32):
+        lay = type("L", (), {})()
+        lay._vtl_gdn_epilogue = {
+            "mode": None, "consumed": 0, "pending": False,
+            "weight_ptr": WEIGHT_PTR, "w_ptr": WEIGHT_PTR, "eps": 1e-6, "is_silu": True,
+            "rows": rows, "hidden": hidden, "fp8": _FakeStage(0x5000),
+            "scales": _FakeStage(0x6000), "views": {},
+        }
+        return lay
+
+    _state["launcher_fused"] = object()
+    EPILOGUE_CONSUMERS.clear()
+    EPILOGUE_CONSUMERS.add(WEIGHT_PTR)
+    # Every decline below logs its reason once, by design. That is the point of the code and
+    # noise in `make check`, so mute the module logger for the duration rather than weaken
+    # the warnings.
+    logging.disable(logging.WARNING)
+    try:
+        lay = _fresh_layer()
+        e = lay._vtl_gdn_epilogue
+        for step in range(PROBE_CONSUMES):
+            got = _fused_plan(lay, qkv, _FakeOut(tok), qwen, conv_dim, tok)
+            assert got is not None and got[2] is True, "probe mode must keep the bf16 write"
+            assert e["mode"] == "probe" and e["pending"] is True
+            _publish_claim(*got[1])
+            assert take_epilogue(_T(0x9000, (tok * 64, 128)), 64) is not None
+        got = _fused_plan(lay, qkv, _FakeOut(tok), qwen, conv_dim, tok)
+        assert got[2] is False, "after PROBE_CONSUMES handoffs the bf16 write is dropped"
+        assert e["mode"] == "fused"
+
+        # ...and the other branch: a claim nobody consumes latches the layer to plain.
+        lay = _fresh_layer()
+        e = lay._vtl_gdn_epilogue
+        assert _fused_plan(lay, qkv, _FakeOut(tok), qwen, conv_dim, tok)[2] is True
+        _claims.clear()          # the consumer never ran
+        assert _fused_plan(lay, qkv, _FakeOut(tok), qwen, conv_dim, tok) is None
+        assert e["mode"] == "plain"
+        assert _fused_plan(lay, qkv, _FakeOut(tok), qwen, conv_dim, tok) is None, "permanent"
+
+        # ...and every claim condition latches plain on the FIRST call, never to fused.
+        # (name, layer, mixed_qkv, out_rows, consumer_registered)
+        flat = _FakeQkv(0x2000, conv_dim, tok, conv_dim * tok * 2)
+        for name, lay, qk, out_rows, consumer in (
+            ("no-consumer", _fresh_layer(), qkv, tok, False),
+            ("staging-rows", _fresh_layer(rows=1), qkv, tok, True),
+            ("out-rows", _fresh_layer(), qkv, tok + 1, True),
+            # a contiguous mixed_qkv is NOT the split view: there is no gate behind it, and
+            # reading one anyway would be reading whatever follows the projection buffer.
+            ("gate-unresolvable", _fresh_layer(), flat, tok, True),
+        ):
+            EPILOGUE_CONSUMERS.clear()
+            if consumer:
+                EPILOGUE_CONSUMERS.add(WEIGHT_PTR)
+            assert _fused_plan(lay, qk, _FakeOut(out_rows), qwen, conv_dim, tok) is None, name
+            assert lay._vtl_gdn_epilogue["mode"] == "plain", name
+
+        # -- _z_ptr's own refusals, directly --
+        assert _z_ptr(qkv, conv_dim, hidden, tok) == (0x2000 + conv_dim * 2, conv_dim + hidden)
+        assert _z_ptr(flat, conv_dim, hidden, tok) is None, "row stride identifies the split"
+        short = _FakeQkv(0x2000, conv_dim + hidden, tok, (conv_dim + hidden) * tok * 2 - 16)
+        assert _z_ptr(short, conv_dim, hidden, tok) is None, "z must be inside the storage"
+        odd = _FakeQkv(0x2004, conv_dim + hidden, tok, (conv_dim + hidden) * tok * 2)
+        assert _z_ptr(odd, conv_dim, hidden, tok) is None, "a 16B vector load must be aligned"
+    finally:
+        logging.disable(logging.NOTSET)
+        _state["launcher_fused"] = None
+        EPILOGUE_CONSUMERS.clear()
+        _claims.clear()
+        _warned.clear()   # the one-shot warnings must still be available to production
     for i in range(_MAX_CLAIMS * 2):
         _publish_claim(0x3000 + i, 1, 8192, None, None)
     assert len(_claims) <= _MAX_CLAIMS, "the claim book must stay bounded"

@@ -102,10 +102,14 @@
 //                                                             order (NaN -> -448)
 //   scales[token * ss_tok + hv * ss_grp] = s                  one scale per (token, head)
 //
-// The bf16 `out` argument stays in the signature (same position) but is NOT written by the
-// fused build -- eliminating that [T, HV*DV] write and the epilogue's matching read is the
-// whole point. vtl/patches/gdn_decode_step.py only launches this variant when it has proven
-// the sole reader of `out` on this path takes the fp8/scales instead.
+// The bf16 `out` argument stays in the signature, at the same position, and is NULLABLE in
+// the fused build (like `conv_bias` already is). Dropping that [T, HV*DV] write and the
+// epilogue's matching read is the whole point -- but it is only safe once the sole reader
+// of `out` on this path is PROVEN to take the fp8/scales instead, and that proof arrives at
+// runtime. So vtl/patches/gdn_decode_step.py runs the fused kernel in a PROBE mode first
+// (`out` non-null: fp8 AND bf16, i.e. a strict superset of the unfused build, correct
+// whichever way the downstream goes), watches the handoff actually land, and only then
+// passes `out = nullptr`. One predicated store per row buys that.
 //
 // NULL ROWS STILL RUN THE EPILOGUE. A NULL_BLOCK_ID row's core output is zero, and the
 // unfused chain still norms+quants that zero row: x=0 gives y=0 for any finite z, amax
@@ -429,7 +433,14 @@ extern "C" __global__ void __launch_bounds__(THREADS) gdn_decode_step(
 #if FUSED_EPILOGUE
         // The zero row still has to be normed and quantized -- see the header. THREADS==DV.
 #pragma unroll
-        for (int j = 0; j < GPB; ++j) s_o[j * DV + tid] = 0.0f;
+        for (int j = 0; j < GPB; ++j) {
+            s_o[j * DV + tid] = 0.0f;
+            if (out != nullptr) {   // probe mode; see the header
+                const long long o_base =
+                    (n * HV + (long long)i_h * GPB + j) * (long long)DV;
+                out[o_base + tid] = __float2bfloat16(0.0f);
+            }
+        }
         __syncthreads();
         gdn_norm_quant_epilogue(s_o, z, norm_w, out_q, scales, n, i_h, tid, norm_eps,
                                 z_stride, oq_stride, ss_tok, ss_grp);
@@ -502,9 +513,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) gdn_decode_step(
         const float beta = s_beta[j];
         float* const h_head =
             ssm_state + state_idx * state_tok_stride + (long long)i_hv * DV * DK;
-#if !FUSED_EPILOGUE
         const long long o_base = (n * HV + i_hv) * (long long)DV;
-#endif
 
         for (int r = 0; r < ROWS_PER_WARP; ++r) {
             const int v = warp * ROWS_PER_WARP + r;
@@ -542,8 +551,13 @@ extern "C" __global__ void __launch_bounds__(THREADS) gdn_decode_step(
             *row = h;   // state written back in place, fp32
 #if FUSED_EPILOGUE
             // Staged, not stored: the bf16 narrowing still happens here (it is part of the
-            // op boundary the epilogue's oracle describes), but it never reaches HBM.
-            if (lane == 0) s_o[j * DV + v] = __bfloat162float(__float2bfloat16(o));
+            // op boundary the epilogue's oracle describes), but it reaches HBM only while
+            // the patch is still probing the handoff.
+            if (lane == 0) {
+                const __nv_bfloat16 ob = __float2bfloat16(o);
+                s_o[j * DV + v] = __bfloat162float(ob);
+                if (out != nullptr) out[o_base + v] = ob;
+            }
 #else
             if (lane == 0) out[o_base + v] = __float2bfloat16(o);
 #endif

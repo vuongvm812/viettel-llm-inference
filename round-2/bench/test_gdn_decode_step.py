@@ -224,10 +224,13 @@ def _stock_pair():
 
 
 def _make_inputs(geom, tokens, dev, seed, layout="DS", idx_stride=1, has_bias=False,
-                 with_gate=False, w_dtype=torch.bfloat16):
+                 with_gate=False, w_dtype=None):
     dk, dv, hk, hv, conv = geom
     conv_dim = patch._conv_dim(geom)
     hidden = hv * dv
+    # NOT a default argument: `make check` imports this module with torch absent, and a
+    # default is evaluated at import time.
+    w_dtype = torch.bfloat16 if w_dtype is None else w_dtype
     g = torch.Generator(device=dev).manual_seed(seed)
 
     def rnd(*shape, dtype=torch.bfloat16, scale=1.0):
@@ -339,13 +342,20 @@ def _make_layer(geom, tensors, with_norm=False):
     )
 
 
-def _attach_epilogue(layer, geom, rows, tensors, consumer=True):
-    """What _arm_epilogue() attaches on the box: staging buffers + the consumer handshake."""
+def _attach_epilogue(layer, geom, rows, tensors, consumer=True, mode=None):
+    """What _arm_epilogue() attaches on the box: staging buffers + the consumer handshake.
+
+    ``mode`` fast-forwards the three-state latch. Production always starts at None (probe),
+    but a test that wants to see the bf16 write actually GONE has to reach "fused", and
+    doing so by hand keeps that assertion independent of PROBE_CONSUMES.
+    """
     dk, dv, hk, hv, conv = geom
     hidden = hv * dv
     dev = tensors["norm_w"].device
     layer._vtl_gdn_epilogue = {
-        "mode": None,
+        "mode": mode,
+        "consumed": patch.PROBE_CONSUMES if mode == "fused" else 0,
+        "pending": False,
         "weight_ptr": tensors["norm_w"].data_ptr(),
         "w_ptr": tensors["norm_w"].data_ptr(),
         "eps": NORM_EPS,
@@ -518,13 +528,13 @@ def _reference_epilogue(x, z, weight, is_silu=True, eps=NORM_EPS):
     return q.reshape(x.shape[0], -1).to(torch.float8_e4m3fn), scale
 
 
-def _run_fused_epilogue(geom, t, dev, tensors, rows=None, is_silu=True):
+def _run_fused_epilogue(geom, t, dev, tensors, rows=None, is_silu=True, mode="fused"):
     """Plan + launch the FUSED variant through the patch, and consume the claim the way
     gdn_kernels' op does. Returns (fp8, scales, out_buffer)."""
     dk, dv, hk, hv, conv = geom
     fused = _arm_fused(geom, is_silu=is_silu)
     layer = _make_layer(geom, tensors, with_norm=True)
-    _attach_epilogue(layer, geom, rows or t, tensors)
+    _attach_epilogue(layer, geom, rows or t, tensors, mode=mode)
 
     out = torch.zeros(t, hv, dv, dtype=torch.bfloat16, device=dev)
     plan = patch._plan(layer, tensors["mixed_qkv"], tensors["b"], tensors["a"], out,
@@ -582,7 +592,7 @@ def test_fused_epilogue_bitmatches_the_standalone_norm_quant_kernel(tokens):
 
     exp_q, exp_s = _run_standalone_norm_quant(out, tensors["z"].reshape(t, hv, dv),
                                               tensors["norm_w"], hv)
-    got_q, got_s, _ = _run_fused_epilogue(geom, t, dev, tensors)
+    got_q, got_s, _ = _run_fused_epilogue(geom, t, dev, tensors, mode="fused")
 
     assert torch.equal(got_q.view(torch.uint8), exp_q.view(torch.uint8)), \
         "the fused epilogue must be BIT-IDENTICAL to the standalone kernel it replaces"
@@ -632,7 +642,7 @@ def test_fused_epilogue_matches_the_chained_stock_oracle(geom):
     ref_cs, ref_ss, ref_out = _run_stock(geom, t, dev, tensors)
     exp_q, exp_s = _reference_epilogue(ref_out, tensors["z"].reshape(t, hv, dv),
                                        tensors["norm_w"])
-    got_q, got_s, out = _run_fused_epilogue(geom, t, dev, tensors)
+    got_q, got_s, out = _run_fused_epilogue(geom, t, dev, tensors, mode="fused")
 
     _assert_fp8_close(got_q, exp_q, got_s, exp_s)
     # The state is still the core's business and still bounded the same way.
@@ -652,12 +662,79 @@ def test_fused_epilogue_quantizes_null_rows_like_the_stock_chain():
     geom = SMALL_GEOM
     dk, dv, hk, hv, conv = geom
     tensors = _make_inputs(geom, t, dev, seed=81, with_gate=True)
-    got_q, got_s, _ = _run_fused_epilogue(geom, t, dev, tensors)
+    got_q, got_s, out = _run_fused_epilogue(geom, t, dev, tensors, mode=None)
     null = (tensors["idx"] == NULL_BLOCK_ID).nonzero().flatten()
+    # probe mode zeroes the bf16 row too, exactly as the unfused build does
+    assert (out[null].float() == 0).all()
     assert null.numel() > 0
     assert (got_q[null].float() == 0).all(), "a null row's codes must all be zero"
     torch.testing.assert_close(
         got_s[null], torch.full_like(got_s[null], 1e-10 / FP8_MAX), rtol=1e-6, atol=0.0)
+
+
+@requires_gpu
+def test_probe_mode_is_a_strict_superset_of_the_unfused_launch():
+    """Before the handoff has been observed working, the fused build must ALSO write the
+    bf16 core output -- bit-identically to the unfused build. That is what makes the very
+    first serving steps safe no matter which way the downstream actually goes, and it is
+    the only reason dropping the write later is not a leap of faith."""
+    dev, t = "cuda", 4
+    geom = SMALL_GEOM
+    dk, dv, hk, hv, conv = geom
+    tensors = _make_inputs(geom, t, dev, seed=111, with_gate=True)
+
+    plain = dict(tensors)
+    plain["conv_state"] = tensors["conv_state"].clone()
+    plain["ssm_state"] = tensors["ssm_state"].clone()
+    _arm_state(geom)
+    layer = _make_layer(geom, plain)
+    ref = torch.zeros(t, hv, dv, dtype=torch.bfloat16, device=dev)
+    grid, block, args, chosen, _ = patch._plan(
+        layer, plain["mixed_qkv"], plain["b"], plain["a"], ref, _FakeMeta(t, plain["idx"]))
+    chosen(grid=grid, block=block, args=args)
+    torch.cuda.synchronize()
+
+    q, s, out = _run_fused_epilogue(geom, t, dev, tensors, mode=None)
+    assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8)), \
+        "probe mode must write the SAME bf16 bytes the unfused build writes"
+    # ...and the fp8 it produced alongside is still the real thing.
+    exp_q, exp_s = _reference_epilogue(ref, tensors["z"].reshape(t, hv, dv),
+                                       tensors["norm_w"])
+    assert torch.equal(q.view(torch.uint8), exp_q.view(torch.uint8))
+    assert torch.equal(s, exp_s)
+
+
+@requires_gpu
+def test_probe_latches_to_fused_only_after_observed_handoffs():
+    """The state machine, on the real launcher: probe until PROBE_CONSUMES claims are
+    actually consumed, then fused. And a claim nobody consumes latches to plain forever."""
+    dev, t = "cuda", 3
+    geom = SMALL_GEOM
+    dk, dv, hk, hv, conv = geom
+    tensors = _make_inputs(geom, t, dev, seed=121, with_gate=True)
+    _arm_fused(geom)
+    layer = _make_layer(geom, tensors, with_norm=True)
+    epi = _attach_epilogue(layer, geom, t, tensors)
+    out = torch.zeros(t, hv, dv, dtype=torch.bfloat16, device=dev)
+    md = _FakeMeta(t, tensors["idx"])
+
+    for _ in range(patch.PROBE_CONSUMES):
+        _, _, _, _, claim = patch._plan(layer, tensors["mixed_qkv"], tensors["b"],
+                                        tensors["a"], out, md)
+        assert epi["mode"] == "probe" and epi["pending"] is True
+        patch._publish_claim(*claim)
+        assert patch.take_epilogue(out.reshape(-1, dv), hv) is not None
+    patch._plan(layer, tensors["mixed_qkv"], tensors["b"], tensors["a"], out, md)
+    assert epi["mode"] == "fused", "observed handoffs must promote the layer"
+
+    # the negative arm, from a fresh layer
+    layer2 = _make_layer(geom, tensors, with_norm=True)
+    epi2 = _attach_epilogue(layer2, geom, t, tensors)
+    patch._plan(layer2, tensors["mixed_qkv"], tensors["b"], tensors["a"], out, md)
+    patch._claims.clear()          # nobody consumed it
+    assert patch._plan(layer2, tensors["mixed_qkv"], tensors["b"], tensors["a"], out,
+                       md)[4] is None
+    assert epi2["mode"] == "plain", "an unconsumed claim must latch the layer off"
 
 
 @requires_gpu
@@ -725,22 +802,47 @@ def _self_check() -> None:
     src = nvrtc.load_source(patch.KERNEL)
     assert src, "vtl/kernels/gdn_decode_step.cu missing from the package"
     assert f'extern "C" __global__ void __launch_bounds__(THREADS) {patch.KERNEL}(' in src
-    for macro in ("DK", "DV", "HK", "HV", "CONV", "THREADS"):
+    for macro in ("DK", "DV", "HK", "HV", "CONV", "THREADS", "FUSED_EPILOGUE"):
         assert f"#ifndef {macro}" in src, f"-D{macro} is not guarded in the source"
     for macro in ("DK", "DV", "HK", "HV"):
         assert f'#error "NVRTC: -D{macro}=' in src, f"-D{macro} must have no default"
     # The stride the eager path needs: block_table_tensor[:, 0] is not contiguous.
     assert "indices_stride" in src
 
+    # -- the epilogue is COMPILED OUT of the unfused build, not branched around, and it
+    #    carries the same constants (and the same hardware converter) as its standalone
+    #    twin. A drift in either would silently end the bit-parity the tests above assert. --
+    assert "#if FUSED_EPILOGUE" in src and "gdn_norm_quant_epilogue" in src
+    twin = nvrtc.load_source("gated_rmsnorm_group_quant")
+    assert twin, "vtl/kernels/gated_rmsnorm_group_quant.cu missing from the package"
+    for const in ("kFp8Max = 448.0f", "kGroupQuantEps = 1e-10f",
+                  "__nv_cvt_float2_to_fp8x2", "__NV_SATFINITE, __NV_E4M3"):
+        assert const in src and const in twin, f"epilogue/twin drift on {const!r}"
+
     # -- defines: exactly the set the .cu reads, at the geometry this ships for --
     assert patch._defines(PROD_GEOM) == {"DK": 128, "DV": 128, "HK": 16, "HV": 64,
-                                         "CONV": 4, "THREADS": 128}
+                                         "CONV": 4, "THREADS": 128, "FUSED_EPILOGUE": 0}
+    assert patch._fused_defines(PROD_GEOM, True, False) == {
+        "DK": 128, "DV": 128, "HK": 16, "HV": 64, "CONV": 4, "THREADS": 128,
+        "FUSED_EPILOGUE": 1, "GROUP": 128, "IS_SILU": 1, "W_FP32": 0}
+    assert patch.GROUP == GROUP, "the quant group must be the checkpoint's 128"
     assert patch._conv_dim(PROD_GEOM) == 12288      # 2*16*128 + 64*128
     assert patch._conv_dim(SMALL_GEOM) == 1536
 
-    # -- one cubin identity per specialization; arch and toolkit count, dict order does not --
+    # 8192 / 128 == 64 == HV: one head is exactly one quant group. That identity is the
+    # whole reason the epilogue needs no cross-block communication -- assert it, do not
+    # assume it.
+    assert (PROD_GEOM[3] * PROD_GEOM[1]) // GROUP == PROD_GEOM[3]
+    assert PROD_GEOM[1] == GROUP
+
+    # -- one cubin identity per specialization; arch and toolkit count, dict order does not.
+    #    The fused and unfused builds are DIFFERENT PROGRAMS and must never share a cubin. --
     sets = [patch._defines(PROD_GEOM), patch._defines(SMALL_GEOM),
-            patch._defines((DK, DV, 8, 64, CONV))]
+            patch._defines((DK, DV, 8, 64, CONV)),
+            patch._fused_defines(PROD_GEOM, True, False),
+            patch._fused_defines(PROD_GEOM, False, False),
+            patch._fused_defines(PROD_GEOM, True, True),
+            patch._fused_defines(SMALL_GEOM, True, False)]
     keys = {nvrtc.cache_key(src, s, "90a", "12.8") for s in sets}
     assert len(keys) == len(sets), "define sets must not collide in the cubin cache"
     assert nvrtc.cache_key(src, sets[0], "90", "12.8") not in keys
@@ -748,6 +850,33 @@ def _self_check() -> None:
     perm = dict(reversed(list(sets[0].items())))
     assert nvrtc.cache_key(src, perm, "90a", "12.8") == nvrtc.cache_key(src, sets[0],
                                                                         "90a", "12.8")
+
+    # -- the fused geometry envelope, on top of the core one --
+    assert patch._fused_geometry_ok(PROD_GEOM) is True
+    assert patch._fused_geometry_ok(SMALL_GEOM) is True
+    assert patch._fused_geometry_ok((DK, DV, 4, 64, CONV)) is False, "GPB=16 -> 256 lanes"
+    assert patch._fused_geometry_ok((DK, 64, 16, 64, CONV)) is False, "DV must BE the group"
+
+    # -- the claim book and the consumer handshake, with fakes. This is the whole safety
+    #    story for dropping the bf16 write: no consumer -> no claim -> no dropped write. --
+    class _Ptr:
+        def __init__(self, ptr, shape):
+            self._p, self.shape = ptr, shape
+
+        def data_ptr(self):
+            return self._p
+
+    patch._claims.clear()
+    patch.EPILOGUE_CONSUMERS.clear()
+    assert patch.take_epilogue(_Ptr(0x40, (128, 128)), 64) is None
+    patch._publish_claim(0x40, 2, 8192, "Q", "S")
+    assert patch.take_epilogue(_Ptr(0x80, (128, 128)), 64) is None, "pointer identity"
+    assert patch.take_epilogue(_Ptr(0x40, (128, 128)), 64) == ("Q", "S")
+    assert patch.take_epilogue(_Ptr(0x40, (128, 128)), 64) is None, "consumed exactly once"
+    patch.note_epilogue_consumer(0x1234)
+    assert 0x1234 in patch.EPILOGUE_CONSUMERS
+    patch.EPILOGUE_CONSUMERS.clear()
+    patch._claims.clear()
 
     # -- geometry envelope --
     assert patch._geometry_ok(*PROD_GEOM) is True
@@ -801,6 +930,14 @@ def _self_check() -> None:
     finally:
         os.environ.pop("VTL_NVRTC", None)
     assert patch._state["launcher"] is None and patch._state["installed"] is False
+    assert patch._state["launcher_fused"] is None, "no fused launcher may survive a bad arm"
+
+    # -- gdn_kernels' side of the handshake must exist and must be import-safe without
+    #    torch: the decode step can only drop the bf16 write because that op calls back. --
+    from vtl.patches import gdn_kernels
+
+    assert hasattr(gdn_kernels, "_decode_step_epilogue")
+    assert gdn_kernels.GROUP == GROUP, "the two patches must agree on the quant group"
 
     print("test_gdn_decode_step self-check ok")
 
