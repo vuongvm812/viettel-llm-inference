@@ -76,6 +76,8 @@ services:
       # is layered on via VTL_W4A8_FROM_FP8 / VTL_ENABLE_MOE_DECODE_GEMV below and degrades
       # to the stock fp8 path per-layer; bench/eval_quality.py is the accuracy gate.
       - --kv-cache-dtype=fp8_e4m3
+      - --kv-offloading-size=64
+      - --kv-offloading-backend=native
       # MTP speculative decoding: PERMITTED for round-2 (user-confirmed 2026-08-16; the
       # round-1.2 "cheating" ban does not carry over). The checkpoint ships a 1-layer MTP
       # drafter (Qwen3_5MoeMTP, registered stock in v0.25.0); greedy tree acceptance rides
