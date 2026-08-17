@@ -6,7 +6,9 @@ stack applies unchanged to whatever gets mounted at `/model`.
 
 Three things to read in order: [what is in here](#1-components), [how to prepare the
 host](#2-host-os-setup), [how to plug in a model and a kernel](#3-adding-a-model) /
-[kernel](#4-adding-a-custom-cuda-kernel).
+[kernel](#4-adding-a-custom-cuda-kernel). What the judges actually run and score is
+[§6](#6-official-grading-workload--scoring-round-2-btc-spec) — read it before tuning
+anything, because both the workload and the scoring band changed from round 1.
 
 Run everything from the **repo root**, not from `round-2/`. `round-2` is the default
 `ROUND`, so `make up` means `make up ROUND=round-2`.
@@ -139,6 +141,8 @@ truncate the patch.
 `sweep_report.py` (reads the noise floor off each run's own boot spread),
 `eval_quality.py` (**the accuracy gate for any quantization change**),
 `trace_stats.py`, `profile_trace.py`, `build_trace_round2.py`, `build_grading_spec.py`,
+`aiperf_adapter.py` (converts a `make bench-aiperf` aiperf run into the repo schema — see
+[§6](#6-official-grading-workload--scoring-round-2-btc-spec)),
 plus `test_*.py` kernel/parity tests run by `make test-kernel`.
 
 ### 1.7 Compose overlays
@@ -535,3 +539,108 @@ engaging on a model it has never seen. Needs the GPU box.
 **Reference material** — `reference/lfm2/` holds the previous round's model-specific
 kernels, patches and tests. Frozen, never imported, excluded from the build. Copy patterns
 from it; do not wire it back in.
+
+---
+
+## 6. Official grading workload & scoring (round-2 BTC spec)
+
+Both halves changed from round 1 — the workload is a different kind of thing entirely, and
+the scoring band moved by more than an order of magnitude. The frozen round-1.2 writeup in
+`reference/lfm2/HANDOFF.md` is **historical**; nothing in it describes what round 2 grades.
+
+### 6.1 Scoring — ERS (Effective Request Score)
+
+Formula unchanged from round 1; per request:
+
+```
+S_request = w · s_ttft + (1 − w) · s_tpot
+s_ttft = [clamp((C_ttft − TTFT)      / (C_ttft − F_ttft), 0, 1)]^γ
+s_tpot = [clamp((C_tpot − TPOT_mean) / (C_tpot − F_tpot), 0, 1)]^γ
+ERS    = mean of S_request over ALL requests — a failed request scores 0 but stays
+         in the denominator.
+```
+
+Round-2 parameters (BTC, 2026-08):
+
+| Param | Round 2 | (Round 1, for contrast) |
+|---|---|---|
+| F_ttft / C_ttft | **200 ms / 6,000 ms** | 10 / 400 ms |
+| F_tpot / C_tpot | **8 ms / 100 ms** | 1 / 10 ms |
+| γ | 2.0 | 2.0 |
+| w | 0.5 | 0.5 |
+
+Reference implementation: `bench/_ci_report.py` (`F_TTFT`/`C_TTFT`/`F_TPOT`/`C_TPOT`).
+
+What the new band means for prioritization:
+
+- **Exchange rate**: the TTFT band is 5,800 ms wide, the TPOT band 92 ms — at equal
+  normalized headroom, **1 ms of TPOT ≈ 63 ms of TTFT**. TPOT still dominates, even more
+  than in round 1.
+- **But the absolute gradient collapsed ~10×**: dERS/dTPOT ≈ 0.011·u per ms (u =
+  normalized headroom ≤ 1), vs ~0.11·u in round 1. Sub-millisecond TPOT micro-opts that
+  were worth real score last round are now near-noise; re-derive any per-knob effort
+  threshold before committing to kernel work (see the sizing note in `RUST-RUNNER.md` §6).
+- The floors moved from "unreachable" (10 ms TTFT / 1 ms TPOT) to **plausibly reachable**
+  (200 ms TTFT / 8 ms TPOT): saturating a component is now a real target, and past the
+  floor further speed buys nothing — spend the headroom on the other component or on
+  avoiding failures.
+- Failures still cost the full request score. A request that exceeds the ceilings scores
+  ~0 anyway, so under load-shedding pressure, degrading one request's latency is no worse
+  than failing it — but a failed request can also invalidate the run (§6.2).
+
+### 6.2 Workload — aiperf AgentX replay of the Weka corpus (spec §3.1)
+
+Grading replays **real multi-turn Claude Code sessions** (the SemiAnalysis Weka corpus,
+including subagent spawn/join and recorded inter-turn think time) against the submission
+for **900 s**, using NVIDIA
+[aiperf](https://docs.nvidia.com/aiperf/tutorials/datasets-inputs/inference-x-agent-x-mvp-benchmark)'s
+locked scenario:
+
+```
+aiperf profile --scenario inferencex-agentx-mvp \
+  --public-dataset semianalysis_cc_traces_weka_062126 \   # HF: semianalysisai/cc-traces-weka-062126 (pinned)
+  --concurrency 5 --max-context-length 204800 \
+  --benchmark-duration 900 --random-seed <hidden>
+```
+
+Confirmed BTC values: concurrency **5** (session *trees* — subagent streams inside a tree
+add parallelism beyond 5 in-flight requests), context cap **204,800**, duration **900 s**,
+dataset pinned to the `062126` snapshot. The seed is hidden. Scenario-locked behavior:
+streaming on, `ignore_eos:true` (full-length decodes, no early stop), per-play cache-bust
+marker on each trace's first turn, recorded inter-turn delays preserved with a 10 s global
+idle cap, chat endpoint, server-reported token counts. aiperf stamps `submission_valid` in
+its output — **false** on >1% context-overflow rate, cancellation, or rule override, and
+an invalid run's numbers are not comparable to anything.
+
+Run it locally with `make bench-aiperf` (H200 box; `pip install -r
+bench/requirements-aiperf.txt` first — the dataset auto-downloads from HF on first run).
+The target mirrors the BTC command except the seed (`AIPERF_SEED`, default 0 — sweep 2–3
+seeds to bound seed sensitivity). `bench/aiperf_adapter.py` converts the aiperf artifacts
+into the repo's run schema and `bench/_ci_report.py` prints the ERS report. Smoke:
+`make bench-aiperf AIPERF_LIMIT=8 AIPERF_DURATION=120`.
+
+### 6.3 Two bench paths — which numbers to trust
+
+| | `make bench` (synthetic trace) | `make bench-aiperf` (grading fidelity) |
+|---|---|---|
+| Workload | authored 420-request trace, `data/input/trace-round2.jsonl` | Weka corpus replay via aiperf |
+| Where it runs | anywhere incl. rtx3060 CI | H200 box only |
+| Use for | fast iteration, CI regression signal | any decision about what to ship |
+
+The synthetic trace's arrival process, token shape, and prefix structure **no longer match
+grading** (it predates spec §3.1). Its numbers remain useful as a *relative* regression
+signal, but final tuning decisions — scheduler settings, `--max-num-seqs`, speculative
+decoding, anything traded against ERS — must be justified on `bench-aiperf` runs.
+
+### 6.4 Serving-config implications (open items)
+
+- **Blocking**: `docker-compose.yaml` still pins the LFM2.5 boot placeholder with
+  `--max-model-len=32768`. 32,768 < 204,800 guarantees a >1% context-overflow rate →
+  `submission_valid: false`. A valid `bench-aiperf` run (and any real submission) needs
+  the round-2 model literals landed first (§3.1 of this handoff).
+- `--max-num-seqs=32`'s comment cites "peak trace concurrency ~6" — that was the dead
+  synthetic trace. Re-measure concurrency under aiperf (5 trees + subagent fan-out) before
+  trusting the cap or the cudagraph capture sizes.
+- `ignore_eos:true` means every request decodes its full recorded length: EOS-dependent
+  early-stop logic (e.g. `VTL_ENABLE_STEP0_EOS_BAN`) is inert under grading, and the
+  decode:prefill ratio is far higher than the prefill-biased synthetic trace assumed.

@@ -1,7 +1,11 @@
-# viettel-llm-inference
+# viettel-llm-inference (round 2)
 
-An OpenAI-compatible inference server that beats the stock vLLM baseline on a 120-request
-trace, scored on **both** latency (TTFT / ITL / E2E percentiles) and throughput (tok/s, req/s).
+An OpenAI-compatible inference server, scored by **ERS** (a per-request blend of TTFT and
+TPOT — round-2 band: TTFT 200/6,000 ms, TPOT 8/100 ms, γ=2, w=0.5) on the official round-2
+workload: an **aiperf AgentX replay of the SemiAnalysis Weka corpus** — real multi-turn
+Claude Code sessions with subagents and recorded think time, 900 s, concurrency 5, context
+cap 204,800. Full spec, commands, and what it means for tuning: [`HANDOFF.md`
+§6](HANDOFF.md#6-official-grading-workload--scoring-round-2-btc-spec).
 
 Rather than reimplementing an engine, we run stock `vllm/vllm-openai` and patch it in-process
 through vLLM's [plugin system](https://docs.vllm.ai/en/latest/design/plugin_system/). The
@@ -10,41 +14,25 @@ in every process before it does any work.
 
 ## Know the workload before tuning it
 
-```
-python bench/trace_stats.py
-```
+Two bench paths, with different jobs:
 
-The trace is **prefill-bound, 101:1** — 2,414,302 prefill tokens against 24,000 decode tokens,
-median prompt 18,707 tokens, `max_tokens=200`, greedy. The conversations are **multi-turn** (1–6
-user turns) on top of a byte-identical 6,388-token system prompt, so later turns replay their own
-earlier history: the block-level prefix-cache hit rate is **82.4%**, eliminating 1,988,864 prefill
-tokens.
+- `make bench-aiperf` — the grading workload itself (aiperf, Weka corpus, H200 only).
+  **Every shipping decision is justified on these runs.**
+- `make bench` — the in-repo synthetic 420-request trace (`bench/replay.py`). Fast and runs
+  anywhere, but its arrival/token/prefix statistics predate the round-2 spec: a *relative*
+  regression signal only.
 
-This is why the flags look the way they do:
-
-- `--max-model-len=32768` — the longest prompt is 27,331 tokens and needs 27,531 with its
-  completion. `16384` rejects most of the trace; `262144` exceeds the model's derived limit and
-  vLLM refuses to boot.
-- `--enable-prefix-caching` — the single biggest win, and it is lossless. vLLM keys each block on
-  `hash(parent_block_hash, block_tokens)`, so the key encodes the whole prefix: a hash-chained
-  prefix index, block-granular rather than SGLang's token-level radix tree. The gap is a prefix
-  ending mid-block, worth **741 tokens (0.03%)** here — the hit rate is 82.4% at every `block_size`
-  from 1 to 64, so don't tune it and don't build a radix tree.
-- **Async scheduling (SGLang's "zero-overhead batch scheduler") is on by default** — do *not* pass
-  `--async-scheduling`. Passing it turns any incompatibility from a warning into a startup
-  `ValueError`. Confirm from the log: `Asynchronous scheduling is enabled.`
-- `--quantization=vtl_fp8` — prefill is GEMM-compute-bound, so Hopper's FP8 tensor cores act on
-  99% of the tokens.
-- Speculative decoding acts only on the decode phase, i.e. ~1% of the tokens. Measured, not assumed.
-- **KV offload is off.** The reusable working set is 15.7 GB against a ~120 GB budget — 8x headroom,
-  so nothing is ever evicted and there is nothing to promote back. See `docker-compose.offload.yaml`.
+The flag rationale that used to live here was derived from the round-1 trace statistics
+(prefill-bound 101:1, 82% prefix-hit) and no longer holds under the grading workload —
+`ignore_eos` full-length decodes shift the balance heavily toward decode. See `HANDOFF.md`
+§6.4 for what has to be re-measured.
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `vtl/` | The plugin. `plugin.py` is the entry point, `registry.py` the patch registry, `patches/` the patches. |
-| `bench/` | `trace_stats.py` (workload characterization), `replay.py` (open/closed-loop replay), `metrics.py`, `compare.py`. |
+| `bench/` | `trace_stats.py` (workload characterization), `replay.py` (open/closed-loop replay), `aiperf_adapter.py` (aiperf → repo schema), `metrics.py`, `compare.py`. |
 | `Dockerfile` | Bakes the plugin **wheel** into the vLLM image. A bind-mount would not register the entry point. |
 | `docker-compose.yaml` | **The submission.** Registry-only: no build context, judge provides `/model`, serves `:8000`. Single source of truth for every serve flag and env var. |
 | `docker-compose-optimized.yaml` | Local-dev overlay — swaps the pinned digest for the `:dev` tag. Stacks on top of `docker-compose.yaml`; not standalone. |
@@ -62,7 +50,8 @@ Each patch registers into `PATCH_REGISTRY` under a name and is gated by `VTL_ENA
 make check      # self-checks; no GPU, no vLLM, no server needed
 make up         # build + run locally against hf-model/ (Linux + GPU)
 make warm       # warm the torch.compile/Triton caches on a GPU, bake into the image
-make bench      # open-loop replay + closed-loop sweep at 1/8/32/128
+make bench      # synthetic trace: open-loop replay + closed-loop sweep at 1/8/32/128
+make bench-aiperf  # grading workload (aiperf AgentX / Weka corpus) + ERS report
 make push       # push and print the digest to pin in the compose file
 ```
 

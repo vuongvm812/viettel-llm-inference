@@ -1,41 +1,56 @@
-# Benchmark harness (P5)
+# Benchmark harness
 
-Head-to-head latency/throughput of **our runtime vs vLLM** on the same 120-request trace
-(`data/input/trace-round1.jsonl`). Open-loop replay honoring per-record arrival times, SSE
-streaming for TTFT/ITL. Spec: [`docs/design/benchmark/design.md`](../docs/design/benchmark/design.md).
+Two paths, different jobs. The grading-fidelity path is what shipping decisions are
+justified on; the synthetic path is the fast, runs-anywhere regression signal. Background
+and the full spec: [`../HANDOFF.md` §6](../HANDOFF.md#6-official-grading-workload--scoring-round-2-btc-spec).
 
-## Setup
+## Path 1 — grading fidelity: aiperf AgentX (`make bench-aiperf`, H200 only)
 
-```bash
-python3 -m venv .venv && source .venv/bin/activate   # optional
-pip install -r bench/requirements.txt                # aiohttp only
-```
-
-## Run
+Replays the SemiAnalysis Weka corpus (real multi-turn Claude Code sessions) through NVIDIA
+aiperf's locked `inferencex-agentx-mvp` scenario — the exact workload and flags the BTC
+grades with, except their hidden seed (`AIPERF_SEED`, default 0; sweep a few).
 
 ```bash
-# our runtime (port 8001 per config/default-config.yaml)
-make run/inference                      # in another shell — starts our server
-python bench/replay.py --target http://localhost:8001 --out ours.json
-
-# vLLM baseline (port 8000) — Linux + GPU only
-docker-compose up                       # in another shell — starts vLLM
-python bench/replay.py --target http://localhost:8000 --out vllm.json
-
-# side-by-side table + fairness notes
-python bench/compare.py vllm.json ours.json
+pip install -r bench/requirements-aiperf.txt   # heavy; H200 host venv only
+make bench-aiperf                              # 900 s run + ERS report
+make bench-aiperf AIPERF_LIMIT=8 AIPERF_DURATION=120   # smoke
 ```
 
-Extra flags: `--closed-loop N` (saturation sweep, N concurrent, send-on-completion),
-`--limit N` (first N records, smoke test), `--trace PATH`, `--timeout SECONDS`.
+The target chains three steps: `aiperf profile ...` → `aiperf_adapter.py` (converts the
+per-request `profile_export.jsonl` into the repo run schema, honoring `submission_valid`)
+→ `_ci_report.py` (ERS tables). The Weka dataset auto-downloads from HuggingFace on first
+run.
+
+First-real-run checklist (two things the docs don't pin down; the Makefile target has the
+same note):
+
+1. If aiperf rejects an explicit flag as duplicate/conflicting with the scenario preset,
+   delete the explicit copy from the `bench-aiperf` target and note which.
+2. Confirm the adapter's field mapping (module docstring table) against the actual
+   `profile_export.jsonl`, and where `submission_valid` sits in `profile_export_aiperf.json`.
+
+## Path 2 — synthetic trace (`make bench`, runs anywhere)
+
+Open-loop replay of `data/input/trace-round2.jsonl` (420 authored requests) honoring
+per-record arrival times, plus a closed-loop sweep at 1/8/32/128. SSE streaming for
+TTFT/ITL.
+
+```bash
+pip install -r bench/requirements.txt          # aiohttp only
+python bench/replay.py --target http://localhost:8000 --out run.json
+python bench/compare.py a.json b.json          # side-by-side + fairness notes
+```
+
+Extra flags: `--closed-loop N`, `--limit N` (smoke), `--trace PATH`, `--timeout SECONDS`.
+
+Its arrival/token/prefix statistics predate the round-2 spec: use it for relative
+regressions and CI, never for final tuning calls.
 
 ## Notes
 
-- **vLLM needs a Linux box with a GPU** — it cannot run in the macOS dev sandbox. The replayer
-  is target-agnostic and is verified locally against our runtime; the actual vLLM side-by-side
-  run is a target-box task.
-- Our runtime is the **P1 mock** until P2+ lands — its latency/token numbers are placeholders,
-  not real-model output. `compare.py` prints this caveat when a `:8001` target is present.
-- Output tokens are counted from streamed content deltas (uniform across targets); `usage` is
-  used only if the stream provides it.
-- Self-check the reporting math: `python bench/metrics.py`.
+- Output tokens are counted from streamed content deltas (uniform across targets); `usage`
+  is used only if the stream provides it. aiperf runs use server-reported counts
+  (`--use-server-token-count`).
+- Self-checks (all off-box, no GPU): `python bench/metrics.py`,
+  `python bench/sweep_report.py --selfcheck`, `python bench/aiperf_adapter.py --selfcheck`
+  — all wired into `make check`.
