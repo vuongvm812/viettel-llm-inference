@@ -36,6 +36,12 @@ the stock path, env revert). NOTE: `Dockerfile.vllm-fork` only runs
 `cargo test -p vllm-engine-core-client`, so these are gated by `cargo test -p vllm-text` --
 run them when regenerating this patch.
 
+The env-revert test mutates the process-global `VTL_STREAM_PER_TOKEN`, and cargo's default
+harness runs tests on parallel threads, so the two tests whose outcome depends on that
+variable serialize on a `PER_TOKEN_ENV_LOCK` mutex and the mutation is reverted by a drop
+guard. Without the lock the burst test intermittently saw the stock single-delta path and
+failed the image build's `cargo test -p vllm-text --lib` gate.
+
 --- a/src/text/src/output/decoded.rs
 +++ b/src/text/src/output/decoded.rs
 @@ -88,6 +88,29 @@
@@ -183,7 +189,7 @@ run them when regenerating this patch.
          }
      }
  
-@@ -596,5 +690,81 @@
+@@ -596,5 +690,107 @@
          // "世界" starts at byte 6
          let result = matches_stop_string(&stops, "你好世界", 3);
          assert_eq!(result, Some((0, 6)));
@@ -234,8 +240,22 @@ run them when regenerating this patch.
 +            .collect()
 +    }
 +
++    /// vtl: `per_token_split_is_env_revertible` mutates the process-global
++    /// `VTL_STREAM_PER_TOKEN`, and cargo's default harness runs tests on parallel
++    /// threads. Every test whose outcome depends on that variable holds this lock while
++    /// it streams, so the mutation cannot race a concurrent reader (previously seen as a
++    /// flaky `burst_record_streams_one_delta_per_token` failure in the image build).
++    static PER_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
++
++    fn per_token_env_lock() -> std::sync::MutexGuard<'static, ()> {
++        // Poison only means an earlier holder failed an assert; the variable itself is
++        // restored by that test's drop guard, so the lock is safe to reuse.
++        PER_TOKEN_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
++    }
++
 +    #[tokio::test]
 +    async fn burst_record_streams_one_delta_per_token() {
++        let _env = per_token_env_lock();
 +        let toks = ascii_tokens("abcd");
 +        let got = deltas(&stream_events(toks.clone()).await);
 +        assert_eq!(got.len(), 4, "one chunk per token, not one per record: {got:?}");
@@ -256,11 +276,23 @@ run them when regenerating this patch.
 +
 +    #[tokio::test]
 +    async fn per_token_split_is_env_revertible() {
-+        // SAFETY: single-threaded test, and the value is restored before returning.
++        let _env = per_token_env_lock();
++        // Restore on drop, not by a trailing remove_var, so a failing assert (or a panic
++        // inside the stream) cannot leak "0" into the process and break other tests.
++        struct Restore;
++        impl Drop for Restore {
++            fn drop(&mut self) {
++                // SAFETY: runs before `_env` unlocks (locals drop in reverse declaration
++                // order), so no lock-serialized reader can observe the mutation.
++                unsafe { std::env::remove_var("VTL_STREAM_PER_TOKEN") };
++            }
++        }
++        // SAFETY: PER_TOKEN_ENV_LOCK serializes every test that reads or writes this
++        // variable, and nothing outside these tests touches it in-process.
 +        unsafe { std::env::set_var("VTL_STREAM_PER_TOKEN", "0") };
++        let _restore = Restore;
 +        let toks = ascii_tokens("abcd");
 +        let got = deltas(&stream_events(toks.clone()).await);
-+        unsafe { std::env::remove_var("VTL_STREAM_PER_TOKEN") };
 +        assert_eq!(got.len(), 1, "VTL_STREAM_PER_TOKEN=0 must restore stock");
 +        assert_eq!(got[0], ("abcd".to_string(), toks));
 +    }
