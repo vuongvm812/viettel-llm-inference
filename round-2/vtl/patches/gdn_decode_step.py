@@ -40,7 +40,7 @@ path does not recognise at call time -- a geometry that is not the compiled one,
 stride outside the envelope, a non-silu activation -- also falls through to stock, once per
 distinct reason and with a warning, so a surprise costs a log line rather than an answer.
 
-Gate: ``VTL_ENABLE_GDN_DECODE_STEP=1`` (default OFF until A/B'd) **and** ``VTL_NVRTC=1``
+Gate: ``VTL_ENABLE_GDN_DECODE_STEP`` (default ON since 2026-08-17) **and** ``VTL_NVRTC=1``
 (the layer-wide switch). Numerics are the Triton pair's op for op -- see the header of
 vtl/kernels/gdn_decode_step.cu for the two tolerated fp32 divergences (reduction order,
 transcendental lowering) and bench/test_gdn_decode_step.py for the bound on them.
@@ -392,7 +392,7 @@ def _arm(vllm_config) -> None:
     )
 
 
-@register_patch(NAME, default=False)
+@register_patch(NAME, default=True)
 def apply() -> None:
     import importlib
 
@@ -472,8 +472,15 @@ def _self_check() -> None:
     from vtl.registry import PATCH_REGISTRY, is_enabled
 
     patch = next(p for p in PATCH_REGISTRY if p.name == NAME)
-    assert patch.default is False, "unproven optimization: default OFF"
-    assert is_enabled(patch) is False
+    # Enabled by default per project decision (2026-08-17), matching the shipped compose.
+    # The safety story is the ladder, not the gate: NVRTC compile -> stock conv1d + delta
+    # rule, the geometry envelope below, the `_decode_batch_ok` engage predicate (prefill,
+    # spec-decode and mixed batches never take this path), and the launch-failure latch
+    # that stands the kernel down for the rest of the run after one bad launch.
+    assert patch.default is True, "shipped ENABLED; NVRTC->stock + the engage predicate guard it"
+    assert is_enabled(patch) is True
+    os.environ["VTL_ENABLE_GDN_DECODE_STEP"] = "0"
+    assert is_enabled(patch) is False, "the gate must still be able to turn it off"
     os.environ["VTL_ENABLE_GDN_DECODE_STEP"] = "1"
     assert is_enabled(patch) is True
     os.environ.pop("VTL_ENABLE_GDN_DECODE_STEP")

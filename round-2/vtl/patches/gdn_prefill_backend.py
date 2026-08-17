@@ -18,8 +18,9 @@ server -- on the H200 (SM90) that means ``cutedsl`` resolves to triton, exactly 
 --additional-config request would.
 
 ``auto`` (or unset) leaves stock resolution completely untouched -- the wrapper is not
-even installed. Registry: ``gdn_prefill_backend``, default OFF
-(``VTL_ENABLE_GDN_PREFILL_BACKEND=1`` to arm the patch, then the env var above per arm).
+even installed. Registry: ``gdn_prefill_backend``, default ON since 2026-08-17
+(``VTL_ENABLE_GDN_PREFILL_BACKEND=0`` disarms the patch; the env var above picks the arm,
+and at the shipped ``auto`` the armed wrapper still defers to the stock resolver).
 """
 
 from __future__ import annotations
@@ -61,7 +62,7 @@ def _call_with_pin(orig, vllm_config, choice: str):  # noqa: ANN001
             ac.pop("gdn_prefill_backend", None)
 
 
-@register_patch("gdn_prefill_backend", default=False)
+@register_patch("gdn_prefill_backend", default=True)
 def apply() -> None:
     choice = _backend_choice()
     if choice in ("", "auto"):
@@ -105,8 +106,13 @@ def _self_check() -> None:
     from vtl.registry import PATCH_REGISTRY, is_enabled
 
     patch = next(p for p in PATCH_REGISTRY if p.name == "gdn_prefill_backend")
-    assert patch.default is False, "prefill pin is an A/B lever, off by default"
-    assert is_enabled(patch) is False
+    # Enabled by default per project decision (2026-08-17), matching the shipped compose.
+    # The wrapper it installs is inert at VTL_GDN_PREFILL_BACKEND=auto (the shipped value):
+    # it forwards to the stock resolver, so default-on installs a pin-point, not a pin.
+    assert patch.default is True, "shipped ENABLED; 'auto' means the stock resolver still decides"
+    assert is_enabled(patch) is True
+    os.environ["VTL_ENABLE_GDN_PREFILL_BACKEND"] = "0"
+    assert is_enabled(patch) is False, "the gate must still be able to turn it off"
     os.environ["VTL_ENABLE_GDN_PREFILL_BACKEND"] = "1"
     assert is_enabled(patch) is True
     os.environ.pop("VTL_ENABLE_GDN_PREFILL_BACKEND")

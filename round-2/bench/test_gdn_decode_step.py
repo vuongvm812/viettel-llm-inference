@@ -453,9 +453,15 @@ def _self_check() -> None:
     assert patch._decode_batch_ok(md) is False, "fewer tokens than decodes is incoherent"
     assert patch._decode_batch_ok(object()) is False, "unknown metadata must not engage"
 
-    # -- registration: present, OFF by default, env-overridable --
+    # -- registration: present, ON by default, env-overridable --
+    # Enabled by default per project decision (2026-08-17); the compose gate now restates the
+    # code default. Default-on is safe because the ladders, not the gate, are the safety
+    # story: NVRTC -> stock conv1d + delta rule, the geometry envelope, the `_decode_batch_ok`
+    # engage predicate, and the launch-failure latch.
     p = next(x for x in PATCH_REGISTRY if x.name == patch.NAME)
-    assert p.default is False and is_enabled(p) is False
+    assert p.default is True and is_enabled(p) is True
+    os.environ["VTL_ENABLE_GDN_DECODE_STEP"] = "0"
+    assert is_enabled(p) is False
     os.environ["VTL_ENABLE_GDN_DECODE_STEP"] = "1"
     assert is_enabled(p) is True
     os.environ.pop("VTL_ENABLE_GDN_DECODE_STEP")

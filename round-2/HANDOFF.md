@@ -507,8 +507,15 @@ make verify     # includes "rms_quant_fusion Replaced N patterns"; N=0 means it 
 
 ### 4.4 Rules of thumb
 
-- **Default off.** Every new kernel gets `@register_patch(..., default=False)` and an env
-  gate. A model it does not fit must degrade, not fail.
+- **Default off while unproven.** Every *new* kernel gets `@register_patch(..., default=False)`
+  and an env gate. A model it does not fit must degrade, not fail. Flip the default to `True`
+  only once the degrade path is the real safety story rather than the gate — which is what
+  happened on 2026-08-17 to the seven Qwen3.5 kernel patches (`gdn_kernels`,
+  `gdn_prefill_backend`, `nvrtc_block_quant`, `gdn_decode_step`, `w4a8_from_fp8`,
+  `moe_decode_gemv`, `greedy_argmax`): each has a per-op fallback ladder
+  (NVRTC → AOT → stock), and `greedy_argmax` additionally registers nothing until a boot
+  parity gate matches `torch.argmax` bit for bit. Their `VTL_ENABLE_*` lines in
+  `docker-compose.yaml` now restate the code default instead of overriding it.
 - **Size the prize before writing it.** A wall-clock A/B beats a profiler's call count;
   small-call profiling overstates dispatch overhead badly.
 - **Numerics are part of the contract.** The fp8 kernels round twice on purpose — matching

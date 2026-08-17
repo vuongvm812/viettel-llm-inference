@@ -82,7 +82,7 @@ original bf16 is (int4 RTN error) + (fp8 error), not a product. Same argument as
 [[w4a8_from_fp8]]; ``bench/test_w4a8_from_fp8.py --self-check`` is where it is checked.
 
 KNOBS.
-    VTL_ENABLE_MOE_DECODE_GEMV=1  registry gate (default off)
+    VTL_ENABLE_MOE_DECODE_GEMV    registry gate (default ON since 2026-08-17; 0 disarms)
     VTL_NVRTC=1                   REQUIRED -- the kernel is NVRTC-compiled; without this
                                   compile_kernel returns None and the patch is a no-op
     VTL_MOE_GEMV_WEIGHTS=fp8|int4 which weight arm to prepare at load (default fp8)
@@ -691,7 +691,7 @@ def _install_load_summary() -> None:
     BaseModelLoader.load_model = mark_patched(load_model, original, patch="moe_decode_gemv")
 
 
-@register_patch("moe_decode_gemv", default=False)
+@register_patch("moe_decode_gemv", default=True)
 def apply() -> None:
     from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
 

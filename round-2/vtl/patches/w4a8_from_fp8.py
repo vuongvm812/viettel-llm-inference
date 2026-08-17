@@ -59,7 +59,8 @@ FAIL-SOFT LADDER, in order of preference:
     method unchanged.
 
 KNOBS.
-    VTL_ENABLE_W4A8_FROM_FP8=1   registry gate; installs the Fp8Config wrapper (default off)
+    VTL_ENABLE_W4A8_FROM_FP8     registry gate; installs the Fp8Config wrapper
+                                 (default ON since 2026-08-17; 0 disarms)
     VTL_W4A8_FROM_FP8            runtime arm; default "1" once the patch is enabled, set 0 to
                                  keep the wrapper installed but requantize nothing (A/B)
     VTL_W4A8_FROM_FP8_IGNORE     substring list of layers to keep on stock fp8
@@ -332,7 +333,7 @@ def _install_load_summary() -> None:
     BaseModelLoader.load_model = mark_patched(load_model, original, patch="w4a8_from_fp8")
 
 
-@register_patch("w4a8_from_fp8", default=False)
+@register_patch("w4a8_from_fp8", default=True)
 def apply() -> None:
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 

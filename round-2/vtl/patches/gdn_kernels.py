@@ -36,8 +36,8 @@ from the live tensors of the loaded model (this is where the NVRTC defines come 
       -> AOT (vtl._C :: gated_rmsnorm_per_group_quant)
         -> stock composition in torch (never raises, only slower)
 
-Gated by ``VTL_ENABLE_GDN_KERNELS`` (default OFF -- arm only after `make test-kernel`
-parity passes on the H200).
+Gated by ``VTL_ENABLE_GDN_KERNELS`` (default ON since 2026-08-17 -- the ladder above is
+what makes that safe; set it to 0 to A/B against stock).
 """
 
 from __future__ import annotations
@@ -483,7 +483,7 @@ def _install_gated_rmsnorm_eager() -> bool:
     return True
 
 
-@register_patch("gdn_kernels", default=False)
+@register_patch("gdn_kernels", default=True)
 def apply() -> None:
     import torch
 
@@ -524,9 +524,16 @@ def _self_check() -> None:
     from vtl.registry import PATCH_REGISTRY, is_enabled
 
     patch = next(p for p in PATCH_REGISTRY if p.name == "gdn_kernels")
-    assert patch.default is False, "GDN kernels are opt-in until parity is verified on the box"
-    assert is_enabled(patch) is False
+    # Enabled by default per project decision (2026-08-17) -- the shipped compose pins
+    # VTL_ENABLE_GDN_KERNELS=1, and the registry default now says the same thing rather
+    # than relying on the compose line to carry it. The safety story is not the gate: the
+    # fusion pass is a no-op on a graph it does not match, and the eager arm degrades
+    # per-op to stock RMSNormGated, so an unfitting model loses speed, not correctness.
+    assert patch.default is True, "shipped ENABLED; the per-op fallback is the safety net"
+    assert is_enabled(patch) is True
 
+    os.environ["VTL_ENABLE_GDN_KERNELS"] = "0"
+    assert is_enabled(patch) is False, "the gate must still be able to turn it off"
     os.environ["VTL_ENABLE_GDN_KERNELS"] = "1"
     assert is_enabled(patch) is True
     os.environ.pop("VTL_ENABLE_GDN_KERNELS")

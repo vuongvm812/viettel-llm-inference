@@ -430,11 +430,14 @@ def _self_check() -> None:
     assert patch._geometry_ok(16384, 128) is False
     assert patch._threads_for(3072) == THREADS
 
-    # -- import-without-vLLM: the module loads, registers, and stays OFF by default --
+    # -- import-without-vLLM: the module loads and registers ON by default --
+    # Enabled by default per project decision (2026-08-17); the compose gate now restates the
+    # code default instead of overriding it. Default-on is safe because the fallback ladder,
+    # not the gate, is the safety story: NVRTC -> AOT -> stock op, behind a geometry envelope.
     from vtl.registry import PATCH_REGISTRY, is_enabled
 
     p = next(x for x in PATCH_REGISTRY if x.name == "nvrtc_block_quant")
-    assert p.default is False and is_enabled(p) is False
+    assert p.default is True and is_enabled(p) is True
 
     # With VTL_NVRTC off, apply() must return cleanly even though vLLM is absent --
     # nothing is imported, nothing is installed, the stock ops keep the dispatch key.

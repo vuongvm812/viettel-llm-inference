@@ -34,7 +34,7 @@ size, non-bf16 input, ue8m0 scales, int8 out...) it falls back to an eager torch
 replication of the stock formula and warns once. That path is unreachable for the model
 the kernels were compiled from; it exists so a surprise degrades to slow-and-right.
 
-Gate: ``VTL_ENABLE_NVRTC_BLOCK_QUANT=1`` (default OFF until A/B'd) **and** ``VTL_NVRTC=1``
+Gate: ``VTL_ENABLE_NVRTC_BLOCK_QUANT`` (default ON since 2026-08-17) **and** ``VTL_NVRTC=1``
 (the layer-wide switch). Numerics are the stock ops' bit for bit -- including the
 double bf16 rounding of ``bf16(x*rms) * bf16(w)`` and the TRUE division by the group
 scale -- see vtl/kernels/rms_norm_block_quant.cu and bench/test_nvrtc_block_quant.py.
@@ -376,7 +376,7 @@ def _arm(vllm_config, model_config) -> None:
     )
 
 
-@register_patch("nvrtc_block_quant", default=False)
+@register_patch("nvrtc_block_quant", default=True)
 def apply() -> None:
     from vtl import nvrtc
 
@@ -412,8 +412,14 @@ def _self_check() -> None:
     from vtl.registry import PATCH_REGISTRY, is_enabled
 
     patch = next(p for p in PATCH_REGISTRY if p.name == "nvrtc_block_quant")
-    assert patch.default is False, "unproven optimization: default OFF"
-    assert is_enabled(patch) is False
+    # Enabled by default per project decision (2026-08-17), matching the shipped compose.
+    # The safety story is the ladder, not the gate: NVRTC compile -> AOT kernel -> stock op,
+    # plus the geometry envelope below, so a foreign shape or a failed compile silently
+    # keeps the stock dispatch key instead of failing the boot.
+    assert patch.default is True, "shipped ENABLED; NVRTC->AOT->stock is the safety net"
+    assert is_enabled(patch) is True
+    os.environ["VTL_ENABLE_NVRTC_BLOCK_QUANT"] = "0"
+    assert is_enabled(patch) is False, "the gate must still be able to turn it off"
     os.environ["VTL_ENABLE_NVRTC_BLOCK_QUANT"] = "1"
     assert is_enabled(patch) is True
     os.environ.pop("VTL_ENABLE_NVRTC_BLOCK_QUANT")

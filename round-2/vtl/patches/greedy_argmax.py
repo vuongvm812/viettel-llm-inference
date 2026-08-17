@@ -51,7 +51,7 @@ and only then register the ops and rebind nstep. ``compile_kernel`` returning No
 off, no cuda-python, bad source, no device -- leaves both consumers on ``torch.argmax``,
 which is the behaviour they already have today.
 
-Gate: ``VTL_ENABLE_GREEDY_ARGMAX=1`` (default OFF) **and** ``VTL_NVRTC=1`` (the layer-wide
+Gate: ``VTL_ENABLE_GREEDY_ARGMAX`` (default ON since 2026-08-17) **and** ``VTL_NVRTC=1`` (the layer-wide
 switch). Block width: ``VTL_GREEDY_ARGMAX_THREADS`` (default 256, a whole number of warps up
 to 1024). Row slices: ``VTL_GREEDY_ARGMAX_SPLIT`` (default 16, 1..1024).
 """
@@ -686,7 +686,7 @@ def _arm(model_config) -> None:
     )
 
 
-@register_patch("greedy_argmax", default=False)
+@register_patch("greedy_argmax", default=True)
 def apply() -> None:
     from vtl import nvrtc
 
@@ -725,8 +725,16 @@ def _self_check() -> None:
     from vtl.registry import PATCH_REGISTRY, is_enabled
 
     patch = next(p for p in PATCH_REGISTRY if p.name == "greedy_argmax")
-    assert patch.default is False, "unproven optimization: default OFF"
-    assert is_enabled(patch) is False
+    # Enabled by default per project decision (2026-08-17), matching the shipped compose.
+    # The safety story is the ladder, not the gate: NVRTC compile -> nothing registered, and
+    # even a successful compile registers the op ONLY after the boot parity gate matches
+    # torch.argmax bit for bit on adversarial rows. Every consumer (the V2 fast path, nstep's
+    # three call sites) resolves through _ARGMAX and falls back to torch.argmax when the op
+    # is absent, so default-on can cost a compile, never a wrong token.
+    assert patch.default is True, "shipped ENABLED; the boot parity gate is the safety net"
+    assert is_enabled(patch) is True
+    os.environ["VTL_ENABLE_GREEDY_ARGMAX"] = "0"
+    assert is_enabled(patch) is False, "the gate must still be able to turn it off"
     os.environ["VTL_ENABLE_GREEDY_ARGMAX"] = "1"
     assert is_enabled(patch) is True
     os.environ.pop("VTL_ENABLE_GREEDY_ARGMAX")

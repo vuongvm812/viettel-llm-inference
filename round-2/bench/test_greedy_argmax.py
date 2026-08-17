@@ -850,11 +850,15 @@ def _self_check() -> None:
     assert patch._vocab_from(_Neither()) == 0
     assert patch._vocab_ok(patch._vocab_from(_Neither())) is False
 
-    # -- import-without-vLLM: the module loads, registers, and stays OFF by default --
+    # -- import-without-vLLM: the module loads and registers ON by default --
+    # Enabled by default per project decision (2026-08-17); the compose gate now restates the
+    # code default. Default-on is safe because the boot parity gate, not the registry gate, is
+    # the safety story: the op is registered only after it matches torch.argmax bit for bit,
+    # and every consumer resolves through _ARGMAX with torch.argmax as the fallback rung.
     from vtl.registry import PATCH_REGISTRY, is_enabled
 
     p = next(x for x in PATCH_REGISTRY if x.name == "greedy_argmax")
-    assert p.default is False and is_enabled(p) is False
+    assert p.default is True and is_enabled(p) is True
 
     from vtl import patches as _patches
 
