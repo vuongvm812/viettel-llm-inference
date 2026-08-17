@@ -49,7 +49,7 @@ services:
       - round2-model
       - --host=0.0.0.0 #Don't change this to vllm-server
       - --port=8000 #Don't change this to vllm-server
-      - --max-model-len=262144 # must equal the model's native context -- see header item 2
+      - --max-model-len=204800 # judge-specified value (2026-08-17)
       # 0.95, not 0.90: ~124 GB of loaded weights on a 141 GB H200 leave nothing for the
       # GDN state pool at 0.90. Sweep 0.93/0.95/0.97 on the box before trusting.
       - --gpu-memory-utilization=0.95
@@ -64,10 +64,7 @@ services:
       # a dense model (startup failure otherwise).
       - --mamba_cache_mode=align
       - --enable-chunked-prefill
-      - --max-num-seqs=32
-      # peak trace concurrency ~6; each resident seq also pins ~154 MB
-      # of fp32 GDN state, so 70 (10.8 GB) does not fit next to 124 GB
-      # of weights. Sweep 16/24/32 with bench/replay.py.
+      - --max-num-seqs=5 # judge-specified value (2026-08-17)
       - --max-num-batched-tokens=8192
       # small prefill chunks keep a new turn's ~4k prefill
       # from spiking in-flight decode ITL; TTFT has slack.
@@ -76,6 +73,8 @@ services:
       # is layered on via VTL_W4A8_FROM_FP8 / VTL_ENABLE_MOE_DECODE_GEMV below and degrades
       # to the stock fp8 path per-layer; bench/eval_quality.py is the accuracy gate.
       - --kv-cache-dtype=fp8_e4m3
+      - --kv-offloading-size=64
+      - --kv-offloading-backend=native
       # MTP speculative decoding: PERMITTED for round-2 (user-confirmed 2026-08-16; the
       # round-1.2 "cheating" ban does not carry over). The checkpoint ships a 1-layer MTP
       # drafter (Qwen3_5MoeMTP, registered stock in v0.25.0); greedy tree acceptance rides
