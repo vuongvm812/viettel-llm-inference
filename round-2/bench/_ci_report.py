@@ -16,9 +16,9 @@ try:
 except ImportError:
     from bench.metrics import aggregate
 
-# ERS constants from the scoring spec.
-F_TTFT, C_TTFT = 10.0, 400.0  # ms
-F_TPOT, C_TPOT = 1.0, 10.0    # ms
+# ERS constants -- round-2 official spec (BTC, 2026-08). Round-1 band was 10/400, 1/10.
+F_TTFT, C_TTFT = 200.0, 6000.0  # ms
+F_TPOT, C_TPOT = 8.0, 100.0     # ms
 GAMMA = 2.0
 W = 0.5
 
@@ -73,7 +73,10 @@ def main():
     for p in sorted(glob("bench-closed-*.json")):
         closed_runs.append(_load(p))
 
-    runs = [r for r in [open_run, *closed_runs] if r is not None]
+    # aiperf AgentX runs (make bench-aiperf -> aiperf_adapter.py); same record schema
+    aiperf_runs = [_load(p) for p in sorted(glob("bench-aiperf*.json"))]
+
+    runs = [r for r in [open_run, *closed_runs, *aiperf_runs] if r is not None]
     if not runs:
         print("ERROR: no bench results found", file=sys.stderr)
         sys.exit(1)

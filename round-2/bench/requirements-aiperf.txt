@@ -1,0 +1,7 @@
+# NVIDIA aiperf, for `make bench-aiperf` (the AgentX MVP grading workload). Kept out of
+# requirements.txt on purpose: heavy dependency tree, only needed on the H200 bench host --
+# never in CI, never in the serving image. bench/aiperf_adapter.py parses its output without
+# importing it, so `make check` stays aiperf-free.
+# Pinned so the scenario rules ("inferencex-agentx-mvp" locks flags and validity checks)
+# don't drift under us; bump deliberately and re-run the smoke checklist in bench/README.md.
+aiperf==0.12.0

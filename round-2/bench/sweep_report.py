@@ -16,7 +16,8 @@ per boot -- boots are the samples, reps are not (rep-to-rep is ~0.05 ms, boot-to
 
 Modelled on bench/ab_summary.py from branch gnhf/goal-minimize-scored-7c79fe, minus its ERS
 ranking: metrics.aggregate on this branch has no `ers` key, so the two scored terms are
-reported directly (1 ms TPOT ~= 28 ms TTFT if you need to trade them off by hand).
+reported directly (1 ms TPOT ~= 63 ms TTFT under the round-2 band if you need to trade them
+off by hand).
 
 Pure stdlib on purpose -- the dev box cannot import aiohttp, so anything needing the venv has
 to run inside the image. Run this on the host.
@@ -78,7 +79,7 @@ def collect(paths):
         run = json.loads(Path(p).read_text())
         agg = aggregate(run["records"], run["wall_time"])
         # The scored quantity, so an arm that trades TPOT against TTFT can be ranked without
-        # doing the 1 ms ~= 28 ms conversion by hand. `_ers` divides by the FULL record count,
+        # doing the 1 ms ~= 63 ms conversion by hand. `_ers` divides by the FULL record count,
         # so failed requests drag the arm down exactly as the scoring spec intends. Stuffed
         # under a "p50" key because that is the shape `summarize` reads; it is a mean, not a
         # median -- the label below says ERS, not ERS p50, for that reason.
@@ -150,7 +151,7 @@ def render(rows, floors, baseline=BASELINE):
     print(f"  ± is peak-to-peak across boots. This run's own noise floor (the `{baseline}` arm's")
     print(f"  boot-to-boot spread): {floor_text}.")
     print("  ~ = delta is inside that floor: NOT a result — add boots (BOOTS=n) or drop the arm.")
-    print("  ! = delta clears the floor. Rank those, and remember 1 ms TPOT ~= 28 ms TTFT.")
+    print("  ! = delta clears the floor. Rank those, and remember 1 ms TPOT ~= 63 ms TTFT.")
     print("  DIRECTION: TPOT/TTFT are lower-is-better, ERS is HIGHER-is-better — so a winning")
     print("  arm shows NEGATIVE TPOT/TTFT deltas and a POSITIVE ERS delta. ERS is the scored")
     print("  quantity; when it disagrees with TPOT, ERS wins.")
