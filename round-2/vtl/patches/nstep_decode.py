@@ -117,6 +117,11 @@ log = logging.getLogger("vllm.vtl.nstep")
 # cudagraph_capture_sizes would lift graph coverage 82%->99%, but stock FULL graphs at
 # never-before-captured sizes carry unvalidated-path risk and wait for a run that can
 # afford to fail (see the compose comment).
+#
+# This is only the SEED value: `_capture_burst_graphs` overwrites both names with whatever
+# FULL decode sizes the cudagraph manager actually captured. Since 2026-08-17 compose asks
+# for exactly [1,2,4,8] (16/32 dropped -- unreachable under --max-num-seqs=5), so the seed
+# and the outcome now coincide.
 BURST_SIZES = (1, 2, 4, 8)
 MAX_BURST_REQS = BURST_SIZES[-1]
 
@@ -628,10 +633,12 @@ def _capture_burst_graphs(runner, b: _Burst) -> None:
     for desc, pair in states.items():
         if desc.cg_mode != CUDAGraphMode.FULL or desc.uniform_token_count != 1:
             continue
-        # Every captured FULL decode size gets a graph, not just BURST_SIZES. Compose
-        # captures [1,2,4,8,16,32] while BURST_SIZES stopped at 8, so sizes 16/32 previously
-        # fell back to the eager loop; with `b.rows` masking the feedback there is no longer
-        # a reason to skip them. LoRA graphs stay out -- the burst has no LoRA story.
+        # Every captured FULL decode size gets a graph, not just the BURST_SIZES seed: with
+        # `b.rows` masking the feedback there is no reason to skip a size the manager already
+        # captured. Historically compose asked for [1,2,4,8,16,32] and 16/32 fell back to the
+        # eager loop; compose now asks for [1,2,4,8] only, so this loop and the seed agree --
+        # but the code stays size-agnostic, so widening compose again needs no edit here.
+        # LoRA graphs stay out -- the burst has no LoRA story.
         if desc.num_active_loras:
             continue
         if desc.num_tokens != desc.num_reqs:

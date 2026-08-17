@@ -89,7 +89,16 @@ services:
       # enable_qk_norm_rope_fusion: stock v0.25.0 pass fusing per-head QK RMSNorm + RoPE for
       # the 12 full-attention layers. Verify at boot it matches interleaved-mrope +
       # partial_rotary_factor 0.25 ("Replaced N patterns", N>0); it self-disables if not.
-      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true, "enable_qk_norm_rope_fusion": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]}'
+      #
+      # cudagraph_capture_sizes [1,2,4,8] -- 16 and 32 DROPPED (2026-08-17). The judge pinned
+      # --max-num-seqs=5 and spec-decode is off, so a decode batch can never exceed 5 rows,
+      # which pads to the 8 bucket; 16 and 32 were pure dead weight. Dropping them cuts the
+      # capture count TWICE over: once for the stock piecewise/FULL set, and again for
+      # nstep_decode, which captures a body + prologue + unroll + continuation graph for every
+      # FULL 1-token-per-request size the manager captured (BURST_SIZES is an OUTCOME of that
+      # set, not a filter -- nstep_decode.py:757). Net: faster boot, less graph-pool VRAM,
+      # zero perf loss, since no replayable shape disappears.
+      - '--compilation-config={"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true, "enable_qk_norm_rope_fusion": true}, "cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8]}'
     ports:
       - "8000:8000"
     environment:
@@ -107,9 +116,15 @@ services:
 
       # ---- Registry gates ---------------------------------------------------------------
       # Every patch in vtl/patches/ reads VTL_ENABLE_<NAME>. All are pinned here so a
-      # `default=` flipped in a future refactor cannot silently change what ships. Each
-      # value equals the current code default. Set any to 0 to A/B that patch alone.
+      # `default=` flipped in a future refactor cannot silently change what ships. Set any
+      # to 0 to A/B that patch alone.
       #
+      # Every value below equals the current `@register_patch(default=)` in code, EXCEPT the
+      # three still registered opt-in on purpose: shm_ipc, rust_sched (both `default=False`,
+      # forced on here because the Rust data/control plane is the shipped configuration and
+      # the master switches below are the real gate) and profiler (`default=False`, and 0
+      # here). The seven Qwen3.5 kernel patches were flipped to `default=True` on 2026-08-17,
+      # so this block no longer differs from the code for any of them.
       # !! EXCEPT the two quant gates: VTL_ENABLE_W4A8/FP8 REGISTER the quantization
       # methods, and --quantization=vtl_w4a8 is a serve flag. With the patch off vLLM aborts
       # at startup with "Invalid quantization method" and never binds :8000. To A/B
@@ -128,8 +143,11 @@ services:
       # OFF in the submission;
       #   docker-compose.profile.yaml overrides to 1
       # -- Qwen3.5 (GDN hybrid + 256-expert MoE) kernel patches. All shipped ENABLED (user
-      # decision); every one degrades per-op to AOT/stock on any mismatch or NVRTC failure,
-      # so a gate here can change speed but not correctness of the boot. A/B by zeroing one.
+      # decision) and, since 2026-08-17, `default=True` in code too -- so these seven lines
+      # now RESTATE the code default rather than override it. Every one degrades per-op to
+      # AOT/stock on any mismatch or NVRTC failure (plus the boot parity gate and the
+      # launch-failure latch), so a gate here can change speed but not correctness of the
+      # boot. A/B by zeroing one.
       VTL_ENABLE_GDN_KERNELS: "1"
       # RMSNormGated -> group-128-fp8-quant fusion for
       #   the 36 GDN layers (the fusion AITER has on
@@ -203,8 +221,14 @@ services:
       # allocated (was 3 vCPU on the round-1.2 MIG box -- every pin below was re-based).
       OMP_NUM_THREADS: "8"
       MKL_NUM_THREADS: "8"
-      OMP_WAIT_POLICY: "PASSIVE"         # ACTIVE lets a spinning libgomp worker steal a third
-                                         #   of the host budget from the decode loop
+      OMP_WAIT_POLICY: "ACTIVE"          # PASSIVE parks an idle libgomp worker on a futex, so
+                                         #   every OMP region re-entry pays a kernel wake. That
+                                         #   pin was made for the 3-vCPU MIG box, where 8
+                                         #   spinning threads WERE a third of the budget; at 22
+                                         #   cores an 8-thread spinning pool starves nothing,
+                                         #   and ACTIVE takes the futex wake off the hot-path
+                                         #   OMP regions. Revert to PASSIVE if the core
+                                         #   allocation ever shrinks again.
       OMP_PROC_BIND: "close"             # keep the OMP threads on the cores they started on:
       OMP_PLACES: "cores"                #   every migration is a cold L1/L2
 
@@ -292,10 +316,17 @@ services:
       VTL_GREEDY_ARGMAX_THREADS: "256" # partial-kernel block width; whole warps, <=1024
       VTL_GREEDY_ARGMAX_SPLIT: "16"
       # row slices per row = the partial kernel's gridDim.x.
-      #   1 is one CTA per row, which at batch<=5 uses 5 of
-      #   132 SMs and is ~5x slower than torch; 16 puts 80
-      #   CTAs on the same reduction. Sweep it with
-      #   VTL_BENCH=1 bench/test_greedy_argmax.py -- the
+      #   The partial launch is grid=(SPLIT, rows, 1), so the
+      #   block count is SPLIT*rows. 1 is one CTA per row, which
+      #   at batch<=5 uses 5 of 132 SMs and is ~5x slower than
+      #   torch. 16 is the ESTIMATED best for this serve config:
+      #   --max-num-seqs=5 caps live rows at 5 (80 blocks), and
+      #   inside a captured decode graph the rows pad to the 8
+      #   bucket -> 16*8 = 128 blocks, i.e. essentially one full
+      #   132-SM wave with no second-wave tail. 8 would half-fill
+      #   the device; 32 would put 256 blocks on 132 SMs, a
+      #   two-wave grid whose second wave is nearly empty. Sweep
+      #   it with VTL_BENCH=1 bench/test_greedy_argmax.py -- the
       #   right value depends on VOCAB and on rows in flight.
       VTL_MOE_GEMV_CHUNK: "64" # (token,slot) chunk per launch wave
       VTL_MOE_GEMV_FREE_FP8: "0"
@@ -363,10 +394,15 @@ services:
       VTL_RUST_SCHED_UFO: "1"
       # batch update_from_output's stop decision into one
       #   Rust call. Needs VTL_RUST_SCHED_FULL.
-      VTL_WARMUP_CONCURRENCY: "8"
-      # warm capture sizes 2/4/8 by replaying the baked trace
+      VTL_WARMUP_CONCURRENCY: "5"
+      # warm the capture sizes by replaying the baked trace
       #   slice concurrently after line 0 (which stays serial,
       #   to seed the shared prefix unraced). 1 = sequential.
+      #   5, not 8: --max-num-seqs=5 caps in-flight decode at 5,
+      #   so requests 6-8 of an 8-wide warm-up only sit in the
+      #   waiting queue and warm nothing. 5 concurrent walks the
+      #   batch up through 1/2/4 and pads into the 8 bucket,
+      #   which is every captured size.
       VTL_HOTPATH_MICROOPT: "1"
       # 5 per-step host micro-opts in model_runner.py +
       #   core.py, behind one in-file env read. (fork patch)
@@ -509,6 +545,11 @@ services:
       #   Routes CPython's allocator through jemalloc (already LD_PRELOADed). Can cut
       #   fragmentation, or lose to pymalloc's free lists on the decode path. Genuinely 50/50.
     shm_size: "2g" # tmpfs counts against the 8GB cgroup; TP=1 needs little
+    # Pin every container thread to the NUMA node the H200 hangs off, so the per-step pinned
+    # H2D/D2H staging buffers and the OMP pool stop paying cross-socket hops. SHIPS COMMENTED:
+    # the core list is host-specific and pinning to the WRONG node is worse than not pinning at
+    # all, and the judge box runs this compose as-is on hardware we cannot inspect.
+    # cpuset: "0-21"   # UNCOMMENT with the GPU-local core list from: scripts/host-tune.sh --cpuset
     # seccomp/apparmor: Docker's default profile puts a BPF filter in front of every syscall.
     # The decode loop is syscall-heavy (futex, epoll, shm reads per step), so that filter is
     # on the hot path, and we run a single trusted process.
