@@ -27,10 +27,20 @@ HTTP_PORT=8000
 # Array (not a string) so each flag is always a distinct argv token — immune to
 # word-splitting/IFS quirks that made `cargo` see one `--features native-tls-vendored`.
 FEAT=(--features native-tls-vendored)
-# Per-decode-step delay for the mock engine (ms). Set to ~the real model's TPOT so the
-# frontend's streaming/detokenize/backpressure loop is profiled at production cadence
-# instead of at memory speed (which biases the profile toward the wrong hot paths).
-PGO_DECODE_STEP_DELAY_MS="${PGO_DECODE_STEP_DELAY_MS:-4}"
+# Mock-engine record shape: match PRODUCTION, not the mock's defaults. The served stack
+# runs the N-step decode burst (compose: VTL_NSTEP_N=4) with VTL_STREAM_PER_TOKEN=1, so the
+# frontend's hot streaming path is a 4-token engine record split into per-token deltas
+# (per_token_stream.patch). The mock's default chunk size of 1 never enters that split
+# branch (it requires >1 token per record), which trained the profile to treat the fork's
+# own hot path as cold. Same for the vocab: the default 32000 covers 13% of Qwen3.5's
+# 248320-token ID space, skewing detokenize profiling toward short ASCII tokens.
+PGO_OUTPUT_TOKEN_CHUNK="${PGO_OUTPUT_TOKEN_CHUNK:-4}"     # = compose VTL_NSTEP_N
+PGO_VOCAB_SIZE="${PGO_VOCAB_SIZE:-248320}"                # = Qwen3.5-122B-A10B vocab_size
+# Per-decode-step delay for the mock engine (ms) — one step now emits one CHUNK, so this
+# is per-record, not per-token: ~chunk_size x the real model's TPOT keeps the frontend's
+# streaming/detokenize/backpressure loop profiled at production cadence instead of at
+# memory speed (which biases the profile toward the wrong hot paths).
+PGO_DECODE_STEP_DELAY_MS="${PGO_DECODE_STEP_DELAY_MS:-16}"
 # -Ctarget-cpu (default native from the build arg): full host codegen (AVX-512 on an H200
 # host). Applies to BOTH the instrumented and final builds, so build on NATIVE amd64 — a
 # native/AVX2 instrumented binary crashes at startup under Rosetta/OrbStack during the training
@@ -91,7 +101,9 @@ LLVM_PROFILE_FILE="$PGO_RAW/serve-%p.profraw" "$BIN/vllm-rs" serve "$MODEL" \
     > "$FRONTEND_LOG" 2>&1 &
 FRONTEND_PID=$!
 "$BIN/vllm-mock-engine" --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" \
-    --decode-step-delay-ms "$PGO_DECODE_STEP_DELAY_MS" &
+    --decode-step-delay-ms "$PGO_DECODE_STEP_DELAY_MS" \
+    --output-token-chunk-size "$PGO_OUTPUT_TOKEN_CHUNK" \
+    --vocab-size "$PGO_VOCAB_SIZE" &
 MOCK_PID=$!
 
 dump_frontend_log() { echo "--- frontend log (${FRONTEND_LOG}) ---"; cat "$FRONTEND_LOG" 2>/dev/null || echo "(empty)"; echo "--- end frontend log ---"; }
