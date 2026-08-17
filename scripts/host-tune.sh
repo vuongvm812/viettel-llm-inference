@@ -130,6 +130,11 @@ cpuset() {
   fi
   log "node $node cpus" "$cores  [$src]"
 
+  # Count the cores in the range list (e.g. "0-2,5" -> 4) so the safety advice below can be
+  # concrete instead of generic. A narrowed set with stacked threads is how a pinned box ends
+  # up SLOWER -- and, combined with realtime scheduling, how a host hard-locks.
+  ncores=$(echo "$cores" | awk -F, '{ n=0; for (i=1;i<=NF;i++) { if (split($i,r,"-")==2) n+=r[2]-r[1]+1; else n+=1 } print n }')
+
   echo
   echo "  Paste under the \`model\` service in round-2/docker-compose.yaml (it ships commented):"
   echo
@@ -137,6 +142,20 @@ cpuset() {
   echo
   echo "  DEV/BENCH BOXES ONLY. This is host-specific: a compose file carrying one host's core"
   echo "  list is a compose file that pins the judge's container to the wrong socket."
+  echo
+  echo "  SAFETY RULES (breaking these has crashed real hosts -- see the compose cpuset note):"
+  echo "    1. Never add an rtprio ulimit while this cpuset is active: one SCHED_FIFO thread"
+  echo "       stacked on a narrowed core starves the kernel's own threads and can hard-lock"
+  echo "       the HOST. The compose deliberately ships no rtprio; keep it that way."
+  echo "    2. This list has $ncores cores. The container runs ~23 runnable-capable threads"
+  echo "       (8 OMP + 6 tokio + 4 zmq + 4 request + engine); below 16 cores, do NOT pin."
+  echo "    3. Keep OMP_NUM_THREADS / MKL_NUM_THREADS / TOKIO_WORKER_THREADS each <= $((ncores > 2 ? ncores - 2 : 1)),"
+  echo "       leaving >= 2 cores of slack for the kernel, IRQs and the healthcheck."
+  if [ "$ncores" -lt 16 ]; then
+    echo
+    echo "  WARNING: only $ncores GPU-local cores -- pinning is NOT recommended on this host."
+    echo "  Leave cpuset commented out; the unpinned scheduler will do better than a stacked set."
+  fi
 }
 
 # --- read current state -------------------------------------------------------------------

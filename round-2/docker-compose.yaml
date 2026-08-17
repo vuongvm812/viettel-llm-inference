@@ -578,10 +578,17 @@ services:
     # the core list is host-specific and pinning to the WRONG node is worse than not pinning at
     # all, and the judge box runs this compose as-is on hardware we cannot inspect.
     # cpuset: "0-21"   # UNCOMMENT with the GPU-local core list from: scripts/host-tune.sh cpuset
-    #   A cpuset NARROWS the pool every thread in this container shares, so keep
-    #   OMP_NUM_THREADS (and MKL_NUM_THREADS, TOKIO_WORKER_THREADS) <= the size of the list
-    #   you paste: oversubscribing a narrowed set is how a pinned container ends up slower
-    #   than an unpinned one.
+    #   A cpuset NARROWS the pool every thread in this container shares. HARD RULES, in order
+    #   of how badly breaking them ends (worst first):
+    #   1. NEVER re-add an rtprio ulimit while a cpuset is active (see the ulimits note below):
+    #      a SCHED_FIFO thread stacked on a narrowed core starves kernel threads on that core
+    #      and can hard-lock the whole HOST, not just the container.
+    #   2. Keep the list >= 16 cores. Below that, the thread census (8 OMP + 6 tokio + 4 zmq
+    #      + 4 request workers + engine + CUDA driver threads) stacks multiple runnable
+    #      threads per core and pinning makes latency WORSE, not better.
+    #   3. Keep OMP_NUM_THREADS + MKL_NUM_THREADS + TOKIO_WORKER_THREADS each <= list size - 2,
+    #      leaving >= 2 cores of slack for the kernel, IRQs and the healthcheck python.
+    #   host-tune.sh cpuset prints these same warnings next to the list it emits.
     # seccomp/apparmor: Docker's default profile puts a BPF filter in front of every syscall.
     # The decode loop is syscall-heavy (futex, epoll, shm reads per step), so that filter is
     # on the hot path, and we run a single trusted process.
@@ -596,7 +603,14 @@ services:
       # silently halving H2D bandwidth on the per-step copies.
       memlock: -1
       nofile: 65536
-      rtprio: 99 # only matters if a thread requests SCHED_FIFO; harmless otherwise
+      # rtprio DELIBERATELY ABSENT (was 99). With RLIMIT_RTPRIO at its default of 0, any
+      # sched_setscheduler(SCHED_FIFO) request from a library (iceoryx2 can ask for RT
+      # listener threads) fails cleanly and the thread stays on CFS -- which is what every
+      # measured number in this file was produced under. With it, an RT thread that ends up
+      # sharing a core (CPU affinity, a future cpuset, or plain load) spins ABOVE the
+      # kernel's own housekeeping threads on that core: watchdog stalls, then a host-wide
+      # lockup. That failure takes down the whole VPS, not the container, and the judge box
+      # cannot be power-cycled by us. No RT = that failure mode cannot exist.
     # Doubles as a one-shot KV-prefix warm-up: the first passing run replays the first few
     # trace requests so the prefix is cached and decode kernels are warm before the container
     # reports healthy. Readiness still gates ONLY on /health -- priming is best-effort and can
