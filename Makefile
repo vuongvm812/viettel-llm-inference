@@ -71,7 +71,7 @@ PGO_MODEL ?= /model
 # `make model-fetch` that ships all 127.2 GB of weights into the build cache for a stage
 # that reads ~25 MB of JSONs. The pgo-hfmodel-ctx target stages the metadata subset (same
 # patterns as fetch-model.sh --meta-only) into $(PGO_HFMODEL_CTX) and buildx gets THAT.
-PGO_HFMODEL ?= ../hf-model
+PGO_HFMODEL ?= /home/team17/Qwen3.5-122B-A10B-FP8
 # Staged metadata-only build context (recreated on every PGO build; gitignored).
 PGO_HFMODEL_CTX ?= ../.pgo-hfmodel-ctx
 # -Ctarget-cpu for the vllm-rs binary (plain AND PGO builds). Default native: full host
