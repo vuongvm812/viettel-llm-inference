@@ -31,9 +31,10 @@ services:
   model:
     image: traitimbanggia/yasuoadc@sha256:42cfc1ae0ca98280df1c008196af21fd389c163ecf260577488a5a642eb7dfbc # submission: re-pin by @sha256:<new digest>
     platform: linux/amd64 # H200 box is amd64; the vLLM base image is multi-arch
+    network_mode: host
     entrypoint:
       - python3 #Don't change this to vllm-server
-      - -m  #Don't change this to vllm-server
+      - -m #Don't change this to vllm-server
       - vllm.entrypoints.openai.api_server #Don't change this to vllm-server
     command:
       - -O3
@@ -63,11 +64,13 @@ services:
       # a dense model (startup failure otherwise).
       - --mamba_cache_mode=align
       - --enable-chunked-prefill
-      - --max-num-seqs=32 # peak trace concurrency ~6; each resident seq also pins ~154 MB
-                          # of fp32 GDN state, so 70 (10.8 GB) does not fit next to 124 GB
-                          # of weights. Sweep 16/24/32 with bench/replay.py.
-      - --max-num-batched-tokens=8192 # small prefill chunks keep a new turn's ~4k prefill
-                          # from spiking in-flight decode ITL; TTFT has slack.
+      - --max-num-seqs=32
+      # peak trace concurrency ~6; each resident seq also pins ~154 MB
+      # of fp32 GDN state, so 70 (10.8 GB) does not fit next to 124 GB
+      # of weights. Sweep 16/24/32 with bench/replay.py.
+      - --max-num-batched-tokens=8192
+      # small prefill chunks keep a new turn's ~4k prefill
+      # from spiking in-flight decode ITL; TTFT has slack.
       # NO --quantization flag: the checkpoint carries its own fp8 block-quant config and
       # stock vLLM auto-detects it. The vtl W4A8 track (int4 requant of the fp8 experts)
       # is layered on via VTL_W4A8_FROM_FP8 / VTL_ENABLE_MOE_DECODE_GEMV below and degrades
@@ -92,16 +95,16 @@ services:
       - "8000:8000"
     environment:
       VLLM_PLUGINS: vtl
-      VLLM_LOGGING_LEVEL: WARNING             # INFO does per-request log work on the hot path
+      VLLM_LOGGING_LEVEL: WARNING # INFO does per-request log work on the hot path
       # `vllm.vtl` subtree only -- vtl/plugin.py gives it its own handler, so it does not
       # inherit the WARNING above. vtl logs at load, not per request, so INFO is free here.
       VTL_LOG_LEVEL: INFO
       # Pin the axum/tower/hyper stack independently, so the per-request tower_http span
       # stays off even if VLLM_LOGGING_LEVEL is raised to debug the app.
       RUST_LOG: "tower_http=warn,tower=warn,axum=warn,hyper=warn,hyper_util=warn,h2=warn"
-      DO_NOT_TRACK: "1"                       # disable anonymous usage stats / telemetry
+      DO_NOT_TRACK: "1" # disable anonymous usage stats / telemetry
       VLLM_NO_USAGE_STATS: "1"
-      VTL_DISABLE: 0                          # 1 = bypass every vtl patch, run stock vLLM
+      VTL_DISABLE: 0 # 1 = bypass every vtl patch, run stock vLLM
 
       # ---- Registry gates ---------------------------------------------------------------
       # Every patch in vtl/patches/ reads VTL_ENABLE_<NAME>. All are pinned here so a
@@ -112,41 +115,47 @@ services:
       # methods, and --quantization=vtl_w4a8 is a serve flag. With the patch off vLLM aborts
       # at startup with "Invalid quantization method" and never binds :8000. To A/B
       # quantization, change the --quantization flag itself.
-      VTL_ENABLE_FP8: "1"                       # vtl_fp8 quant method
-      VTL_ENABLE_W4A8: "1"                      # vtl_w4a8 quant method (the served one)
-      VTL_ENABLE_RMS_NORM_QUANT: "1"            # fused RMSNorm+quant pass
-      VTL_ENABLE_DYNAMIC_PER_TOKEN_QUANT: "1"   # fused per-token activation quant
-      VTL_ENABLE_SILU_MUL_QUANT: "1"            # fused SiLU*mul+quant pass
-      VTL_ENABLE_KV_CACHE_MANAGER: "1"          # KV block-manager fast paths
-      VTL_ENABLE_SCHED_POLICY: "1"              # scheduling policy tweaks
-      VTL_ENABLE_GREEDY_SAMPLER: "1"            # V1 greedy argmax short-circuit
-      VTL_ENABLE_STEP0_EOS_BAN: "1"             # suppress an immediate EOS on the first step
-      VTL_ENABLE_L2_PERSIST: "1"                # L2 persisting-access window for the KV block
-      VTL_ENABLE_PROFILER: "0"                  # OFF in the submission;
-                                                #   docker-compose.profile.yaml overrides to 1
+      VTL_ENABLE_FP8: "1" # vtl_fp8 quant method
+      VTL_ENABLE_W4A8: "1" # vtl_w4a8 quant method (the served one)
+      VTL_ENABLE_RMS_NORM_QUANT: "1" # fused RMSNorm+quant pass
+      VTL_ENABLE_DYNAMIC_PER_TOKEN_QUANT: "1" # fused per-token activation quant
+      VTL_ENABLE_SILU_MUL_QUANT: "1" # fused SiLU*mul+quant pass
+      VTL_ENABLE_KV_CACHE_MANAGER: "1" # KV block-manager fast paths
+      VTL_ENABLE_SCHED_POLICY: "1" # scheduling policy tweaks
+      VTL_ENABLE_GREEDY_SAMPLER: "1" # V1 greedy argmax short-circuit
+      VTL_ENABLE_STEP0_EOS_BAN: "1" # suppress an immediate EOS on the first step
+      VTL_ENABLE_L2_PERSIST: "1" # L2 persisting-access window for the KV block
+      VTL_ENABLE_PROFILER: "0"
+      # OFF in the submission;
+      #   docker-compose.profile.yaml overrides to 1
       # -- Qwen3.5 (GDN hybrid + 256-expert MoE) kernel patches. All shipped ENABLED (user
       # decision); every one degrades per-op to AOT/stock on any mismatch or NVRTC failure,
       # so a gate here can change speed but not correctness of the boot. A/B by zeroing one.
-      VTL_ENABLE_GDN_KERNELS: "1"               # RMSNormGated -> group-128-fp8-quant fusion for
-                                                #   the 36 GDN layers (the fusion AITER has on
-                                                #   ROCm and stock CUDA lacks). Grep make verify
-                                                #   for "Replaced N patterns", N>0.
-      VTL_ENABLE_GDN_PREFILL_BACKEND: "1"       # installs the env pin below (auto = stock choice)
-      VTL_ENABLE_NVRTC_BLOCK_QUANT: "1"         # NVRTC re-spec of stock block-quant ops at
-                                                #   -DHIDDEN=3072 -DGROUP=128. Needs VTL_NVRTC=1.
-      VTL_ENABLE_GDN_DECODE_STEP: "1"           # fused conv1d+delta-rule decode step, one launch
-                                                #   per GDN layer; non-spec decode only.
-                                                #   Needs VTL_NVRTC=1.
-      VTL_ENABLE_W4A8_FROM_FP8: "1"             # extend vtl_w4a8 to fp8-block checkpoints
-      VTL_ENABLE_MOE_DECODE_GEMV: "1"           # grouped-GEMV MoE decode at M<=MAX_M.
-                                                #   Needs VTL_NVRTC=1.
+      VTL_ENABLE_GDN_KERNELS: "1"
+      # RMSNormGated -> group-128-fp8-quant fusion for
+      #   the 36 GDN layers (the fusion AITER has on
+      #   ROCm and stock CUDA lacks). Grep make verify
+      #   for "Replaced N patterns", N>0.
+      VTL_ENABLE_GDN_PREFILL_BACKEND: "1" # installs the env pin below (auto = stock choice)
+      VTL_ENABLE_NVRTC_BLOCK_QUANT: "1"
+      # NVRTC re-spec of stock block-quant ops at
+      #   -DHIDDEN=3072 -DGROUP=128. Needs VTL_NVRTC=1.
+      VTL_ENABLE_GDN_DECODE_STEP: "1"
+      # fused conv1d+delta-rule decode step, one launch
+      #   per GDN layer; non-spec decode only.
+      #   Needs VTL_NVRTC=1.
+      VTL_ENABLE_W4A8_FROM_FP8: "1" # extend vtl_w4a8 to fp8-block checkpoints
+      VTL_ENABLE_MOE_DECODE_GEMV: "1"
+      # grouped-GEMV MoE decode at M<=MAX_M.
+      #   Needs VTL_NVRTC=1.
 
       # ---- Knobs whose defaults live in code -------------------------------------------
-      VTL_GIL_SWITCH_INTERVAL: "0.0002"  # sys.setswitchinterval, seconds. 0 = interpreter default
-      VTL_SILU_MUL_FUSION: "1"           # 0 = keep SiLU*mul and the quant as separate kernels
-      VTL_STEP0_EOS_ID: "248044"         # token id banned on step 0; comma-separate for several.
-                                         #   MODEL-SPECIFIC: Qwen3.5's eos_token_id (config.json)
-      VTL_SCHED_LEAN_CHECK: "0"          # 1 = dual-run Phase A and diff. Debug arm, costs a step
+      VTL_GIL_SWITCH_INTERVAL: "0.0002" # sys.setswitchinterval, seconds. 0 = interpreter default
+      VTL_SILU_MUL_FUSION: "1" # 0 = keep SiLU*mul and the quant as separate kernels
+      VTL_STEP0_EOS_ID: "248044"
+      # token id banned on step 0; comma-separate for several.
+      #   MODEL-SPECIFIC: Qwen3.5's eos_token_id (config.json)
+      VTL_SCHED_LEAN_CHECK: "0" # 1 = dual-run Phase A and diff. Debug arm, costs a step
       # "1": NVRTC kernels are shipped ENABLED for this round (user decision). Every NVRTC
       # consumer degrades per-op to AOT/stock when compile fails, so this cannot crash the
       # boot; the judge-boot JIT cost is amortized by `make warm` baking the cubin cache
@@ -165,11 +174,12 @@ services:
       # VLLM_USE_V2_MODEL_RUNNER "0" (which also makes every VTL_V2_* inert). Each VTL_V2_*
       # fails closed to the stock V2 path, so default-on cannot crash.
       VLLM_USE_V2_MODEL_RUNNER: "1"
-      VTL_V2_GREEDY_FASTPATH: "1"        # argmax short-circuit for provably-greedy batches
-      VTL_V2_GREEDY_ARGMAX_KERNEL: "0"   # reserved: fused argmax .cu not built
-      VTL_V2_FUSED_POSTPROCESS: "1"      # skip the dead num_accepted scatter when no spec-decode
-      VTL_V2_FORCE_CUTLASS_FP8: "1"      # force fp8 layers off Marlin (its stable-ABI
-                                         #   aten::empty crashes under V2) onto CUTLASS
+      VTL_V2_GREEDY_FASTPATH: "1" # argmax short-circuit for provably-greedy batches
+      VTL_V2_GREEDY_ARGMAX_KERNEL: "0" # reserved: fused argmax .cu not built
+      VTL_V2_FUSED_POSTPROCESS: "1" # skip the dead num_accepted scatter when no spec-decode
+      VTL_V2_FORCE_CUTLASS_FP8: "1"
+      # force fp8 layers off Marlin (its stable-ABI
+      #   aten::empty crashes under V2) onto CUTLASS
 
       # ---- CPU / threading -------------------------------------------------------------
       # vLLM only pins torch's thread count in the MULTIPROC executor path, which TP=1 never
@@ -177,41 +187,49 @@ services:
       # pools to the HOST's core count inside our 3-core budget.
       OMP_NUM_THREADS: "3"
       MKL_NUM_THREADS: "3"
-      OMP_WAIT_POLICY: "PASSIVE"         # ACTIVE lets a spinning libgomp worker steal a third
-                                         #   of the host budget from the decode loop
-      OMP_PROC_BIND: "close"             # keep the 3 OMP threads on the cores they started on:
-      OMP_PLACES: "cores"                #   every migration is a cold L1/L2
+      OMP_WAIT_POLICY: "PASSIVE"
+      # ACTIVE lets a spinning libgomp worker steal a third
+      #   of the host budget from the decode loop
+      OMP_PROC_BIND: "close" # keep the 3 OMP threads on the cores they started on:
+      OMP_PLACES: "cores" #   every migration is a cold L1/L2
 
       # ---- Rust frontend ---------------------------------------------------------------
       VLLM_USE_RUST_FRONTEND: "1"
-      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "60" # multi-turn gaps tail out past 30s; 60 races a slow
-                                         #   turn's connection reuse less than the 30s default
-      TOKIO_WORKER_THREADS: "3"          # HTTP runtime only. MUST be a positive int -- empty
-                                         #   or 0 panics vllm-rs at boot
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "60"
+      # multi-turn gaps tail out past 30s; 60 races a slow
+      #   turn's connection reuse less than the 30s default
+      TOKIO_WORKER_THREADS: "3"
+      # HTTP runtime only. MUST be a positive int -- empty
+      #   or 0 panics vllm-rs at boot
       # vllm-rs starts two more runtimes that ignore TOKIO_WORKER_THREADS. Pinned to 2:
       # JUDGE-SWEPT, not hypothesized -- full submissions at 1/2/3 scored 71.5 / 72.5 / 72.1.
       # Do not re-derive from theory.
       VLLM_RS_ZMQ_WORKER_THREADS: "2"
       VLLM_RS_REQUEST_WORKER_THREADS: "2"
-      VLLM_RS_DISABLE_HTTP_TRACE: "1"    # drop the per-request axum TraceLayer span.
-                                         #   0 restores it (and rejected-request log visibility)
+      VLLM_RS_DISABLE_HTTP_TRACE: "1"
+      # drop the per-request axum TraceLayer span.
+      #   0 restores it (and rejected-request log visibility)
 
       # ---- Quantization ----------------------------------------------------------------
-      VTL_W4A8_IGNORE: ""                # layer-name substrings forced out of int4 (they fall
-                                         #   back to fp8, not bf16). For the head use
-                                         #   VTL_LM_HEAD_QUANT instead.
-      VTL_FP8_IGNORE: "lm_head"          # fp8 is the per-layer fallback for W4A8. INERT for
-                                         #   lm_head (a ParallelLMHead never reaches this list);
-                                         #   kept as documentation of intent.
-      VTL_LM_HEAD_QUANT: "int4"          # int4 | fp8 | off. NOT a boolean: anything unrecognised
-                                         #   means off, because every other value changes model
-                                         #   OUTPUT and a typo must not ship an unmeasured
-                                         #   accuracy change. UNMEASURED -- run eval_quality.py
-                                         #   across all three. VTL_W4A8_IGNORE="lm_head" overrides.
-      VTL_W4A8_SCHEDULE: ""              # CUTLASS tile/cluster schedule; empty = the kernel's own
-                                         #   heuristic, which is what submissions ship. Ten legal
-                                         #   names, validated -- a typo warns, it cannot crash the
-                                         #   server. Driven by `make sweep-schedule`.
+      VTL_W4A8_IGNORE: ""
+      # layer-name substrings forced out of int4 (they fall
+      #   back to fp8, not bf16). For the head use
+      #   VTL_LM_HEAD_QUANT instead.
+      VTL_FP8_IGNORE: "lm_head"
+      # fp8 is the per-layer fallback for W4A8. INERT for
+      #   lm_head (a ParallelLMHead never reaches this list);
+      #   kept as documentation of intent.
+      VTL_LM_HEAD_QUANT: "int4"
+      # int4 | fp8 | off. NOT a boolean: anything unrecognised
+      #   means off, because every other value changes model
+      #   OUTPUT and a typo must not ship an unmeasured
+      #   accuracy change. UNMEASURED -- run eval_quality.py
+      #   across all three. VTL_W4A8_IGNORE="lm_head" overrides.
+      VTL_W4A8_SCHEDULE: ""
+      # CUTLASS tile/cluster schedule; empty = the kernel's own
+      #   heuristic, which is what submissions ship. Ten legal
+      #   names, validated -- a typo warns, it cannot crash the
+      #   server. Driven by `make sweep-schedule`.
       # v2 schedules (Stream-K / cluster / small-tile arms). Empty = off, stock kernel
       # everywhere. MODEL-SPECIFIC: the "n<out>k<in>" key encodes this model's hidden size, so
       # it resolves to no key on a different geometry (silent, not fatal). CLEARED: the old
@@ -219,44 +237,49 @@ services:
       # Boot once, read the "w4a8 observed shape keys" log line, then `make sweep-schedule`
       # to re-derive keys on the full (non-MIG) H200.
       VTL_W4A8_SCHEDULE_V2: ""
-      VTL_W4A8_V2_MTHRESH: "16"          # decode band upper bound; 0 = always stock kernel
+      VTL_W4A8_V2_MTHRESH: "16" # decode band upper bound; 0 = always stock kernel
       # Prefill band, M in (MTHRESH, PREFILL_MAX]. Band closed until schedules are re-swept
       # for this model's geometry (see above); "0" = stock heuristic.
       VTL_W4A8_SCHEDULE_V2_PREFILL: ""
       VTL_W4A8_V2_PREFILL_MAX: "0"
-      VTL_W4A8_SM_COUNT: ""              # empty = query the device. Round-2 runs the FULL H200
-                                         #   (132 SMs), not a MIG slice -- the query is correct;
-                                         #   set only if the "cutlass sm_count=N" boot line
-                                         #   disagrees with the hardware.
+      VTL_W4A8_SM_COUNT: ""
+      # empty = query the device. Round-2 runs the FULL H200
+      #   (132 SMs), not a MIG slice -- the query is correct;
+      #   set only if the "cutlass sm_count=N" boot line
+      #   disagrees with the hardware.
 
       # ---- Qwen3.5 GDN + MoE kernel knobs ----------------------------------------------
-      VTL_GDN_RMSNORM_FUSION: "1"        # 1 = torch.compile fusion pattern; 0 = eager
-                                         #   RMSNormGated.forward monkeypatch (A/B lever;
-                                         #   mutually exclusive arms of the same kernel)
-      VTL_GDN_PREFILL_BACKEND: "auto"    # auto|triton|flashinfer|cutedsl. auto = wrapper not
-                                         #   installed, stock resolver decides. Pin per-arm in
-                                         #   bench A/Bs; flashinfer vs triton is the sweep that
-                                         #   matters at this trace's ~3k-token prefills.
+      VTL_GDN_RMSNORM_FUSION: "1"
+      # 1 = torch.compile fusion pattern; 0 = eager
+      #   RMSNormGated.forward monkeypatch (A/B lever;
+      #   mutually exclusive arms of the same kernel)
+      VTL_GDN_PREFILL_BACKEND: "auto"
+      # auto|triton|flashinfer|cutedsl. auto = wrapper not
+      #   installed, stock resolver decides. Pin per-arm in
+      #   bench A/Bs; flashinfer vs triton is the sweep that
+      #   matters at this trace's ~3k-token prefills.
       # int4-from-fp8 requant (dense LinearBase layers). QUALITY-GATED: double quantization
       # (fp8 -> int4 RTN group-128). Nesting property bounds the added error (block scale is
       # constant across each int4 group), but bench/eval_quality.py on the H200 is the ship
       # gate -- ladder: fp8 MoE arm first, then dense int4, then MoE int4.
       VTL_W4A8_FROM_FP8: "1"
-      VTL_W4A8_FROM_FP8_IGNORE: ""       # layer-name substrings kept on stock fp8
+      VTL_W4A8_FROM_FP8_IGNORE: "" # layer-name substrings kept on stock fp8
       # MoE decode grouped-GEMV. fp8 arm is the memory-neutral default: stock fused_moe keeps
       # serving prefill/large-M (this trace is 11:1 prefill:decode), our GEMV takes M<=MAX_M
       # decode. int4 arm halves expert reads but only pays with FREE_FP8=1 (else both copies
       # resident = OOM at 116 GB of experts); that pair is the experiment, not the default.
-      VTL_MOE_GEMV_WEIGHTS: "fp8"        # fp8 | int4
-      VTL_MOE_GEMV_MAX_M: "16"           # decode band; larger M falls through to stock
+      VTL_MOE_GEMV_WEIGHTS: "fp8" # fp8 | int4
+      VTL_MOE_GEMV_MAX_M: "16" # decode band; larger M falls through to stock
       VTL_MOE_GEMV_THREADS: "256"
-      VTL_MOE_GEMV_CHUNK: "64"           # (token,slot) chunk per launch wave
-      VTL_MOE_GEMV_FREE_FP8: "0"         # 1 = drop fp8 expert copies after int4 pack (frees
-                                         #   ~58 GB, removes the stock prefill path -- only
-                                         #   with VTL_MOE_GEMV_WEIGHTS=int4, measured first)
-      VTL_MOE_GEMV_PACK_CHUNK: "4"       # experts packed per host chunk during int4 arming
-      VTL_ENABLE_MEGAKERNEL_PROBE: 1     # read-only go/no-go probe. Launches nothing, allocates
-                                         #   nothing; two device-attribute queries at load.
+      VTL_MOE_GEMV_CHUNK: "64" # (token,slot) chunk per launch wave
+      VTL_MOE_GEMV_FREE_FP8: "0"
+      # 1 = drop fp8 expert copies after int4 pack (frees
+      #   ~58 GB, removes the stock prefill path -- only
+      #   with VTL_MOE_GEMV_WEIGHTS=int4, measured first)
+      VTL_MOE_GEMV_PACK_CHUNK: "4" # experts packed per host chunk during int4 arming
+      VTL_ENABLE_MEGAKERNEL_PROBE: 1
+      # read-only go/no-go probe. Launches nothing, allocates
+      #   nothing; two device-attribute queries at load.
 
       # ---- shm IPC data plane ----------------------------------------------------------
       # iceoryx2 shm between frontend and EngineCore (ZMQ stays for handshake/death/fallback).
@@ -265,20 +288,23 @@ services:
       VTL_ENABLE_SHM_IPC: 1
       VTL_SHM_IPC: 1
       VTL_SHM_IPC_RAW: 1
-      VTL_SHM_IPC_RUST_PUB: "1"          # the crate publishes the finished record from the
-                                         #   engine thread, skipping a GIL hop. Falls back to
-                                         #   the Python publisher if the channel cannot open.
-      VTL_SHM_IPC_RUST_SUB: "1"          # ...and the mirror image: the crate parks on the
-                                         #   request channel and splits the frame with the GIL
-                                         #   RELEASED. The python decoders, the ready
-                                         #   handshake and the ABORT dual-queue put are
-                                         #   unchanged; falls back to the iceoryx2-python loop
-                                         #   if the channel (or the `shm` feature) is missing.
-      VTL_SHM_IPC_LAZY_COPY: "1"         # `Request.__init__`'s prompt_token_ids.copy() hands
-                                         #   back a numpy view + an appended-output list
-                                         #   instead of building ~4400 PyLongs on the ingest
-                                         #   thread under the GIL. Needs SHM_IPC_RAW_ADD to
-                                         #   pay (a msgpack ADD has no u32 block to view).
+      VTL_SHM_IPC_RUST_PUB: "1"
+      # the crate publishes the finished record from the
+      #   engine thread, skipping a GIL hop. Falls back to
+      #   the Python publisher if the channel cannot open.
+      VTL_SHM_IPC_RUST_SUB: "1"
+      # ...and the mirror image: the crate parks on the
+      #   request channel and splits the frame with the GIL
+      #   RELEASED. The python decoders, the ready
+      #   handshake and the ABORT dual-queue put are
+      #   unchanged; falls back to the iceoryx2-python loop
+      #   if the channel (or the `shm` feature) is missing.
+      VTL_SHM_IPC_LAZY_COPY: "1"
+      # `Request.__init__`'s prompt_token_ids.copy() hands
+      #   back a numpy view + an appended-output list
+      #   instead of building ~4400 PyLongs on the ingest
+      #   thread under the GIL. Needs SHM_IPC_RAW_ADD to
+      #   pay (a msgpack ADD has no u32 block to view).
 
       # ---- Rust scheduler core (vtl-sched) ---------------------------------------------
       # RUST makes the Rust manager authoritative; FULL also runs schedule() in Rust (SJF
@@ -295,48 +321,61 @@ services:
       # Revert ladder: SPEC->0 (table only) -> TABLE->0 (the R6a path).
       VTL_RUST_SCHED_TABLE: 1
       VTL_RUST_SCHED_SPEC: 1
-      VTL_SCHED_TIMING: 0                # diagnostic: schedule-phase p50/p95 every 500 steps
+      VTL_SCHED_TIMING: 0 # diagnostic: schedule-phase p50/p95 every 500 steps
 
       # ---- Hot path: micro-opts, output collapse, N-step burst -------------------------
       # INERT UNTIL THE FORK IMAGE IS REBUILT: VTL_HOTPATH_MICROOPT and VTL_STREAM_PER_TOKEN
       # ride in fork patches, so they do nothing until `make vllm-fork PUSH=1` -> re-pin the
       # digest above -> `make build`. Everything else is plugin/Rust-wheel code and is live on
       # a plain `make build`. Each carries a one-line revert; bisect one at a time.
-      VTL_ENABLE_DECODE_FASTPATH: "1"    # skip the metadata build FULL cudagraph discards on
-                                         #   repeat pure-decode steps
-      VTL_UVA_POOL: "1"                  # pooled pinned staging instead of a cudaHostAlloc
-                                         #   twice per step
-      VTL_RUST_SCHED_UFO: "1"            # batch update_from_output's stop decision into one
-                                         #   Rust call. Needs VTL_RUST_SCHED_FULL.
-      VTL_WARMUP_CONCURRENCY: "8"        # warm capture sizes 2/4/8 by replaying the baked trace
-                                         #   slice concurrently after line 0 (which stays serial,
-                                         #   to seed the shared prefix unraced). 1 = sequential.
-      VTL_HOTPATH_MICROOPT: "1"          # 5 per-step host micro-opts in model_runner.py +
-                                         #   core.py, behind one in-file env read. (fork patch)
-      VTL_RUST_SCHED_R8: "1"             # Rust packs the shm output record and the
-                                         #   EngineCoreOutput build is skipped. Needs UFO +
-                                         #   SHM_IPC + SHM_IPC_RAW (modes() enforces).
-      VTL_RUST_HASHER: "1"               # block hashing via vtl_sched. Request.block_hashes
-                                         #   stays the source of truth.
-      VTL_ENABLE_NSTEP_DECODE: "1"       # runner half: N decode iterations per engine step
-      VTL_NSTEP: "1"                     # scheduler half: commit the burst at schedule time
-      VTL_NSTEP_N: "4"                   # burst width. 4 because the align gate covers 13/16 of
-                                         #   decode steps at N=4 vs 9/16 at N=8, and ITL p95
-                                         #   burstiness grows with N. Sweep 2/4/8.
-      VTL_NSTEP_MODE: "graph"            # ladder: graph -> eager -> off. A capture failure at
-                                         #   boot logs once and drops to eager on its own.
-      VTL_NSTEP_QUEUE_EMPTY_ONLY: "1"    # TTFT guard: no burst while a request is waiting, so
-                                         #   admission is never delayed by N-1 iterations
+      VTL_ENABLE_DECODE_FASTPATH: "1"
+      # skip the metadata build FULL cudagraph discards on
+      #   repeat pure-decode steps
+      VTL_UVA_POOL: "1"
+      # pooled pinned staging instead of a cudaHostAlloc
+      #   twice per step
+      VTL_RUST_SCHED_UFO: "1"
+      # batch update_from_output's stop decision into one
+      #   Rust call. Needs VTL_RUST_SCHED_FULL.
+      VTL_WARMUP_CONCURRENCY: "8"
+      # warm capture sizes 2/4/8 by replaying the baked trace
+      #   slice concurrently after line 0 (which stays serial,
+      #   to seed the shared prefix unraced). 1 = sequential.
+      VTL_HOTPATH_MICROOPT: "1"
+      # 5 per-step host micro-opts in model_runner.py +
+      #   core.py, behind one in-file env read. (fork patch)
+      VTL_RUST_SCHED_R8: "1"
+      # Rust packs the shm output record and the
+      #   EngineCoreOutput build is skipped. Needs UFO +
+      #   SHM_IPC + SHM_IPC_RAW (modes() enforces).
+      VTL_RUST_HASHER: "1"
+      # block hashing via vtl_sched. Request.block_hashes
+      #   stays the source of truth.
+      VTL_ENABLE_NSTEP_DECODE: "1" # runner half: N decode iterations per engine step
+      VTL_NSTEP: "1" # scheduler half: commit the burst at schedule time
+      VTL_NSTEP_N: "4"
+      # burst width. 4 because the align gate covers 13/16 of
+      #   decode steps at N=4 vs 9/16 at N=8, and ITL p95
+      #   burstiness grows with N. Sweep 2/4/8.
+      VTL_NSTEP_MODE: "graph"
+      # ladder: graph -> eager -> off. A capture failure at
+      #   boot logs once and drops to eager on its own.
+      VTL_NSTEP_QUEUE_EMPTY_ONLY: "1"
+      # TTFT guard: no burst while a request is waiting, so
+      #   admission is never delayed by N-1 iterations
       # The three below are a LADDER: each is captured separately at boot and each failure
       # demotes to the rung under it, logging once. All inert under VTL_NSTEP_MODE=eager,
       # since every one of them IS a capture.
-      VTL_NSTEP_FOLD_T1: "1"             # fold token 1's compute_logits+argmax into the burst
-                                         #   capture, so the graph arm host-launches no logits
-      VTL_NSTEP_UNROLL: "1"              # capture prologue + N-1 bodies + the accumulator store
-                                         #   as ONE graph per burst size. Needs FOLD_T1.
-      VTL_SAMPLE_IN_GRAPH: "1"           # the rung that pays even if bursts stay dormant: a plain
-                                         #   greedy 1-token step replays the prologue graph
-                                         #   instead of calling the V2 sampler. Needs FOLD_T1.
+      VTL_NSTEP_FOLD_T1: "1"
+      # fold token 1's compute_logits+argmax into the burst
+      #   capture, so the graph arm host-launches no logits
+      VTL_NSTEP_UNROLL: "1"
+      # capture prologue + N-1 bodies + the accumulator store
+      #   as ONE graph per burst size. Needs FOLD_T1.
+      VTL_SAMPLE_IN_GRAPH: "1"
+      # the rung that pays even if bursts stay dormant: a plain
+      #   greedy 1-token step replays the prologue graph
+      #   instead of calling the V2 sampler. Needs FOLD_T1.
 
       # ---- Rust steady-state runner (RUST-RUNNER.md) -----------------------------------
       # Rust drives the captured whole-step graph directly: host writes -> cuGraphLaunch ->
@@ -351,20 +390,22 @@ services:
       # steps ARE ordered. No interlock, the depth-2 overlap is kept, and the runner engages
       # under this config. "sample" is the legacy interlocked path (idles here; only it can use
       # the multi-step residency loop). See rust_runner.py's docstring.
-      VTL_RUST_RUNNER: "1"               # 0 = off (Python owns the step), 1 = Rust owns it
-      VTL_RUST_RUNNER_COMMIT: "update"   # "update" = launch at sample time, commit at update
-                                         #   time behind a pinned ring of 2. "sample" = legacy.
-      VTL_RUST_RUNNER_STEPS: "8"         # Max burst launches Rust takes back-to-back before
-                                         #   returning to Python, in BOTH commit modes: launch
-                                         #   1 replays the unroll graph, 2..k the continuation
-                                         #   graph, and ONE tail D2H covers all k. This is only
-                                         #   the CEILING -- the crate clamps to 1 where a shape
-                                         #   captured no continuation graph, the stash clamps
-                                         #   to 1 without the inline shm publish, and the
-                                         #   scheduler clamps to the align window's headroom
-                                         #   (and to 1 while anything is waiting). "1" = one
-                                         #   burst per engine step. A/B this knob 1/4/8: it is
-                                         #   the only one of these that moves TPOT alone.
+      VTL_RUST_RUNNER: "1" # 0 = off (Python owns the step), 1 = Rust owns it
+      VTL_RUST_RUNNER_COMMIT: "update"
+      # "update" = launch at sample time, commit at update
+      #   time behind a pinned ring of 2. "sample" = legacy.
+      VTL_RUST_RUNNER_STEPS: "8"
+      # Max burst launches Rust takes back-to-back before
+      #   returning to Python, in BOTH commit modes: launch
+      #   1 replays the unroll graph, 2..k the continuation
+      #   graph, and ONE tail D2H covers all k. This is only
+      #   the CEILING -- the crate clamps to 1 where a shape
+      #   captured no continuation graph, the stash clamps
+      #   to 1 without the inline shm publish, and the
+      #   scheduler clamps to the align window's headroom
+      #   (and to 1 while anything is waiting). "1" = one
+      #   burst per engine step. A/B this knob 1/4/8: it is
+      #   the only one of these that moves TPOT alone.
       # "1" DELIBERATELY, on this dev branch: 1 turns a silent runner refusal into a BOOT
       # FAILURE. A runner that armed and then quietly stood down measures the Python step
       # while looking like a win, which is the one thing an A/B arm must not do.
@@ -374,62 +415,71 @@ services:
       # causes a guaranteed boot failure (score 0) when the Rust runner cannot engage
       # (e.g. when VTL_RUST_SCHED_FULL falls back due to --speculative-config). Must be "0" in submit.
       VTL_RUST_RUNNER_REQUIRE: "0"
-      VTL_RUST_PREREG: "1"               # register a request with the crate at ADD time, on
-                                         #   the input thread (pack-ok bit + stop params in
-                                         #   one GIL-released crossing), instead of on its
-                                         #   first decode step. decide()'s miss arm still does
-                                         #   the full work for anything not preregistered.
-      VTL_RUST_SCHED_TOKSTORE: "1"       # Rust owns each slot's output tokens, counters and
-                                         #   block-hash chain. Needs R8 + VTL_RUST_HASHER.
-      VTL_RUST_SCHED_R9: "1"             # collapse decide()/r8_apply's per-request Python loops
-                                         #   into one update_step_pack_np crossing plus a thin
-                                         #   residue loop. Needs TOKSTORE. Fail-open.
-      VTL_RUST_SCHED_LEAN: "1"           # stop producing decision payload no consumer on a V2 /
-                                         #   no-PP / no-iteration-logging boot reads. Re-checks
-                                         #   the live config at first schedule and reverts if any
-                                         #   reader exists.
-      VTL_SCHED_DECISIONS_ARENA: "1"     # decisions arrive in persistent numpy buffers instead of
-                                         #   a per-step PyDict. Needs LEAN; falls back to the dict
-                                         #   path on a wheel without schedule_arena.
-      VTL_SCHED_SO_RING: "1"             # SET BUT INERT: re-serves a prebuilt SchedulerOutput on
-                                         #   pure-decode steps, but self-refuses unless the
-                                         #   executor is `mp`, and this compose runs `uni`.
-      VTL_SHM_IPC_RAW_ADD: "1"           # frontend sends ADD prompt ids as a raw LE u32 block
-                                         #   instead of ~4400 msgpack ints. Needs VTL_SHM_IPC.
-                                         #   (fork patch)
-      VTL_FRONTEND_ENCODE_CACHE: "1"     # per-conversation prompt-prefix -> ids cache in the Rust
-                                         #   frontend; 83% of trace requests extend an earlier
-                                         #   prompt verbatim. First 8 requests are verified against
-                                         #   a full encode; a mismatch kills the cache. (fork patch)
-      VTL_ENCODE_CACHE_SPLIT: "<|im_end|>\n"  # the turn boundary the cache splits on. ChatML
-                                         #   default; a marker that does not match the live
-                                         #   template yields <2 occurrences per prompt = cache
-                                         #   bypassed. (fork patch)
-      VTL_STREAM_PER_TOKEN: "1"          # one SSE chunk per TOKEN instead of per engine record.
-                                         #   MANDATORY with the burst -- a chunk-counting ITL
-                                         #   metric would otherwise score it N x worse. (fork patch)
+      VTL_RUST_PREREG: "1"
+      # register a request with the crate at ADD time, on
+      #   the input thread (pack-ok bit + stop params in
+      #   one GIL-released crossing), instead of on its
+      #   first decode step. decide()'s miss arm still does
+      #   the full work for anything not preregistered.
+      VTL_RUST_SCHED_TOKSTORE: "1"
+      # Rust owns each slot's output tokens, counters and
+      #   block-hash chain. Needs R8 + VTL_RUST_HASHER.
+      VTL_RUST_SCHED_R9: "1"
+      # collapse decide()/r8_apply's per-request Python loops
+      #   into one update_step_pack_np crossing plus a thin
+      #   residue loop. Needs TOKSTORE. Fail-open.
+      VTL_RUST_SCHED_LEAN: "1"
+      # stop producing decision payload no consumer on a V2 /
+      #   no-PP / no-iteration-logging boot reads. Re-checks
+      #   the live config at first schedule and reverts if any
+      #   reader exists.
+      VTL_SCHED_DECISIONS_ARENA: "1"
+      # decisions arrive in persistent numpy buffers instead of
+      #   a per-step PyDict. Needs LEAN; falls back to the dict
+      #   path on a wheel without schedule_arena.
+      VTL_SCHED_SO_RING: "1"
+      # SET BUT INERT: re-serves a prebuilt SchedulerOutput on
+      #   pure-decode steps, but self-refuses unless the
+      #   executor is `mp`, and this compose runs `uni`.
+      VTL_SHM_IPC_RAW_ADD: "1"
+      # frontend sends ADD prompt ids as a raw LE u32 block
+      #   instead of ~4400 msgpack ints. Needs VTL_SHM_IPC.
+      #   (fork patch)
+      VTL_FRONTEND_ENCODE_CACHE: "1"
+      # per-conversation prompt-prefix -> ids cache in the Rust
+      #   frontend; 83% of trace requests extend an earlier
+      #   prompt verbatim. First 8 requests are verified against
+      #   a full encode; a mismatch kills the cache. (fork patch)
+      VTL_ENCODE_CACHE_SPLIT: "<|im_end|>\n"
+      # the turn boundary the cache splits on. ChatML
+      #   default; a marker that does not match the live
+      #   template yields <2 occurrences per prompt = cache
+      #   bypassed. (fork patch)
+      VTL_STREAM_PER_TOKEN: "1"
+      # one SSE chunk per TOKEN instead of per engine record.
+      #   MANDATORY with the burst -- a chunk-counting ITL
+      #   metric would otherwise score it N x worse. (fork patch)
 
       # ---- L2 / misc -------------------------------------------------------------------
       # The boot probe runs regardless (read-only). Expect 0: the CUDA docs say the L2
       # set-aside is disabled under MIG. The window itself is a no-op while the probe reads 0.
       VTL_L2_PERSIST: 1
-      VTL_L2_PERSIST_BYTES: "25165824"       # 24 MiB request, clamped to the device max
-      VTL_L2_HIT_RATIO: "0.6"                # fraction of window lines marked persisting
-      VTL_KERNEL_SYNC: 0                     # DEBUG only: cudaStreamSynchronize per kernel (slow)
-      VTL_DISABLE_WARMUP: 0                  # 1 = pure /health check, skip system-prefix priming
-
-      # ---- A/B CANDIDATES: left OFF on purpose. Turn ONE on, run `make bench` with >=3
-      # boots per arm, keep it only if the delta clears that run's reported noise floor.
-      #
-      # CUDA_DEVICE_MAX_CONNECTIONS: "1"
-      #   Fewer hardware work queues = less per-launch overhead, but it SERIALIZES independent
-      #   streams and so fights VTL_STREAM_PER_TOKEN. A/B the pair, not each alone.
-      # CUDA_MODULE_LOADING: "EAGER"
-      #   Moves per-module load cost onto boot, which the health-gated warm-up already hides.
-      #   Costs boot time and VRAM for modules never used.
-      # PYTHONMALLOC: "malloc"
-      #   Routes CPython's allocator through jemalloc (already LD_PRELOADed). Can cut
-      #   fragmentation, or lose to pymalloc's free lists on the decode path. Genuinely 50/50.
+      VTL_L2_PERSIST_BYTES: "25165824" # 24 MiB request, clamped to the device max
+      VTL_L2_HIT_RATIO: "0.6" # fraction of window lines marked persisting
+      VTL_KERNEL_SYNC: 0 # DEBUG only: cudaStreamSynchronize per kernel (slow)
+      VTL_DISABLE_WARMUP: 0 # 1 = pure /health check, skip system-prefix priming
+    # ---- A/B CANDIDATES: left OFF on purpose. Turn ONE on, run `make bench` with >=3
+    # boots per arm, keep it only if the delta clears that run's reported noise floor.
+    #
+    # CUDA_DEVICE_MAX_CONNECTIONS: "1"
+    #   Fewer hardware work queues = less per-launch overhead, but it SERIALIZES independent
+    #   streams and so fights VTL_STREAM_PER_TOKEN. A/B the pair, not each alone.
+    # CUDA_MODULE_LOADING: "EAGER"
+    #   Moves per-module load cost onto boot, which the health-gated warm-up already hides.
+    #   Costs boot time and VRAM for modules never used.
+    # PYTHONMALLOC: "malloc"
+    #   Routes CPython's allocator through jemalloc (already LD_PRELOADed). Can cut
+    #   fragmentation, or lose to pymalloc's free lists on the decode path. Genuinely 50/50.
     shm_size: "2g" # tmpfs counts against the 8GB cgroup; TP=1 needs little
     # seccomp/apparmor: Docker's default profile puts a BPF filter in front of every syscall.
     # The decode loop is syscall-heavy (futex, epoll, shm reads per step), so that filter is
@@ -445,13 +495,13 @@ services:
       # silently halving H2D bandwidth on the per-step copies.
       memlock: -1
       nofile: 65536
-      rtprio: 99   # only matters if a thread requests SCHED_FIFO; harmless otherwise
+      rtprio: 99 # only matters if a thread requests SCHED_FIFO; harmless otherwise
     # Doubles as a one-shot KV-prefix warm-up: the first passing run replays the first few
     # trace requests so the prefix is cached and decode kernels are warm before the container
     # reports healthy. Readiness still gates ONLY on /health -- priming is best-effort and can
     # never leave the container un-healthy. See vtl/warmup_healthcheck.py.
     healthcheck:
-      test: ["CMD", "python3", "/opt/vtl/warmup_healthcheck.py"]
+      test: [ "CMD", "python3", "/opt/vtl/warmup_healthcheck.py" ]
       interval: 10s
       timeout: 30s
       retries: 40
@@ -462,4 +512,4 @@ services:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]
+              capabilities: [ gpu ]
