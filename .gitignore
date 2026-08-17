@@ -51,3 +51,4 @@ mistral.rs/
 
 *.pem
 .env
+/.pgo-hfmodel-ctx/

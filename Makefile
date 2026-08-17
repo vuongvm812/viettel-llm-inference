@@ -60,12 +60,20 @@ VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
 # (CPU-only training run against the mock engine). 0 = plain optimized (fat-LTO) build.
 VLLM_RS_PGO ?= 1
 # Tokenizer the PGO training run boots the frontend with. Defaults to the local model
-# (hf-model/, bind-mounted at /model in the fork's PGO stage — only tokenizer/config are
-# read, the mock fakes the forward pass so the 5.9 GB of weights are never loaded).
+# (hf-model/, bind-mounted at /model in the fork's PGO stage — only the tokenizer/config
+# JSONs are read, the mock fakes the forward pass so the round-2 checkpoint's 127.2 GB of
+# weights are never loaded).
 # Override with a HF repo id to fetch a stand-in over the network, e.g. PGO_MODEL=Qwen/Qwen3-0.6B.
 PGO_MODEL ?= /model
-# Host path to the local model dir mounted at /model for the PGO training run.
+# Host path to the local model dir the PGO training run reads. NOT passed to buildx
+# directly: the Dockerfile's `RUN --mount=type=bind,from=hfmodel` mounts the context ROOT,
+# so buildx would sync the whole directory into BuildKit — on a GPU host after a full
+# `make model-fetch` that ships all 127.2 GB of weights into the build cache for a stage
+# that reads ~25 MB of JSONs. The pgo-hfmodel-ctx target stages the metadata subset (same
+# patterns as fetch-model.sh --meta-only) into $(PGO_HFMODEL_CTX) and buildx gets THAT.
 PGO_HFMODEL ?= ../hf-model
+# Staged metadata-only build context (recreated on every PGO build; gitignored).
+PGO_HFMODEL_CTX ?= ../.pgo-hfmodel-ctx
 # -Ctarget-cpu for the vllm-rs binary (plain AND PGO builds). Default native: full host
 # codegen (AVX-512 on an H200 host CPU). Bakes in the BUILD box's ISA — build on the deploy
 # CPU (the H200) for the full win; an older build box (Mac under Rosetta ≈ AVX2) yields a
@@ -110,7 +118,7 @@ IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: check stats build up down warm push bench bench-aiperf sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show model-fetch model-fetch-meta vllm-src
+.PHONY: pgo-hfmodel-ctx check stats build up down warm push bench bench-aiperf sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show model-fetch model-fetch-meta vllm-src
 
 ## Host-level latency tuning for the DEV/BENCH box. NOT part of any submission -- the judge
 ## runs `docker compose up` on their host and none of these knobs are reachable from a
@@ -351,8 +359,19 @@ BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 ##   make vllm-fork VLLM_RS_PGO=1   # + profile-guided optimization
 ##   make vllm-fork PUSH=1
 ##   make push VLLM_IMAGE=$(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)@sha256:<digest>
-vllm-fork:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg NO_PROXY=localhost,127.0.0.1 --build-arg no_proxy=localhost,127.0.0.1 --build-arg http_proxy="$(HTTP_PROXY)" --build-arg https_proxy="$(HTTPS_PROXY)" --build-arg HTTP_PROXY="$(HTTP_PROXY)" --build-arg HTTPS_PROXY="$(HTTPS_PROXY)" --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg PGO_MODEL='$(PGO_MODEL)' --build-arg PGO_TARGET_CPU='$(PGO_TARGET_CPU)' $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-context hfmodel=$(PGO_HFMODEL)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
+# Stage a metadata-only copy of $(PGO_HFMODEL) for the buildx named context. The PGO stage
+# only reads the tokenizer/config JSONs (the frontend has no weight loader at all), but a
+# `RUN --mount=type=bind,from=hfmodel` makes buildx sync the WHOLE context to BuildKit —
+# with the full round-2 checkpoint in hf-model/ that is a 127.2 GB transfer plus a second
+# on-disk copy in the build cache, for ~25 MB actually used. Include patterns mirror
+# fetch-model.sh --meta-only (plus *.jinja for the dedicated chat template file).
+pgo-hfmodel-ctx:
+	$(IN) test -f "$(PGO_HFMODEL)/config.json" || { echo "FAIL: $(PGO_HFMODEL)/config.json missing -- run 'make model-fetch-meta' (~25 MB) first or point PGO_HFMODEL at a model dir"; exit 1; }
+	$(IN) rm -rf "$(PGO_HFMODEL_CTX)" && mkdir -p "$(PGO_HFMODEL_CTX)" && find "$(PGO_HFMODEL)" -maxdepth 1 -type f \( -name '*.json' -o -name '*.jinja' -o -name '*.txt' -o -name 'tokenizer*' -o -name 'vocab*' -o -name 'merges*' \) -exec cp {} "$(PGO_HFMODEL_CTX)/" \;
+	@$(IN) du -sh "$(PGO_HFMODEL_CTX)" | sed 's/^/staged metadata-only PGO context: /'
+
+vllm-fork: $(if $(filter 1,$(VLLM_RS_PGO)),pgo-hfmodel-ctx)
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg NO_PROXY=localhost,127.0.0.1 --build-arg no_proxy=localhost,127.0.0.1 --build-arg http_proxy="$(HTTP_PROXY)" --build-arg https_proxy="$(HTTPS_PROXY)" --build-arg HTTP_PROXY="$(HTTP_PROXY)" --build-arg HTTPS_PROXY="$(HTTPS_PROXY)" --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg PGO_MODEL='$(PGO_MODEL)' --build-arg PGO_TARGET_CPU='$(PGO_TARGET_CPU)' $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-context hfmodel=$(PGO_HFMODEL_CTX)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
 	@echo "forked vLLM base: $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)"
 	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'pin this digest: {{.Manifest.Digest}}'; fi
 
