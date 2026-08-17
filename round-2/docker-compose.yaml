@@ -266,7 +266,10 @@ services:
       # decode. int4 arm halves expert reads but only pays with FREE_FP8=1 (else both copies
       # resident = OOM at 116 GB of experts); that pair is the experiment, not the default.
       VTL_MOE_GEMV_WEIGHTS: "fp8" # fp8 | int4
-      VTL_MOE_GEMV_MAX_M: "16" # decode band; larger M falls through to stock
+      VTL_MOE_GEMV_MAX_M: "8" # decode band; larger M falls through to stock. 8, not 16:
+                              #   the judge pinned --max-num-seqs=5 and spec-decode is off,
+                              #   so decode M never exceeds 5 -- a tighter band claims
+                              #   fewer batches the GEMV was not measured on.
       VTL_MOE_GEMV_THREADS: "256"
       VTL_MOE_GEMV_CHUNK: "64" # (token,slot) chunk per launch wave
       VTL_MOE_GEMV_FREE_FP8: "0"
