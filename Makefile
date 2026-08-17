@@ -188,6 +188,12 @@ check:
 	  PYTHONPATH=. python3 bench/test_nvrtc_block_quant.py --self-check; fi
 	$(IN) if [ -f bench/test_gdn_decode_step.py ]; then \
 	  PYTHONPATH=. python3 bench/test_gdn_decode_step.py --self-check; fi
+	@# Fused greedy argmax (round-2+). Pure half here -- kernel entry <-> op name <-> the
+	@# name the forked V2 sampler resolves, nstep's three call sites going through _ARGMAX,
+	@# and cubin cache-key distinctness across {VOCAB, THREADS}. Bit-parity against
+	@# torch.argmax needs a GPU and runs under `make test-kernel`.
+	$(IN) if [ -f bench/test_greedy_argmax.py ]; then \
+	  PYTHONPATH=. python3 bench/test_greedy_argmax.py --self-check; fi
 	@# The int4 track (round-2+): the fp8-block -> int4 requant of the dense layers, and the
 	@# MoE decode grouped-GEMV. Pure half here -- the double-quantization error bound in numpy,
 	@# the (token, slot) bookkeeping, and cubin cache-key distinctness across the int4/fp8

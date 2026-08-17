@@ -136,6 +136,27 @@ def _flag(name: str, default: str = "1") -> bool:
 
 
 # ---------------------------------------------------------------------------------------
+# The token pick, behind one name.
+# ---------------------------------------------------------------------------------------
+
+
+def _argmax_out(logits, out) -> None:
+    """``out := argmax(logits, dim=-1)`` -- int64, in place, no allocation."""
+    import torch
+
+    torch.argmax(logits, dim=-1, out=out)
+
+
+# Every place this module picks a token goes through this global, so a fused kernel can be
+# swapped in without touching the three call sites and without this module importing it
+# (the dependency points one way: vtl/patches/greedy_argmax.py rebinds `_ARGMAX` at model
+# load, which is BEFORE _capture_burst_graphs runs, so whatever is bound here is what the
+# burst graphs capture -- and therefore what the Rust runner replays). Unbound, it is
+# exactly the torch.argmax it replaced.
+_ARGMAX = _argmax_out
+
+
+# ---------------------------------------------------------------------------------------
 # The scheduler-facing handshake. Module state, read by rust_sched.py in the same process.
 # ---------------------------------------------------------------------------------------
 
@@ -350,8 +371,6 @@ def _burst_body(runner, b: _Burst, rows: int, pad: int, forward):
     In graph mode ``rows == pad`` by construction (a burst graph is only used when the real
     batch is exactly the captured size), so the capture and the replay see one width.
     """
-    import torch
-
     from vtl.patches import decode_fastpath as dfp
 
     ibuf = runner.input_buffers
@@ -383,7 +402,7 @@ def _burst_body(runner, b: _Burst, rows: int, pad: int, forward):
 
     hidden = forward()
     logits = runner.model.compute_logits(hidden[:rows])
-    torch.argmax(logits, dim=-1, out=b.tok[:rows])
+    _ARGMAX(logits, b.tok[:rows])
 
 
 def _prologue(runner, b: _Burst, rows: int) -> None:
@@ -398,12 +417,8 @@ def _prologue(runner, b: _Burst, rows: int) -> None:
     On a 1-token-per-request decode step ``logits_indices`` is ``arange(num_reqs)``, so the
     ``[:rows]`` slice IS stock's gather -- and unlike ``logits_indices`` it allocates nothing.
     """
-    import torch
-
     hidden = runner.cudagraph_manager.hidden_states
-    torch.argmax(
-        runner.model.compute_logits(hidden[:rows]), dim=-1, out=b.tok[:rows]
-    )
+    _ARGMAX(runner.model.compute_logits(hidden[:rows]), b.tok[:rows])
 
 
 def _accum_tail(runner, b: _Burst, rows: int, pad: int | None = None) -> None:
@@ -766,7 +781,6 @@ def _graph_shape_ok(b: _Burst, ib, num_reqs: int, entry) -> bool:
 
 def _run_burst(runner, b: _Burst, n: int, ib, hidden):
     """Sample N tokens. Returns the ``SamplerOutput`` the stock tail expects."""
-    import torch
     from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
     num_reqs = ib.num_reqs
@@ -805,9 +819,7 @@ def _run_burst(runner, b: _Burst, n: int, ib, hidden):
         pro[0].replay()
     else:
         # Token 1 from the hidden states the stock forward already produced, host-launched.
-        torch.argmax(
-            runner.model.compute_logits(hidden[:num_reqs]), dim=-1, out=b.tok[:num_reqs]
-        )
+        _ARGMAX(runner.model.compute_logits(hidden[:num_reqs]), b.tok[:num_reqs])
 
     if shape_ok:
         graph = entry[0]

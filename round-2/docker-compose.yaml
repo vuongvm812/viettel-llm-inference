@@ -147,6 +147,11 @@ services:
       VTL_ENABLE_MOE_DECODE_GEMV: "1"
       # grouped-GEMV MoE decode at M<=MAX_M.
       #   Needs VTL_NVRTC=1.
+      VTL_ENABLE_GREEDY_ARGMAX: "1"
+      # fused argmax over the 248320-wide vocab, one
+      #   launch, straight into nstep's persistent
+      #   token buffer. Registers nothing unless the
+      #   compile succeeds. Needs VTL_NVRTC=1.
 
       # ---- Knobs whose defaults live in code -------------------------------------------
       VTL_GIL_SWITCH_INTERVAL: "0.0002" # sys.setswitchinterval, seconds. 0 = interpreter default
@@ -174,7 +179,15 @@ services:
       # fails closed to the stock V2 path, so default-on cannot crash.
       VLLM_USE_V2_MODEL_RUNNER: "1"
       VTL_V2_GREEDY_FASTPATH: "1" # argmax short-circuit for provably-greedy batches
-      VTL_V2_GREEDY_ARGMAX_KERNEL: "0" # reserved: fused argmax .cu not built
+      VTL_V2_GREEDY_ARGMAX_KERNEL: "1"
+      # let the fast path resolve the fused argmax. A
+      #   three-rung ladder, resolved ONCE on the first
+      #   greedy step: torch.ops.vllm_cuda.greedy_argmax_i64
+      #   (registered by VTL_ENABLE_GREEDY_ARGMAX above,
+      #   only after its NVRTC compile succeeded) ->
+      #   logits.argmax(dim=-1) when the op is absent.
+      #   Set to 0 to A/B the fork against torch.argmax
+      #   with the kernel still built for nstep.
       VTL_V2_FUSED_POSTPROCESS: "1" # skip the dead num_accepted scatter when no spec-decode
       VTL_V2_FORCE_CUTLASS_FP8: "1"
       # force fp8 layers off Marlin (its stable-ABI

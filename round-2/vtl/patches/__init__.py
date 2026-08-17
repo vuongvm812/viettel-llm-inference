@@ -44,6 +44,11 @@ _MODULES: tuple[str, ...] = (
     # (-DHIDDEN/-DGROUP). Op-identity-preserving: leaves the stock op untouched when NVRTC
     # is off or the compile fails. First production consumer of vtl/nvrtc.py.
     "nvrtc_block_quant",
+    # Fused greedy argmax over the vocab, -DVOCAB-specialized. Fills the seams the forked V2
+    # sampler and nstep_decode already have (torch.ops.vllm_cuda.greedy_argmax_i64 and
+    # nstep's `_ARGMAX`); registers nothing unless the compile succeeds, so both stay on
+    # torch.argmax otherwise. Needs VTL_NVRTC=1.
+    "greedy_argmax",
     # Fused GDN decode step (conv1d update + gating delta rule, one NVRTC launch per layer,
     # pure non-spec decode only; spec/MTP and prefill fall through to stock Triton).
     "gdn_decode_step",

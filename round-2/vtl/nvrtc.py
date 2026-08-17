@@ -344,7 +344,7 @@ def _self_check() -> None:
     assert source_dir().name == "kernels", source_dir()
 
     # -- the shipped kernels must actually be readable from the installed package --
-    for name in ("rms_norm_quant",):
+    for name in ("rms_norm_quant", "greedy_argmax"):
         assert load_source(name), f"vtl/kernels/{name}.cu missing from the package"
 
     os.environ["VTL_NVRTC_CACHE"] = "/tmp/x"
