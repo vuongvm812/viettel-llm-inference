@@ -6,7 +6,7 @@
 # pairing `vllm-rs serve --data-parallel-size-local 0` (frontend-only, owns the
 # ZMQ handshake) with `vllm-mock-engine` (fakes prefill, emits random decode
 # tokens). The real CPU tokenizer + full HTTP→sonic_rs-parse→stream path are
-# exercised by replaying the recorded round-2 trace. That training run steers the
+# exercised by replaying the Weka-derived grading trace (make trace-weka). That run steers the
 # final `-Cprofile-use` build.
 #
 # Fails loudly (set -e) rather than silently shipping a non-PGO binary — matches
@@ -62,7 +62,7 @@ RUSTFLAGS="-Cprofile-generate=$PGO_RAW $CPU" \
 echo "== [pgo 3/6] prepare training trace (pin model to the served tokenizer)"
 python3 - <<'PY'
 import json
-src = "/src/trace-round2.jsonl"
+src = "/src/trace-weka.jsonl"
 dst = "/tmp/pgo-train.jsonl"
 model = __import__("os").environ.get("PGO_MODEL", "/model")
 n = 0
@@ -124,9 +124,10 @@ curl -fsS "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null || { dump_frontend_l
 
 echo "== [pgo 5/6] replay training corpus"
 pip install --no-cache-dir -q aiohttp
-# closed-loop 8 ~= the trace's PEAK in-flight count (~6, per --max-num-seqs), so the profile
-# covers concurrent-decode/batching paths, not just the ~2-3 steady-state average. Stay well
-# under 16, which over-saturated queues and biased toward backpressure paths production never hits.
+# closed-loop 8 ~= grading's effective in-flight count (5 session-trees plus subagent
+# fan-out), so the profile covers concurrent-decode/batching paths, not just the steady-state
+# average. Stay well under 16, which over-saturated queues and biased toward backpressure
+# paths production never hits.
 ( cd /src/bench && python3 replay.py \
     --target "http://127.0.0.1:${HTTP_PORT}" \
     --trace /tmp/pgo-train.jsonl \

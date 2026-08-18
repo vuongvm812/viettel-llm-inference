@@ -13,6 +13,8 @@
 !data/input/trace-round1.jsonl
 # PGO training corpus + replayer for the fork's rust-builder stage (VLLM_RS_PGO=1).
 !data/input/trace-round2.jsonl
+# Weka-derived PGO/BOLT training corpus (make trace-weka; generated, gitignored).
+!data/input/trace-weka.jsonl
 !bench
 !bench/*
 # WS4 Rust scheduler crate (built in its own stage; only the wheel reaches the image).

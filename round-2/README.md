@@ -49,6 +49,7 @@ Each patch registers into `PATCH_REGISTRY` under a name and is gated by `VTL_ENA
 ```
 make check      # self-checks; no GPU, no vLLM, no server needed
 make up         # build + run locally against hf-model/ (Linux + GPU)
+make trace-weka # build the grading-shaped replay trace (needed once, for warm + PGO)
 make warm       # warm the torch.compile/Triton caches on a GPU, bake into the image
 make bench      # synthetic trace: open-loop replay + closed-loop sweep at 1/8/32/128
 make bench-aiperf  # grading workload (aiperf AgentX / Weka corpus) + ERS report

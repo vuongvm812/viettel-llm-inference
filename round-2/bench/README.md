@@ -46,6 +46,24 @@ Extra flags: `--closed-loop N`, `--limit N` (smoke), `--trace PATH`, `--timeout 
 Its arrival/token/prefix statistics predate the round-2 spec: use it for relative
 regressions and CI, never for final tuning calls.
 
+## Weka-derived trace for `make warm` + PGO/BOLT (`make trace-weka`)
+
+`build_trace_weka.py` converts the REAL grading corpus (HF
+`semianalysisai/cc-traces-weka-062126` — KV-block hash traces, no text) into a replay.py
+trace at `data/input/trace-weka.jsonl` (generated, gitignored). It synthesizes
+deterministic text per 64-token block hash, so input sizes, prefix-cache topology,
+output lengths (`max_tokens` + `ignore_eos`, as grading runs), and think-time arrivals
+(capped at the scenario's 10 s idle guard) all match grading shape. Traces whose peak
+context exceeds 204,800 are dropped whole, mirroring aiperf's `--max-context-length`.
+
+`make warm` (cache baking) and the vllm-fork PGO/BOLT training stages replay THIS trace
+— they shape what the shipped image is optimized for, so they must not run on the stale
+synthetic trace. `make bench`/CI deliberately stay on Path 2.
+
+Run `make trace-weka` once per checkout (streams the corpus from HF, stops early; with
+`hf-model/` metadata present — `make model-fetch-meta` — blocks are sized
+tokenizer-exactly, else a word-count fallback is used).
+
 ## Notes
 
 - Output tokens are counted from streamed content deltas (uniform across targets); `usage`

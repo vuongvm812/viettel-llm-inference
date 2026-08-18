@@ -11,18 +11,29 @@ are read back with `airace list` ("chấm: xong — ĐIỂM …" / "đang chạy
 
 Decision: the server runs continuously and is managed manually — the automation only
 **submits on a schedule** via cron. It autodetects the remaining daily attempts and stops
-at 0; `--submissions N` runs N submissions, 3 min apart. No config changes, no restarts,
+at 0; `--submissions N` runs N submissions, 30 min apart. No config changes, no restarts,
 no failure orchestration (a `lỗi` result is just logged; the next tick proceeds normally).
 
 airace cannot be driven remotely (interactive-TTY SSH only), so the script lives in the
 repo and is installed by hand on the VM.
 
+**Overnight**: the daily 30-attempt budget and ~20-30 min grading time mean the
+00:00-07:00 Asia/Ho_Chi_Minh window is otherwise idle capacity. `--overnight` submits
+every 30 min and stops at the next 00:00 UTC. Working assumption (not verified against
+airace's actual behavior): its daily quota resets at UTC midnight — which, since Vietnam
+has no DST (ICT is a fixed UTC+7), is the same instant as 07:00 VNT. That coincidence is
+why the run never needs to survive across a quota rollover: it's designed to stop exactly
+when the reset it's built around would happen.
+
 ## The script: `scripts/vm/submit-cron.sh`
 
 - `submit-cron.sh` — one guarded submission (what cron calls hourly).
-- `submit-cron.sh --submissions N` — N submissions, sleeping 3 min between each.
+- `submit-cron.sh --submissions N` — N submissions, sleeping 30 min between each.
   Submissions **queue on the judge** — this does not wait for a prior run to finish
   grading before firing the next one.
+- `submit-cron.sh --overnight` — submissions every 30 min until the next 00:00 UTC
+  (== 07:00 VNT). Same queuing behavior as `--submissions`, just time-bounded instead of
+  count-bounded and at a slower cadence.
 
 Guards, all purely budget-protective:
 
@@ -57,7 +68,11 @@ someone can react. If airace refuses to run without a TTY under cron, wrap its c
 - Manual run prints `SUBMIT (remaining before: NN)`; `airace list` shows the new
   submission; `~/submit-log/` contains the day's log + cached remaining count.
 - With the server stopped: `STOP: endpoint not answering, attempt preserved`.
-- `--submissions 2` shows two `SUBMIT` lines, 3 min apart, with no wait for grading
+- `--submissions 2` shows two `SUBMIT` lines, 30 min apart, with no wait for grading
   in between.
+- `--overnight` shows `stopping at <ISO-timestamp>T00:00:00+00:00`, then `SUBMIT` lines
+  30 min apart, ending in `STOP: reached 00:00 UTC (07:00 VNT)`. First real run: check
+  whether `Lượt còn lại` actually resets to 30 at UTC midnight, confirming or disproving
+  the reset-timezone assumption above.
 - Quota exhausted: `STOP: no attempts left today`, no airace registration attempted.
 - Next day: the date-suffixed remaining-file rolls over automatically; no reset job needed.
