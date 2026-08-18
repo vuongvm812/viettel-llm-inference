@@ -119,7 +119,7 @@ IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: pgo-hfmodel-ctx check stats build up down warm push bench bench-aiperf sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show host-tune-cpuset model-fetch model-fetch-meta vllm-src
+.PHONY: pgo-hfmodel-ctx check stats build up down warm trace-weka push bench bench-aiperf sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show host-tune-cpuset model-fetch model-fetch-meta vllm-src
 
 ## Host-level latency tuning for the DEV/BENCH box. NOT part of any submission -- the judge
 ## runs `docker compose up` on their host and none of these knobs are reachable from a
@@ -151,6 +151,17 @@ model-fetch:
 	scripts/fetch-model.sh
 model-fetch-meta:
 	scripts/fetch-model.sh --meta-only
+
+## Grading-shaped replay trace derived from the REAL round-2 grading corpus (the
+## SemiAnalysis Weka Claude Code sessions aiperf replays -- HANDOFF §6.2). Generated, not
+## committed: consumed by `make warm` and the vllm-fork PGO/BOLT stages. The synthetic
+## trace-round2.jsonl stays for `make bench`/CI. Streams the corpus from HF (stops early;
+## no 1.85 GB download) and sizes blocks tokenizer-exactly when hf-model/ metadata exists
+## (`make model-fetch-meta`), else falls back to a word-count heuristic.
+WEKA_TRACE ?= data/input/trace-weka.jsonl
+trace-weka:
+	$(IN) python3 bench/build_trace_weka.py --out $(WEKA_TRACE) \
+	  $(if $(wildcard $(PGO_HFMODEL)/tokenizer.json),--tokenizer $(PGO_HFMODEL))
 
 ## Pristine vLLM v0.25.0 source tree at repo-root vllm/ (gitignored). This is the REFERENCE
 ## tree that $(ROUND)/vtl/vllm_patches/gen.sh diffs against (its V025=... path) when
@@ -211,6 +222,7 @@ check:
 	$(IN) python3 bench/sweep_report.py --selfcheck
 	@# aiperf -> repo-schema converter. Parses files only, so it runs off-box without aiperf.
 	$(IN) if [ -f bench/aiperf_adapter.py ]; then python3 bench/aiperf_adapter.py --selfcheck; fi
+	$(IN) if [ -f bench/build_trace_weka.py ]; then python3 bench/build_trace_weka.py --self-check; fi
 	$(IN) python3 bench/eval_quality.py --self-check
 	$(IN) python3 bench/profile_trace.py --self-check
 	@# if-form, not `[ -f x ] && cmd || true`: that swallows the script's OWN failure as well as
@@ -392,6 +404,7 @@ BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 # fetch-model.sh --meta-only (plus *.jinja for the dedicated chat template file).
 pgo-hfmodel-ctx:
 	$(IN) test -f "$(PGO_HFMODEL)/config.json" || { echo "FAIL: $(PGO_HFMODEL)/config.json missing -- run 'make model-fetch-meta' (~25 MB) first or point PGO_HFMODEL at a model dir"; exit 1; }
+	$(IN) test -f "$(WEKA_TRACE)" || { echo "FAIL: $(WEKA_TRACE) missing -- the PGO/BOLT training replay needs it; run 'make trace-weka' first"; exit 1; }
 	$(IN) rm -rf "$(PGO_HFMODEL_CTX)" && mkdir -p "$(PGO_HFMODEL_CTX)" && find "$(PGO_HFMODEL)" -maxdepth 1 -type f \( -name '*.json' -o -name '*.jinja' -o -name '*.txt' -o -name 'tokenizer*' -o -name 'vocab*' -o -name 'merges*' \) -exec cp {} "$(PGO_HFMODEL_CTX)/" \;
 	@$(IN) du -sh "$(PGO_HFMODEL_CTX)" | sed 's/^/staged metadata-only PGO context: /'
 
@@ -416,13 +429,18 @@ down:
 ## enough traffic to trigger compile + CUDA graph capture + FlashInfer autotune, then copy the
 ## caches back into the build context and rebuild. Two passes: open-loop warms low-concurrency
 ## shapes; closed-loop saturates a full batch so the multi-seq kernels compile into the cache too.
+## Replays the Weka-derived grading-shaped trace (`make trace-weka`), NOT the synthetic
+## trace-round2.jsonl -- caches baked here must cover the judge's real shapes (long contexts,
+## decode-heavy), which the synthetic trace predates (HANDOFF §6.3).
 WARM_CONCURRENCY ?= 16
-WARM_REQS ?= 32
+WARM_REQS ?= 64
+WARM_TRACE ?= $(WEKA_TRACE)
 warm:
+	$(IN) test -f "$(WARM_TRACE)" || { echo "FAIL: $(WARM_TRACE) missing -- run 'make trace-weka' first"; exit 1; }
 	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)'
 	$(IN) $(DC) up -d --wait   # --wait blocks until the healthcheck passes
-	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --limit 4 --out /dev/null
-	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(WARM_TRACE) --limit 4 --out /dev/null
+	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(WARM_TRACE) \
 	  --closed-loop $(WARM_CONCURRENCY) --limit $(WARM_REQS) --out /dev/null
 	$(IN) docker cp "$$($(DC) ps -q model)":/opt/vtl/cache/. docker/cache/
 	$(IN) $(DC) down

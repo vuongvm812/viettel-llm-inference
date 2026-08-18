@@ -639,6 +639,12 @@ grading** (it predates spec §3.1). Its numbers remain useful as a *relative* re
 signal, but final tuning decisions — scheduler settings, `--max-num-seqs`, speculative
 decoding, anything traded against ERS — must be justified on `bench-aiperf` runs.
 
+**`make warm` and the vllm-fork PGO/BOLT stages no longer replay the synthetic trace.**
+They consume `data/input/trace-weka.jsonl` (`make trace-weka`, generated from the real
+Weka corpus by `bench/build_trace_weka.py` — see `bench/README.md`), so baked compile
+caches and the frontend's profile-guided layout are trained on grading-shaped traffic
+(long contexts, decode-heavy, real prefix-reuse topology).
+
 ### 6.4 Serving-config implications (open items)
 
 - **Blocking**: `docker-compose.yaml` still pins the LFM2.5 boot placeholder with
@@ -646,8 +652,9 @@ decoding, anything traded against ERS — must be justified on `bench-aiperf` ru
   `submission_valid: false`. A valid `bench-aiperf` run (and any real submission) needs
   the round-2 model literals landed first (§3.1 of this handoff).
 - `--max-num-seqs=32`'s comment cites "peak trace concurrency ~6" — that was the dead
-  synthetic trace. Re-measure concurrency under aiperf (5 trees + subagent fan-out) before
-  trusting the cap or the cudagraph capture sizes.
+  synthetic trace (whose role in warm/PGO the Weka-derived trace has since taken over).
+  Re-measure concurrency under aiperf (5 trees + subagent fan-out) before trusting the
+  cap or the cudagraph capture sizes.
 - `ignore_eos:true` means every request decodes its full recorded length: EOS-dependent
   early-stop logic (e.g. `VTL_ENABLE_STEP0_EOS_BAN`) is inert under grading, and the
   decode:prefill ratio is far higher than the prefill-biased synthetic trace assumed.

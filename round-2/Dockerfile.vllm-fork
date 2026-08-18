@@ -122,7 +122,7 @@ RUN set -eu; \
 # PGO training assets (only used by the rust-builder-pgo stage below).
 COPY vtl/pgo_train.sh /src/pgo_train.sh
 COPY bench /src/bench
-COPY data/input/trace-round2.jsonl /src/trace-round2.jsonl
+COPY data/input/trace-weka.jsonl /src/trace-weka.jsonl
 
 WORKDIR /src/rust
 # -Ctarget-cpu applies to the plain build too (not just PGO), so a non-PGO image gets the
@@ -146,7 +146,7 @@ RUN set -eux; \
 # RUST_BUILDER=rust-builder-pgo (VLLM_RS_PGO=1), so plain/CI builds never require the
 # hf-model context, a network model, or any of the BOLT machinery below.
 # The CPU-only training run (pgo_train.sh) drives the frontend + mock engine and
-# replays the round-2 trace; the served tokenizer is the local hf-model mounted at
+# replays the Weka-derived grading trace; the served tokenizer is the local hf-model mounted at
 # /model (weights ignored — the mock fakes the forward pass).
 #
 # BOLT (Binary Optimization and Layout Tool) is a SECOND, complementary layer on top of
@@ -354,7 +354,7 @@ skip() { echo "BOLT: skipped -- $*"; cleanup; exit 0; }
 . /tmp/bolt-tools.env
 [ -x "${LLVM_BOLT:-}" ] && [ -x "${MERGE_FDATA:-}" ] || skip "llvm-bolt/merge-fdata vanished after install"
 [ -x "$BIN/vllm-mock-engine" ] || skip "no mock engine binary -- cannot replay training traffic"
-[ -s /src/trace-round2.jsonl ] || skip "no training trace at /src/trace-round2.jsonl"
+[ -s /src/trace-weka.jsonl ] || skip "no training trace at /src/trace-weka.jsonl"
 
 rm -rf "$WORK"
 mkdir -p "$FDATA"
@@ -398,7 +398,7 @@ with open(src) as f, open(dst, "w") as out:
         rec.setdefault("body", {})["model"] = model
         out.write(json.dumps(rec) + "\n")
         n += 1
-print("prepared %d training requests" % n)' "$MODEL" /src/trace-round2.jsonl "$TRACE" \
+print("prepared %d training requests" % n)' "$MODEL" /src/trace-weka.jsonl "$TRACE" \
   || skip "could not prepare the training trace"
 [ -s "$TRACE" ] || skip "prepared training trace is empty"
 
