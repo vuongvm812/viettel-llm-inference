@@ -1132,6 +1132,22 @@ def bail_reason(scheduler):
     return None
 
 
+def kick_failure_is_transient(exc: BaseException) -> bool:
+    """True for a pyclass borrow conflict, which costs this step's kick and nothing else.
+
+    PyO3 renders a refused pycell borrow as a plain ``RuntimeError`` -- ``"Already
+    borrowed"`` for a refused exclusive borrow, ``"Already mutably borrowed"`` for a
+    refused shared one. Neither says anything about the resident table: the state the
+    crate holds is untouched, only the crossing was declined, so the answer is to skip
+    the speculation and let the next step try again.
+
+    Matched on the message because PyO3 exposes no distinct exception type for it, and
+    narrowed to RuntimeError so an unrelated class carrying a similar message (a crate
+    error string, a vLLM error) still takes the permanent-fallback arm.
+    """
+    return isinstance(exc, RuntimeError) and str(exc).startswith("Already ")
+
+
 # --------------------------------------------------------------------------
 # C1a -- N-step decode burst: the scheduler side
 # --------------------------------------------------------------------------
@@ -2663,6 +2679,20 @@ def _install_update_from_output(scheduler_cls, m: dict):
         Refuses on anything the worker cannot model: a non-empty waiting queue (spec.rs
         invariant 3 / journal.rs's scope invariant), a dirty table, a bail condition, or a
         step where any request fell back to Python's check_stop.
+
+        THE BORROW ARM. ``core.kick`` is the one Rust call this wrapper makes with the
+        manager pyclass reachable from a second thread: ``VTL_RUST_PREREG``'s add-time
+        hook runs ``set_request_meta`` on ``EngineCoreProc``'s input thread, and that
+        pymethod holds a SHARED pycell borrow of the manager for as long as it is parked
+        on the crate mutex inside ``allow_threads``. Any call that wants an EXCLUSIVE
+        borrow of the same object in that window is refused by PyO3 with
+        ``RuntimeError("Already borrowed")``. The crate takes no exclusive borrow on this
+        path, so the known collision is gone; the arm below stays because ``fail()`` is
+        permanent -- turning one contended microsecond into a process-lifetime fallback
+        to the marshalled path is the wrong trade for any exclusive-borrow site a future
+        pymethod might introduce. A refused borrow means the crossing never happened, so
+        the table is exactly as valid as it was: disarm, skip this step's speculation,
+        and leave `dirty` and `gen` alone (no resync -- nothing went stale).
         """
         tbl = getattr(kv, "_vtl_table", None)
         core = getattr(self, "_vtl_rust_core", None)
@@ -2692,6 +2722,9 @@ def _install_update_from_output(scheduler_cls, m: dict):
         try:
             tbl.armed = bool(core.kick(kv._rust, tbl.gen, slots))
         except BaseException as exc:
+            if kick_failure_is_transient(exc):
+                tbl.armed = False
+                return
             tbl.fail("kick", exc)
 
     def update_from_output(self, scheduler_output, model_runner_output):
@@ -4122,6 +4155,26 @@ def _self_check() -> None:
         pass
     else:  # pragma: no cover
         raise AssertionError("fail() must not swallow interpreter signals")
+
+    # maybe_kick's two-arm handler. Only a PyO3 borrow refusal is transient, and only when
+    # it arrives as a RuntimeError -- the message alone is not the signal.
+    assert kick_failure_is_transient(RuntimeError("Already borrowed")) is True
+    assert kick_failure_is_transient(RuntimeError("Already mutably borrowed")) is True
+    assert kick_failure_is_transient(RuntimeError("boom")) is False
+    assert kick_failure_is_transient(ValueError("Already borrowed-ish")) is False
+    assert kick_failure_is_transient(KeyboardInterrupt()) is False
+    # The transient arm must cost the kick and NOTHING else: a table that was clean and
+    # armed stays live, stays clean and keeps its generation, so the next step can arm
+    # again. (Contrast fail(), asserted above, which is off-forever.)
+    tbl = TableState()
+    tbl.dirty, tbl.armed = False, True
+    exc = RuntimeError("Already borrowed")
+    if kick_failure_is_transient(exc):
+        tbl.armed = False
+    else:  # pragma: no cover
+        tbl.fail("kick", exc)
+    assert tbl.off is False and tbl.armed is False
+    assert tbl.dirty is False and tbl.gen == 0, "a refused borrow does not stale the table"
 
     # PhaseTimers: p50/p95 off a sorted ring, and the ring is drained each report.
     pt = PhaseTimers()

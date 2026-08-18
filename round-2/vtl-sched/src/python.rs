@@ -167,12 +167,26 @@ pub struct KvManager {
     /// The mutable core, shared with the `vtl-sched-spec` worker (`spec.rs`).
     pub(crate) shared: Arc<Mutex<Shared>>,
     /// Spawned on the first `kick`; `None` means speculation was never asked for.
-    driver: Option<SpecDriver>,
+    ///
+    /// Behind its own mutex so the lazy spawn happens through `&self`. Taking the manager
+    /// as `&mut KvManager` — the only other way to assign the field — is an EXCLUSIVE
+    /// pycell borrow, and this pyclass is reachable from two threads: the input thread's
+    /// [`KvManager::set_request_meta`] holds a SHARED borrow of it for as long as it is
+    /// parked on the crate mutex inside `allow_threads`. An exclusive borrow taken by the
+    /// engine thread in that window fails with `RuntimeError: Already borrowed`. Same rule
+    /// the [`Scheduler::arena`] comment states for `&mut self` pymethods, one step
+    /// further: it applies to `&mut` pyclass ARGUMENTS too.
+    driver: Mutex<Option<SpecDriver>>,
     /// One persistent numpy buffer per KV cache group; block IDs are written here and
     /// Python takes a zero-copy `[:n]` view. Outside the mutex — GIL-protected.
     bufs: Vec<Py<PyArray1<i64>>>,
     buf_cap: usize,
-    flat: Vec<u32>,
+    /// Scratch for the two block-id list builders, recycled instead of reallocated.
+    /// Interior-mutable for the same reason as `driver`: `&mut self` would be an exclusive
+    /// pycell borrow racing the input thread's shared one. A `RefCell` is enough here —
+    /// unlike `driver` the borrow never spans an `allow_threads`, so it is only ever
+    /// observed by GIL-holding code and cannot be seen concurrently.
+    flat: RefCell<Vec<u32>>,
     n_groups: usize,
 }
 
@@ -268,10 +282,10 @@ impl KvManager {
             .collect();
         Ok(KvManager {
             shared: Arc::new(Mutex::new(Shared::new(inner))),
-            driver: None,
+            driver: Mutex::new(None),
             bufs,
             buf_cap,
-            flat: Vec::with_capacity(256),
+            flat: RefCell::new(Vec::with_capacity(256)),
             n_groups,
         })
     }
@@ -894,15 +908,18 @@ impl KvManager {
         self.w().manager.free(slot)
     }
 
-    fn pop_blocks_for_free<'py>(&mut self, py: Python<'py>, slot: u32) -> Bound<'py, PyList> {
-        let mut out = std::mem::take(&mut self.flat);
+    fn pop_blocks_for_free<'py>(&self, py: Python<'py>, slot: u32) -> Bound<'py, PyList> {
+        // Taken out of the cell rather than borrowed across the body: the crate mutex is
+        // acquired below, and a `RefCell` borrow spanning a lock acquisition is the shape
+        // that turns a lock wait into a borrow error.
+        let mut out = std::mem::take(&mut *self.flat.borrow_mut());
         out.clear();
         {
             let mut sh = self.w();
             sh.manager.pop_blocks_for_free(slot, &mut out);
         }
         let list = PyList::new_bound(py, out.iter().map(|&b| b as i64));
-        self.flat = out;
+        *self.flat.borrow_mut() = out;
         list
     }
 
@@ -967,15 +984,17 @@ impl KvManager {
         Ok(Some(d))
     }
 
-    fn take_new_block_ids<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyList> {
-        let mut out = std::mem::take(&mut self.flat);
+    fn take_new_block_ids<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
+        // See `pop_blocks_for_free`: the scratch leaves the cell before the crate mutex is
+        // acquired and goes back after the list is built.
+        let mut out = std::mem::take(&mut *self.flat.borrow_mut());
         out.clear();
         {
             let mut sh = self.w();
             sh.manager.take_new_block_ids(&mut out);
         }
         let list = PyList::new_bound(py, out.iter().map(|&b| b as i64));
-        self.flat = out;
+        *self.flat.borrow_mut() = out;
         list
     }
 
@@ -1434,16 +1453,31 @@ impl Scheduler {
     ///
     /// Returns False when speculation is unavailable (thread spawn failed, or it was
     /// permanently disabled by a worker panic).
-    fn kick(&self, kv: &mut KvManager, generation: u64, running_slots: Vec<u32>) -> PyResult<bool> {
+    ///
+    /// `kv` is SHARED on purpose even though the lazy spawn writes to it. This runs on the
+    /// engine thread while the input thread may be parked inside
+    /// [`KvManager::set_request_meta`], which holds a shared pycell borrow of the same
+    /// object across its `allow_threads`; a `&mut KvManager` here is an exclusive borrow
+    /// that PyO3 refuses in that window with `RuntimeError: Already borrowed` — the rule
+    /// the [`Scheduler::arena`] comment states for `&mut self`. Python treats a kick
+    /// failure as a dead resident table, so the error would cost far more than the kick.
+    /// [`KvManager::driver`] carries its own mutex instead.
+    fn kick(&self, kv: &KvManager, generation: u64, running_slots: Vec<u32>) -> PyResult<bool> {
         let p = self.params()?;
+        // The crate mutex is taken and RELEASED here: `SpecDriver::spawn` hands the worker
+        // that same `Arc<Mutex<Shared>>`, and the driver mutex below is held while the
+        // spawned thread may already be reaching for the crate one. Nesting the two in the
+        // other order on any path would close a cycle.
         if kv.r().spec.disabled {
             return Ok(false);
         }
-        if kv.driver.is_none() {
-            let shared = kv.shared.clone();
-            match SpecDriver::spawn(shared) {
-                Ok(d) => kv.driver = Some(d),
+        let mut slot = kv.driver.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            match SpecDriver::spawn(kv.shared.clone()) {
+                Ok(d) => *slot = Some(d),
                 Err(e) => {
+                    // Dropped before the crate mutex is taken, for the ordering above.
+                    drop(slot);
                     kv.r().spec.disabled = true;
                     return Err(PyRuntimeError::new_err(format!(
                         "could not spawn the vtl-sched-spec thread: {e}"
@@ -1451,7 +1485,7 @@ impl Scheduler {
                 }
             }
         }
-        let driver = kv.driver.as_ref().unwrap();
+        let driver = slot.as_ref().unwrap();
         if driver.is_disabled() {
             return Ok(false);
         }
