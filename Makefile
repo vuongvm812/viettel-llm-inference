@@ -32,7 +32,7 @@ TARGET ?= http://localhost:8000
 PLATFORM ?= linux/amd64
 # SM archs baked into vtl._C. A wrong arch fails at the first kernel launch, not at import.
 # Narrow to '9.0+PTX' for the submission build. See the ARG in Dockerfile.
-CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
+CUDA_ARCHS ?= 9.0+PTX
 # Cap parallel nvcc so the CUDA build does not OOM a small box (see ARG in Dockerfile).
 # Bump on a big-RAM CI host: make build MAX_JOBS=28.
 MAX_JOBS ?= 4
@@ -52,10 +52,11 @@ VLLM_FORK_IMAGE ?= traitimbanggia/slowleveling
 # latest@a44447ac is a byte-identical mirror of the old unseenablefuture/vllm-fork
 # v0.25.0-tree@a41d4237 pin (all 38 layer digests verified equal; only the manifest digest
 # changed, as re-pushing re-serializes it). Account move, not a content change.
-VLLM_FORK_TAG ?= latest@sha256:a44447acf529bb7c5a48ee454bd36bebfb4f727f92e13c80c25ffecb5dec7dc4
+VLLM_FORK_TAG ?= latest@sha256:f92d99748a320fe0268620e77ba4a3718e05c7455b5517674139ecf6e84f4dca
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
+VLLM_IMAGE_FORK ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
 # 1 = the fork's rust-builder stage does a profile-guided-optimization build of vllm-rs
 # (CPU-only training run against the mock engine). 0 = plain optimized (fat-LTO) build.
 VLLM_RS_PGO ?= 1
@@ -102,7 +103,7 @@ AIPERF_ART ?= bench-aiperf
 # docker-compose.yaml is the SUBMISSION artifact and the single source of truth for every
 # serve flag and env var; the three overlays only carry their differences (dev image tag,
 # local build+mount, judge-box resource caps). Order matters -- later -f wins.
-COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
+COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml #-f docker-compose.cpucap.yaml
 DC := docker compose $(COMPOSE_FILES)
 
 # CI bench lifecycle (remote runner). No build step — image is the pinned digest from ci-build,
@@ -437,7 +438,7 @@ WARM_REQS ?= 64
 WARM_TRACE ?= $(WEKA_TRACE)
 warm:
 	$(IN) test -f "$(WARM_TRACE)" || { echo "FAIL: $(WARM_TRACE) missing -- run 'make trace-weka' first"; exit 1; }
-	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)'
+	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE_FORK)'
 	$(IN) $(DC) up -d --wait   # --wait blocks until the healthcheck passes
 	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(WARM_TRACE) --limit 4 --out /dev/null
 	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(WARM_TRACE) \
