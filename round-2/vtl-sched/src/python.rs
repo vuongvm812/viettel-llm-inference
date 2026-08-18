@@ -966,6 +966,20 @@ impl KvManager {
         self.r().manager.cache_fold_skips
     }
 
+    /// B4: count of running entries the schedule loop refused because their
+    /// `num_computed_tokens` had run past `num_tokens_with_spec + num_output_placeholders`
+    /// (`sched.rs`'s `checked_sub`). Should stay 0 forever; a rise is the async counter
+    /// invariant broken somewhere upstream, and `rust_sched.py` reads it on the one branch
+    /// that can observe the consequence -- a step that scheduled nothing while requests are
+    /// still RUNNING -- to name the cause and force a table resync.
+    ///
+    /// `r()`, not `w()`: a monotonic diagnostic counter cannot be wrong through a pending
+    /// speculation (the worker only ever adds to it), and a probe that invalidated would
+    /// make the diagnosis change the thing being diagnosed.
+    fn inconsistent_skips(&self) -> u64 {
+        self.r().core.inconsistent
+    }
+
     fn take_prefix_cache_stats<'py>(
         &self,
         py: Python<'py>,

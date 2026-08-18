@@ -142,6 +142,13 @@ pub fn mamba_block_aligned_split(
 
 pub struct ScheduleCore {
     pub decisions: Decisions,
+    /// Running entries the loop refused because `num_computed_tokens` was past
+    /// `num_tokens_with_spec + num_output_placeholders` -- see the `checked_sub` in
+    /// [`ScheduleCore::run`]. Monotonic for the life of the boot and exposed to Python as
+    /// `KvManager::inconsistent_skips` so a step that scheduled nothing can say WHY: a
+    /// batch that stops making progress with this counter rising is a bookkeeping skew the
+    /// resident table has absorbed, not a scheduler that ran out of budget.
+    pub(crate) inconsistent: u64,
     running: Vec<SchedReq>,
     waiting: Vec<SchedReq>,
     keys: Vec<(u8, usize, usize)>,
@@ -158,6 +165,7 @@ impl ScheduleCore {
     pub fn new() -> Self {
         ScheduleCore {
             decisions: Decisions::default(),
+            inconsistent: 0,
             running: Vec::with_capacity(64),
             waiting: Vec::with_capacity(256),
             keys: Vec::with_capacity(256),
@@ -271,17 +279,47 @@ impl ScheduleCore {
             let request = self.running[req_index];
 
             // Async scheduling: the previous step already reached max_tokens.
+            //
+            // ADDITION FORM, deliberately. Python writes this as `num_computed_tokens + 2 -
+            // num_output_placeholders >= num_prompt_tokens + max_tokens` in signed
+            // arithmetic; in usize the `- num_output_placeholders` is a wrap waiting for a
+            // `P > C + 2` entry, and a wrapped left-hand side is an ENORMOUS number that
+            // makes the skip fire for a request nowhere near its cap (in debug it panics
+            // instead, which kills the resident path for the rest of the boot). Moving the
+            // subtrahend to the other side is the same inequality over the integers for
+            // every state that can legitimately occur -- both sides are only ever compared,
+            // never stored -- and is total over all of usize. The `P > 0` guard stays: it is
+            // what limits this branch to the async path, where a placeholder means a token
+            // the previous step promised.
             if request.num_output_placeholders > 0
-                && request.num_computed_tokens + 2 - request.num_output_placeholders
-                    >= request.num_prompt_tokens + request.max_tokens
+                && request.num_computed_tokens + 2
+                    >= request.num_prompt_tokens
+                        + request.max_tokens
+                        + request.num_output_placeholders
             {
                 req_index += 1;
                 continue;
             }
 
-            let mut num_new_tokens = request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens;
+            // The work derivation, and the one subtraction in this loop that CANNOT be
+            // rearranged away: an entry whose `num_computed_tokens` has run past
+            // `num_tokens_with_spec + num_output_placeholders` is broken bookkeeping (the
+            // `C == T + P - 1` invariant `rust_sched.py::burst_invariant_broken` guards),
+            // and there is no defensible number to schedule for it. Wrapping would hand
+            // `allocate_slots` a count near usize::MAX -- garbage blocks, or an error that
+            // fails the whole step; panicking (which is what plain `-` does in debug) kills
+            // the resident path permanently for one bad entry. Counting it and skipping is
+            // the third answer: this request stalls, every other request in the batch is
+            // scheduled normally, and Python's probe on the counter resyncs the table --
+            // which is the only thing that can actually repair the entry.
+            let Some(mut num_new_tokens) = (request.num_tokens_with_spec
+                + request.num_output_placeholders)
+                .checked_sub(request.num_computed_tokens)
+            else {
+                self.inconsistent = self.inconsistent.saturating_add(1);
+                req_index += 1;
+                continue;
+            };
             if params.long_prefill_token_threshold > 0
                 && params.long_prefill_token_threshold < num_new_tokens
             {
@@ -950,6 +988,69 @@ mod tests {
         // 200 - 200 % 16 = 192 is the last cacheable position, so the chunk is 192 - 32.
         // With the stale hint it would have been floored to 48.
         assert_eq!(core.decisions.scheduled_admitted[1].1, 160);
+    }
+
+    /// B4a: an entry with more placeholders than `C + 2` is exactly the state the old
+    /// subtraction form wrapped on (debug: panicked on). The addition form has to reach a
+    /// verdict without either, and the rest of the batch has to be scheduled around it.
+    #[test]
+    fn a_placeholder_count_past_the_computed_tokens_does_not_wrap_the_max_tokens_guard() {
+        let mut kv = Manager::new(cfg(512)).unwrap();
+        let mut core = ScheduleCore::new();
+        let p = params();
+        let mut running = decode_batch(&mut kv, 2);
+        // P = 70 with C = 64: `C + 2 - P` is -4 over the integers, i.e. a wrap in usize.
+        // Over the integers the guard is false (66 < 64 + 128 + 70 either way), so the
+        // request stays schedulable -- and `T + P - C` is 65 + 70 - 64 = 71, a real count.
+        running[0].num_output_placeholders = 70;
+        core.schedule(&mut kv, &running, &[], &p).unwrap();
+        assert_eq!(core.inconsistent, 0, "a large P is not a broken entry");
+        assert_eq!(core.decisions.scheduled_running.len(), 2);
+        assert_eq!(core.decisions.scheduled_running[0].1, 71);
+        assert_eq!(core.decisions.scheduled_running[1].1, 1, "the healthy one is untouched");
+    }
+
+    /// B4b: `C` past `T + P` is the skew that used to wrap the work derivation into a
+    /// near-`usize::MAX` count (or panic in debug). It must be counted and skipped, with the
+    /// rest of the batch scheduled normally.
+    #[test]
+    fn computed_tokens_past_num_tokens_plus_placeholders_is_counted_and_skipped() {
+        let mut kv = Manager::new(cfg(512)).unwrap();
+        let mut core = ScheduleCore::new();
+        let p = params();
+        let mut running = decode_batch(&mut kv, 2);
+        // T = 65, P = 0, C = 100: the entry promises 65 tokens and claims 100 computed.
+        running[0].num_computed_tokens = 100;
+        core.schedule(&mut kv, &running, &[], &p).unwrap();
+        assert_eq!(core.inconsistent, 1, "the broken entry is counted, once");
+        assert_eq!(
+            core.decisions.scheduled_running.len(),
+            1,
+            "...and skipped, while the healthy request in the same batch is scheduled"
+        );
+        assert_eq!(core.decisions.scheduled_running[0].0, running[1].slot);
+        // Monotonic across steps -- the Python probe watches it for an INCREASE.
+        core.schedule(&mut kv, &running, &[], &p).unwrap();
+        assert_eq!(core.inconsistent, 2);
+    }
+
+    /// The addition form is the same predicate as the subtraction form on every state that
+    /// can legitimately occur, which is the whole justification for rewriting it. Spot-check
+    /// the two against each other over a grid of healthy values (`P <= C + 2`, so the old
+    /// form is even computable).
+    #[test]
+    fn the_max_tokens_guard_matches_the_subtraction_form_on_healthy_values() {
+        for c in 0..40usize {
+            for p in 0..=(c + 2) {
+                for prompt in 0..8usize {
+                    for max_tokens in 0..8usize {
+                        let old = c + 2 - p >= prompt + max_tokens;
+                        let new = c + 2 >= prompt + max_tokens + p;
+                        assert_eq!(old, new, "C={c} P={p} prompt={prompt} max={max_tokens}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

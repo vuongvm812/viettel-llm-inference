@@ -394,6 +394,23 @@ def ring_reuse(scheduler, slot, sched_running) -> object | None:
         if not request.is_prefill_chunk:
             scheduler._inflight_prefills.discard(request)
             structured |= request.use_structured_output
+            # ...and `AsyncScheduler._update_after_schedule`'s placeholder bump, which this
+            # inlining has to carry too. WITHOUT IT THE REUSE IS THE HANG: C advances by 1
+            # every step while P stands still, so `T + P - C` walks down to 0 and wraps, and
+            # `sched.rs`'s running loop skips the request forever (`continue` without
+            # leaving `running`) -- the engine schedules empty steps and generation wedges
+            # with requests pinned RUNNING. Inert today only because `ring_blocked` refuses
+            # the `uni` executor and compose runs it.
+            #
+            # ORDERING is load-bearing and matches `sched::advance` / `burst_commit` exactly:
+            # `is_prefill_chunk` is computed from the PRE-bump placeholder count above, and
+            # the bump happens only for a request that is no longer a prefill chunk -- a
+            # chunk produces no token this step and must claim no placeholder for one. The
+            # amount is 1, not `num_sampled_tokens_per_step`, for the same reason C advances
+            # by exactly 1 here: `ring_reuse` is only ever consulted for a batch of 1-token
+            # decodes, and `schedule_supported` refuses spec decode outright, so the two are
+            # the same number.
+            request.num_output_placeholders += 1
     crd.__dict__.pop("_req_id_to_num_output_tokens", None)
     so.has_structured_output_requests = structured
     d = so.__dict__
@@ -1220,6 +1237,18 @@ def burst_sampler_blocked(request, computed_before: int, n: int,
     Split out because N=1 needs it without the align gate: one token crosses no block
     boundary by construction, so the whole "the block tables the graph baked stay valid"
     argument is vacuous for it.
+
+    THE max_model_len ARM IS ``max_model_len - 1``, NOT ``max_model_len``. Every scheduled
+    count in a burst step is 1 (``num_sampled_tokens_per_step == 1``; the crate's
+    ``burst_eligible`` and ``burst_blocked_batch`` both require it), so stock's own running
+    loop -- which clamps the step to ``max_model_len - num_computed_tokens -
+    num_sampled_tokens_per_step`` -- never advances ``num_computed_tokens`` past
+    ``max_model_len - 1``. A burst that commits ``C == max_model_len`` leaves that clamp at
+    0 for every later step, so the request is skipped while it is still RUNNING and nothing
+    ever finishes it: no token, no ``_update_request_with_output``, no length stop. Refusing
+    one step earlier costs the burst its last iteration and lands the request on the
+    ``num_prompt_tokens + max_tokens`` arm instead, where the stock decode path finishes it
+    at update time exactly as it always has.
     """
     sp = request.sampling_params
     if sp is None or request.pooling_params is not None:
@@ -1229,7 +1258,7 @@ def burst_sampler_blocked(request, computed_before: int, n: int,
     if request.num_output_placeholders < 0:
         return "negative placeholder count"
     max_tokens = getattr(request, "max_tokens", None) or 0
-    limit = min(max_model_len, request.num_prompt_tokens + max_tokens)
+    limit = min(max_model_len - 1, request.num_prompt_tokens + max_tokens)
     if computed_before + n > limit:
         return "burst would run past max_tokens / max_model_len"
     if sp.temperature != 0.0:
@@ -1294,11 +1323,18 @@ def _burst_gate(mirror, slot: int, request, computed_before: int, n: int,
     """``burst_request_blocked``/``burst_sampler_blocked``, with the immutable clauses
     interned per slot in ``mirror._burst_lim`` (RustMirror-owned, popped on ``drop()``
     so a recycled slot re-evaluates). First sight of a slot pays the full
-    ``_burst_immutable_blocked`` check once and caches ``lim = min(max_model_len,
+    ``_burst_immutable_blocked`` check once and caches ``lim = min(max_model_len - 1,
     num_prompt_tokens + max_tokens)``, or ``-1`` if permanently ineligible. Every later
     step only re-checks what a step can actually change: the align gate (when
     ``block_size`` is given), the placeholder count, and the length-cap arithmetic
     against the cached ``lim``.
+
+    ``max_model_len - 1``, not ``max_model_len``: committing ``C == max_model_len`` wedges
+    the request permanently, because the crate's next-step clamp is ``max_model_len -
+    num_computed_tokens - num_sampled_tokens_per_step`` and that is 0 from then on -- the
+    request is skipped while still RUNNING and never reaches the update-side length stop.
+    See ``burst_sampler_blocked``'s docstring for the full argument; the two limits are the
+    same expression and must stay that way.
 
     ``block_size is None`` skips the align gate -- the N=1 in-graph path doesn't need
     it (one token crosses no block boundary; see ``burst_sampler_blocked``'s
@@ -1311,7 +1347,9 @@ def _burst_gate(mirror, slot: int, request, computed_before: int, n: int,
             mirror._burst_lim[slot] = -1
             return reason
         max_tokens = getattr(request, "max_tokens", None) or 0
-        lim = mirror._burst_lim[slot] = min(max_model_len, request.num_prompt_tokens + max_tokens)
+        lim = mirror._burst_lim[slot] = min(
+            max_model_len - 1, request.num_prompt_tokens + max_tokens
+        )
     elif lim < 0:
         return "ineligible request (interned)"
     if block_size is not None and computed_before % block_size + n > block_size:
@@ -1331,8 +1369,10 @@ def burst_steps(computed_before: int, n: int, block_size: int, lim: int,
     exists does not change when they are back-to-back: the mamba ``state_indices_tensor_d``
     and the block tables are baked into the captured graphs and re-derived by nothing, so
     the WHOLE span has to stay inside the KV block the first launch started in. ``lim`` is
-    the ``min(max_model_len, num_prompt_tokens + max_tokens)`` cap ``_burst_gate`` interned
-    for the slot, so a multi-burst step cannot run past ``max_tokens`` either.
+    the ``min(max_model_len - 1, num_prompt_tokens + max_tokens)`` cap ``_burst_gate``
+    interned for the slot, so a multi-burst step cannot run past ``max_tokens`` -- nor onto
+    the ``C == max_model_len`` position that would make the request unschedulable while
+    still RUNNING (see ``burst_sampler_blocked``).
 
     Never returns 0: this is only ever asked about a request whose SINGLE-burst gate
     already passed, and the two answers agree by construction -- ``(block_size -
@@ -2878,7 +2918,29 @@ def _install_update_from_output(scheduler_cls, m: dict):
             # commits here, so a launch while an earlier step is still unapplied would order
             # this step's tokens ahead of that one's (rust_runner's module docstring).
             state = runner_mod.STATE
-            state.step = None
+            # THE SWEEP, not a clear. The engine thread's order is `schedule(k) -> dispatch
+            # execute(k) -> update(k-1)`, and the worker's `sample(k)` -- the one caller
+            # entitled to `schedule(k)`'s stash -- runs concurrently with that last step, so
+            # the stash sitting in `state.step` when this runs is very often step k's, still
+            # waiting to be launched. The unconditional `state.step = None` that used to
+            # live here destroyed it in exactly that race, step after step, which is why the
+            # runner almost never engaged despite arming cleanly.
+            #
+            # `clear_step_upto` keeps the one case that is genuinely garbage: a stash whose
+            # seq is at or before the step being applied. That step's `sample_tokens` has
+            # provably returned (its output is the `model_runner_output` in hand), so
+            # nothing will ever claim the stash. Anything newer belongs to a step that has
+            # not been sampled yet and is left alone.
+            #
+            # Firing at all means a sample-side exit leaked one, which should be unreachable
+            # now that `sample_tokens` pops before its first return -- hence the error, once.
+            if state.clear_step_upto(getattr(scheduler_output, "vtl_runner_seq", 0)):
+                if not getattr(self, "_vtl_stash_leak_logged", False):
+                    self._vtl_stash_leak_logged = True
+                    log.error(
+                        "rust_sched: step %d's runner stash was never consumed; dropped",
+                        getattr(scheduler_output, "vtl_runner_seq", 0),
+                    )
             state.inflight = max(0, state.inflight - 1)
             done = state.done
             if state.update and state.pending:
@@ -3353,8 +3415,8 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                         # The stash promises that this scheduled step will be launched,
                         # packed and applied by `r9_apply` against a burst budget that no
                         # longer exists. It is popped by seq: `runner_seq` names THIS
-                        # SchedulerOutput, and a bare `take_step()` would just as happily
-                        # destroy the launch a later schedule stashed.
+                        # SchedulerOutput, and a blind pop would just as happily destroy
+                        # the launch a later schedule stashed.
                         if granted and runner_mod is not None:
                             runner_mod.STATE.take_step_for(getattr(so, "vtl_runner_seq", 0))
                         # A `table_burst` that half-applied across the batch before the
@@ -3910,6 +3972,41 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             ring_i ^= 1
         if NSTEP:
             commit_burst(self, kv, scheduler_output, by_slot, sched_slots)
+        if not total and self.running:
+            # THE WEDGE PROBE, and the only branch it can afford to sit on. A step that
+            # schedules nothing while requests are still RUNNING is either a legitimate
+            # squeeze (no KV, no budget -- rare, and it clears) or the forever-skip: an
+            # entry whose `num_computed_tokens` ran past `num_tokens_with_spec +
+            # num_output_placeholders`, which `sched.rs`'s `checked_sub` now counts instead
+            # of wrapping on. The two look identical from here -- 0 tok/s, no exception --
+            # and the counter is what tells them apart. Off the hot path by construction:
+            # every step that scheduled anything at all skips it.
+            try:
+                rust = kv._rust
+                if hasattr(rust, "inconsistent_skips"):
+                    seen = getattr(self, "_vtl_inconsistent_seen", 0)
+                    now_skips = rust.inconsistent_skips()
+                    if now_skips > seen:
+                        self._vtl_inconsistent_seen = now_skips
+                        if not getattr(self, "_vtl_inconsistent_logged", False):
+                            self._vtl_inconsistent_logged = True
+                            log.error(
+                                "rust_sched: empty step with %d running request(s) -- the "
+                                "crate skipped %d entry/entries whose num_computed_tokens "
+                                "is past num_tokens_with_spec + num_output_placeholders. "
+                                "The resident table is resynced; if this repeats, a burst "
+                                "commit or a placeholder bump is being lost upstream.",
+                                len(self.running), now_skips - seen,
+                            )
+                        if tbl is not None and not tbl.off:
+                            # Same argument as `burst_invariant_alarm`: Python's counters and
+                            # the resident entry are the same numbers marshalled twice, so a
+                            # skew the crate can see is one the table has already absorbed,
+                            # and a full marshalled schedule is its only way back.
+                            tbl.resync("scheduler skipped an inconsistent entry")
+            except BaseException as exc:
+                # A diagnostic must never be the reason a step fails.
+                reraise_fatal(exc)
         if TIMING:
             t_exit = ns()
             timers.add("apply", t_exit - t_rust)
@@ -4527,10 +4624,26 @@ def _self_check() -> None:
         == list(range(13)), "the align gate still applies to the BURST"
     assert burst_sampler_blocked(REQ(sampling_params=SP(temperature=0.7)), 0, 1, 32768)
     assert burst_sampler_blocked(REQ(sampling_params=SP(min_tokens=8)), 0, 1, 32768)
-    # limit = min(32768, 100 + 2) = 102, so offset 101 still fits and 102 does not.
+    # limit = min(32767, 100 + 2) = 102, so offset 101 still fits and 102 does not. The
+    # prompt+max_tokens arm binds here, which is why these are unchanged by the -1 below.
     assert burst_sampler_blocked(REQ(max_tokens=2), 101, 1, 32768) is None
     assert burst_sampler_blocked(REQ(max_tokens=2), 102, 1, 32768), "max_tokens caps N=1 too"
     assert burst_sampler_blocked(REQ(max_tokens=1 << 20), 32768, 1, 32768) is not None
+
+    # THE max_model_len BOUNDARY, with max_tokens far away so only that arm can bind. A
+    # burst may take C up to `max_model_len - 1` and no further: at C == max_model_len the
+    # crate's `max_model_len - C - num_sampled_tokens_per_step` clamp is 0 for every later
+    # step, so the request is skipped while still RUNNING and never reaches the update-side
+    # length stop that would finish it.
+    huge = dict(max_tokens=1 << 20, num_prompt_tokens=1)
+    for mml in (256, 4096, 32768):
+        assert burst_sampler_blocked(REQ(**huge), mml - 1, 1, mml) is not None, mml
+        assert burst_sampler_blocked(REQ(**huge), mml - 2, 1, mml) is None, mml
+        # ...and the same boundary however the burst is split across `n`.
+        assert burst_sampler_blocked(REQ(**huge), mml - 4, 4, mml) is not None, mml
+        assert burst_sampler_blocked(REQ(**huge), mml - 5, 4, mml) is None, mml
+    assert burst_request_blocked(REQ(**huge), 4096 - 5, 4, 16, 4096) is None
+    assert burst_request_blocked(REQ(**huge), 4096 - 4, 4, 16, 4096) is not None
 
     # The Rust runner's multi-burst headroom. At block_size 16 / N 4 a step can only take
     # 4 launches from a block-aligned offset, 3 from offset 4, and so on -- and NEVER 0,
@@ -4674,7 +4787,7 @@ def _self_check() -> None:
             pass
 
     mirror = RustMirror(FakeRustForget())
-    req = REQ(max_tokens=2)  # lim = min(32768, 100 + 2) = 102
+    req = REQ(max_tokens=2)  # lim = min(32767, 100 + 2) = 102
     # Miss: full evaluation, lim cached.
     assert _burst_gate(mirror, 5, req, 0, 4, 32768, 16) is None
     assert mirror._burst_lim[5] == 102
@@ -4699,6 +4812,18 @@ def _self_check() -> None:
     assert mirror._burst_lim[9] == -1
     bad.sampling_params = SP()  # now "eligible" -- the intern must still refuse
     assert _burst_gate(mirror, 9, bad, 0, 4, 32768, 16) == "ineligible request (interned)"
+
+    # The interned lim carries the SAME max_model_len - 1 boundary the pure gate does: at
+    # C == max_model_len the crate's `max_model_len - C - num_sampled_tokens_per_step`
+    # clamp is 0 forever and the request wedges RUNNING, so the last legal landing spot is
+    # max_model_len - 1. `max_tokens` is put out of reach so only that arm can bind.
+    far = REQ(max_tokens=1 << 20, num_prompt_tokens=1)
+    assert _burst_gate(mirror, 11, far, 4096 - 5, 4, 4096, 16) is None
+    assert mirror._burst_lim[11] == 4095, mirror._burst_lim[11]
+    assert _burst_gate(mirror, 11, far, 4096 - 4, 4, 4096, 16) is not None, \
+        "landing on C == max_model_len is the wedge, not the last valid step"
+    assert _burst_gate(mirror, 11, far, 4096 - 2, 1, 4096) is None, "N=1 may reach 4095"
+    assert _burst_gate(mirror, 11, far, 4096 - 1, 1, 4096) is not None, "...and no further"
 
     # drop() clears the intern so a recycled slot re-evaluates.
     mirror._slots["r1"] = 9
@@ -4997,9 +5122,29 @@ def _self_check() -> None:
         "the payload carries the PRE-advance values, like _make_cached_request_data"
     )
     assert [r.num_computed_tokens for r in reqs] == [11, 21]
+    # ...and `AsyncScheduler`'s placeholder bump rode along with the computed-token advance.
+    # Dropping it is the forever-skip: `T + P - C` shrinks by one every step until the
+    # crate's usize subtraction wraps and the request is never scheduled again.
+    assert [r.num_output_placeholders for r in reqs] == [1, 1]
+    assert [r.num_computed_tokens - r.num_output_placeholders for r in reqs] \
+        == [r.num_tokens - 1 for r in reqs], "C == T + P - 1, the one shape a burst extends"
     assert "_req_id_to_num_output_tokens" not in so.scheduled_cached_reqs.__dict__
     assert so.has_structured_output_requests is False, "recomputed, never |="
     assert not hasattr(so, "vtl_burst_n") and not hasattr(so, "vtl_sample_in_graph")
+
+    # The bump is CONDITIONAL, exactly as `_update_after_schedule` is: a request still short
+    # of `num_tokens + num_output_placeholders` after the advance produces no token this
+    # step and must claim no placeholder for one. (Unreachable through the ring's own
+    # predicate, which only ever sees 1-token decodes -- pinned because the ordering here is
+    # the same ordering `sched::advance` and `burst_commit` depend on.)
+    chunk = RingReq("c", 5, 100)
+    chunk_host = RingHost()
+    chunk_host.requests = {"c": chunk}
+    chunk_host._inflight_prefills = {chunk}
+    assert ring_reuse(chunk_host, (RingSO(1), (3,), [chunk]), [(3, 1)]) is not None
+    assert (chunk.num_computed_tokens, chunk.num_output_placeholders) == (6, 0)
+    assert chunk.is_prefill_chunk is True
+    assert chunk in chunk_host._inflight_prefills, "a chunk is not discarded either"
     rslot[0].finished_req_ids.add("dirty")
     assert ring_reuse(host, rslot, [(5, 1), (6, 1)]) is None, (
         "a dirtied slot set must refuse rather than serve a stale finished list"
