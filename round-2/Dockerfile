@@ -183,13 +183,20 @@ RUN if pip install --no-cache-dir iceoryx2==0.9.3 && python3 -c "import iceoryx2
 # hiccup costs an optimization, not the image (a failed build scores ZERO). The base image
 # often already ships cuda-python as a vLLM dependency, in which case this is a no-op.
 # Grep the build log for "cuda-python:" to see which happened.
+# Pinned to the IMAGE's CUDA major (torch reports it), not left floating: on a driver-13.0
+# host an unpinned install resolves to cuda-python 13.x, whose libnvrtc.so.13 is a different
+# toolkit than the image's 12.x -- every warmed cubin misses (toolkit is in the cache key)
+# and the recompiles see 13.x NVRTC header behavior instead of what was A/B'd.
 RUN if python3 -c "from cuda.bindings import nvrtc, driver" 2>/dev/null; then \
   echo "cuda-python: OK (already in the base image)"; \
-  elif pip install --no-cache-dir "cuda-python>=12.3" \
+  else \
+  CU_MAJOR="$(python3 -c 'import torch; print(torch.version.cuda.split(".")[0])' 2>/dev/null || echo 12)"; \
+  if pip install --no-cache-dir "cuda-python==${CU_MAJOR}.*" \
   && python3 -c "from cuda.bindings import nvrtc, driver"; then \
-  echo "cuda-python: OK (installed)"; \
+  echo "cuda-python: OK (installed, pinned to CUDA ${CU_MAJOR}.x)"; \
   else \
   echo "cuda-python: MISSING -- VTL_NVRTC will be inert, kernels stay AOT (still correct)"; \
+  fi; \
   fi
 
 COPY pyproject.toml setup.py README.md /src/
