@@ -9,6 +9,8 @@
 //!   * `:466` `free`                         -> [`Manager::free`]
 //!   * `:476` `remove_skipped_blocks`        -> [`Manager::remove_skipped_blocks`]
 //!   * `:495` `pop_blocks_for_free`          -> [`Manager::pop_blocks_for_free`]
+//!   * scheduler.py:2157 `block_pool.free_blocks(reversed(blocks))`
+//!                                           -> [`Manager::free_block_ids`]
 //!   * `:508` `evict_blocks`                 -> [`Manager::evict_blocks`]
 //!   * `:516` `reset_prefix_cache`           -> [`Manager::reset_prefix_cache`]
 //!   * `:532` `get_num_common_prefix_blocks` -> [`Manager::get_num_common_prefix_blocks`]
@@ -974,6 +976,36 @@ impl Manager {
         self.coord.pop_blocks_for_free(req, out);
     }
 
+    /// U1a: the DEFERRED-FREE return path — `Scheduler._drain_deferred_frees`
+    /// (scheduler.py:2145), whose pool call is
+    /// `self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))` (`:2157`).
+    ///
+    /// `ids` is exactly what [`Manager::pop_blocks_for_free`] handed the scheduler: every
+    /// group's block list concatenated in group order
+    /// (`KVCacheCoordinator.pop_blocks_for_free`, kv_cache_coordinator.py:309-312), flat.
+    ///
+    /// THE REVERSE IS OVER THE WHOLE FLAT LIST, and that is NOT what [`TypeManager::free`]
+    /// does. That one reverses each group's own slice before freeing it (`single_type.rs`,
+    /// `:402`), because it frees one group at a time; stock's deferred path collects every
+    /// group first and then reverses ONCE, so on a two-group hybrid the last group's blocks
+    /// are evicted before the first group's and each group's tail before its head. The
+    /// difference is only ever an eviction-ORDER heuristic — the free queue's order decides
+    /// which cached block is reused first, never which blocks are free — so both are
+    /// correct, and this one is stock's. Reversing per group here would be a silent
+    /// divergence from the scheduler this port replaces, which is the thing worth avoiding.
+    ///
+    /// Null blocks and ref counts are [`BlockPool::free_blocks`]' business and are not
+    /// re-implemented: it skips the null placeholder (mamba-align rows pad with it),
+    /// decrements `ref_cnt` and only queues a block that reached zero, splitting hashed
+    /// from unhashed so the unhashed ones are evicted first.
+    pub fn free_block_ids(&mut self, ids: &[u32]) {
+        let mut ordered = self.coord.pool.take_scratch();
+        ordered.clear();
+        ordered.extend(ids.iter().rev().copied());
+        self.coord.pool.free_blocks(&ordered);
+        self.coord.pool.put_scratch(ordered);
+    }
+
     pub fn remove_skipped_blocks(&mut self, req: u32, total_computed_tokens: usize) {
         self.coord.remove_skipped_blocks(req, total_computed_tokens);
     }
@@ -1617,6 +1649,66 @@ mod tests {
         assert!(before < 63);
         m.free(a);
         assert_eq!(m.coord.pool.get_num_free_blocks(), 63);
+    }
+
+    /// U1a: the deferred path must land the pool in the SAME STATE as the direct one.
+    ///
+    /// `Scheduler._free_request_blocks` picks between the two purely on whether the
+    /// request's last scheduled step has been processed, so both have to be
+    /// interchangeable: `free()` (per-group reverse, one group at a time) versus
+    /// `pop_blocks_for_free()` + `free_block_ids()` (one reverse over the flat list).
+    ///
+    /// SETS, not sequences: the two differ in the free queue's ORDER, which is the
+    /// eviction heuristic and nothing more. What must be identical is which blocks are
+    /// free and that no ref count survived — a leaked count is the permanent leak this
+    /// whole stage exists to remove.
+    #[test]
+    fn free_then_popfree_equivalent() {
+        fn build() -> (Manager, u32, u32) {
+            let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+            let a = m.intern("a");
+            m.push_hashes(a, &packed(&chain(2, 5)), 32);
+            m.get_computed_blocks(a, 32, 0, false);
+            m.allocate_slots(a, 32, 0, true, 0, 0, 32, STATUS_WAITING, false, 0, false, 0)
+                .unwrap();
+            // A second request with its OWN prefix, so the two hold disjoint blocks and
+            // the flat list `pop_blocks_for_free` returns spans both groups.
+            m.new_step_starts();
+            let b = m.intern("b");
+            m.push_hashes(b, &packed(&chain(3, 9)), 48);
+            m.get_computed_blocks(b, 48, 0, false);
+            m.allocate_slots(b, 48, 0, true, 0, 0, 48, STATUS_WAITING, false, 0, false, 0)
+                .unwrap();
+            (m, a, b)
+        }
+
+        fn state(m: &Manager) -> (std::collections::BTreeSet<u32>, usize) {
+            let free: std::collections::BTreeSet<u32> =
+                m.coord.pool.arena.free_order().into_iter().collect();
+            (free, m.coord.pool.get_num_free_blocks())
+        }
+
+        // Run 1: both requests through `free()`.
+        let (mut direct, a1, b1) = build();
+        direct.free(a1);
+        direct.free(b1);
+
+        // Run 2: `a` through `free()`, `b` through the deferred path.
+        let (mut deferred, a2, b2) = build();
+        deferred.free(a2);
+        let mut ids = Vec::new();
+        deferred.pop_blocks_for_free(b2, &mut ids);
+        assert!(!ids.is_empty(), "the deferred path must have blocks to return");
+        deferred.free_block_ids(&ids);
+
+        assert_eq!(state(&direct), state(&deferred), "same free set, same count");
+        for id in 0..64u32 {
+            assert_eq!(
+                deferred.coord.pool.arena.get(id).ref_cnt,
+                0,
+                "block {id} kept a reference after the deferred free",
+            );
+        }
     }
 
     #[test]

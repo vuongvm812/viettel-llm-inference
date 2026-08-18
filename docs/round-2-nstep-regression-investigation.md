@@ -267,3 +267,80 @@ pool is live and standing down would split-brain it.
 `VTL_RUST_SCHED_FULL`, the resident table, the N-step burst and the Rust runner are all
 inactive and none of their measurements apply. Either drop the `--kv-offloading-*` flags
 or set `VTL_RUST_SCHED=0` and own the choice.
+
+---
+
+## Connector support (stages Q/R/A/S/U1, 2026-08-18)
+
+The "connector XOR Rust stack" decision above is **resolved**: for one configuration the
+answer is now *both*. `OffloadingConnector` on the `native` backend — `kv_role=kv_both`,
+`CPUOffloadingSpec`, no offloaded `block_size`, `kv_load_failure_policy=recompute` — is
+ported, and authority mode stays engaged for it. Every other connector (and every other
+configuration of this one) still stands down to the stock scheduler, loudly.
+
+### What now works
+
+* **Q/R/A** — the crate carries external allocation (`Manager::allocate_external`,
+  `remaining_blocks`, `block_meta`) and a `KVCacheBlock`-shaped block-record view over
+  Rust-owned ids (`RustBlocks` + `_BlockRecordView`), which is what
+  `update_state_after_alloc` reads.
+* **S** — `schedule()` drives the connector protocol itself: `schedule_phase1` (running
+  arm + the cache-hit probe for every waiting candidate) → `get_num_new_matched_tokens`
+  per candidate in Python → `schedule_phase2` (external allocation, async loads parked in
+  `skipped_waiting` as `WAITING_FOR_REMOTE_KVS`) → `build_connector_meta`, unconditional
+  and in stock's place.
+* **U1a** — the deferred-free queue. `kv_role=kv_both` + async scheduling makes stock set
+  `defer_block_free=True`, so a request finishing with a step still in flight is freed via
+  `pop_blocks_for_free` and drained later. Both halves are ported:
+  `Manager::free_block_ids` (one reverse over the flat cross-group list, as
+  `scheduler.py:2157` does — *not* `TypeManager::free`'s per-group reverse) and a
+  `_drain_deferred_frees` / `_request_remaining_blocks` pair installed on the scheduler
+  class **only when the connector is live**. The manager's `pop_blocks_for_free` also drops
+  the `RustMirror` slot, which the deferred path would otherwise leak for the boot —
+  nothing else on that path calls `kv.free()`.
+* **U1a guard** — a non-empty `kv_connector_output.invalid_block_ids` raises immediately.
+  `OffloadingConnector` never produces one (it does not override
+  `get_block_ids_with_load_errors`; the base returns an empty set), and stock's own repair
+  path is single-group-only (`(req_block_ids,) = get_block_ids(req_id)`, the
+  `TODO (davidb): add support for hybrid memory allocator`), so refusing is inherited stock
+  behaviour on this hybrid model, not a regression.
+
+### The compose line this requires
+
+```yaml
+- '--kv-transfer-config={"kv_load_failure_policy": "recompute"}'
+```
+
+The default is `fail` (`config/kv_transfer.py:69`), which the allow-list refuses. Nothing
+else goes in that JSON: `VllmConfig._post_init_kv_transfer_config` synthesizes
+`kv_connector=OffloadingConnector` and `kv_role=kv_both` on top of it. Without the line the
+boot stands authority mode down and serves stock + offloading.
+
+### What stays excluded
+
+* **tokstore (Port-2)** — its facade freezes `request.block_hashes`, which the connector
+  walks on every `build_connector_meta`. Off for the whole boot under a live connector;
+  a *declared scope exclusion*, so it never raises, `VTL_RUST_SCHED_REQUIRE` included, and
+  it names itself as `tokstore=OFF(connector (block_hashes must stay live))` in RUNGS.
+* **r8 / r9** — `step_packable` already refuses a step with a connector or
+  `defer_block_free`, so the packed output record and the collapsed residue loop are inert
+  here. Documented trade; re-porting them under `defer_block_free` is an optional
+  follow-up.
+* **lean / arena / SO-ring** — refused on a connector-live boot (the connector rebuilds its
+  metadata from every `SchedulerOutput`, and the arena would have to split its persistent
+  buffers across the phase seam).
+* **every other connector** — LMCache, NIXL, SimpleCPUOffload, `kv_producer`/`kv_consumer`,
+  an offloaded `block_size`, an EC transfer config: authority mode stands down.
+
+### On-box validation arms
+
+| Arm | One-liner |
+| --- | --- |
+| A | Shipped compose as-is: expect `RUNGS authority=on full=on ... connector=OffloadingConnector/native tokstore=OFF(connector ...)` in the boot log, then a clean bench run. |
+| B | Same, `-e VTL_RUST_SCHED_REQUIRE=1`: any silent demotion becomes a boot failure — this is the arm that proves the numbers are the port's. |
+| C | `-e VTL_NSTEP=1` (default) vs `-e VTL_NSTEP=0`: the burst must still commit with the connector live (`rust_sched: nstep engaged`). |
+| D | `--disable-log-stats` removed for one run: read the connector's external hit rate off the prefix-cache stats and confirm the CPU cache is actually serving. |
+| E | Connector-off regression: delete the three `--kv-*offloading/transfer*` lines, re-run the same trace, and compare — the port must not have cost the connector-less path anything. |
+| F | SIMPLE offload stand-down: `-e VLLM_USE_SIMPLE_KV_OFFLOAD=1` must log the stand-down and serve stock. |
+| G | NIXL stand-down: `--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_both"}` must stand down, not hang or raise. |
+| H | Abort/preempt soak: cancel requests mid-prefill and mid-decode under load, and force preemption (small `--max-num-seqs`) — this is the arm that exercises `pop_blocks_for_free` + the deferred drain, so watch `usage`/free-block count for a leak over ~10 min. |

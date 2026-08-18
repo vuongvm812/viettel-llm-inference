@@ -73,21 +73,48 @@ services:
       # is layered on via VTL_W4A8_FROM_FP8 / VTL_ENABLE_MOE_DECODE_GEMV below and degrades
       # to the stock fp8 path per-layer; bench/eval_quality.py is the accuracy gate.
       - --kv-cache-dtype=fp8_e4m3
-      # KV offloading: judge-specified 2026-08-17 (commit 3823158).
-      # THESE TWO FLAGS CONFIGURE A vLLM V1 KV CONNECTOR (boot logs
-      # "Initializing KVConnectorBase_V1" + an OffloadingSpec), and a connector is mutually
-      # exclusive with the Rust KV/scheduler stack in this build: schedule_supported()
-      # refuses connectors outright, and authority mode STANDS DOWN when it detects one
-      # (rust_sched.py::kv_connector_configured / authority_stand_down). So while these
-      # flags are present the box serves the STOCK scheduler + offloading, and
-      # VTL_RUST_SCHED / VTL_RUST_SCHED_FULL, the resident table, the N-step burst and the
-      # Rust runner below are ALL INACTIVE regardless of what they are set to -- the boot
-      # logs one loud stand-down warning and keeps serving.
-      # Decide deliberately: keep the offloading connector, or delete these two lines and
-      # keep the Rust stack. Not both. (The flags are left AS SPECIFIED here; changing them
-      # is the team's call, not this comment's.)
+      # KV offloading: judge-specified 2026-08-17 (commit 3823158). The flags are left AS
+      # SPECIFIED; the third line below is this stack's requirement, not a change to them.
+      #
+      # THESE FLAGS CONFIGURE A vLLM V1 KV CONNECTOR (boot logs "Initializing
+      # KVConnectorBase_V1" + an OffloadingSpec) -- and that connector is now PORTED.
+      # OffloadingConnector on the "native" backend, at kv_role=kv_both, CPUOffloadingSpec,
+      # no offloaded block_size, recompute-on-load-failure is the ONE configuration
+      # rust_sched.py::offloading_connector_supported allow-lists, and for it authority mode
+      # no longer stands down: schedule() drives the connector protocol itself (probe ->
+      # get_num_new_matched_tokens -> allocate/park -> build_connector_meta), and the
+      # deferred-free queue that kv_role=kv_both + async scheduling (on by default here) turns
+      # on is routed through the Rust pool.
+      # With these three lines the FULL Rust stack serves alongside the offloading
+      # connector; the first schedule() proves it in one line:
+      #   rust_sched: RUNGS authority=on full=on ... connector=OffloadingConnector/native
+      # ANY OTHER connector -- LMCache, NIXL, SimpleCPUOffload, a different role, an
+      # offloaded block_size, or kv_load_failure_policy=fail -- still stands authority mode
+      # down to the stock scheduler, with one loud warning. That is a supported outcome, not
+      # a crash, but none of the Rust measurements apply to it.
+      #
+      # TWO RUNGS ARE OFF while a connector is live, deliberately and named in RUNGS:
+      #   * tokstore (Port-2) -- its facade freezes request.block_hashes, which the connector
+      #     reads on every build_connector_meta. RUNGS shows tokstore=OFF(connector ...).
+      #     Declared scope exclusion: it never raises, VTL_RUST_SCHED_REQUIRE included.
+      #   * r8/r9 -- step_packable refuses a step with a connector or defer_block_free, so
+      #     the packed output record and the collapsed residue loop are inert on this boot.
+      #     A documented trade (the connector's own bookkeeping is what they cannot express);
+      #     re-porting them under defer_block_free is an optional follow-up.
       - --kv-offloading-size=64
       - --kv-offloading-backend=native
+      # REQUIRED BY THE PORT, and the reason it is a separate flag: KVTransferConfig defaults
+      # kv_load_failure_policy to 'fail' (config/kv_transfer.py:69), which the allow-list
+      # refuses -- 'fail' repairs a bad load through _update_requests_with_invalid_blocks,
+      # whose `(req_block_ids,) = get_block_ids(req_id)` is single-group-only in stock (the
+      # "TODO (davidb): add support for hybrid memory allocator") and would raise on this
+      # model's two kv cache groups; it is not ported here either. 'recompute' just rewinds
+      # num_computed_tokens and prefills again. Nothing else is set here on purpose:
+      # VllmConfig._post_init_kv_transfer_config synthesizes kv_connector=OffloadingConnector
+      # and kv_role=kv_both ON TOP of whatever this provides (config/vllm.py:789-823), so
+      # naming them again would only be a second place to keep in sync. Delete this line and
+      # the boot stands authority mode down (RUNGS connector=OFF(kv_load_failure_policy ...)).
+      - '--kv-transfer-config={"kv_load_failure_policy": "recompute"}'
       # MTP speculative decoding: PERMITTED for round-2 (user-confirmed 2026-08-16; the
       # round-1.2 "cheating" ban does not carry over). The checkpoint ships a 1-layer MTP
       # drafter (Qwen3_5MoeMTP, registered stock in v0.25.0); greedy tree acceptance rides

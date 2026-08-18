@@ -989,6 +989,16 @@ impl KvManager {
         list
     }
 
+    /// U1a: `Scheduler._drain_deferred_frees`' pool call (scheduler.py:2157), re-pointed
+    /// at the Rust pool. `ids` is the flat list a previous `pop_blocks_for_free` returned;
+    /// the reverse stock applies to it happens crate-side (see `Manager::free_block_ids`).
+    ///
+    /// `w()` and `&self`, like every other mutating pymethod here: a `&mut self` pymethod
+    /// is an EXCLUSIVE pycell borrow and this pyclass is reachable from the input thread.
+    fn free_block_ids(&self, ids: Vec<u32>) {
+        self.w().manager.free_block_ids(&ids)
+    }
+
     fn remove_skipped_blocks(&self, slot: u32, total_computed_tokens: usize) {
         self.w()
             .manager

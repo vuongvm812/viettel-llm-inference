@@ -83,6 +83,17 @@ connector's ``get_num_new_matched_tokens`` between them (``ScheduleCore::schedul
 CONFIGURATION of this one -- still stands authority mode down, so the serve line still has
 to pick one stack unless it is exactly that shape.
 
+U1 closed that configuration's last two gaps. ``kv_role="kv_both"`` plus async scheduling
+makes stock set ``defer_block_free=True``, so a request that finishes with a step still in
+flight is freed through ``pop_blocks_for_free`` + ``_drain_deferred_frees``; both are now
+ported (``Manager::free_block_ids``, ``drain_deferred_frees``) and installed on the
+scheduler class only when the connector is live. And two rungs are DECLARED OUT OF SCOPE
+under a live connector rather than silently wrong: the Port-2 token store (its facade
+freezes ``request.block_hashes``, which the connector reads every step) and, through
+``step_packable``'s existing ``defer_block_free`` clause, R8/R9. The serve line must also
+carry ``--kv-transfer-config={"kv_load_failure_policy": "recompute"}``; the allow-list
+refuses the ``"fail"`` default, whose repair path is single-group-only in stock.
+
 MODEL-AGNOSTIC, WITH ONE SHARP EDGE. Nothing here reads a model name or a layer count --
 the config is derived from ``kv_cache_config.kv_cache_groups`` at runtime, so a plain dense
 model (one full-attention group, unitary path) works with no changes, and so does an
@@ -203,6 +214,17 @@ def reraise_fatal(exc: BaseException) -> None:
 #
 # The scratch namespace ``sc_*`` is reserved for ``_self_check``: those keys drive the
 # shipped functions without claiming a place in the table below.
+#
+# WHAT IS NOT IN HERE, AND ON PURPOSE: a DECLARED SCOPE EXCLUSION. U1b turns the Port-2
+# token store off for the whole boot whenever the ported KV connector is live -- the
+# connector reads ``request.block_hashes`` on every ``build_connector_meta`` and the store's
+# facade freezes that list at install (``tokstore_connector_stand_down``). That is not a
+# demotion of a rung that was supposed to engage; it is the port declaring that the two
+# features do not compose, decided from config before either one runs. So it goes through
+# NEITHER ``refuse`` nor ``require_latch`` and NEVER raises, REQUIRE or not -- it logs one
+# line and names itself in the RUNGS ``tokstore`` cell as ``OFF(connector ...)``, which is
+# the record. The class-C key ``token_store`` below stays what it always was: the store
+# armed, ran, and then had to disable itself mid-boot.
 _REQUIRE_KEYS = {
     "bail": ("B", "schedule() handed this step back to stock vLLM (bail_reason)"),
     "table_dirty": ("B", "resident table dirty; this step re-marshals every request"),
@@ -958,6 +980,133 @@ def connector_live_from_config(cfg=None) -> bool:
     return kv_connector_configured(cfg) is True and offloading_connector_supported(cfg) is None
 
 
+# --------------------------------------------------------------------------
+# U1b -- the two interlocks a live connector imposes on the rungs above
+# --------------------------------------------------------------------------
+
+
+def hash_granularity_blocked(hash_block_size, group_block_sizes, resolved=None) -> str | None:
+    """Why this boot's hash granularity cannot serve the connector, or None. Pure --
+    self-checked.
+
+    WHAT MIS-KEYING WOULD LOOK LIKE, which is why this is a boot check and not a comment.
+    ``OffloadingSpec.__init__`` (v1/kv_offload/base.py:538-549) resolves its OWN
+    ``hash_block_size`` from ``resolve_kv_cache_block_sizes`` and asserts every group's GPU
+    block size is a multiple of it; it then keys the CPU cache on
+    ``request.block_hashes[i]``, i.e. on hashes computed at THAT granularity. This port
+    keys the GPU prefix cache on the same list at ``block_pool.hash_block_size``. The two
+    numbers come from the same function today, so they agree by construction -- and if a
+    vLLM bump ever makes them disagree, nothing raises: the connector simply stores blocks
+    under keys that mean a different number of tokens than the ones it later looks up,
+    which serves WRONG KV rather than fewer hits. Cheap to check, unrecoverable to miss.
+
+    Both clauses are the spec's own, restated:
+
+    * every group's block size must be a whole number of hash blocks (the spec's assert);
+    * ``resolved`` -- ``resolve_kv_cache_block_sizes(...)[1]``, i.e. exactly what the spec
+      will compute for itself -- must equal the granularity this port hashes at. ``None``
+      means the caller could not read it (no ambient config), which is a skip and not a
+      failure: the first clause still holds and the boot-time answer is unchanged from
+      every pre-connector boot.
+    """
+    try:
+        hbs = int(hash_block_size)
+    except (TypeError, ValueError):
+        return f"hash_block_size is unreadable ({hash_block_size!r})"
+    if hbs <= 0:
+        return f"hash_block_size is {hbs}"
+    for bs in group_block_sizes:
+        try:
+            bs = int(bs)
+        except (TypeError, ValueError):
+            return f"a kv cache group has an unreadable block_size ({bs!r})"
+        if bs <= 0 or bs % hbs:
+            return (
+                f"kv cache group block_size {bs} is not a multiple of the hash "
+                f"granularity {hbs}"
+            )
+    if resolved is not None and int(resolved) != hbs:
+        return (
+            f"the connector hashes at resolve_kv_cache_block_sizes()={int(resolved)} "
+            f"while this port hashes at {hbs}"
+        )
+    return None
+
+
+def connector_hash_granularity_blocked(manager) -> str | None:
+    """``hash_granularity_blocked`` against a live ``KVCacheManager``. Never raises.
+
+    Defensive by getattr chain throughout: this runs on the boot path of a manager that is
+    about to serve, and an attribute this build does not carry must answer "cannot check"
+    (skip the clause) rather than take the boot down on its own.
+    """
+    try:
+        pool = getattr(manager, "block_pool", None)
+        hbs = getattr(pool, "hash_block_size", None)
+        groups = getattr(getattr(manager, "kv_cache_config", None), "kv_cache_groups", ())
+        sizes = [
+            getattr(getattr(g, "kv_cache_spec", None), "block_size", None) for g in groups
+        ]
+        if hbs is None or not sizes or any(s is None for s in sizes):
+            return None
+        resolved = None
+        try:
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+            vcfg = get_current_vllm_config_or_none()
+            if vcfg is not None:
+                resolved = resolve_kv_cache_block_sizes(manager.kv_cache_config, vcfg)[1]
+        except Exception:
+            # No ambient config, or a build whose resolver moved: the multiple-of clause
+            # still runs, which is the half that catches a hybrid geometry.
+            resolved = None
+        return hash_granularity_blocked(hbs, sizes, resolved)
+    except Exception as exc:
+        # A probe must not be the reason a boot fails; an unreadable manager is the same
+        # "cannot check" as an unreadable field.
+        log.warning("rust_sched: hash-granularity check could not run (%r)", exc)
+        return None
+
+
+# The RUNGS reason and the log text for the token store's connector exclusion. One string,
+# named once, so the log line and the RUNGS cell cannot drift apart.
+TOKSTORE_CONNECTOR_WHY = "connector (block_hashes must stay live)"
+
+
+def tokstore_connector_stand_down(connector_live: bool) -> bool:
+    """Port-2 is OFF for the whole boot under the ported KV connector. True = it must not
+    arm.
+
+    THE INTERLOCK. The token store's facade freezes ``request.block_hashes`` at install and
+    grows the chain crate-side instead (``tokens.rs``); Python's list then never gets
+    another entry -- ``RustMirror.slot``'s ``len(hashes) > have`` is False forever, which is
+    the whole point on a connector-less boot. With a connector live it is a corruption:
+    ``OffloadingConnector`` walks ``request.block_hashes`` on EVERY
+    ``build_connector_meta`` to extend its per-group ``offload_keys``
+    (offloading/scheduler.py:274-283) and asserts against that same list when it builds a
+    store event (``assert last_hash_idx <= len(req.block_hashes)``, offloading/events.py:160).
+    A frozen list stalls the connector's key space -- silently at first (no new block is
+    ever offered to the CPU cache) and then on that assert.
+
+    NOT A DEMOTION: see the note above ``_REQUIRE_KEYS``. This never raises, REQUIRE or not.
+    Idempotent, and safe to call from both the arming site and the first ``schedule()``.
+    """
+    if not connector_live:
+        return False
+    if not TOK.off_why:
+        TOK.off_why = TOKSTORE_CONNECTOR_WHY
+        log.warning(
+            "rust_sched: Port-2 token store is OFF for this boot -- %s. The KV connector "
+            "reads request.block_hashes every step and the store's facade would freeze "
+            "that list; this is a declared scope exclusion, not a demotion "
+            "(VTL_RUST_SCHED_REQUIRE does not make it fatal).",
+            TOKSTORE_CONNECTOR_WHY,
+        )
+    TOK.live = False
+    return True
+
+
 def build_config(manager, radix: bool, connector: bool | None = None):
     """Flatten a live ``KVCacheManager`` into the plain data the crate accepts.
 
@@ -1361,13 +1510,35 @@ CONNECTOR_CONFLICT_REMEDIES = (
 )
 
 
+def stand_down_to_stock(instance, base, why: str) -> None:
+    """The class swap itself, shared by the two reasons authority mode can abandon a
+    half-built manager (a connector it cannot drive; a hash granularity it cannot key on).
+
+    See ``authority_stand_down`` for why rebinding ``__class__`` is the only working shape
+    and why it is sound at exactly one point in ``__init__``. Factored out so the second
+    caller cannot re-derive the ``TypeError`` handling slightly differently: a build whose
+    class layout forbids the swap cannot serve either way, and a boot failure naming both
+    remedies is the only honest answer left.
+    """
+    try:
+        instance.__class__ = base
+    except TypeError as exc:
+        raise RuntimeError(
+            f"VTL_RUST_SCHED=1 cannot engage ({why}), and this build cannot stand down "
+            f"to {base.__name__} ({exc}). {CONNECTOR_CONFLICT_REMEDIES}."
+        ) from exc
+
+
 def authority_stand_down(instance, base, cfg=None) -> bool:
     """Turn a half-built authority manager back into a plain ``base`` instance.
 
     THE CONFLICT. With a KV connector live, scheduler.py binds the (now stale) python
     block_pool into the connector (`:280`) and, when ``defer_block_free`` is on, drains
     ``pop_blocks_for_free``'s result through ``block_pool.free_blocks`` (`:2157`) -- which
-    leaks every deferred block out of the Rust pool for good. The connector also owns
+    leaks every deferred block out of the Rust pool for good. (U1a re-points that one call
+    at the Rust pool, but ONLY for the ported connector: `_install_connector_scheduler_hooks`
+    runs from the first `schedule()` on a connector-live boot, which by construction is a
+    boot this function did not stand down.) The connector also owns
     allocation paths this port refuses outright (``allocate_slots``'
     ``num_external_computed_tokens`` / ``delay_cache_blocks``) and KV-transfer waits
     nothing here drives. There is no partial coexistence to negotiate.
@@ -1414,13 +1585,7 @@ def authority_stand_down(instance, base, cfg=None) -> bool:
         )
         return False
     log.warning("rust_sched: KV connector is not the ported configuration -- %s", why)
-    try:
-        instance.__class__ = base
-    except TypeError as exc:
-        raise RuntimeError(
-            "VTL_RUST_SCHED=1 is not compatible with a KV connector, and this build "
-            f"cannot stand down to {base.__name__} ({exc}). {CONNECTOR_CONFLICT_REMEDIES}."
-        ) from exc
+    stand_down_to_stock(instance, base, f"a KV connector is configured -- {why}")
     log.warning("%s", STAND_DOWN_WARNING)
     return True
 
@@ -1450,6 +1615,24 @@ def _install_authority(base, mirror_modes):
             # cross-checks this against the live `scheduler.connector` -- a crate built for
             # the wrong answer cannot be corrected, only refused.
             self._vtl_connector_cfg = connector_live_from_config()
+            if self._vtl_connector_cfg:
+                # U1b: the hash-granularity interlock, taken HERE -- the last point at
+                # which standing down is still possible (nothing Rust-side exists yet) and
+                # the first at which the base state it reads is complete. `build_config`
+                # would be the natural home, but its contract is "never raises" and its
+                # reason is a hard boot failure in this mode; a mis-keyed CPU cache should
+                # cost the Rust stack, not the boot. See
+                # `hash_granularity_blocked` for what mis-keying would actually do.
+                why = connector_hash_granularity_blocked(self)
+                if why is not None:
+                    stand_down_to_stock(self, base, why)
+                    # Class A, and the state is already recorded when this raises under
+                    # REQUIRE -- same ordering doctrine as `require_latch`.
+                    refuse(
+                        "the KV connector's hash granularity does not match this port's "
+                        f"-- {why}"
+                    )
+                    return
             cfg, reason = build_config(
                 self, mirror_modes["radix"], connector=self._vtl_connector_cfg
             )
@@ -1649,25 +1832,64 @@ def _install_authority(base, mirror_modes):
                 self._rust.remove_skipped_blocks(slot, int(total_computed_tokens))
 
         def pop_blocks_for_free(self, request):
-            # Defence in depth behind the kv_transfer_config refusal in __init__: the only
-            # caller is `_free_request_blocks` under `defer_block_free`, which hands the
-            # result to the STALE python `block_pool.free_blocks` (scheduler.py:2157).
-            # Returning ints there is an AttributeError; returning anything is a permanent
-            # leak from the Rust pool.
-            #
-            # STAGE S LEAVES THIS AS THE ONE REMAINING BOOT BLOCKER for a connector-live
-            # run, deliberately and loudly. `kv_role="kv_both"` makes the offloading config
-            # a KV CONSUMER, and with async scheduling (max_concurrent_batches == 2) stock
-            # sets `defer_block_free = True` (scheduler.py:150-152) -- so a request that
-            # finishes while its last scheduled step is still in flight reaches this raiser.
-            # Fixing it means porting the deferred-free queue itself: `pop_blocks_for_free`
-            # already exists on the crate (`Manager::pop_blocks_for_free`), but
-            # `_drain_deferred_frees` (`:2145`) returns the ids through the stale python
-            # pool and has to be re-pointed at the Rust one. That is a separate wrapper and
-            # a separate stage; raising here is the honest state until then.
-            raise RuntimeError(
-                "VTL_RUST_SCHED=1 does not support deferred block freeing "
-                "(pop_blocks_for_free drains the stale python block pool)"
+            """``KVCacheManager.pop_blocks_for_free`` (`:495`), over Rust-owned ids.
+
+            The caller is ``_free_request_blocks`` under ``defer_block_free``
+            (scheduler.py:2140): it takes the blocks OUT of the manager's bookkeeping
+            without returning them to the pool, and parks ``(sched_step_seq, blocks)`` on
+            ``deferred_frees`` until the fence step has been processed. The return trip is
+            ``_drain_deferred_frees``, which stock sends through
+            ``kv_cache_manager.block_pool.free_blocks`` -- the STALE python pool in this
+            mode, i.e. a permanent leak. U1a re-points that one call at
+            ``free_block_ids`` below (``_install_connector_scheduler_hooks``); the two are
+            a pair and neither is correct without the other.
+
+            WHY THE MIRROR DROP LIVES HERE, and not where it lives for every other exit.
+            ``RustMirror.drop`` -- the slot's return to the intern pool, and the crate-side
+            ``forget`` that clears its hashes, stops, tokens and table entry -- normally
+            rides on ``free()``. The deferred path NEVER CALLS ``free()``: the request's
+            blocks leave here and its ids never come back through the manager, so a slot
+            dropped nowhere else is a slot leaked for the life of the boot, and with it the
+            request id -> slot map entry that would make a re-used id answer with a dead
+            request's state. Stock has no such bookkeeping and so has nothing to do here,
+            which is exactly why the omission would be invisible.
+
+            Safe to drop the slot before the blocks are returned: ``forget`` touches no
+            block list (``Manager::forget``), and this call has already emptied the ones
+            the coordinator held.
+            """
+            slot = self._mirror.slot(request)
+            ids = self._rust.pop_blocks_for_free(slot)
+            self._mirror.drop(request.request_id)
+            tbl = getattr(self, "_vtl_table", None)
+            if tbl is not None:
+                # The request's blocks left the pool's bookkeeping without being freed and
+                # its slot was recycled: any resident entry or pending speculation naming
+                # that slot is stale, same argument as `evict_blocks`.
+                tbl.resync("pop_blocks_for_free")
+            return ids
+
+        def free_block_ids(self, blocks):
+            """The Rust pool's half of ``_drain_deferred_frees`` (scheduler.py:2157).
+
+            Thin by design: the crate reverses the flat list itself, exactly once, which is
+            what stock's ``free_blocks(reversed(blocks))`` does -- see
+            ``Manager::free_block_ids`` for why that differs from the per-group reverse
+            ``free()`` uses and why both are correct.
+            """
+            self._rust.free_block_ids([int(b) for b in blocks])
+
+        def remaining_blocks(self, request):
+            """``Scheduler._request_remaining_blocks`` (scheduler.py:2387), over Rust state.
+
+            Stock reads it off ``kv_cache_manager.coordinator``, which authority mode froze
+            at construction -- it would answer confidently from a pool that has not
+            allocated a block since boot. The crate's primitive takes the slot and does the
+            ``min(num_tokens, max_model_len)`` clamp itself.
+            """
+            slot = self._mirror.slot(request)
+            return self._rust.remaining_blocks(
+                slot, int(request.num_tokens), int(request.num_computed_tokens)
             )
 
         def evict_blocks(self, block_ids):
@@ -2484,7 +2706,7 @@ class _TokState:
     lifetime story -- same shape as ``nstep_decode.BURST``."""
 
     __slots__ = ("live", "armed", "hash_block_size", "facaded",
-                 "materialized", "divergences", "warned")
+                 "materialized", "divergences", "warned", "off_why")
 
     def __init__(self) -> None:
         self.live = False          # numpy fast path + facade installation
@@ -2494,6 +2716,10 @@ class _TokState:
         self.materialized = 0
         self.divergences = 0
         self.warned = False
+        # U1b: the RUNGS reason when the store was never allowed to arm at all (today:
+        # only ``TOKSTORE_CONNECTOR_WHY``). Distinct from `disable()`'s mid-boot latch,
+        # which the `token_store` REQUIRE key owns; empty means "no scope exclusion".
+        self.off_why = ""
 
     def disable(self, why: str) -> None:
         """Permanent, boot-lifetime fallback. Requests already facaded keep working: the
@@ -3173,6 +3399,22 @@ def _install_update_from_output(scheduler_cls, m: dict):
         """
         if getattr(request, "_vtl_tok_off", False):
             return False
+        # U1b: the arming site's own connector check. The first `schedule()` has already
+        # called this for the boot, so on the served path it is a False; it stays here
+        # because THIS is where the facade would be installed, and a rung that can only be
+        # refused somewhere else is a rung one refactor away from arming by accident. The
+        # manager's flag is the config answer resolved at its construction
+        # (`_vtl_connector_cfg`); `connector_live_from_config` is the fallback for a
+        # manager that predates it.
+        if tokstore_connector_stand_down(
+            bool(getattr(kv, "_vtl_connector_cfg", None))
+            if hasattr(kv, "_vtl_connector_cfg")
+            else connector_live_from_config()
+        ):
+            # Per-request latch, so the check above answers on one getattr from here on
+            # rather than re-deriving for every request on every step.
+            request._vtl_tok_off = True
+            return False
         try:
             if not tok_arm(kv):
                 return False
@@ -3820,6 +4062,21 @@ def _install_update_from_output(scheduler_cls, m: dict):
         # of by update_step -- which is exactly when the resident table missed a token
         # delta and must be resynced before it can be scheduled from again.
         self._vtl_ufo_clean = True
+        # U1a: the invalid-block refusal, taken FIRST -- before any Rust state moves, so a
+        # boot that somehow reaches it fails on a clean step rather than half-applied.
+        # `require_latch` style (loud, immediate, unrecoverable) but a plain raise: there is
+        # no rung to disable, and continuing means serving KV that the connector has already
+        # said is wrong. See `CONNECTOR_INVALID_BLOCKS_MSG` for why this is unreachable for
+        # the connector the allow-list admits, and why stock's own handler is no fallback on
+        # a hybrid layout.
+        if getattr(self, "_vtl_connector_live", False):
+            bad = connector_invalid_blocks(model_runner_output)
+            if bad is not None:
+                raise RuntimeError(
+                    CONNECTOR_INVALID_BLOCKS_MSG.format(
+                        n=len(bad), sample=sorted(bad)[:8]
+                    )
+                )
         kv = self.kv_cache_manager
         done = None
         if RUNNER:
@@ -4201,6 +4458,135 @@ def _install_preempt_hook(scheduler_cls) -> None:
     )
 
 
+# --------------------------------------------------------------------------
+# U1a -- the deferred-free drain, and the two scheduler methods that reach past
+#        the frozen python coordinator into the Rust one
+# --------------------------------------------------------------------------
+#
+# BOTH ARE INSTALLED ONLY ON A CONNECTOR-LIVE BOOT (`_install_connector_scheduler_hooks`,
+# called from the first `schedule()` once `connector_live` is resolved). Without a connector
+# `defer_block_free` is False -- stock only sets it for a KV CONSUMER with overlapping
+# batches (scheduler.py:150-152) -- so `deferred_frees` is never appended to and
+# `_request_remaining_blocks` is only ever reached from `_inflight_prefill_reserved_blocks`,
+# which is itself on the connector's async-load path (`:901`). Patching the stock class on a
+# boot that has neither would be surface area for nothing.
+
+
+def drain_deferred_frees(self) -> None:
+    """``Scheduler._drain_deferred_frees`` with exactly ONE line changed. Module level so
+    the self-check drives the SHIPPED body and not a copy of it.
+
+    Stock (scheduler.py:2145-2157), quoted whole because the fence loop below has to stay
+    byte-equivalent to it::
+
+        while self.deferred_frees:
+            fence, _ = self.deferred_frees[0]
+            if fence > self.processed_step_seq:
+                break
+            _, blocks = self.deferred_frees.popleft()
+            # Free in reverse order so that the tail blocks are evicted first.
+            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+
+    Entries are appended with monotonically non-decreasing fences, so the first still-pending
+    one ends the drain -- that is the whole ordering argument and it is unchanged.
+
+    THE ONE LINE. ``block_pool`` is the PYTHON pool, which authority mode froze at
+    construction: every id it took back would be handed out again by a pool that never owned
+    them, on top of the Rust pool still holding them allocated. And ``blocks`` here is a list
+    of plain ints (``pop_blocks_for_free`` returns the crate's ids), not ``KVCacheBlock``s,
+    so stock's ``free_blocks`` would fail on ``.ref_cnt`` before it could do that damage --
+    which is what made this the last boot blocker rather than a silent one. The replacement
+    hands the same flat list to the crate, which applies the same single reverse.
+    """
+    while self.deferred_frees:
+        fence, _ = self.deferred_frees[0]
+        if fence > self.processed_step_seq:
+            break
+        _, blocks = self.deferred_frees.popleft()
+        # Free in reverse order so that the tail blocks are evicted first -- the reverse is
+        # `Manager::free_block_ids`', over the whole flat list, exactly as stock's is.
+        self.kv_cache_manager.free_block_ids(blocks)
+
+
+def request_remaining_blocks(self, request) -> int:
+    """``Scheduler._request_remaining_blocks`` (scheduler.py:2387), re-pointed at Rust.
+
+    Stock reaches through ``kv_cache_manager.coordinator.get_num_blocks_to_allocate``, i.e.
+    the python coordinator authority mode replaced -- it would answer from a pool that has
+    not allocated a block since boot, and the number is the ``reserved_blocks`` an async
+    connector load is gated on (``_inflight_prefill_reserved_blocks``, `:2400`). Too small
+    and a parked load can be admitted into KV that its in-flight prefills have already
+    promised away.
+
+    THE REACHABLE CALLER on a connector-live boot is a BAILED step. The schedule wrapper
+    computes its own ``base_reserved`` straight off ``kv._rust.remaining_blocks``, so the
+    ported path never comes through here -- but a step that hands itself back to stock
+    ``schedule()`` reaches ``_inflight_prefill_reserved_blocks`` (`:901`), and that is the
+    call this override exists for.
+
+    The manager method resolves the slot and clamps ``num_tokens`` to ``max_model_len``
+    crate-side; ``apply_admission_cap=True`` is a no-op on this stack (see
+    ``Manager::remaining_blocks``).
+    """
+    return self.kv_cache_manager.remaining_blocks(request)
+
+
+def _install_connector_scheduler_hooks(scheduler_cls) -> None:
+    """Install both overrides on the scheduler class. Idempotent; connector-live only.
+
+    The base ``Scheduler`` is the right class for both: ``AsyncScheduler`` -- the subclass
+    an async-scheduling boot actually runs -- overrides neither, so patching the base covers
+    it through plain inheritance (the same reason ``_install_update_from_output`` patches
+    the base).
+    """
+    if already_patched(scheduler_cls, "_drain_deferred_frees", patch="rust_sched_connector"):
+        return
+    scheduler_cls._drain_deferred_frees = mark_patched(
+        drain_deferred_frees,
+        scheduler_cls._drain_deferred_frees,
+        patch="rust_sched_connector",
+    )
+    scheduler_cls._request_remaining_blocks = mark_patched(
+        request_remaining_blocks,
+        scheduler_cls._request_remaining_blocks,
+        patch="rust_sched_connector",
+    )
+    log.info(
+        "rust_sched: connector scheduler hooks installed "
+        "(_drain_deferred_frees + _request_remaining_blocks -> the Rust pool)"
+    )
+
+
+# The invalid-block refusal, as one named string: `update_from_output` raises it and the
+# self-check asserts on it, so it cannot drift into two half-true explanations.
+CONNECTOR_INVALID_BLOCKS_MSG = (
+    "VTL_RUST_SCHED=1 with a live OffloadingConnector received "
+    "kv_connector_output.invalid_block_ids ({n} block(s), e.g. {sample}). "
+    "OffloadingConnector never produces load errors -- it does not override "
+    "KVConnectorBase_V1.get_block_ids_with_load_errors, whose base returns an empty set -- "
+    "so a non-empty set means this boot is running a connector the allow-list should have "
+    "refused. Stock's repair path is not an alternative here: "
+    "_update_requests_with_invalid_blocks does `(req_block_ids,) = get_block_ids(req_id)` "
+    "(scheduler.py:2544, the 'TODO (davidb): add support for hybrid memory allocator'), "
+    "which raises on this model's two kv cache groups whether or not this port is engaged. "
+    "Refusing is inherited stock behaviour on a hybrid layout, not a regression this port "
+    "introduced."
+)
+
+
+def connector_invalid_blocks(model_runner_output):
+    """The KV blocks the connector reported as failed loads, or None. Pure -- self-checked.
+
+    ``None`` for a step with no connector output and for an empty set alike: stock's own
+    guard is ``if kv_connector_output and kv_connector_output.invalid_block_ids``
+    (scheduler.py:1527), so "absent" and "empty" are the same non-event.
+    """
+    kvo = getattr(model_runner_output, "kv_connector_output", None)
+    if kvo is None:
+        return None
+    return getattr(kvo, "invalid_block_ids", None) or None
+
+
 def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     """Replace ``Scheduler.schedule`` with the Rust-driven decision loop."""
     import time
@@ -4563,6 +4949,18 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                         f"{reason or 'KV manager is not Rust-backed'}"
                     )
                 return wrapped(self, *args, **kwargs)
+            if connector_live:
+                # U1a: the deferred-free drain and the reserved-blocks read, both of which
+                # stock routes through state authority mode froze. Installed HERE, after
+                # the connector is proven live and the Rust manager proven present, and on
+                # the class so `AsyncScheduler` inherits them. See
+                # `_install_connector_scheduler_hooks`.
+                _install_connector_scheduler_hooks(scheduler_cls)
+                # U1b: and the token store cannot arm on this boot at all -- declared scope
+                # exclusion, never fatal. Called here as well as at the arming site so the
+                # RUNGS cell below is right even on a boot where no request ever reaches
+                # `store_take_over`.
+                tokstore_connector_stand_down(True)
             core = self._vtl_rust_core = vtl_sched.Scheduler()
             if NSTEP and nstep_mod.BURST.n > 1:
                 # Reserve KV headroom for the burst's extra tokens at queue depth 2. The
@@ -4727,7 +5125,10 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 rung(RING, ring_why),
                 rung(r8_on, "VTL_RUST_SCHED_R8 off or no shm raw path"),
                 rung(R9.live, "VTL_RUST_SCHED_R9 off or disabled"),
-                rung(TOK.live, "VTL_RUST_SCHED_TOKSTORE off or disabled"),
+                # U1b: `TOK.off_why` is the DECLARED SCOPE EXCLUSION (a live connector),
+                # which is a different sentence from "the gate is off" and has to read as
+                # one in the proof line.
+                rung(TOK.live, TOK.off_why or "VTL_RUST_SCHED_TOKSTORE off or disabled"),
                 rung(RUNNER, "VTL_RUST_RUNNER off or not armed"),
                 connector_cell,
                 "on" if env_on("VTL_RUST_SCHED_REQUIRE") else "off",
@@ -7303,6 +7704,164 @@ def _self_check() -> None:
     assert cands == [w1, w2] and skipped_out == []
     cands, skipped_out = assemble_candidates([], [], is_blocked, promote)
     assert cands == [] and skipped_out == []
+
+    # ---- U1a: the deferred-free drain --------------------------------------------------
+    # The SHIPPED body, driven directly: the fence loop must stop at the first pending
+    # entry (fences are appended non-decreasing, so anything after it is pending too), and
+    # the flat block list must reach the manager UNREVERSED -- the single reverse stock
+    # applies is `Manager::free_block_ids`' now, and doing it twice would undo it.
+    from collections import deque as _deque
+
+    class FakeRustKV:
+        def __init__(self):
+            self.freed = []
+            self.asked = []
+
+        def free_block_ids(self, blocks):
+            self.freed.append(list(blocks))
+
+        def remaining_blocks(self, request):
+            self.asked.append(request)
+            return 7
+
+    class DrainSched:
+        def __init__(self, seq, entries):
+            self.processed_step_seq = seq
+            self.deferred_frees = _deque(entries)
+            self.kv_cache_manager = FakeRustKV()
+
+    ds = DrainSched(5, [(3, [10, 11, 12]), (5, [20]), (7, [30])])
+    drain_deferred_frees(ds)
+    assert ds.kv_cache_manager.freed == [[10, 11, 12], [20]], ds.kv_cache_manager.freed
+    assert list(ds.deferred_frees) == [(7, [30])], "the pending fence must stay queued"
+    # Nothing due, and an empty queue: both are no-ops rather than errors.
+    ds2 = DrainSched(0, [(1, [1])])
+    drain_deferred_frees(ds2)
+    assert ds2.kv_cache_manager.freed == [] and len(ds2.deferred_frees) == 1
+    ds3 = DrainSched(99, [])
+    drain_deferred_frees(ds3)
+    assert ds3.kv_cache_manager.freed == []
+
+    # `_request_remaining_blocks` is a pure forward to the manager's Rust-backed answer.
+    req_obj = object()
+    assert request_remaining_blocks(ds, req_obj) == 7
+    assert ds.kv_cache_manager.asked == [req_obj]
+
+    # The install is idempotent and touches BOTH methods; a class that was never installed
+    # on keeps its stock bodies (the connector-off boot).
+    class FakeSchedulerCls:
+        def _drain_deferred_frees(self):
+            return "stock drain"
+
+        def _request_remaining_blocks(self, request):
+            return "stock remaining"
+
+    assert not already_patched(
+        FakeSchedulerCls, "_drain_deferred_frees", patch="rust_sched_connector"
+    )
+    logging.disable(logging.CRITICAL)
+    try:
+        _install_connector_scheduler_hooks(FakeSchedulerCls)
+        _install_connector_scheduler_hooks(FakeSchedulerCls)  # idempotent
+    finally:
+        logging.disable(logging.NOTSET)
+    assert already_patched(
+        FakeSchedulerCls, "_drain_deferred_frees", patch="rust_sched_connector"
+    )
+    assert FakeSchedulerCls._drain_deferred_frees is drain_deferred_frees
+    assert FakeSchedulerCls._request_remaining_blocks is request_remaining_blocks
+
+    # ---- U1a: the invalid-block refusal ------------------------------------------------
+    # "absent" and "empty" are the same non-event, exactly as stock's own guard reads them
+    # (`if kv_connector_output and kv_connector_output.invalid_block_ids`, scheduler.py:1527).
+    class FakeMRO:
+        def __init__(self, kvo=None):
+            self.kv_connector_output = kvo
+
+    assert connector_invalid_blocks(FakeMRO()) is None
+    assert connector_invalid_blocks(object()) is None
+    assert connector_invalid_blocks(
+        FakeMRO(type("O", (), {"invalid_block_ids": set()})())
+    ) is None
+    bad_blocks = connector_invalid_blocks(
+        FakeMRO(type("O", (), {"invalid_block_ids": {9, 4}})())
+    )
+    assert bad_blocks == {9, 4}, bad_blocks
+    msg = CONNECTOR_INVALID_BLOCKS_MSG.format(n=len(bad_blocks), sample=sorted(bad_blocks))
+    assert "get_block_ids_with_load_errors" in msg and "[4, 9]" in msg, msg
+
+    # ---- U1b: the hash-granularity interlock -------------------------------------------
+    # The served shape: two groups at block_size 16, hashing at 16.
+    assert hash_granularity_blocked(16, [16, 16]) is None
+    assert hash_granularity_blocked(16, [16, 16], resolved=16) is None
+    # A finer hash granularity that still divides every group is legal (that is the whole
+    # point of a separate hash_block_size on a hybrid layout).
+    assert hash_granularity_blocked(16, [16, 32], resolved=16) is None
+    for args, needle in (
+        ((16, [16, 24]), "not a multiple"),
+        ((0, [16]), "hash_block_size is 0"),
+        ((None, [16]), "unreadable"),
+        ((16, [None]), "unreadable block_size"),
+        ((16, [16], 32), "while this port hashes at 16"),
+    ):
+        why = hash_granularity_blocked(*args)
+        assert why and needle in why, (args, why)
+
+    class FakeManagerOK:
+        block_pool = type("P", (), {"hash_block_size": 16})()
+        kv_cache_config = type("C", (), {"kv_cache_groups": [
+            type("G", (), {"kv_cache_spec": type("S", (), {"block_size": 16})()})(),
+        ]})()
+
+    # No vLLM here, so `resolved` is None and only the multiple-of clause runs -- which is
+    # the documented degraded mode, not a failure.
+    assert connector_hash_granularity_blocked(FakeManagerOK()) is None
+    class FakeManagerBad(FakeManagerOK):
+        kv_cache_config = type("C", (), {"kv_cache_groups": [
+            type("G", (), {"kv_cache_spec": type("S", (), {"block_size": 24})()})(),
+        ]})()
+
+    assert "not a multiple" in (connector_hash_granularity_blocked(FakeManagerBad()) or "")
+    # An unreadable manager is "cannot check", never a boot failure of its own.
+    logging.disable(logging.CRITICAL)
+    try:
+        assert connector_hash_granularity_blocked(object()) is None
+    finally:
+        logging.disable(logging.NOTSET)
+
+    # ---- U1b: the token store stands down under a live connector -----------------------
+    # Driven off the SAME config the crate's `connector` flag comes from, so the exclusion
+    # cannot disagree with the boot that triggers it. And it must never raise -- REQUIRE on
+    # or off -- because this is a declared scope exclusion, not a demoted rung.
+    saved_tok, saved_why = TOK.live, TOK.off_why
+    saved_req = os.environ.get("VTL_RUST_SCHED_REQUIRE")
+    try:
+        TOK.live, TOK.off_why = True, ""
+        assert tokstore_connector_stand_down(False) is False
+        assert TOK.live is True and TOK.off_why == "", "no connector, no exclusion"
+        os.environ["VTL_RUST_SCHED_REQUIRE"] = "1"
+        logging.disable(logging.CRITICAL)
+        try:
+            assert tokstore_connector_stand_down(
+                connector_live_from_config(offload_cfg())
+            ) is True
+            assert tokstore_connector_stand_down(True) is True  # idempotent
+        finally:
+            logging.disable(logging.NOTSET)
+        assert TOK.live is False
+        assert TOK.off_why == TOKSTORE_CONNECTOR_WHY
+        assert TOK.off_why == "connector (block_hashes must stay live)"
+        # ...and that reason is what the RUNGS tokstore cell reads.
+        assert rung(TOK.live, TOK.off_why) == "OFF(connector (block_hashes must stay live))"
+        # An unported connector is not this exclusion's business: the whole authority layer
+        # stands down for it long before the store could arm.
+        assert connector_live_from_config(offload_cfg(kv_role="kv_consumer")) is False
+    finally:
+        TOK.live, TOK.off_why = saved_tok, saved_why
+        if saved_req is None:
+            os.environ.pop("VTL_RUST_SCHED_REQUIRE", None)
+        else:
+            os.environ["VTL_RUST_SCHED_REQUIRE"] = saved_req
 
     # The first-schedule backstop tests membership in this tuple, so "ec_connector" must
     # NOT read as "connector" -- which it would under a substring match on the reason.
