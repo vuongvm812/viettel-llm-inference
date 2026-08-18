@@ -60,6 +60,15 @@ pub struct Params {
     /// [`Decisions::burst_eligible`] permanently false, i.e. Python re-derives it exactly
     /// as it did before this port.
     pub burst_max_reqs: usize,
+    /// A KV connector is live (`Config::connector`'s twin on the schedule-loop side).
+    ///
+    /// The waiting arm needs NO branch of its own for it: a connector that only serves
+    /// SYNCHRONOUS hits changes nothing here, and an ASYNC load never reaches this loop —
+    /// `schedule_supported` refuses a scheduler with a connector attached, and the parked
+    /// request path lives entirely in Python (`Manager::allocate_external`). The field is
+    /// carried so the loop can refuse loudly rather than silently mis-schedule if that
+    /// ever changes.
+    pub connector: bool,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -367,6 +376,11 @@ impl ScheduleCore {
                     request.num_tokens,
                     request.status,
                     true,
+                    // No connector work in the running arm: external tokens, delayed
+                    // caching and reserved headroom are all admission-time concerns.
+                    0,
+                    false,
+                    0,
                 )?;
                 if allocated {
                     break;
@@ -473,6 +487,12 @@ impl ScheduleCore {
                     request.num_tokens,
                     request.status,
                     !self.running.is_empty(),
+                    // An ASYNC connector load is the only producer of these three, and it
+                    // never enters this loop (`Params::connector`). A synchronous connector
+                    // hit contributes no external tokens either.
+                    0,
+                    false,
+                    0,
                 )?;
                 if !ok {
                     break;
@@ -643,6 +663,7 @@ mod tests {
             log_stats: false,
             watermark: 0.0,
             radix: false,
+            connector: false,
             groups: vec![
                 GroupConfig {
                     kind: Kind::FullAttention,
@@ -681,6 +702,7 @@ mod tests {
             sjf_usage_tight: 0.90,
             lean_decisions: false,
             burst_max_reqs: 0,
+            connector: false,
         }
     }
 
@@ -942,7 +964,9 @@ mod tests {
         core2.schedule(&mut kv2, &[], &[req(a2, 64)], &p).unwrap();
         kv2.new_step_starts();
         assert!(kv2
-            .allocate_slots(a2, 1, 0, false, 0, 64, 65, crate::manager::STATUS_RUNNING, true)
+            .allocate_slots(
+                a2, 1, 0, false, 0, 64, 65, crate::manager::STATUS_RUNNING, true, 0, false, 0,
+            )
             .unwrap());
 
         let d = &core.decisions;

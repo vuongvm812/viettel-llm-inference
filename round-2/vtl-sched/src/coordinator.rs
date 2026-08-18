@@ -238,6 +238,53 @@ impl Coordinator {
         hit_length
     }
 
+    /// `find_longest_cache_hit_per_group` (`:742`). Returns `max(per-group hit lengths)`;
+    /// the per-group blocks land in [`Self::hit_blocks`] exactly as the converging walk
+    /// leaves them.
+    ///
+    /// The connector path uses this INSTEAD of [`Self::find_longest_cache_hit`]
+    /// (scheduler.py:698, gated on `connector is not None and has_mamba_layers and
+    /// isinstance(coordinator, HybridKVCacheCoordinator)`): each group walks independently
+    /// against the SAME fixed `max_cache_hit_length`, with no fixed point and no trimming
+    /// of one group against another. The FA hit is then handed to the connector as
+    /// `num_new_local_computed_tokens` so it only transfers what D-side does not have,
+    /// while the mamba state (always the last block) is transferred unconditionally by
+    /// `_apply_prefix_caching` in nixl/worker.py.
+    ///
+    /// DELIBERATELY does not write `num_uncached_common_prefix_tokens`: that field belongs
+    /// to the converging walk (`:735`) and feeds `_mamba_block_aligned_split`. Stock leaves
+    /// it untouched here, and the scheduler still reads it (scheduler.py:727) — so writing
+    /// a per-group-derived value would change the split for every request on this path.
+    pub fn find_longest_cache_hit_per_group(
+        &mut self,
+        hashes: &[Digest32],
+        max_cache_hit_length: usize,
+    ) -> usize {
+        for b in self.hit_blocks.iter_mut() {
+            b.clear();
+        }
+        self.seen.iter_mut().for_each(|s| *s = false);
+        self.eagle_verified.iter_mut().for_each(|s| *s = false);
+        if !self.enable_caching {
+            return 0;
+        }
+        let mut longest = 0usize;
+        for idx in 0..self.attention_groups.len() {
+            // Stock passes `drop_eagle_block=use_eagle` unconditionally (`:769`) — there is
+            // no verification loop to re-run the lookup, so a spec-decode group would need
+            // the drop on the FIRST and only pass. `build_config` refuses spec decode and
+            // `unsupported_features` refuses eagle, so this arm is unreachable; assert
+            // rather than implement a path that was never exercised.
+            assert!(
+                !self.attention_groups[idx].use_eagle,
+                "per-group cache hit does not support eagle/spec decode"
+            );
+            let hit = self.lookup_group(idx, hashes, max_cache_hit_length, false, self.scheduler_block_size);
+            longest = longest.max(hit);
+        }
+        longest
+    }
+
     pub fn hit_blocks(&self, group: usize) -> &[u32] {
         &self.hit_blocks[group]
     }
@@ -274,13 +321,13 @@ impl Coordinator {
         total
     }
 
-    /// `allocate_new_computed_blocks` (`:187`). The two-phase external-block dance
-    /// (`:225`) is absent: connectors are rejected by the config gate.
+    /// `allocate_new_computed_blocks` (`:187`).
     pub fn allocate_new_computed_blocks(
         &mut self,
         req: u32,
         new_computed_blocks: &[Vec<u32>],
         num_local_computed_tokens: usize,
+        num_external_computed_tokens: usize,
     ) -> Result<(), String> {
         if self
             .managers
@@ -290,13 +337,30 @@ impl Coordinator {
             debug_assert!(new_computed_blocks.iter().all(|b| b.is_empty()));
             return Ok(());
         }
+        // TWO-PHASE ALLOCATION (`:213`, issue #33775), quoted verbatim from the stock
+        // comment: "first touch every group's local cache-hit blocks, then allocate
+        // external blocks for every group. This ensures an earlier group's external
+        // `get_new_blocks` cannot evict a later group's not-yet-touched cache-hit blocks."
+        // The loops must therefore stay SEPARATE — fusing them into one pass over the
+        // managers reintroduces exactly that eviction, and it corrupts silently.
         for i in 0..self.managers.len() {
             self.managers[i].add_local_computed_blocks(
                 &mut self.pool,
                 req,
                 &new_computed_blocks[i],
                 num_local_computed_tokens,
+                num_external_computed_tokens,
             )?;
+        }
+        if num_external_computed_tokens > 0 {
+            for i in 0..self.managers.len() {
+                self.managers[i].allocate_external_computed_blocks(
+                    &mut self.pool,
+                    req,
+                    num_local_computed_tokens,
+                    num_external_computed_tokens,
+                )?;
+            }
         }
         Ok(())
     }

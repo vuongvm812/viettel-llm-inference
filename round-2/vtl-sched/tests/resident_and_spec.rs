@@ -34,6 +34,7 @@ fn cfg(num_blocks: usize, radix: bool) -> Config {
         log_stats: false,
         watermark: 0.0,
         radix,
+        connector: false,
         groups: vec![
             GroupConfig {
                 kind: Kind::FullAttention,
@@ -74,6 +75,7 @@ fn params() -> Params {
         // The burst gate is a `rust_sched.py` handshake, not part of the resident/spec
         // parity this suite covers; 0 keeps `burst_eligible` false throughout.
         burst_max_reqs: 0,
+        connector: false,
     }
 }
 

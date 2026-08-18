@@ -339,6 +339,7 @@ mod tests {
             log_stats: false,
             watermark: 0.0,
             radix: false,
+            connector: false,
             groups: vec![GroupConfig {
                 kind: Kind::FullAttention,
                 block_size: 16,
@@ -366,6 +367,7 @@ mod tests {
             sjf_usage_tight: 0.90,
             lean_decisions: false,
             burst_max_reqs: 0,
+            connector: false,
         }
     }
 

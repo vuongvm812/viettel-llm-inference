@@ -263,6 +263,13 @@ impl KvManager {
                 .map(|v| v.extract::<bool>())
                 .transpose()?
                 .unwrap_or(false),
+            // Optional key: a plugin older than this wheel does not send it, and false is
+            // the shipped behaviour (the converging cache-hit walk).
+            connector: config
+                .get_item("connector")?
+                .map(|v| v.extract::<bool>())
+                .transpose()?
+                .unwrap_or(false),
             groups,
         };
         cfg.validate().map_err(PyValueError::new_err)?;
@@ -831,6 +838,9 @@ impl KvManager {
         num_request_tokens: usize,
         status: u8,
         has_scheduled_reqs: bool,
+        num_external_computed_tokens: usize,
+        delay_cache_blocks: bool,
+        reserved_blocks: usize,
     ) -> PyResult<bool> {
         self.w()
             .manager
@@ -844,8 +854,64 @@ impl KvManager {
                 num_request_tokens,
                 status,
                 has_scheduled_reqs,
+                num_external_computed_tokens,
+                delay_cache_blocks,
+                reserved_blocks,
             )
             .map_err(err)
+    }
+
+    /// `allocate_slots(request, 0, ..., delay_cache_blocks=True)` — the parked async
+    /// connector load (scheduler.py:903 under `load_kv_async`). Mutates, so it takes the
+    /// `w()` guard like `allocate_slots` does; `&self` for the same reason every other
+    /// pymethod here is `&self` (a `&mut self` pymethod is an EXCLUSIVE pycell borrow and
+    /// this pyclass is reachable from the input thread).
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_external(
+        &self,
+        slot: u32,
+        num_local_computed_tokens: usize,
+        num_external_computed_tokens: usize,
+        num_request_tokens: usize,
+        status: u8,
+        has_scheduled_reqs: bool,
+        reserved_blocks: usize,
+    ) -> PyResult<bool> {
+        self.w()
+            .manager
+            .allocate_external(
+                slot,
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+                num_request_tokens,
+                status,
+                has_scheduled_reqs,
+                reserved_blocks,
+            )
+            .map_err(err)
+    }
+
+    /// `Scheduler._request_remaining_blocks` (scheduler.py:2387), summed by the caller into
+    /// the `reserved_blocks` an async load is gated on.
+    fn remaining_blocks(
+        &self,
+        slot: u32,
+        full_num_tokens: usize,
+        num_computed_tokens: usize,
+    ) -> usize {
+        self.w()
+            .manager
+            .remaining_blocks(slot, full_num_tokens, num_computed_tokens)
+    }
+
+    /// `(num_cached_block, null_block_id)` for one group — everything a block-record view
+    /// needs beyond the ids themselves (`RustBlocks._meta` in `rust_sched.py`).
+    ///
+    /// READ guard, not `w()`: the one caller is the connector post-pass that runs
+    /// immediately after `allocate_slots`, whose `w()` already rolled back any in-flight
+    /// speculation, so there is nothing pending for this read to see through.
+    fn block_meta(&self, slot: u32, group: usize) -> (usize, u32) {
+        self.r().manager.block_meta(slot, group)
     }
 
     /// Blocks newly allocated by the last `allocate_slots`, per group.
@@ -1350,6 +1416,13 @@ impl Scheduler {
                 .map(|v| v.extract::<usize>())
                 .transpose()?
                 .unwrap_or(0),
+            // Optional for the same reason. false = no connector, which is the shipped
+            // behaviour and the only one `schedule_supported` currently admits.
+            connector: params
+                .get_item("connector")?
+                .map(|v| v.extract::<bool>())
+                .transpose()?
+                .unwrap_or(false),
         });
         Ok(())
     }

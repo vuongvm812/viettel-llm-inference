@@ -6,6 +6,7 @@
 //!   * `:33`   `SingleTypeKVCacheManager`      -> [`TypeManager`] (shared paths)
 //!   * `:102`  `get_num_blocks_to_allocate`    -> [`TypeManager::get_num_blocks_to_allocate`]
 //!   * `:183`  `add_local_computed_blocks`     -> [`TypeManager::add_local_computed_blocks`]
+//!   * `:231`  `allocate_external_computed_blocks` -> [`TypeManager::allocate_external_computed_blocks`]
 //!   * `:279`  `allocate_new_blocks`           -> [`TypeManager::allocate_new_blocks`]
 //!   * `:319`  `cache_blocks`                  -> [`TypeManager::cache_blocks`]
 //!   * `:480`  `_remove_blocks_in_range`       -> [`TypeManager::remove_blocks_in_range`]
@@ -25,7 +26,7 @@
 //! sink managers, `reachable_block_mask` sparse retention
 //! (`VLLM_PREFIX_CACHE_RETENTION_INTERVAL`), DCP/PCP block-size scaling, the
 //! recycling-aware admission cap (`_max_admission_blocks_per_request`, only set for SWA /
-//! chunked-local), and external/connector computed blocks.
+//! chunked-local).
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
@@ -291,17 +292,25 @@ impl TypeManager {
         num_new_blocks.max(0) as usize + self.num_evictable(pool, new_computed_blocks)
     }
 
-    /// `add_local_computed_blocks` (`:183`). `num_external_computed_tokens` is always 0
-    /// here (connectors are rejected by the config gate).
+    /// `add_local_computed_blocks` (`:183`).
+    ///
+    /// `num_external_computed_tokens` is 0 unless a KV connector is live. It is NOT a
+    /// cosmetic argument: stock derives the skipped prefix from `num_local + num_external`
+    /// (`:207`), so with a connector the skip window is wider than the local hit and a
+    /// mamba group pads MORE nulls here than it would locally — which is exactly what
+    /// leaves room for [`TypeManager::allocate_external_computed_blocks`] to place the one
+    /// state block at the right index.
     pub fn add_local_computed_blocks(
         &mut self,
         pool: &mut BlockPool,
         req: u32,
         new_computed_blocks: &[u32],
         num_local_computed_tokens: usize,
+        num_external_computed_tokens: usize,
     ) -> Result<(), String> {
         debug_assert!(self.blocks(req).is_empty());
-        let num_skipped_tokens = self.num_skipped_tokens(num_local_computed_tokens as i64);
+        let num_total_computed_tokens = num_local_computed_tokens + num_external_computed_tokens;
+        let num_skipped_tokens = self.num_skipped_tokens(num_total_computed_tokens as i64);
         let num_skipped_blocks = floordiv(num_skipped_tokens, self.block_size as i64).max(0) as usize;
         let kept: &[u32] = if num_skipped_blocks > 0 {
             if num_skipped_blocks >= new_computed_blocks.len() {
@@ -329,6 +338,77 @@ impl TypeManager {
         let (g, old) = (self.group_id, self.num_cached_block.get(&req).copied());
         self.jrn(pool, || Undo::NumCachedBlock(g, req, old));
         self.num_cached_block.insert(req, n);
+        Ok(())
+    }
+
+    /// `allocate_external_computed_blocks` (`:231`).
+    ///
+    /// Blocks for tokens the KV CONNECTOR has cached but vLLM has not: nothing to touch
+    /// (they are not in the prefix cache), so they are plain fresh allocations sized to
+    /// cover `local + external` tokens.
+    ///
+    /// ORDERING CONTRACT (`:243`, issue #33775): this must run only after EVERY group's
+    /// [`TypeManager::add_local_computed_blocks`] has touched its local hits, or this
+    /// group's `get_new_blocks` could evict a later group's not-yet-touched hit blocks.
+    /// [`crate::coordinator::Coordinator::allocate_new_computed_blocks`] is the one caller
+    /// and enforces the two-phase order.
+    pub fn allocate_external_computed_blocks(
+        &mut self,
+        pool: &mut BlockPool,
+        req: u32,
+        num_local_computed_tokens: usize,
+        num_external_computed_tokens: usize,
+    ) -> Result<(), String> {
+        // SCOPE INVARIANT: external loads are a WAITING-arm concern, and the waiting arm
+        // runs outside the speculative window (`spec.rs` only speculates the resident
+        // schedule). Nothing here journals, so a future relaxation that armed the journal
+        // over this path would silently produce an unrollbackable state — fail loudly in
+        // debug builds instead.
+        debug_assert!(
+            pool.arena.journal.is_none(),
+            "allocate_external_computed_blocks ran inside the speculative window"
+        );
+        let num_total_computed_tokens = num_local_computed_tokens + num_external_computed_tokens;
+        let num_skipped_tokens = self.num_skipped_tokens(num_total_computed_tokens as i64);
+        let mut num_external = num_external_computed_tokens as i64;
+        if num_skipped_tokens > 0 {
+            // Some external tokens fall inside the skipped prefix too (`:246`). For mamba
+            // this is the `C - 1` rule, so all but the last token's worth is skipped.
+            num_external = num_external.min(num_total_computed_tokens as i64 - num_skipped_tokens);
+        }
+        if num_external <= 0 {
+            return Ok(());
+        }
+
+        let num_required_blocks = cdiv(num_total_computed_tokens, self.block_size);
+        let have = self.blocks_mut(pool, req).len();
+        // Stock passes `cdiv(total, block_size) - len(req_blocks)` straight to
+        // `get_new_blocks`, where a negative count yields an empty list rather than an
+        // error (`range(negative)`), so saturate rather than underflowing usize.
+        let num_new = num_required_blocks.saturating_sub(have);
+        let mut fresh = std::mem::take(&mut self.scratch);
+        fresh.clear();
+        let res = pool.get_new_blocks(num_new, &mut fresh);
+        if res.is_err() {
+            self.scratch = fresh;
+            return res;
+        }
+        let (g, len) = (self.group_id, have);
+        self.jrn(pool, || Undo::ReqBlocksLen(g, req, len));
+        self.req_to_blocks
+            .get_mut(&req)
+            .expect("entry created by blocks_mut above")
+            .extend_from_slice(&fresh);
+        if self.tracks_new_block_ids {
+            // `type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec,
+            // MLAAttentionSpec, HiddenStateCacheSpec)` (`:272`) — the same FA-family
+            // predicate `allocate_new_blocks` uses, so mamba state blocks are NOT queued
+            // for zeroing here either.
+            let n = self.new_block_ids.len();
+            self.jrn(pool, || Undo::NewBlockIdsLen(g, n));
+            self.new_block_ids.extend_from_slice(&fresh);
+        }
+        self.scratch = fresh;
         Ok(())
     }
 

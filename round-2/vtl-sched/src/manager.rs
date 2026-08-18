@@ -547,6 +547,18 @@ impl Manager {
         num_preemptions: u32,
         skip_reading_prefix_cache: bool,
     ) -> usize {
+        if self.cfg.connector {
+            // scheduler.py:687 takes the per-group branch for a connector + mamba-hybrid
+            // engine and never calls `KVCacheManager.get_computed_blocks` at all. The
+            // dispatch is here rather than at the call sites so every caller (the schedule
+            // loop, the FFI probe) follows the live engine's shape.
+            return self.get_computed_blocks_per_group(
+                req,
+                num_tokens,
+                num_preemptions,
+                skip_reading_prefix_cache,
+            );
+        }
         for b in self.pending_hit.iter_mut() {
             b.clear();
         }
@@ -571,6 +583,52 @@ impl Manager {
         hit
     }
 
+    /// The connector arm of `get_computed_blocks` (scheduler.py:687-721): the per-group
+    /// walk, `max(per-group hits)` as `num_new_local_computed_tokens`, and the SAME
+    /// `prefix_cache_stats.record` the non-connector arm does (scheduler.py:715-721 hand-
+    /// rolls it because it bypassed `KVCacheManager.get_computed_blocks`).
+    ///
+    /// Bookkeeping is mirrored from [`Manager::get_computed_blocks`] field for field:
+    /// `pending_hit` refilled from the coordinator, `hit_len` recorded, stats recorded once
+    /// and only when `log_stats`. `pending_hit` keeps the per-group vec shape, so
+    /// `allocate_slots`'s `has_hit` arm consumes it unchanged.
+    ///
+    /// ONE DELIBERATE DIVERGENCE FROM STOCK: `skip_reading_prefix_cache` is honoured here.
+    /// scheduler.py:698 calls `find_longest_cache_hit_per_group` directly and so never
+    /// consults that flag — but the flag exists because the request needs its prompt
+    /// RECOMPUTED (prompt logprobs, all-token pooling), and serving it cache hits produces
+    /// wrong output rather than a slow path. `kv_cache_manager.py:221` refuses on exactly
+    /// this flag for every other route into the cache; this port keeps that refusal
+    /// uniform. Diverging the other way is unrecoverable; diverging this way costs a hit.
+    pub fn get_computed_blocks_per_group(
+        &mut self,
+        req: u32,
+        num_tokens: usize,
+        num_preemptions: u32,
+        skip_reading_prefix_cache: bool,
+    ) -> usize {
+        for b in self.pending_hit.iter_mut() {
+            b.clear();
+        }
+        if !self.cfg.enable_caching || skip_reading_prefix_cache {
+            self.hit_len.insert(req, 0);
+            return 0;
+        }
+        let max_cache_hit_length = num_tokens.saturating_sub(1);
+        let hashes = std::mem::take(&mut self.reqs.entry(req).or_default().hashes);
+        let hit = self
+            .coord
+            .find_longest_cache_hit_per_group(&hashes, max_cache_hit_length);
+        self.reqs.get_mut(&req).unwrap().hashes = hashes;
+        self.coord.take_hit_blocks(&mut self.pending_hit);
+        if self.cfg.log_stats {
+            self.stats
+                .record(num_tokens as u64, hit as u64, num_preemptions > 0);
+        }
+        self.hit_len.insert(req, hit);
+        hit
+    }
+
     /// Cache-hit walk that does NOT touch `prefix_cache_stats` — the read-only signal
     /// `vtl/patches/kv_cache_manager.py::plan_request` needs.
     pub fn peek_cache_hit(&mut self, req: u32, num_tokens: usize) -> usize {
@@ -585,13 +643,15 @@ impl Manager {
         hit
     }
 
-    /// `allocate_slots` (`:248`). Returns `Some(())` when the request fits (new blocks
-    /// land in `self.new_blocks`), `None` when it does not.
+    /// `allocate_slots` (`:248`). Returns `Ok(true)` when the request fits (new blocks
+    /// land in `self.new_blocks`), `Ok(false)` when it does not.
     ///
-    /// Arguments narrowed to what the served configuration can produce: no external
-    /// (connector) tokens, no encoder tokens, no `delay_cache_blocks`, no
-    /// `full_sequence_must_fit`, no `reserved_blocks`. The config gate rejects the
-    /// features that would set them.
+    /// Arguments narrowed to what the served configuration can produce: no encoder tokens
+    /// and no `full_sequence_must_fit` (the config gate rejects the features that would set
+    /// them). The three connector arguments — `num_external_computed_tokens`,
+    /// `delay_cache_blocks`, `reserved_blocks` — ARE carried, and all three are inert at
+    /// their zero/false defaults, so a connector-less engine takes the same branches as
+    /// before this port.
     #[allow(clippy::too_many_arguments)]
     pub fn allocate_slots(
         &mut self,
@@ -604,9 +664,18 @@ impl Manager {
         num_request_tokens: usize,
         status: u8,
         has_scheduled_reqs: bool,
+        num_external_computed_tokens: usize,
+        delay_cache_blocks: bool,
+        reserved_blocks: usize,
     ) -> Result<bool, String> {
-        if num_new_tokens == 0 {
-            return Err("num_new_tokens must be greater than 0".into());
+        // `:345`: an async KV load has zero new tokens to COMPUTE while still needing slots
+        // for the tokens the connector already holds, so the guard fires only when there is
+        // no work of either kind.
+        if num_new_tokens == 0 && num_external_computed_tokens == 0 {
+            return Err(
+                "num_new_tokens must be greater than 0 when there are no external computed tokens"
+                    .into(),
+            );
         }
         // kv_cache_manager.py:428 gates `allocate_new_computed_blocks` on
         // `new_computed_block_list is not self.empty_kv_cache_blocks.blocks`. That
@@ -622,7 +691,11 @@ impl Manager {
         };
 
         let num_local_computed_tokens = num_computed_tokens + num_new_computed_tokens;
-        let total_computed_tokens = num_local_computed_tokens.min(self.cfg.max_model_len);
+        // `:369`: the CAPPED total drives `remove_skipped_blocks` and
+        // `num_tokens_main_model`; the UNCAPPED sum drives `get_num_blocks_to_allocate`
+        // (`:414`). Stock is asymmetric here and the asymmetry is preserved below.
+        let total_computed_tokens =
+            (num_local_computed_tokens + num_external_computed_tokens).min(self.cfg.max_model_len);
 
         let watermark_blocks = if has_scheduled_reqs
             && (status == STATUS_WAITING || status == STATUS_PREEMPTED)
@@ -643,20 +716,35 @@ impl Manager {
             req,
             num_tokens_need_slot,
             new_computed,
-            num_local_computed_tokens,
+            // `:414` passes `num_local_computed_tokens + num_external_computed_tokens`
+            // UNCAPPED, unlike `total_computed_tokens` above. Preserved verbatim.
+            num_local_computed_tokens + num_external_computed_tokens,
             num_tokens_main_model,
         );
 
-        let available_blocks = self.coord.pool.get_num_free_blocks();
-        if num_blocks_to_allocate + watermark_blocks > available_blocks {
+        // `:420`: `reserved_blocks` is headroom an async connector load must leave for
+        // sequences already prefilling; the watermark is the separate admission headroom.
+        // Stock computes `free - reserved` in Python ints, so it can go NEGATIVE and then
+        // refuse even a zero-block request — done in i64 here for exactly that reason
+        // (a `saturating_sub` would admit a zero-block request that stock refuses).
+        let available_blocks =
+            self.coord.pool.get_num_free_blocks() as i64 - reserved_blocks as i64;
+        let required_blocks = (num_blocks_to_allocate + watermark_blocks) as i64;
+        if required_blocks > available_blocks {
             return Ok(false);
         }
 
-        if has_hit {
+        // `:434`: the local-hit arm and the external arm share one call — an external load
+        // with no local hit still has to reach `allocate_external_computed_blocks`.
+        if has_hit || num_external_computed_tokens > 0 {
             let pending = std::mem::take(&mut self.pending_hit);
-            let res = self
-                .coord
-                .allocate_new_computed_blocks(req, &pending, num_local_computed_tokens);
+            let blocks: &[Vec<u32>] = if has_hit { &pending } else { &self.empty_groups };
+            let res = self.coord.allocate_new_computed_blocks(
+                req,
+                blocks,
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+            );
             self.pending_hit = pending;
             res?;
         }
@@ -668,7 +756,11 @@ impl Manager {
         self.new_blocks = out;
         res?;
 
-        if !self.cfg.enable_caching {
+        // `:446` P/D: an async load's blocks must not be published to the prefix cache
+        // until the transfer lands, so `delay_cache_blocks` returns before the trailing
+        // `cache_blocks`. The caller runs `cache_blocks(local + external)` itself once the
+        // load completes (`delay_then_cache` proves the two are equivalent).
+        if !self.cfg.enable_caching || delay_cache_blocks {
             return Ok(true);
         }
 
@@ -676,6 +768,88 @@ impl Manager {
         let num_tokens_to_cache = (total_computed_tokens + num_new_tokens).min(num_request_tokens);
         self.cache_blocks(req, num_tokens_to_cache);
         Ok(true)
+    }
+
+    /// The parked-load allocation: `allocate_slots(request, 0, ...)` with the async-load
+    /// argument shape from scheduler.py:903 (`num_new_tokens == 0` because `load_kv_async`
+    /// took the `:797` branch, `delay_cache_blocks=load_kv_async`, `reserved_blocks` from
+    /// `_inflight_prefill_reserved_blocks`, `num_lookahead_tokens=0` because
+    /// `limit_lookahead_tokens` zeroed it at `:884`).
+    ///
+    /// The LOCAL HIT BLOCKS ARE PASSED. Stock hands the same `new_computed_blocks` it built
+    /// at `:687` to this call, so the pending hit must be consumed exactly as the normal
+    /// waiting arm consumes it: `use_pending_hit = true`, and `num_new_computed_tokens =
+    /// num_local_computed_tokens` because this path is only reached with
+    /// `request.num_computed_tokens == 0` (the `:687` branch's own precondition).
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_external(
+        &mut self,
+        req: u32,
+        num_local_computed_tokens: usize,
+        num_external_computed_tokens: usize,
+        num_request_tokens: usize,
+        status: u8,
+        has_scheduled_reqs: bool,
+        reserved_blocks: usize,
+    ) -> Result<bool, String> {
+        self.allocate_slots(
+            req,
+            0,
+            num_local_computed_tokens,
+            true,
+            0,
+            0,
+            num_request_tokens,
+            status,
+            has_scheduled_reqs,
+            num_external_computed_tokens,
+            true,
+            reserved_blocks,
+        )
+    }
+
+    /// `Scheduler._request_remaining_blocks` (scheduler.py:2387): the blocks a request
+    /// still needs in order to hold its FULL sequence. Summed over the in-flight prefills
+    /// it becomes the `reserved_blocks` an async connector load is gated on
+    /// (`_inflight_prefill_reserved_blocks`, `:2400`).
+    ///
+    /// Stock passes `apply_admission_cap=True`. That cap is
+    /// `_max_admission_blocks_per_request`, which is set only for the recycling-aware specs
+    /// — sliding-window and chunked-local — and both are refused by `config.rs::validate`,
+    /// so on this stack the cap is always `None` and the argument is a no-op. If either
+    /// spec is ever admitted, `get_num_blocks_to_allocate` needs the cap FIRST.
+    pub fn remaining_blocks(
+        &mut self,
+        req: u32,
+        full_num_tokens: usize,
+        num_computed_tokens: usize,
+    ) -> usize {
+        let full_num_tokens = full_num_tokens.min(self.cfg.max_model_len);
+        self.coord.get_num_blocks_to_allocate(
+            req,
+            full_num_tokens,
+            &self.empty_groups,
+            num_computed_tokens,
+            full_num_tokens,
+        )
+    }
+
+    /// The per-group block-record metadata the connector's block view needs:
+    /// `(num_cached_block, null_block_id)`.
+    ///
+    /// `num_cached_block` is the count of this request's leading blocks that are already
+    /// in the prefix cache (`add_local_computed_blocks` `:227` sets it to the whole prefix
+    /// it just installed, `cache_blocks` `:341` raises it as blocks fill). It is exactly
+    /// the boundary the connector scans for: `KVCacheBlock.block_hash is None` iff the
+    /// block index is `>= num_cached_block`. A request the manager has never seen answers
+    /// 0, i.e. "nothing is cached", which is the safe reading — the connector then treats
+    /// every block as pending.
+    pub fn block_meta(&self, req: u32, group: usize) -> (usize, u32) {
+        let m = &self.coord.managers[group];
+        (
+            m.num_cached_block.get(&req).copied().unwrap_or(0),
+            self.coord.pool.null_block,
+        )
     }
 
     /// `cache_blocks` (`:620`).
@@ -1215,6 +1389,7 @@ mod tests {
             log_stats: true,
             watermark: 0.0,
             radix: false,
+            connector: false,
             groups: vec![
                 GroupConfig {
                     kind: Kind::FullAttention,
@@ -1236,6 +1411,34 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// [`hybrid_cfg`] with the connector live — the ONLY thing that changes inside the
+    /// crate is which cache-hit walk `get_computed_blocks` dispatches to.
+    fn connector_cfg(num_blocks: usize) -> Config {
+        let mut c = hybrid_cfg(num_blocks);
+        c.connector = true;
+        c
+    }
+
+    /// Two FULL-ATTENTION groups. Not the served shape — it exists for
+    /// `external_two_phase_touch_order`, which needs a second group whose local hits are
+    /// really touched. In the served FA+mamba hybrid the mamba group's hits are always
+    /// inside its `C - 1` skip window once `ext > 0` (so they are padded to nulls and never
+    /// touched), which makes the eviction hazard the two-phase order exists to prevent
+    /// unobservable there. The ORDER under test is group-count agnostic.
+    fn two_fa_cfg(num_blocks: usize) -> Config {
+        let mut c = hybrid_cfg(num_blocks);
+        c.groups[1] = GroupConfig {
+            kind: Kind::FullAttention,
+            block_size: 16,
+            is_full_attention: true,
+            spec_signature: "full-b".into(),
+            mamba_align: false,
+            num_speculative_blocks: 0,
+            use_eagle: false,
+        };
+        c
     }
 
     fn packed(hashes: &[Digest32]) -> Vec<u8> {
@@ -1261,7 +1464,7 @@ mod tests {
         m.push_hashes(a, &packed(&hs), 64);
         assert_eq!(m.get_computed_blocks(a, 64, 0, false), 0);
         assert!(m
-            .allocate_slots(a, 64, 0, true, 0, 0, 64, STATUS_WAITING, false)
+            .allocate_slots(a, 64, 0, true, 0, 0, 64, STATUS_WAITING, false, 0, false, 0)
             .unwrap());
         // Full attention holds 4 blocks; mamba (align) holds 3 nulls + 1 state.
         assert_eq!(m.group_blocks(a, 0).len(), 4);
@@ -1305,7 +1508,7 @@ mod tests {
         assert_eq!(m.get_computed_blocks(a, 1024, 0, false), 0);
         // 1024 tokens needs 64 full-attn blocks; only 7 are free.
         assert!(!m
-            .allocate_slots(a, 1024, 0, true, 0, 0, 1024, STATUS_WAITING, false)
+            .allocate_slots(a, 1024, 0, true, 0, 0, 1024, STATUS_WAITING, false, 0, false, 0)
             .unwrap());
         assert_eq!(m.coord.pool.get_num_free_blocks(), 7, "no partial allocation");
     }
@@ -1316,7 +1519,7 @@ mod tests {
         let a = m.intern("a");
         m.push_hashes(a, &packed(&chain(2, 5)), 32);
         m.get_computed_blocks(a, 32, 0, false);
-        m.allocate_slots(a, 32, 0, true, 0, 0, 32, STATUS_WAITING, false)
+        m.allocate_slots(a, 32, 0, true, 0, 0, 32, STATUS_WAITING, false, 0, false, 0)
             .unwrap();
         let before = m.coord.pool.get_num_free_blocks();
         assert!(before < 63);
@@ -1334,11 +1537,11 @@ mod tests {
         m.get_computed_blocks(a, 640, 0, false);
         // 640 tokens -> 40 full-attn blocks + 1 mamba state = 41; free = 63; 41 + 32 > 63.
         assert!(!m
-            .allocate_slots(a, 640, 0, true, 0, 0, 640, STATUS_WAITING, true)
+            .allocate_slots(a, 640, 0, true, 0, 0, 640, STATUS_WAITING, true, 0, false, 0)
             .unwrap());
         // Same allocation for a RUNNING request skips the watermark.
         assert!(m
-            .allocate_slots(a, 640, 0, true, 0, 0, 640, STATUS_RUNNING, true)
+            .allocate_slots(a, 640, 0, true, 0, 0, 640, STATUS_RUNNING, true, 0, false, 0)
             .unwrap());
     }
 
@@ -1590,7 +1793,7 @@ mod tests {
             m.push_hashes(a, &packed(&hs[..3]), 48);
             assert_eq!(m.get_computed_blocks(a, 48, 0, false), 0);
             assert!(m
-                .allocate_slots(a, 48, 0, true, 0, 0, 48, STATUS_WAITING, false)
+                .allocate_slots(a, 48, 0, true, 0, 0, 48, STATUS_WAITING, false, 0, false, 0)
                 .unwrap());
             m.store_init(a, &[], 48, 0).unwrap();
             // Schedule-time allocation for the 16-token burst -- `num_request_tokens` is
@@ -1598,7 +1801,7 @@ mod tests {
             // this allocates the 4th physical block WITHOUT caching it yet (matching
             // `allocate_slots`'s own `min(total_computed + new, num_request_tokens)` clip).
             assert!(m
-                .allocate_slots(a, 16, 0, false, 0, 48, 48, STATUS_RUNNING, true)
+                .allocate_slots(a, 16, 0, false, 0, 48, 48, STATUS_RUNNING, true, 0, false, 0)
                 .unwrap());
             // The decode-produced 4th block's hash, pushed the way `RustMirror.slot()`
             // would once the block hasher has it -- BEFORE the FFI crossing that applies
@@ -1883,5 +2086,314 @@ mod tests {
         let mut m = Manager::new(hybrid_cfg(64)).unwrap();
         let a = m.intern("req-a");
         assert!(m.store_init(a, &[], 10, 0).is_err());
+    }
+
+    // ---- Stage R / Stage A: the connector paths ---------------------------------------
+
+    /// The connector's boundary scan (offloading/scheduler.py:726-730) expressed against
+    /// the crate's `(ids, num_cached, null_id)` view — the same three inputs
+    /// `Manager::block_meta` + `group_blocks` hand to `rust_sched.py`'s `_BlockRecordView`.
+    ///
+    /// ```python
+    /// for i, block in enumerate(group_blocks[:num_gpu_blocks]):
+    ///     if not block.is_null and block.block_hash is None:
+    ///         num_locally_computed_gpu_blocks = i
+    ///         break
+    /// ```
+    fn connector_boundary(ids: &[u32], num_cached: usize, null: u32, n: usize) -> usize {
+        for (i, &b) in ids[..n].iter().enumerate() {
+            // `block_hash is None` <=> the block is not prefix-cached <=> i >= num_cached.
+            if b != null && i >= num_cached {
+                return i;
+            }
+        }
+        n
+    }
+
+    /// One cached 64-token request ("a"), left ALIVE so its blocks keep `ref_cnt == 1`.
+    fn seed_prefix(m: &mut Manager, hs: &[Digest32]) -> u32 {
+        let a = m.intern("a");
+        m.push_hashes(a, &packed(hs), 64);
+        assert_eq!(m.get_computed_blocks(a, 64, 0, false), 0);
+        assert!(m
+            .allocate_slots(a, 64, 0, true, 0, 0, 64, STATUS_WAITING, false, 0, false, 0)
+            .unwrap());
+        m.new_step_starts();
+        a
+    }
+
+    #[test]
+    fn per_group_hit_matches_stock() {
+        // `find_longest_cache_hit_per_group` (kv_cache_coordinator.py:742) vs the
+        // converging fixed point, on the SAME seeded pool.
+        //
+        // The converging walk collapses an identical 64-token follow-up to 0 (see
+        // `hybrid_second_request_reuses_the_prefix`): full attention matches 3 blocks
+        // (capped at num_tokens - 1 = 63) but the only cached mamba state sits at token 64,
+        // so the fixed point trims FA down to the mamba group's 0. The per-group walk never
+        // converges the two — each group answers for itself against the same fixed
+        // `max_cache_hit_length` — so FA keeps its 3 blocks and the scheduler hands
+        // `max(per_group_hits) = 48` to the connector as `num_new_local_computed_tokens`
+        // (scheduler.py:715).
+        let hs = chain(4, 1);
+
+        let mut conv = Manager::new(hybrid_cfg(256)).unwrap();
+        seed_prefix(&mut conv, &hs);
+        let b = conv.intern("b");
+        conv.push_hashes(b, &packed(&hs), 64);
+        assert_eq!(conv.get_computed_blocks(b, 64, 0, false), 0, "the converging walk");
+        assert!(conv.pending_hit[0].is_empty());
+
+        let mut pg = Manager::new(connector_cfg(256)).unwrap();
+        seed_prefix(&mut pg, &hs);
+        // A sentinel the per-group walk must NOT overwrite: that field belongs to the
+        // converging walk (`:735`) and still feeds `_mamba_block_aligned_split`.
+        pg.coord.num_uncached_common_prefix_tokens = 12_345;
+        let b = pg.intern("b");
+        pg.push_hashes(b, &packed(&hs), 64);
+        assert_eq!(pg.get_computed_blocks(b, 64, 0, false), 48, "max(per-group hits)");
+        assert_eq!(pg.pending_hit[0].len(), 3, "full attention keeps its own hit");
+        assert!(pg.pending_hit[1].is_empty(), "mamba's only state is past the cap");
+        assert_eq!(
+            pg.coord.num_uncached_common_prefix_tokens, 12_345,
+            "num_uncached_common_prefix_tokens belongs to the converging path"
+        );
+
+        // The stats record is the one `get_computed_blocks` makes, once per request, with
+        // the per-group max as the hit count (scheduler.py:717).
+        let stats = pg.take_prefix_cache_stats().unwrap();
+        assert_eq!((stats.requests, stats.queries, stats.hits), (2, 128, 48));
+    }
+
+    #[test]
+    fn external_two_phase_touch_order() {
+        // issue #33775: EVERY group's local hits must be touched before ANY group allocates
+        // external blocks, or an earlier group's `get_new_blocks` evicts a later group's
+        // not-yet-touched hit — which does not raise, it double-refs a shared block.
+        //
+        // The probe is pool state: the free queue is arranged so that the block at its head
+        // after group 0's touches is group 1's LAST hit block. Under the fused order group
+        // 0's external allocation pops exactly that block (evicting it and taking
+        // `ref_cnt` to 1), and group 1's `touch` then takes it to 2. Under the two-phase
+        // order group 1 has already touched it, so the head is a third request's block.
+        let mut m = Manager::new(two_fa_cfg(13)).unwrap();
+        let a = seed_prefix(&mut m, &chain(4, 1));
+        let a_g0 = m.group_blocks(a, 0).to_vec();
+        let a_g1 = m.group_blocks(a, 1).to_vec();
+        assert_eq!((a_g0.len(), a_g1.len()), (4, 4));
+
+        // A second cached request, freed AFTER `a`, so its blocks sit BEHIND a's in the
+        // free queue (`free_blocks` appends hashed blocks to the tail).
+        let c = m.intern("c");
+        m.push_hashes(c, &packed(&chain(2, 9)), 32);
+        assert_eq!(m.get_computed_blocks(c, 32, 0, false), 0);
+        assert!(m
+            .allocate_slots(c, 32, 0, true, 0, 0, 32, STATUS_WAITING, false, 0, false, 0)
+            .unwrap());
+        let c_g0 = m.group_blocks(c, 0).to_vec();
+        assert_eq!(m.coord.pool.get_num_free_blocks(), 0, "the pool is exactly full");
+        m.free(a);
+        m.free(c);
+        m.new_step_starts();
+
+        // The waiting-arm shape: both groups hit the whole 64-token prefix, the connector
+        // holds the next 16 tokens.
+        let b = m.intern("b");
+        let hits = vec![a_g0.clone(), a_g1.clone()];
+        m.coord
+            .allocate_new_computed_blocks(b, &hits, 64, 16)
+            .unwrap();
+
+        for (g, hit) in [(0usize, &a_g0), (1usize, &a_g1)] {
+            for &id in hit.iter() {
+                assert_eq!(
+                    m.coord.pool.arena.get(id).ref_cnt, 1,
+                    "group {g} hit block {id} was evicted and re-handed out"
+                );
+                assert!(
+                    m.coord.pool.arena.get(id).hash.is_some(),
+                    "group {g} hit block {id} lost its cache entry"
+                );
+            }
+        }
+        assert_eq!(m.group_blocks(b, 0), &[&a_g0[..], &[c_g0[1]]].concat()[..]);
+        assert_eq!(m.group_blocks(b, 1), &[&a_g1[..], &[c_g0[0]]].concat()[..]);
+        assert_eq!(m.coord.pool.get_num_free_blocks(), 2);
+    }
+
+    /// The A2/A3 scenario every external test below shares: 64 cached tokens plus 16 the
+    /// connector holds, parked with `delay_cache_blocks=True`.
+    fn external_load(m: &mut Manager) -> u32 {
+        let hs = chain(4, 1);
+        seed_prefix(m, &hs);
+        let hs2 = {
+            let mut v = hs.clone();
+            v.push([42; HASH_LEN]);
+            v
+        };
+        let b = m.intern("b");
+        m.push_hashes(b, &packed(&hs2), 80);
+        assert_eq!(m.get_computed_blocks(b, 80, 0, false), 64, "both groups hit 64");
+        b
+    }
+
+    #[test]
+    fn external_boundary() {
+        // After a parked load, the block-record view the connector reads must place the
+        // cached/uncached boundary exactly at the end of the LOCAL hit.
+        let mut m = Manager::new(connector_cfg(64)).unwrap();
+        let b = external_load(&mut m);
+        assert!(m
+            .allocate_external(b, 64, 16, 80, STATUS_WAITING, false, 0)
+            .unwrap());
+
+        let null = m.coord.pool.null_block;
+        for g in 0..2 {
+            let (num_cached, null_id) = m.block_meta(b, g);
+            assert_eq!(null_id, null);
+            assert_eq!(num_cached, 4, "group {g}: the 64-token local prefix");
+            let ids = m.group_blocks(b, g);
+            assert_eq!(ids.len(), 5, "group {g}: 4 prefix blocks + 1 external block");
+            assert_eq!(
+                connector_boundary(ids, num_cached, null_id, ids.len()),
+                4,
+                "group {g}: the connector must start loading at block 4"
+            );
+        }
+        // Full attention holds four REAL cached blocks; the mamba group pads the same
+        // prefix with nulls (its `C - 1` skip window), and a null must not move the
+        // boundary — that is what `not block.is_null` in the stock scan is for.
+        assert!(m.group_blocks(b, 0).iter().all(|&x| x != null));
+        assert_eq!(&m.group_blocks(b, 1)[..4], &[null; 4]);
+        assert_ne!(m.group_blocks(b, 1)[4], null);
+    }
+
+    #[test]
+    fn external_mamba_align() {
+        // The mamba half of the same load. `get_num_skipped_tokens = C - 1` with
+        // `C = local + external = 80` skips 4 blocks, so `add_local_computed_blocks` pads 4
+        // nulls and drops the whole hit, and `allocate_external_computed_blocks` clamps the
+        // external tokens to `80 - 79 = 1` — one state block, at index 4.
+        let mut m = Manager::new(connector_cfg(64)).unwrap();
+        let b = external_load(&mut m);
+        let mut drained = Vec::new();
+        m.take_new_block_ids(&mut drained); // whatever seeding queued
+        assert!(m
+            .allocate_external(b, 64, 16, 80, STATUS_WAITING, false, 0)
+            .unwrap());
+
+        let null = m.coord.pool.null_block;
+        let mamba = m.group_blocks(b, 1).to_vec();
+        assert_eq!(mamba.len(), 5);
+        assert_eq!(&mamba[..4], &[null; 4], "the C - 1 skip window is all nulls");
+        assert_ne!(mamba[4], null, "exactly one live state block");
+        assert_eq!(m.block_meta(b, 1).0, 4);
+
+        let fa = m.group_blocks(b, 0).to_vec();
+        let mut ids = Vec::new();
+        m.take_new_block_ids(&mut ids);
+        // `allocate_external_computed_blocks` extends `new_block_ids` only for the
+        // FA-family specs (single_type_kv_cache_manager.py:272), so the mamba state block
+        // is NOT queued for zeroing.
+        assert_eq!(ids, vec![fa[4]], "only the full-attention external block");
+        assert!(!ids.contains(&mamba[4]), "a mamba state block is never zeroed");
+    }
+
+    #[test]
+    fn delay_then_cache() {
+        // THE PARITY ANCHOR for `delay_cache_blocks`: parking the caching and doing it by
+        // hand afterwards must land in a bit-identical state to caching inline. If these
+        // ever diverge, every P/D load silently publishes a different prefix cache than the
+        // synchronous path does.
+        fn run(delay: bool) -> u64 {
+            let mut m = Manager::new(connector_cfg(64)).unwrap();
+            let b = external_load(&mut m);
+            assert!(m
+                .allocate_slots(b, 0, 64, true, 0, 0, 80, STATUS_WAITING, false, 16, delay, 0)
+                .unwrap());
+            if delay {
+                // `min(total_computed_tokens + num_new_tokens, request.num_tokens)`
+                // (kv_cache_manager.py:458) with `num_new_tokens == 0`.
+                m.cache_blocks(b, 80);
+            }
+            m.state_fingerprint()
+        }
+        assert_eq!(run(true), run(false));
+    }
+
+    #[test]
+    fn reserved_blocks_gate() {
+        // `available = free - reserved_blocks` (kv_cache_manager.py:422), checked BEFORE
+        // the watermark's own headroom. 32 tokens costs 3 blocks here: 2 full-attention
+        // plus 1 mamba state.
+        let fresh = || {
+            let mut m = Manager::new(hybrid_cfg(11)).unwrap();
+            let a = m.intern("a");
+            m.push_hashes(a, &packed(&chain(2, 3)), 32);
+            assert_eq!(m.get_computed_blocks(a, 32, 0, false), 0);
+            assert_eq!(m.coord.pool.get_num_free_blocks(), 10);
+            (m, a)
+        };
+
+        let (mut m, a) = fresh();
+        assert!(
+            !m.allocate_slots(a, 32, 0, true, 0, 0, 32, STATUS_WAITING, false, 0, false, 8)
+                .unwrap(),
+            "3 blocks needed, only 10 - 8 = 2 admissible"
+        );
+        assert_eq!(m.coord.pool.get_num_free_blocks(), 10, "no partial allocation");
+
+        let (mut m, a) = fresh();
+        assert!(m
+            .allocate_slots(a, 32, 0, true, 0, 0, 32, STATUS_WAITING, false, 0, false, 7)
+            .unwrap(), "3 <= 10 - 7 fits exactly");
+
+        let (mut m, a) = fresh();
+        assert!(m
+            .allocate_slots(a, 32, 0, true, 0, 0, 32, STATUS_WAITING, false, 0, false, 0)
+            .unwrap(), "no reservation, no gate");
+    }
+
+    #[test]
+    fn zero_work_guard() {
+        // `:345`: zero new tokens is legal ONLY when the connector has tokens to allocate
+        // for -- an async load runs no forward pass at all.
+        let mut m = Manager::new(connector_cfg(64)).unwrap();
+        let a = m.intern("a");
+        m.push_hashes(a, &packed(&chain(2, 3)), 32);
+        assert_eq!(m.get_computed_blocks(a, 32, 0, false), 0);
+        assert!(m
+            .allocate_slots(a, 0, 0, true, 0, 0, 32, STATUS_WAITING, false, 0, false, 0)
+            .is_err());
+        assert!(m
+            .allocate_slots(a, 0, 0, true, 0, 0, 32, STATUS_WAITING, false, 16, true, 0)
+            .unwrap());
+        assert_eq!(m.group_blocks(a, 0).len(), 1, "one block for the 16 external tokens");
+    }
+
+    #[test]
+    fn remaining_blocks_matches_get_num_blocks_to_allocate() {
+        // `Scheduler._request_remaining_blocks` (scheduler.py:2387). Stock passes
+        // `apply_admission_cap=True`; that cap is only ever set for sliding-window and
+        // chunked-local specs, both of which `config.rs::validate` refuses, so it is a
+        // no-op here and the two calls must agree exactly.
+        let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+        let a = m.intern("a");
+        m.push_hashes(a, &packed(&chain(4, 1)), 64);
+        assert_eq!(m.get_computed_blocks(a, 64, 0, false), 0);
+        // Mid-prefill: the first 32-token chunk is allocated, 32 tokens still to go.
+        assert!(m
+            .allocate_slots(a, 32, 0, true, 0, 0, 64, STATUS_WAITING, false, 0, false, 0)
+            .unwrap());
+
+        for (full, computed) in [(64usize, 32usize), (64, 64), (16, 0)] {
+            let want = m
+                .coord
+                .get_num_blocks_to_allocate(a, full, &m.empty_groups, computed, full);
+            assert_eq!(m.remaining_blocks(a, full, computed), want, "{full}/{computed}");
+        }
+        // `min(request.num_tokens, self.max_model_len)` is applied inside.
+        let capped = m.remaining_blocks(a, usize::MAX / 2, 32);
+        assert_eq!(capped, m.remaining_blocks(a, m.cfg.max_model_len, 32));
     }
 }

@@ -752,6 +752,14 @@ def spec_signature(spec) -> str:
     return type(spec).__name__ + repr(sorted((k, repr(v)) for k, v in fields.items()))
 
 
+# Stage S flips this. Until then the crate is told "no connector" on both wires, which
+# keeps `Config::connector` / `Params::connector` false and every allocator path
+# bit-identical to the pre-connector build: the per-group cache-hit walk is never
+# dispatched to, and the three connector arguments to `allocate_slots` stay at their
+# inert defaults. One constant rather than two literals so the two wires cannot drift.
+CONNECTOR_LIVE = False
+
+
 def build_config(manager, radix: bool):
     """Flatten a live ``KVCacheManager`` into the plain data the crate accepts.
 
@@ -810,6 +818,10 @@ def build_config(manager, radix: bool):
             "log_stats": bool(manager.log_stats),
             "watermark": float(manager.watermark_blocks) / max(kv_cache_config.num_blocks, 1),
             "radix": bool(radix),
+            # Optional on the crate side; decides which cache-hit walk
+            # `Manager::get_computed_blocks` dispatches to (kv_cache_coordinator.py:742
+            # vs the converging fixed point).
+            "connector": bool(CONNECTOR_LIVE),
             "groups": groups,
         }
         return cfg, None
@@ -956,21 +968,106 @@ def status_code(request) -> int:
 # --------------------------------------------------------------------------
 
 
+# Stand-in for ``KVCacheBlock.block_hash``. A KV connector only ever tests it for
+# ``is None`` (offloading/scheduler.py:727 -- ``if not block.is_null and
+# block.block_hash is None``), so any non-None sentinel is indistinguishable from the
+# real hash, and materialising real hashes would mean copying a request's whole hash
+# chain across the FFI boundary for a value nothing reads.
+_HASH_PRESENT = object()
+
+
+class _BlockRecord:
+    """One ``KVCacheBlock``-shaped record: the three attributes a connector reads."""
+
+    __slots__ = ("block_id", "is_null", "block_hash")
+
+    def __init__(self, block_id, is_null, block_hash):
+        self.block_id = block_id
+        self.is_null = is_null
+        self.block_hash = block_hash
+
+
+class _BlockRecordView:
+    """Lazy ``Sequence[KVCacheBlock]`` over ONE group's Rust-owned block ids.
+
+    The connector contract (offloading/scheduler.py:711-761) needs ``len``, iteration,
+    integer indexing and slicing over records exposing ``block_id`` / ``is_null`` /
+    ``block_hash``. Everything but the ids is derivable from two numbers the crate already
+    holds, so nothing is materialised until a record is actually asked for:
+
+    * ``is_null``    -- the id equals the pool's null block (mamba padding / SWA holes).
+    * ``block_hash`` -- ``None`` iff the index is at or past ``num_cached``, i.e. the block
+      is NOT prefix-cached. ``num_cached`` is the crate's ``num_cached_block``, which is
+      exactly the count of leading blocks whose ``block_hash`` stock has set.
+    """
+
+    __slots__ = ("_ids", "_num_cached", "_null_id")
+
+    def __init__(self, ids, num_cached, null_id):
+        self._ids = ids
+        self._num_cached = num_cached
+        self._null_id = null_id
+
+    def _record(self, i):
+        block_id = self._ids[i]
+        return _BlockRecord(
+            block_id,
+            block_id == self._null_id,
+            None if i >= self._num_cached else _HASH_PRESENT,
+        )
+
+    def __len__(self):
+        return len(self._ids)
+
+    def __iter__(self):
+        for i in range(len(self._ids)):
+            yield self._record(i)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, _stop, step = index.indices(len(self._ids))
+            if step != 1:
+                raise NotImplementedError("strided block-record slices are not supported")
+            # A slice starting at `start` shifts every index down by `start`, so the
+            # cached/uncached boundary moves with it. Clamped at 0 because the connector
+            # slices with `start <= num_cached` (`group_blocks[num_locally_computed:...]`)
+            # as well as with `start == 0`, and past the boundary NOTHING is cached.
+            return _BlockRecordView(
+                self._ids[index], max(0, self._num_cached - start), self._null_id
+            )
+        if index < 0:
+            index += len(self._ids)
+        if not 0 <= index < len(self._ids):
+            raise IndexError(index)
+        return self._record(index)
+
+
 class RustBlocks:
     """``KVCacheBlocks`` stand-in over Rust-owned block IDs.
 
     Only the members vLLM's scheduler actually touches are implemented; anything else
     raises loudly rather than returning something plausible.
+
+    ``meta`` is the OPT-IN block-record view: ``None`` (the default, and what every
+    existing producer passes) makes ``blocks`` the raw per-group id tuples it has always
+    been. A connector post-pass builds one with ``meta = ((num_cached, null_id), ...)``,
+    and then -- and only then -- ``blocks`` answers with per-group record views.
     """
 
-    __slots__ = ("_ids",)
+    __slots__ = ("_ids", "_meta")
 
-    def __init__(self, ids):
+    def __init__(self, ids, meta=None):
         self._ids = tuple(ids)
+        self._meta = meta
 
     @property
     def blocks(self):
-        return self._ids
+        if self._meta is None:
+            return self._ids
+        return tuple(
+            _BlockRecordView(ids, num_cached, null_id)
+            for ids, (num_cached, null_id) in zip(self._ids, self._meta)
+        )
 
     def get_block_ids(self, allow_none: bool = False):
         if allow_none and all(len(g) == 0 for g in self._ids):
@@ -981,9 +1078,10 @@ class RustBlocks:
         return RustBlocks(tuple([] for _ in self._ids))
 
     def __add__(self, other):
-        return RustBlocks(
-            tuple(list(a) + list(b) for a, b in zip(self._ids, other.blocks))
-        )
+        # IDs on both sides, never records: reading a meta-carrying operand through
+        # `.blocks` would splice block records into a list of ints.
+        rhs = other._ids if isinstance(other, RustBlocks) else other.blocks
+        return RustBlocks(tuple(list(a) + list(b) for a, b in zip(self._ids, rhs)))
 
     def get_unhashed_block_ids(self):
         raise NotImplementedError("KV connectors are not supported by VTL_RUST_SCHED")
@@ -1168,12 +1266,13 @@ def _install_authority(base, mirror_modes):
 
         # --- helpers --------------------------------------------------------
 
-        def _blocks_of(self, slot):
+        def _blocks_of(self, slot, meta=None):
             return RustBlocks(
                 tuple(
                     self._rust.buffer(g)[: self._rust.blocks_into_buffer(slot, g)].tolist()
                     for g in range(self._rust.num_groups)
-                )
+                ),
+                meta,
             )
 
         def _pending(self):
@@ -1255,15 +1354,13 @@ def _install_authority(base, mirror_modes):
             reserved_blocks: int = 0,
             has_scheduled_reqs: bool = True,
         ):
-            if (
-                num_external_computed_tokens
-                or delay_cache_blocks
-                or num_encoder_tokens
-                or full_sequence_must_fit
-                or reserved_blocks
-            ):
+            if num_encoder_tokens or full_sequence_must_fit:
+                # Still unported: cross-attention allocation, and the admission gate that
+                # re-runs `get_num_blocks_to_allocate` over the full sequence with
+                # `apply_admission_cap=True`. The three connector arguments below ARE
+                # ported and pass straight through.
                 raise NotImplementedError(
-                    "VTL_RUST_SCHED=1 does not support connector / encoder / "
+                    "VTL_RUST_SCHED=1 does not support encoder / "
                     "full-sequence-admission allocation paths"
                 )
             slot = self._mirror.slot(request)
@@ -1271,12 +1368,17 @@ def _install_authority(base, mirror_modes):
                 slot,
                 int(num_new_tokens),
                 int(num_new_computed_tokens),
+                # Unchanged: the crate consumes the hit it is already holding, and the
+                # identity of `new_computed_blocks` is what says whether there is one.
                 new_computed_blocks is not None,
                 int(num_lookahead_tokens),
                 int(request.num_computed_tokens),
                 int(request.num_tokens),
                 status_code(request),
                 bool(has_scheduled_reqs),
+                int(num_external_computed_tokens),
+                bool(delay_cache_blocks),
+                int(reserved_blocks),
             )
             if not ok:
                 return None
@@ -1338,6 +1440,23 @@ def _install_authority(base, mirror_modes):
             if slot is None:
                 return self._empty
             return self._blocks_of(slot)
+
+        def get_blocks_with_meta(self, request_id):
+            """``get_blocks`` whose ``.blocks`` are BLOCK RECORDS, not raw ids.
+
+            A separate method rather than a flag on ``get_blocks``: that one is on the
+            routed-experts path (and every other in-tree caller), all of which want the
+            plain id tuples, and a record view would break them. Only the connector
+            post-pass -- which runs right after ``allocate_slots(delay_cache_blocks=True)``
+            and before any ``cache_blocks`` -- asks for this shape.
+            """
+            slot = self._rust.lookup(request_id)
+            if slot is None:
+                return self._empty
+            meta = tuple(
+                self._rust.block_meta(slot, g) for g in range(self._rust.num_groups)
+            )
+            return self._blocks_of(slot, meta)
 
         def get_block_ids(self, request_id):
             slot = self._rust.lookup(request_id)
@@ -4121,6 +4240,10 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     # Scheduler this closure belongs to exists. 0 = no burst on this boot,
                     # which leaves the derivation in `burst_blocked_batch`.
                     "burst_max_reqs": int(nstep_mod.MAX_BURST_REQS) if NSTEP else 0,
+                    # Optional on the crate side too. False today: `schedule_supported`
+                    # refuses a scheduler with a connector attached, so this loop never
+                    # runs with one live (Stage S).
+                    "connector": bool(CONNECTOR_LIVE),
                 }
             )
             log.info(
@@ -5127,6 +5250,77 @@ def _self_check() -> None:
         pass
     else:  # pragma: no cover
         raise AssertionError("connector path must refuse loudly")
+    try:
+        rb.get_unhashed_block_ids_all_groups()
+    except NotImplementedError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("connector path must refuse loudly")
+
+    # ---- Stage R: the block-record view --------------------------------------------
+    # `_meta is None` must leave RustBlocks EXACTLY as it was: `blocks` is the raw id
+    # tuples, and the three id-only members are untouched.
+    assert rb._meta is None
+    assert rb.blocks == ([1, 2], [3]), "meta-free blocks are still raw ids"
+    assert rb.get_block_ids() == ([1, 2], [3])
+    assert rb.new_empty().get_block_ids() == ([], [])
+    assert (rb + RustBlocks(([9], [8]))).get_block_ids() == ([1, 2, 9], [3, 8])
+    # ...including when the OTHER operand carries meta: ids concatenate, never records.
+    meta_rhs = RustBlocks(([9], [8]), ((1, 0), (0, 0)))
+    assert (rb + meta_rhs).get_block_ids() == ([1, 2, 9], [3, 8])
+    assert (rb + meta_rhs)._meta is None, "the sum is a plain id container"
+
+    # THE CONNECTOR CONTRACT (offloading/scheduler.py:726-730). Group 0 is a mamba-style
+    # row: two null placeholders, then two real blocks, three of which are prefix-cached.
+    NULL = 0
+    mb = RustBlocks(([NULL, NULL, 7, 9], [4]), ((3, NULL), (1, NULL)))
+    g = mb.blocks[0]
+    assert len(g) == 4
+    assert [b.block_id for b in g] == [NULL, NULL, 7, 9]
+    assert [b.is_null for b in g] == [True, True, False, False]
+    assert [b.block_hash is None for b in g] == [False, False, False, True]
+
+    def _boundary(group, n):
+        """The connector's scan, verbatim."""
+        out = n
+        for i, b in enumerate(group[:n]):
+            if not b.is_null and b.block_hash is None:
+                out = i
+                break
+        return out
+
+    assert _boundary(g, 4) == 3, "the boundary is the first uncached NON-null block"
+    assert _boundary(g, 3) == 3, "a shorter scan finds nothing uncached"
+    # Slicing: `group_blocks[a:b]` with `a <= num_cached`, which is how the connector
+    # builds its destination block list.
+    tail = g[3:4]
+    assert len(tail) == 1 and tail[0].block_id == 9 and tail[0].block_hash is None
+    inner = g[2:4]
+    assert [b.block_id for b in inner] == [7, 9]
+    assert [b.block_hash is None for b in inner] == [False, True], (
+        "num_cached must shift down by the slice start"
+    )
+    assert [b.block_hash is None for b in g[3:]] == [True]
+    assert [b.block_hash is None for b in g[:2]] == [False, False]
+    assert len(g[4:]) == 0 and list(g[4:]) == []
+    assert g[-1].block_id == 9 and g[1].is_null
+    for bad in (4, -5):
+        try:
+            g[bad]
+        except IndexError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError("out-of-range index must raise")
+    try:
+        g[::2]
+    except NotImplementedError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("strided slices must refuse loudly")
+    # Group 1 is a plain single-block full-attention row, fully cached.
+    g1 = mb.blocks[1]
+    assert len(g1) == 1 and g1[0].block_hash is not None and not g1[0].is_null
+    assert _boundary(g1, 1) == 1
     log.setLevel(logging.NOTSET)
 
     # ---- C1a: the N-step burst gate + the num_computed_tokens arithmetic -------------
