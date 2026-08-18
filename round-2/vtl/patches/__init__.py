@@ -109,6 +109,9 @@ _MODULES: tuple[str, ...] = (
     "megakernel_probe",  # read-only go/no-go for a cooperative-grid decode megakernel. Same
                          # load_model seam as the two above, so it goes after them; it only
                          # reads device attributes, so the order between them does not matter.
+    "stall_dump",        # liveness flight recorder: running-but-frozen counters -> log the
+                         # burst state + all-thread stacks. AFTER rust_sched so it wraps the
+                         # finally-bound update_from_output. Diagnostics only.
 )
 
 for _name in _MODULES:

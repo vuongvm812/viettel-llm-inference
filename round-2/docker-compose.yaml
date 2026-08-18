@@ -155,6 +155,11 @@ services:
       VTL_ENABLE_GREEDY_SAMPLER: "1" # V1 greedy argmax short-circuit
       VTL_ENABLE_STEP0_EOS_BAN: "1" # suppress an immediate EOS on the first step
       VTL_ENABLE_L2_PERSIST: "1" # L2 persisting-access window for the KV block
+      VTL_ENABLE_STALL_DUMP: "1"
+      # liveness flight recorder: if running requests freeze
+      #   for VTL_STALL_DUMP_SECS (20s), log request counters +
+      #   BURST state + all-thread stacks. Diagnostics only --
+      #   it never intervenes. Added while hunting the nstep hang.
       VTL_ENABLE_PROFILER: "0"
       # OFF in the submission;
       #   docker-compose.profile.yaml overrides to 1
