@@ -55,6 +55,16 @@ in charge.
 
     VTL_RUST_SCHED_REQUIRE=1  turn that refusal into a BOOT FAILURE.
 
+...and not only that refusal. Under REQUIRE every way this stack can quietly step down is
+loud, in three classes: a boot-config refusal raises at the site (``refuse``); a per-step
+fallback is legitimate and is only fatal once it has fired for
+``VTL_RUST_SCHED_REQUIRE_STEPS`` consecutive steps, i.e. once it is permanent
+(``require_watch``); and a rung that latches itself off mid-boot raises immediately
+(``require_latch``). See the block above ``_REQUIRE_KEYS`` for why those are three things
+and not one. Independently of REQUIRE, the first ``schedule()`` logs one ``rust_sched:
+RUNGS ...`` line naming every rung's resolved state and, for the off ones, the reason --
+the record that tells a finished bench run whether it measured this port or stock vLLM.
+
 A KV connector is the one refusal that has to be taken BEFORE the manager is in service,
 because ``schedule_supported`` sees it only once the Scheduler exists and by then the Rust
 pool is live. ``kv_connector_configured`` probes the config for every shape a connector can
@@ -95,7 +105,7 @@ def env_on(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in _TRUTHY
 
 
-def refuse(reason: str) -> None:
+def refuse(reason: str, rung_only: bool = False) -> None:
     """Report a refusal to engage the Rust scheduler. Raises under VTL_RUST_SCHED_REQUIRE=1.
 
     WHY THIS EXISTS. The port covers exactly two KV cache-spec kinds (full attention and
@@ -108,6 +118,13 @@ def refuse(reason: str) -> None:
 
     Adding a spec kind means adding a `Kind` variant in vtl-sched/src/single_type.rs AND
     the matching arm in build_config -- not just silencing this.
+
+    ``rung_only=True`` says "an OPTIONAL rung above the authority manager refused; the
+    scheduler itself is engaged". It suppresses exactly the VTL_RUST_RUNNER_REQUIRE clause
+    below, which is the difference between "this refusal means the runner has no KV
+    authority" and "this refusal means the lean payload / the arena / add-time
+    registration is not available on this boot". Without it, a runner-REQUIRE bench would
+    die on a refused Phase A -- a rung the runner does not use and never asked for.
     """
     if env_on("VTL_RUST_SCHED_REQUIRE"):
         raise RuntimeError(
@@ -118,7 +135,7 @@ def refuse(reason: str) -> None:
     # init (the capture-time REQUIRE check waives the not-yet-armed state), this is the
     # only place left that can enforce VTL_RUST_RUNNER_REQUIRE on a boot where the
     # scheduler never engages at all.
-    if env_on("VTL_RUST_RUNNER_REQUIRE") \
+    if not rung_only and env_on("VTL_RUST_RUNNER_REQUIRE") \
             and os.environ.get("VTL_RUST_RUNNER", "1").strip().lower() in _TRUTHY:
         raise RuntimeError(
             "VTL_RUST_RUNNER_REQUIRE=1 but the Rust scheduler cannot engage, so the "
@@ -137,6 +154,177 @@ def reraise_fatal(exc: BaseException) -> None:
     """
     if isinstance(exc, (KeyboardInterrupt, SystemExit)):
         raise exc
+
+
+# --------------------------------------------------------------------------
+# VTL_RUST_SCHED_REQUIRE, the other two classes
+# --------------------------------------------------------------------------
+#
+# THREE KINDS OF DEMOTION, NOT ONE. ``refuse()`` above is the whole story only for the
+# refusals that are taken at BOOT, where "cannot engage" and "will never engage" are the
+# same sentence. Every rung below the authority manager can also step down LATER, and
+# those steps down are not all alike:
+#
+#   class A -- a boot-config refusal. Decided once, from config, before any step runs.
+#              ``refuse()`` is exactly right: raise under REQUIRE, warn otherwise.
+#
+#   class B -- a per-step, LEGITIMATE fallback. One step took the stock path because that
+#              step's shape was outside what the Rust rung models (a bail condition, a
+#              dirty table, a contended pycell borrow, an unportable batch). A single one
+#              of these is not a bug and must never be fatal -- the fail-open design is
+#              the point. What IS a bug is the same fallback firing on EVERY step from
+#              here to the end of the run: that is a rung which is permanently demoted
+#              while still looking, in every log line and every latency number, exactly
+#              like a rung that engaged and did not help. So class B COUNTS CONSECUTIVE
+#              demoted steps and only raises once the count says "permanent".
+#
+#   class C -- a corruption latch. A rung caught something it cannot recover from and
+#              turned itself off for the rest of the process by design (``TableState.off``,
+#              ``TOK.live = False``, ``R9.live = False``, ``BURST.disable``). There is no
+#              counting to do: one of these has already decided the rest of the boot runs
+#              on stock. Under REQUIRE it raises immediately; otherwise it logs, once per
+#              key, so a latch re-entered every step cannot flood the log.
+#
+# THE RESET DISCIPLINE. Class B is a CONSECUTIVE counter, which is only meaningful if the
+# success path clears it. Every ``require_watch(key, reason)`` site in this module has a
+# matching ``require_watch(key, ok=True)`` on the path where that same rung did its job.
+# A class-B site added without its reset turns a healthy bursty workload into a boot
+# failure at step ``_REQUIRE_THRESHOLD``, which is the opposite of what this is for.
+#
+# The scratch namespace ``sc_*`` is reserved for ``_self_check``: those keys drive the
+# shipped functions without claiming a place in the table below.
+_REQUIRE_KEYS = {
+    "bail": ("B", "schedule() handed this step back to stock vLLM (bail_reason)"),
+    "table_dirty": ("B", "resident table dirty; this step re-marshals every request"),
+    "kick_borrow": ("B", "speculation kick skipped -- a refused pycell borrow"),
+    "ufo": ("B", "step decided by Python check_stop instead of one update_step"),
+    "ufo_exception": ("B", "decide() raised; this step falls back to check_stop"),
+    "prereg": ("B", "add-time registration failed; decide() interns the request"),
+    "nstep_skip": ("B", "nstep committed no burst on this step"),
+    "resident_table": ("C", "resident-table path permanently marshalled"),
+    "token_store": ("C", "Port-2 token store off for the rest of the boot"),
+    "r9": ("C", "R9 collapsed FFI + residue loop off for the rest of the boot"),
+    "nstep_burst": ("C", "nstep bursts off for the rest of the boot"),
+}
+
+# key -> [consecutive demoted steps, last reason]. Only ever written under REQUIRE.
+_REQUIRE_WATCH: dict[str, list] = {}
+
+# Keys whose class-C latch has already been logged, so a latch re-entered per step logs
+# once and not a million times. Only used when REQUIRE is OFF (under REQUIRE the first
+# latch raises and there is no second).
+_REQUIRE_LATCHED: set = set()
+
+
+def _require_steps(default: int = 512) -> int:
+    """``VTL_RUST_SCHED_REQUIRE_STEPS``, parse-safe.
+
+    Deliberately never raises on a malformed value: a typo in a bench env line must not be
+    the thing that takes the engine down, because the whole point of this knob is to make
+    the engine's own demotions the only fatal thing on the boot.
+
+    512 consecutive steps is well past any legitimate transient (the longest is a burst
+    rollback, which resyncs and recovers on the next step) and far short of a run.
+    """
+    try:
+        n = int(os.environ.get("VTL_RUST_SCHED_REQUIRE_STEPS", "").strip() or default)
+    except ValueError:
+        return default
+    return max(1, n)
+
+
+_REQUIRE_THRESHOLD = _require_steps()
+
+# The one key that does not measure a per-step rung (see `require_watch`'s docstring):
+# `nstep_skip` counts steps on which no burst was committed, and a workload whose waiting
+# queue keeps refilling legitimately skips for as long as that lasts. 16x the default
+# still catches "the burst never engaged on this boot" and cannot be reached by an idle
+# gap in a run that is otherwise bursting.
+_NSTEP_SKIP_THRESHOLD = 16 * _REQUIRE_THRESHOLD
+
+
+def require_watch(key: str, reason: str = "", ok: bool = False,
+                  threshold: int | None = None) -> None:
+    """Class B: count CONSECUTIVE demoted steps for one rung; raise only when permanent.
+
+    A no-op unless ``VTL_RUST_SCHED_REQUIRE=1`` -- in the submission every one of these
+    fallbacks is a feature, and the counters themselves are not worth a dict write per
+    step. Under REQUIRE the contract is:
+
+      * ``ok=True``  -- this rung did its job on this step. Reset. THIS CALL IS MANDATORY
+        for every site that increments ``key``; see the reset-discipline note above.
+      * otherwise    -- one more consecutive demoted step. On the first step that reaches
+        ``threshold`` (default ``_REQUIRE_THRESHOLD``), raise.
+
+    ``threshold`` exists for exactly one site. ``nstep_skip`` counts steps on which no
+    burst was committed, and the queue-empty guard makes a legitimately bursty-idle
+    workload skip for as long as the queue keeps refilling -- a run that is doing the right
+    thing can sit well past 512 skipped steps and then commit again. Its own much higher
+    ceiling keeps the key useful as a "the burst never engages on this boot" alarm without
+    turning an idle gap into a boot failure. Every other key measures a rung that should
+    engage on essentially every steady-decode step.
+    """
+    if not env_on("VTL_RUST_SCHED_REQUIRE"):
+        return
+    slot = _REQUIRE_WATCH.get(key)
+    if slot is None:
+        slot = _REQUIRE_WATCH[key] = [0, ""]
+    if ok:
+        slot[0] = 0
+        return
+    slot[0] += 1
+    slot[1] = reason
+    lim = _REQUIRE_THRESHOLD if threshold is None else threshold
+    if slot[0] >= lim:
+        raise RuntimeError(
+            f"VTL_RUST_SCHED_REQUIRE=1 but the Rust scheduler rung {key!r} has been "
+            f"demoted for {slot[0]} consecutive steps, i.e. permanently: {reason}"
+        )
+
+
+def require_latch(key: str, reason: str, exc: BaseException | None = None) -> None:
+    """Class C: a rung has turned itself off for the rest of the process.
+
+    Called AFTER the site's own logging and its own off-latch, so the non-REQUIRE
+    behaviour of every caller is exactly what it was plus one extra line, and so that
+    under REQUIRE the disabled state is already recorded when the raise unwinds (the
+    process is going down either way, but a half-applied latch would be the worse of the
+    two states to leave behind for an ``atexit`` dump).
+
+    ``exc`` becomes the raised error's ``__cause__`` when there is one: these latches are
+    usually taken from an exception handler and the original traceback is the whole
+    diagnostic.
+    """
+    if env_on("VTL_RUST_SCHED_REQUIRE"):
+        raise RuntimeError(
+            f"VTL_RUST_SCHED_REQUIRE=1 but the Rust scheduler rung {key!r} disabled "
+            f"itself for the rest of this boot: {reason}"
+        ) from exc
+    if key not in _REQUIRE_LATCHED:
+        _REQUIRE_LATCHED.add(key)
+        log.error(
+            "rust_sched: rung %s is permanently demoted -- %s "
+            "(VTL_RUST_SCHED_REQUIRE=1 makes this fatal)", key, reason
+        )
+
+
+_RUNG_WHY_MAX = 48
+
+
+def rung(live: bool, why: str) -> str:
+    """One cell of the RUNGS proof line: ``on``, or ``OFF(<short reason>)``.
+
+    The reason is squeezed to one line and clipped: RUNGS has to stay ONE line to be worth
+    grepping, and every refusal it names has already logged its full text at the site.
+    What this cell owes the reader is enough to tell which refusal it was, not the refusal
+    itself.
+    """
+    if live:
+        return "on"
+    why = " ".join(str(why or "gate off").split())
+    if len(why) > _RUNG_WHY_MAX:
+        why = why[: _RUNG_WHY_MAX - 1] + "…"
+    return f"OFF({why})"
 
 
 # Every way a V1 KV connector can be requested, as (probe name, predicate). A LIST of
@@ -1222,6 +1410,19 @@ class TableState:
 
     def resync(self, why: str) -> None:
         if not self.dirty:
+            # Class B, counted on the TRANSITION and not on every call. This object is
+            # constructed unconditionally (see the manager's __init__) while the reset --
+            # `dirty = False` in the schedule() wrapper -- is reachable only under
+            # VTL_RUST_SCHED_TABLE, so counting every call would let `evict_blocks` /
+            # `reset_prefix_cache` walk a TABLE-off boot into a REQUIRE failure for a rung
+            # that was never armed. On such a boot the table is born dirty and never
+            # cleaned, so this branch is dead and the key correctly stays at zero.
+            #
+            # The counterpart case -- a table that goes dirty and never comes back -- is
+            # not this key's to catch: nothing clears `dirty` except the marshalled
+            # schedule, so a table stuck dirty means the wrapper is bailing every step,
+            # and "bail" is the key that says so.
+            require_watch("table_dirty", why)
             self.dirty = True
             log.debug("rust_sched: resident table marked dirty -- %s", why)
         self.bump()
@@ -1236,6 +1437,9 @@ class TableState:
             log.exception(
                 "rust_sched: resident-table path failed in %s; permanently marshalled", where
             )
+            # Class C, after the off-latch: R6b/R6c are gone for this process, which is
+            # exactly the "measures stock while looking engaged" state REQUIRE exists for.
+            require_latch("resident_table", f"{where}: {exc!r}", exc)
 
 
 class PhaseTimers:
@@ -1317,6 +1521,11 @@ def kick_failed(tbl, exc: BaseException) -> None:
     """
     if kick_failure_is_transient(exc):
         tbl.armed = False
+        # Class B: one contended microsecond costs one speculation. A borrow refused on
+        # every step for the rest of the run is R6c not existing, which is not visible
+        # anywhere else -- `fail()` is deliberately NOT taken here, so nothing else marks
+        # it. Reset: the `core.kick` success path in `maybe_kick`.
+        require_watch("kick_borrow", f"kick borrow refused: {exc}")
         return
     tbl.fail("kick", exc)
 
@@ -1801,10 +2010,15 @@ class _TokState:
     def disable(self, why: str) -> None:
         """Permanent, boot-lifetime fallback. Requests already facaded keep working: the
         per-request writer branch keys off the FACADE, not off this flag, and the next step
-        that cannot take the numpy path materializes them back onto the stock path."""
-        if self.live:
-            log.error("rust_sched: token store disabled for this boot -- %s", why)
+        that cannot take the numpy path materializes them back onto the stock path.
+
+        Class C: process-lifetime by design, so there is nothing to count -- the first one
+        of these has already decided that the rest of the boot runs Port-2-less."""
+        was_live = self.live
         self.live = False
+        if was_live:
+            log.error("rust_sched: token store disabled for this boot -- %s", why)
+            require_latch("token_store", why)
 
 
 TOK = _TokState()
@@ -1828,9 +2042,13 @@ class _R9State:
         self.warned_kinds: set = set()
 
     def disable(self, why: str) -> None:
-        if self.live:
-            log.error("rust_sched: R9 disabled for this boot -- %s", why)
+        """Class C, same contract as ``TOK.disable``: boot-lifetime, so REQUIRE raises on
+        the first one rather than counting anything."""
+        was_live = self.live
         self.live = False
+        if was_live:
+            log.error("rust_sched: R9 disabled for this boot -- %s", why)
+            require_latch("r9", why)
 
     def warn_once(self, kind: str, msg: str, *args) -> None:
         """One ERROR per mismatch KIND per boot -- a soak that finds the same divergence
@@ -2366,9 +2584,16 @@ def _install_update_from_output(scheduler_cls, m: dict):
                 except Exception:
                     ok = False
                 if not ok:
-                    log.warning(
-                        "rust_sched: R8 disabled -- the shm raw output path is not "
-                        "installed, so nothing on the output queue could read the bytes"
+                    # Class A. Resolved from what did and did not install, i.e. from the
+                    # boot config -- one answer for the whole process, exactly the shape
+                    # `refuse` is for. It happens to be computed lazily (shm_ipc applies
+                    # after this module) which is why it did not go through `refuse` when
+                    # it was written; laziness is not a reason for a whole rung to
+                    # disappear silently under a REQUIRE bench.
+                    refuse(
+                        "R8 disabled -- the shm raw output path is not installed, so "
+                        "nothing on the output queue could read the bytes",
+                        rung_only=True,
                     )
                 _r8[0] = ok
         return _r8[0]
@@ -3083,6 +3308,9 @@ def _install_update_from_output(scheduler_cls, m: dict):
             return
         try:
             tbl.armed = bool(core.kick(kv._rust, tbl.gen, slots))
+            # The class-B reset for "kick_borrow": the crossing happened. Whether the
+            # worker then took the speculation is `armed`'s business, not the borrow's.
+            require_watch("kick_borrow", ok=True)
         except BaseException as exc:
             # Both arms return from here -- this is the tail of the function, so the
             # transient arm's "skip this step's speculation" needs no `return` of its own.
@@ -3157,6 +3385,13 @@ def _install_update_from_output(scheduler_cls, m: dict):
             except BaseException as exc:
                 reraise_fatal(exc)
                 log.exception("rust_sched: UFO batch failed; this step uses check_stop")
+                # DEVIATION from the class table, deliberate: this arm reads like a
+                # corruption latch but it is not one -- it disables nothing, and the very
+                # next step calls `decide()` again. So it is class B (per-step, counted),
+                # not class C. What makes it worth its own key rather than folding into
+                # "ufo" is that a raise every step and a refusal every step have completely
+                # different causes; the reset is shared with "ufo" below.
+                require_watch("ufo_exception", repr(exc))
                 self._vtl_ufo = None
                 self._vtl_r8_record = None
                 self._vtl_r8_published = False
@@ -3167,10 +3402,14 @@ def _install_update_from_output(scheduler_cls, m: dict):
                 if mirror is not None:
                     mirror._batch_cache = None
             if self._vtl_ufo is None:
+                # Class B: R6a refused THIS step's batch. Reset below, on any step that
+                # ends with `_vtl_ufo_clean` still True.
+                require_watch("ufo", "decide() refused this step's batch")
                 self._vtl_ufo_clean = False
         elif sampled:
             # Tokens were produced but nothing was portable: stock check_stop ran for the
             # whole batch, so update_step applied no delta at all.
+            require_watch("ufo", "nothing in this step's batch was portable")
             self._vtl_ufo_clean = False
         try:
             # `or self._vtl_r8_published`: Batch 3's inline-delivered case leaves the
@@ -3204,6 +3443,13 @@ def _install_update_from_output(scheduler_cls, m: dict):
                 # Applied (or dropped, if the branch above raised): either way this step's
                 # result must not be seen again, and the next launch is unblocked.
                 state.done = None
+        if self._vtl_ufo_clean:
+            # THE class-B reset for both UFO keys: this step's whole batch was decided by
+            # one `update_step`, which is R6a doing exactly its job. Read here rather than
+            # inside `maybe_kick` because that only runs under SPEC, and the counters have
+            # to be reset on every boot that arms UFO at all.
+            require_watch("ufo", ok=True)
+            require_watch("ufo_exception", ok=True)
         if spec:
             maybe_kick(self, kv)
         if outputs:
@@ -3312,6 +3558,10 @@ def _install_update_from_output(scheduler_cls, m: dict):
     mark_patched(_update_request_with_output, wrapped_urwo, patch="rust_sched_ufo")
     scheduler_cls.update_from_output = update_from_output
     scheduler_cls._update_request_with_output = _update_request_with_output
+    # The RUNGS proof line is emitted from `_install_full_schedule`'s closure, which cannot
+    # see `r8_live`; the same class seam `_vtl_runner_stash` uses carries it across. A
+    # staticmethod so the attribute is the plain closure, not a bound method wanting `self`.
+    scheduler_cls._vtl_r8_live = staticmethod(r8_live)
     if RUNNER:
         # `commit_burst` lives in `_install_full_schedule`'s closure, which cannot see
         # `r8_live` / `out_publish_ready` / this function's R9 view. Publishing the stash
@@ -3356,8 +3606,15 @@ def _install_prereg() -> None:
     """
     try:
         from vllm.v1.engine.core import EngineCoreProc
-    except Exception:
+    except Exception as exc:
         log.exception("rust_sched: EngineCoreProc not importable; VTL_RUST_PREREG inert")
+        # Class A: an install that cannot happen is a boot-config refusal, and the whole
+        # rung is then absent for the process. `log.exception` first so the traceback is
+        # on the record whichever way `refuse` goes.
+        refuse(
+            f"VTL_RUST_PREREG cannot install -- EngineCoreProc not importable ({exc!r})",
+            rung_only=True,
+        )
         return
     if already_patched(EngineCoreProc, "preprocess_add_request", patch="rust_sched_prereg"):
         return
@@ -3376,8 +3633,22 @@ def _install_prereg() -> None:
                 req._vtl_preregistered = rust.set_request_meta(
                     req.request_id, _pack_ok_clauses(req), *params
                 )
+                # The class-B reset: one request interned at add time. `params is None` is
+                # NOT a demotion -- `stop_params` refuses shapes the crate does not model,
+                # which is the same fail-closed answer `decide()` would reach anyway.
+                require_watch("prereg", ok=True)
         except BaseException as exc:
             reraise_fatal(exc)
+            # Class B, per REQUEST rather than per step: the once-latch below means a
+            # config where every arrival fails logs exactly one line for the whole boot,
+            # which is precisely the silent-demotion shape REQUIRE exists to catch.
+            #
+            # The raise this can produce under REQUIRE does NOT reach the engine thread --
+            # both input paths wrap this call and answer with
+            # `_handle_request_preproc_error`, so it surfaces as a failed request rather
+            # than a dead input thread. Once the counter is at the threshold every
+            # subsequent arrival fails the same way, which is as loud as this seam gets.
+            require_watch("prereg", f"add-time registration failed: {exc!r}")
             # Once per boot: a config where this always fails must not flood the log, and
             # the cost of failing is only that `decide()` does the work itself.
             if not getattr(preprocess_add_request, "_vtl_warned", False):
@@ -3516,7 +3787,16 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             RUNNER = False
 
     def skip_note(self, why: str) -> None:
-        """First-reason-only logging: names each new reason once, then stays quiet."""
+        """First-reason-only logging: names each new reason once, then stays quiet.
+
+        Also the class-B counter for the burst. It carries its own much higher ceiling
+        (`_NSTEP_SKIP_THRESHOLD`) because unlike every other class-B key this one is
+        SUPPOSED to fire in long stretches: `VTL_NSTEP_QUEUE_EMPTY_ONLY` skips the burst
+        for as long as the waiting queue keeps refilling, so an admission-heavy phase of a
+        healthy run sits here for thousands of steps and then commits again. The reset is
+        the `so.vtl_burst_n` stamp in `commit_burst`.
+        """
+        require_watch("nstep_skip", why, threshold=_NSTEP_SKIP_THRESHOLD)
         seen = self._vtl_burst_skips
         if why not in seen:
             seen.add(why)
@@ -3647,6 +3927,9 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     # above: an attribute set on a plain object is infallible, and it is
                     # what makes the commit visible to `reconcile_burst` / `r9_apply`.
                     so.vtl_burst_n = n * steps
+                    # The class-B reset for "nstep_skip": a burst is committed, so the run
+                    # of skipped steps this key counts has ended.
+                    require_watch("nstep_skip", ok=True)
                     self._vtl_burst_commits = c = getattr(self, "_vtl_burst_commits", 0) + 1
                     if c == 1 or not c & 0x1FFF:
                         log.info(
@@ -3680,12 +3963,23 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                         self._vtl_sample_in_graph_logged = True
                         log.info("rust_sched: in-graph sampling engaged")
                     so.vtl_sample_in_graph = True
+                    # The OTHER class-B reset for "nstep_skip". `skip_note` is shared by
+                    # both commits, so both have to clear it: a workload whose burst gate
+                    # refuses while the cheaper N=1 rung commits on every step is engaged,
+                    # not demoted, and must not be walked into a REQUIRE failure by the
+                    # skip note the burst arm left behind on the way here.
+                    require_watch("nstep_skip", ok=True)
                     return
                 skip_note(self, f"in-graph sampling: {why}")
         except BaseException as exc:
             reraise_fatal(exc)
             log.exception("rust_sched: nstep commit failed; bursts disabled for this boot")
             nstep_mod.BURST.disable("scheduler commit raised")
+            # Class C, latched after the disable: bursts are gone for the process, and
+            # `skip_note` will never fire again to say so (the gate stops before it).
+            # nstep_decode's own `disable` callers are the worker half and stay untouched
+            # in this stage -- rust_runner already honours VTL_RUST_RUNNER_REQUIRE there.
+            require_latch("nstep_burst", f"scheduler commit raised: {exc!r}", exc)
 
     def schedule(self, *args, **kwargs):
         nonlocal LEAN, lean_check_left, ARENA, arena_check_left, arena_bufs
@@ -3725,11 +4019,18 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             reason = schedule_supported(self)
             if reason is not None or not hasattr(kv, "_rust"):
                 if not getattr(self, "_vtl_rust_warned", False):
-                    log.warning(
-                        "rust_sched: full schedule() disabled -- %s",
-                        reason or "KV manager is not Rust-backed",
-                    )
+                    # Class A. The once-latch stays and is set FIRST: `core` is never
+                    # assigned on this path, so this block is re-entered on every step for
+                    # the rest of the boot and `refuse` would otherwise warn every step.
+                    # `refuse` logs the NOT-ENGAGED line itself, so with REQUIRE off this
+                    # is still exactly one warning followed by the stock path -- the only
+                    # behaviour change is that a REQUIRE bench now dies here, which is the
+                    # single most likely way this port silently measures stock vLLM.
                     self._vtl_rust_warned = True
+                    refuse(
+                        "full schedule() disabled -- "
+                        f"{reason or 'KV manager is not Rust-backed'}"
+                    )
                 return wrapped(self, *args, **kwargs)
             core = self._vtl_rust_core = vtl_sched.Scheduler()
             if NSTEP and nstep_mod.BURST.n > 1:
@@ -3741,6 +4042,12 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 self.num_lookahead_tokens = max(
                     self.num_lookahead_tokens, 2 * (nstep_mod.BURST.n - 1)
                 )
+            # The three resolutions below each keep their reason, because the RUNGS line
+            # at the end of this block has to be able to say WHY a rung is off, and by
+            # then `LEAN`/`ARENA`/`RING` are just False.
+            lean_why = "VTL_RUST_SCHED_LEAN off"
+            arena_why = "VTL_SCHED_DECISIONS_ARENA off"
+            ring_why = "VTL_SCHED_SO_RING off"
             if LEAN:
                 why = lean_blocked(self)
                 if why is None:
@@ -3748,13 +4055,24 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 else:
                     LEAN = False
                     lean_check_left = 0
-                    log.warning("rust_sched: lean decisions refused -- %s", why)
+                    lean_why = why
+                    # Class A: decided from the live scheduler's config, once, for the
+                    # whole boot. `refuse` logs the reason when REQUIRE is off, so this is
+                    # still one warning and the dict payload -- an optional rung is not
+                    # allowed to cost a submission boot, and `refuse` is precisely the
+                    # thing that raises ONLY under REQUIRE.
+                    refuse(f"lean decisions refused -- {why}", rung_only=True)
             if ARENA and not (LEAN and hasattr(core, "schedule_arena")):
                 # Old wheel + new plugin, or the lean predicate refused: both are the
                 # shipped dict path, which is still fully wired below.
                 ARENA = False
                 arena_check_left = 0
-                log.warning("rust_sched: decisions arena unavailable; staying on the dict")
+                arena_why = ("no schedule_arena in this wheel"
+                             if LEAN else f"needs lean ({lean_why})")
+                refuse(
+                    f"decisions arena unavailable -- {arena_why}; staying on the dict",
+                    rung_only=True,
+                )
             elif ARENA:
                 arena_bufs = core.arena_buffers()
                 log.info("rust_sched: decisions arena active%s",
@@ -3765,6 +4083,13 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     log.info("rust_sched: SchedulerOutput ring active")
                 else:
                     RING = False
+                    ring_why = why
+                    # DELIBERATELY NOT `refuse`. Phase C self-refuses on the `uni`
+                    # executor by design (see `ring_blocked`), and `uni` is a normal,
+                    # supported way to serve -- routing this through `refuse` would make
+                    # every single-process REQUIRE bench a boot failure over a rung that
+                    # is meant to be unavailable there. It is still named in RUNGS below,
+                    # which is what keeps it from being invisible.
                     log.warning("rust_sched: SchedulerOutput ring refused -- %s", why)
             # Engine constants: handed over once, not re-parsed from a dict per step.
             core.set_params(
@@ -3802,6 +4127,41 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 "rust_sched: FULL schedule() loop active "
                 "(sjf=%s, table=%s, spec=%s, timing=%s)",
                 sjf_enabled, TABLE, SPEC, TIMING,
+            )
+            # THE RUNGS PROOF LINE. One line, once, always -- REQUIRE or not. Everything
+            # else in this block logs a rung only when it has something to say, so the
+            # ladder's resolved shape has to be reassembled from a dozen scattered lines
+            # that may or may not be present, in a log that may or may not be at INFO.
+            # This is the single record that names EVERY rung and, for the off ones, why.
+            #
+            # It is emitted after the feature resolution above and NOT gated on REQUIRE,
+            # because the case it exists for is the submission boot where nothing raises:
+            # a bench run whose numbers turn out to be stock vLLM's is diagnosed from this
+            # line alone. Stable prefix, fixed key order, one "on"/"OFF(reason)" per rung;
+            # keep both if a compose gate ever pins it.
+            #
+            # `r8_live()` is the one probe with a side effect -- it latches the shm answer
+            # on first call, and calling it HERE (first schedule) rather than at first
+            # update_from_output is strictly earlier and equally correct: shm_ipc.apply()
+            # has long since run. Under REQUIRE it can raise, which is the class-A
+            # contract; the line is then not printed, and the traceback says why.
+            probe = getattr(self, "_vtl_r8_live", None)
+            r8_on = bool(probe()) if probe is not None else False
+            log.info(
+                "rust_sched: RUNGS authority=%s full=%s table=%s spec=%s lean=%s "
+                "arena=%s ring=%s r8=%s r9=%s tokstore=%s runner=%s require=%s",
+                rung(bool(m["authority"]), "VTL_RUST_SCHED off"),
+                rung(bool(m["full"]), "VTL_RUST_SCHED_FULL off"),
+                rung(TABLE, "VTL_RUST_SCHED_TABLE off"),
+                rung(SPEC, "VTL_RUST_SCHED_SPEC off"),
+                rung(LEAN, lean_why),
+                rung(ARENA, arena_why),
+                rung(RING, ring_why),
+                rung(r8_on, "VTL_RUST_SCHED_R8 off or no shm raw path"),
+                rung(R9.live, "VTL_RUST_SCHED_R9 off or disabled"),
+                rung(TOK.live, "VTL_RUST_SCHED_TOKSTORE off or disabled"),
+                rung(RUNNER, "VTL_RUST_RUNNER off or not armed"),
+                "on" if env_on("VTL_RUST_SCHED_REQUIRE") else "off",
             )
 
         if TIMING:
@@ -3843,6 +4203,11 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             if tbl is not None:
                 # Stock vLLM now mutates requests and queues with no Rust call at all.
                 tbl.resync(bail)
+            # Class B, and the loudest of the set: a bail is the WHOLE Rust loop not
+            # running for this step. The once-per-reason warning below means a boot that
+            # bails on every single step says so exactly once, at whatever level `warning`
+            # is filtered to, and then measures stock vLLM for the rest of the run.
+            require_watch("bail", bail)
             seen = getattr(self, "_vtl_rust_bails", None)
             if seen is None:
                 seen = self._vtl_rust_bails = set()
@@ -3851,6 +4216,8 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 log.warning("rust_sched: this step falls back to vLLM -- %s", bail)
             return wrapped(self, *args, **kwargs)
 
+        # The class-B reset for "bail": past this point the Rust loop decides this step.
+        require_watch("bail", ok=True)
         self.current_step += 1
         if TIMING:
             t_marshal = ns()
@@ -3900,7 +4267,13 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 decisions = core.schedule(kv._rust, running, waiting)
             if tbl is not None:
                 # `Scheduler.schedule` rewrites every running entry: this call is the
-                # full resync, and the only place `dirty` clears.
+                # full resync, and the only place `dirty` clears -- so it is also the
+                # class-B reset for "table_dirty". Note the asymmetry with the counter in
+                # `TableState.resync`: a table that is dirtied and re-cleaned every step
+                # sits at a count of 1 forever, which is the correct reading (R6b is
+                # paying for itself, just not resident), while a table that goes dirty and
+                # never comes back never reaches this line.
+                require_watch("table_dirty", ok=True)
                 tbl.dirty = False
                 tbl.armed = False
         if TIMING:
@@ -5848,6 +6221,243 @@ def _self_check() -> None:
     os.environ["VTL_RUST_SCHED_REQUIRE"] = "0"
     refuse("still just a warning")  # explicit 0 is off, not "set therefore on"
     os.environ.pop("VTL_RUST_SCHED_REQUIRE", None)
+
+    # ---- refuse(rung_only=): an optional rung is not the runner's KV authority ----
+    # Class A covers rungs the runner does not use (Phase A/B, R8, add-time registration)
+    # as well as the scheduler itself. Only the latter may trip VTL_RUST_RUNNER_REQUIRE.
+    saved_rr = {k: os.environ.get(k) for k in ("VTL_RUST_RUNNER_REQUIRE", "VTL_RUST_RUNNER")}
+    try:
+        os.environ["VTL_RUST_RUNNER_REQUIRE"] = "1"
+        os.environ["VTL_RUST_RUNNER"] = "1"
+        refuse("lean decisions refused -- V1 model runner", rung_only=True)  # must not raise
+        try:
+            refuse("full schedule() disabled -- unported kv cache spec")
+        except RuntimeError as e:
+            assert "VTL_RUST_RUNNER_REQUIRE" in str(e), e
+        else:
+            raise AssertionError("a scheduler that cannot engage IS the runner's death")
+    finally:
+        for k, v in saved_rr.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # ---- require_watch / require_latch: the other two REQUIRE classes ----
+    global _REQUIRE_THRESHOLD
+    saved_thr = _REQUIRE_THRESHOLD
+    saved_steps = os.environ.get("VTL_RUST_SCHED_REQUIRE_STEPS")
+    try:
+        # The threshold parse is deliberately unable to take a boot down: a typo in a
+        # bench env line must not be the fatal thing on the boot.
+        os.environ.pop("VTL_RUST_SCHED_REQUIRE_STEPS", None)
+        assert _require_steps() == 512
+        os.environ["VTL_RUST_SCHED_REQUIRE_STEPS"] = "not-a-number"
+        assert _require_steps() == 512, "a malformed threshold falls back, never raises"
+        os.environ["VTL_RUST_SCHED_REQUIRE_STEPS"] = "0"
+        assert _require_steps() == 1, "0 would raise on the first fallback ever taken"
+        os.environ["VTL_RUST_SCHED_REQUIRE_STEPS"] = "-7"
+        assert _require_steps() == 1
+        os.environ["VTL_RUST_SCHED_REQUIRE_STEPS"] = " 64 "
+        assert _require_steps() == 64, "whitespace is not a parse failure"
+
+        # REQUIRE OFF: never raises, and never even records. The default boot pays one
+        # env read per call and nothing else -- these sites are per-step.
+        os.environ.pop("VTL_RUST_SCHED_REQUIRE", None)
+        _REQUIRE_WATCH.clear()
+        for _ in range(10_000):
+            require_watch("sc_watch", "a reason nobody is counting")
+        assert _REQUIRE_WATCH == {}, _REQUIRE_WATCH
+
+        os.environ["VTL_RUST_SCHED_REQUIRE_STEPS"] = "3"
+        _REQUIRE_THRESHOLD = _require_steps()
+        assert _REQUIRE_THRESHOLD == 3
+        os.environ["VTL_RUST_SCHED_REQUIRE"] = "1"
+
+        # Below the threshold: counted, not fatal. A fallback is a FEATURE until it is
+        # permanent, which is the whole reason class B is not just `refuse`.
+        require_watch("sc_watch", "step 1")
+        require_watch("sc_watch", "step 2")
+        assert _REQUIRE_WATCH["sc_watch"] == [2, "step 2"], _REQUIRE_WATCH
+
+        # ok=True is the reset, and the reset is what makes the counter mean
+        # "consecutive". Without it every class-B site would be a slow boot failure on a
+        # perfectly healthy run.
+        require_watch("sc_watch", ok=True)
+        assert _REQUIRE_WATCH["sc_watch"][0] == 0
+        for i in range(100):
+            require_watch("sc_watch", f"blip {i}")
+            require_watch("sc_watch", ok=True)
+        assert _REQUIRE_WATCH["sc_watch"][0] == 0, "an alternating rung never trips"
+
+        # ...and the threshold itself.
+        for i in range(2):
+            require_watch("sc_watch", f"run {i}")
+        try:
+            require_watch("sc_watch", "the third consecutive one")
+        except RuntimeError as e:
+            assert "sc_watch" in str(e) and "3 consecutive" in str(e), e
+            assert "the third consecutive one" in str(e), e
+        else:
+            raise AssertionError("a permanently demoted rung must not stay quiet")
+
+        # A per-key threshold override beats the global one -- `nstep_skip` is the site
+        # that needs it, and 16x is exactly what it gets.
+        assert _NSTEP_SKIP_THRESHOLD == 16 * 512, _NSTEP_SKIP_THRESHOLD
+        _REQUIRE_WATCH.pop("sc_watch", None)
+        for i in range(20):
+            require_watch("sc_watch", f"skip {i}", threshold=1000)
+        assert _REQUIRE_WATCH["sc_watch"][0] == 20, "the override must not use the global"
+
+        # require_latch: immediate under REQUIRE, and the cause survives.
+        cause = ValueError("the crate said no")
+        try:
+            require_latch("sc_latch", "a rung turned itself off", cause)
+        except RuntimeError as e:
+            assert "sc_latch" in str(e), e
+            assert e.__cause__ is cause, "the original traceback is the whole diagnostic"
+        else:
+            raise AssertionError("a mid-boot latch must not be silent under REQUIRE")
+
+        # ...and once per key, not once per step, when REQUIRE is off.
+        os.environ.pop("VTL_RUST_SCHED_REQUIRE", None)
+        _REQUIRE_LATCHED.discard("sc_latch")
+        records = []
+
+        class _Sink(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        sink = _Sink()
+        log.addHandler(sink)
+        propagate = log.propagate
+        log.propagate = False   # the point is to COUNT the records, not print them
+        try:
+            for _ in range(500):
+                require_latch("sc_latch", "the same latch, every step")
+        finally:
+            log.propagate = propagate
+            log.removeHandler(sink)
+        assert len(records) == 1, f"a re-entered latch must not flood: {len(records)}"
+        assert "sc_latch" in records[0] and "VTL_RUST_SCHED_REQUIRE" in records[0]
+        assert "sc_latch" in _REQUIRE_LATCHED
+
+        # ---- the SHIPPED sites, not a copy of them ----
+        # A key table and a pair of helpers prove nothing on their own; what has to hold
+        # is that the real demotion paths reach them. These drive the shipped objects.
+        os.environ["VTL_RUST_SCHED_REQUIRE"] = "1"
+        # These sites log a traceback on their way to the raise; the raise is the point.
+        logging.disable(logging.CRITICAL)
+        try:
+            # table_dirty counts TRANSITIONS: a table that is already dirty is not being
+            # demoted again, and a TABLE-off boot never leaves the born-dirty state.
+            _REQUIRE_WATCH.pop("table_dirty", None)
+            off_gate = TableState()
+            for _ in range(50):
+                off_gate.resync("evict_blocks on a boot with no resident table")
+            assert "table_dirty" not in _REQUIRE_WATCH, _REQUIRE_WATCH
+
+            tbl = TableState()
+            for i in range(2):
+                tbl.dirty = False
+                tbl.resync(f"dirtied {i}")
+            assert _REQUIRE_WATCH["table_dirty"][0] == 2
+            tbl.dirty = False
+            try:
+                tbl.resync("and once too often")
+            except RuntimeError as e:
+                assert "table_dirty" in str(e), e
+            else:
+                raise AssertionError("a table that never goes resident must be loud")
+
+            # The transient kick arm is the one demotion `fail()` deliberately does NOT
+            # take, so this key is the only thing that can ever notice it.
+            _REQUIRE_WATCH.pop("kick_borrow", None)
+            borrow = RuntimeError("Already borrowed")
+            for _ in range(2):
+                kick_failed(tbl, borrow)
+            assert _REQUIRE_WATCH["kick_borrow"][0] == 2 and tbl.off is False
+            try:
+                kick_failed(tbl, borrow)
+            except RuntimeError as e:
+                assert "kick_borrow" in str(e), e
+            else:
+                raise AssertionError("R6c never speculating again must be loud")
+
+            # ...and the class-C latches, each from its own shipped disable path.
+            fresh = TableState()
+            try:
+                fresh.fail("schedule_resident", ValueError("crate said no"))
+            except RuntimeError as e:
+                assert "resident_table" in str(e) and isinstance(e.__cause__, ValueError)
+            else:
+                raise AssertionError("a permanent marshalled fallback must be loud")
+            assert fresh.off is True, "the latch is recorded before the raise unwinds"
+
+            for state, key in ((TOK, "token_store"), (R9, "r9")):
+                was = state.live
+                state.live = True
+                try:
+                    state.disable("a self-check reason")
+                except RuntimeError as e:
+                    assert key in str(e), e
+                else:
+                    raise AssertionError(f"{key} disabling itself must be loud")
+                finally:
+                    assert state.live is False, "disable() latches before it raises"
+                    state.live = was
+        finally:
+            logging.disable(logging.NOTSET)
+            for k in ("table_dirty", "kick_borrow"):
+                _REQUIRE_WATCH.pop(k, None)
+    finally:
+        _REQUIRE_THRESHOLD = saved_thr
+        _REQUIRE_WATCH.pop("sc_watch", None)
+        # Not just the scratch key: the sections above drive `TOK.disable` / `R9.disable`
+        # / `TableState.fail` with REQUIRE off, which arms their real latches. Leave the
+        # module as the check found it so a later import cannot inherit a swallowed log.
+        _REQUIRE_LATCHED.clear()
+        os.environ.pop("VTL_RUST_SCHED_REQUIRE", None)
+        if saved_steps is None:
+            os.environ.pop("VTL_RUST_SCHED_REQUIRE_STEPS", None)
+        else:
+            os.environ["VTL_RUST_SCHED_REQUIRE_STEPS"] = saved_steps
+
+    # ---- every key used is a key that is documented ----
+    # The table is the only place the class of a key is written down, and a key that is
+    # not in it is a site whose author never decided whether it was B or C. Read off THIS
+    # module's own source rather than a hand-kept list, so the check cannot go stale the
+    # way a duplicate list would.
+    import inspect
+    import re
+    import sys as _sys
+
+    src = inspect.getsource(_sys.modules[__name__])
+    used = set(re.findall(r'require_(?:watch|latch)\(\s*"([a-z0-9_]+)"', src))
+    assert used, "the key scan found nothing; the call shape must have changed"
+    undocumented = {k for k in used if k not in _REQUIRE_KEYS and not k.startswith("sc_")}
+    assert not undocumented, f"undocumented REQUIRE keys: {sorted(undocumented)}"
+    for key, (cls, desc) in _REQUIRE_KEYS.items():
+        assert cls in ("B", "C"), (key, cls)
+        assert desc, key
+    # Every class-B key must have BOTH an incrementing site and a matching `ok=True`
+    # reset; a reset-less counter turns a healthy run into a boot failure at the
+    # threshold, which is the exact opposite of what this is for.
+    resets = set(re.findall(r'require_watch\(\s*"([a-z0-9_]+)"\s*,\s*ok=True\s*\)', src))
+    b_keys = {k for k, (cls, _) in _REQUIRE_KEYS.items() if cls == "B"}
+    assert b_keys <= resets, f"class-B keys with no reset: {sorted(b_keys - resets)}"
+    c_keys = {k for k, (cls, _) in _REQUIRE_KEYS.items() if cls == "C"}
+    assert not (c_keys & resets), "a class-C latch is permanent; it cannot be reset"
+    latched = set(re.findall(r'require_latch\(\s*"([a-z0-9_]+)"', src))
+    assert {k for k in latched if not k.startswith("sc_")} == c_keys, sorted(latched)
+
+    # The RUNGS cell renderer: "on", or an OFF that always carries a reason.
+    assert rung(True, "whatever") == "on"
+    assert rung(False, "no shm raw path") == "OFF(no shm raw path)"
+    assert rung(False, "") == "OFF(gate off)", "an OFF rung without a reason is useless"
+    assert rung(False, "a\nb  c") == "OFF(a b c)", "RUNGS is one line or it is nothing"
+    long = rung(False, "x" * 200)
+    assert len(long) == _RUNG_WHY_MAX + len("OFF()") and long.endswith("…)"), long
 
     try:
         import vtl_sched  # noqa: F401
