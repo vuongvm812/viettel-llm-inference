@@ -157,13 +157,14 @@ _KV_CONNECTOR_PROBES = (
     ("cache_config.kv_offloading_config",
      lambda cfg: getattr(cfg.cache_config, "kv_offloading_config", None) is not None),
     ("cache_config.kv_offloading_size",
-     lambda cfg: bool(getattr(cfg.cache_config, "kv_offloading_size", None))),
-    ("cache_config.kv_offloading_backend",
-     lambda cfg: bool(getattr(cfg.cache_config, "kv_offloading_backend", None))),
+     lambda cfg: getattr(cfg.cache_config, "kv_offloading_size", None) is not None),
     ("kv_offloading_size",
-     lambda cfg: bool(getattr(cfg, "kv_offloading_size", None))),
-    ("kv_offloading_backend",
-     lambda cfg: bool(getattr(cfg, "kv_offloading_backend", None))),
+     lambda cfg: getattr(cfg, "kv_offloading_size", None) is not None),
+    # NO probe on kv_offloading_backend: in v0.25.0 CacheConfig it DEFAULTS to "native"
+    # with offloading off ("KV offloading is only activated when kv_offloading_size is
+    # set", config/cache.py) -- a backend probe fires on every boot and would stand
+    # authority mode down unconditionally. The size is the activation signal; the
+    # backend only names which connector the size turns on.
 )
 
 
@@ -5739,17 +5740,21 @@ def _self_check() -> None:
     # offloading rows are the incident (`--kv-offloading-size=64 --kv-offloading-backend=
     # native` reached the engine while the kv_transfer_config-only probe said False).
     assert kv_connector_configured(fake_cfg(transfer=object())) is True
-    assert kv_connector_configured(fake_cfg(kv_offloading_backend="native")) is True
     assert kv_connector_configured(fake_cfg(kv_offloading_size=64)) is True
     assert kv_connector_configured(fake_cfg(kv_offloading_config=object())) is True
     assert kv_connector_configured(
         fake_cfg(top={"kv_offloading_size": 64})
     ) is True
     assert kv_connector_configured(fake_cfg()) is False
-    # Zeroed knobs are "no connector", not "the field exists".
+    # The backend field ALONE is not a connector: v0.25.0 CacheConfig defaults it to
+    # "native" with offloading off, so a backend probe would fire on every boot and stand
+    # authority mode down unconditionally. The size is the activation signal -- and vLLM
+    # activates on `size is not None`, 0 included, so the probe mirrors that exactly.
+    assert kv_connector_configured(fake_cfg(kv_offloading_backend="native")) is False
     assert kv_connector_configured(
         fake_cfg(kv_offloading_size=0, kv_offloading_backend="")
-    ) is False
+    ) is True, "size 0 is SET; only None means offloading is off (config/vllm.py)"
+    assert kv_connector_configured(fake_cfg(kv_offloading_size=None)) is False
 
     # An unknown layout must degrade to the OTHER probes rather than take the answer down.
     class ExplodingCfg:
@@ -5761,7 +5766,7 @@ def _self_check() -> None:
 
     assert kv_connector_configured(ExplodingCfg()) is False
     bad = ExplodingCfg()
-    bad.kv_offloading_backend = "native"  # a surviving probe still finds the connector
+    bad.kv_offloading_size = 64  # a surviving probe still finds the connector
     assert kv_connector_configured(bad) is True
 
     # authority_stand_down: the instance must become the STOCK class wholesale, which is
@@ -5781,7 +5786,7 @@ def _self_check() -> None:
     logging.disable(logging.CRITICAL)  # the stand-down warning is expected here
     try:
         stood = authority_stand_down(
-            inst, FakeStockKV, cfg=fake_cfg(kv_offloading_backend="native")
+            inst, FakeStockKV, cfg=fake_cfg(kv_offloading_size=64)
         )
     finally:
         logging.disable(logging.NOTSET)
