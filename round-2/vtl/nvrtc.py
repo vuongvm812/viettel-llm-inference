@@ -194,6 +194,11 @@ def _nvrtc_compile(src: str, name: str, flags: tuple[str, ...]) -> bytes | None:
         if text:
             log.info("nvrtc: %s compile log:\n%s", name, text)
         _, size = nvrtc.nvrtcGetCUBINSize(prog)
+        # A zero-size "cubin" reaches cuModuleLoadData as an empty buffer and dies there
+        # with the opaque CUDA_ERROR_INVALID_IMAGE; catch it here with the real reason.
+        if int(size) == 0:
+            log.warning("nvrtc: %s compiled but yielded a 0-byte cubin; keeping the AOT kernel", name)
+            return None
         cubin = b" " * size
         nvrtc.nvrtcGetCUBIN(prog, cubin)
         return cubin
@@ -234,7 +239,9 @@ def build_cubin(src: str, name: str, defines: dict[str, object], arch: str | Non
         )
 
     # Fold the header identity in next to the toolkit version -- see headers_fingerprint.
-    key = cache_key(src, defines, arch, f"{toolkit}+hdr:{headers_fingerprint(inc)}")
+    # The arch component carries the sm_ spelling so cubins cached from the old compute_
+    # (virtual-arch) flag can never be served against the new flag.
+    key = cache_key(src, defines, f"sm_{arch}", f"{toolkit}+hdr:{headers_fingerprint(inc)}")
     path = cache_dir() / f"{name}-{key}.cubin"
     try:
         if path.is_file():
@@ -243,7 +250,10 @@ def build_cubin(src: str, name: str, defines: dict[str, object], arch: str | Non
         log.info("nvrtc: cache read failed (%r); recompiling", exc)
 
     inc_flags = (f"-I{inc}",) if inc is not None else ()
-    flags = BASE_FLAGS + inc_flags + (f"--gpu-architecture=compute_{arch}",) + render_defines(defines)
+    # sm_ (real arch), not compute_ (virtual): nvrtcGetCUBIN only has SASS to hand out for a
+    # real arch -- for a virtual one NVRTC stops at PTX, and what GetCUBIN returns then is
+    # version-dependent garbage from cuModuleLoadData's point of view (CUDA_ERROR_INVALID_IMAGE).
+    flags = BASE_FLAGS + inc_flags + (f"--gpu-architecture=sm_{arch}",) + render_defines(defines)
     cubin = _nvrtc_compile(src, name, flags)
     if cubin is None:
         return None
@@ -287,6 +297,7 @@ def compile_kernel(name: str, defines: dict[str, object], entry: str | None = No
         kernel = _load_cubin(cubin, entry or name)
     except Exception as exc:
         log.warning("nvrtc: %s built but failed to load (%r); keeping the AOT kernel", name, exc)
+        _log_version_skew()
         return None
     log.info("nvrtc: %s specialized for %s (cubin %s)", name, render_defines(defines), key)
     return kernel
@@ -330,6 +341,35 @@ def pack_args(*args):
     arr = (ctypes.c_void_p * len(holders))(*[ctypes.addressof(h) for h in holders])
     arr._vtl_holders = holders  # keep-alive; see docstring
     return arr
+
+
+def _log_version_skew() -> None:
+    """Name the usual culprit behind a load failure: libnvrtc newer than the driver.
+
+    ``CUDA_ERROR_INVALID_IMAGE`` from ``cuModuleLoadData`` is opaque; when the loaded
+    libnvrtc (a pip wheel, not the driver's toolkit) is newer than what the driver
+    supports, its SASS can be rejected outright. Best-effort: only ever logs.
+    """
+    try:
+        from cuda.bindings import driver, nvrtc
+
+        _, nvrtc_major, nvrtc_minor = nvrtc.nvrtcVersion()
+        _, drv = driver.cuDriverGetVersion()
+        drv_major, drv_minor = drv // 1000, (drv % 1000) // 10
+        if (nvrtc_major, nvrtc_minor) > (drv_major, drv_minor):
+            log.warning(
+                "nvrtc: libnvrtc %d.%d is NEWER than the driver's CUDA %d.%d -- its cubins "
+                "can be rejected at load; pin cuda-python/nvidia-cuda-nvrtc at or below the "
+                "driver's version",
+                nvrtc_major, nvrtc_minor, drv_major, drv_minor,
+            )
+        else:
+            log.info(
+                "nvrtc: no version skew (libnvrtc %d.%d, driver CUDA %d.%d)",
+                nvrtc_major, nvrtc_minor, drv_major, drv_minor,
+            )
+    except Exception:
+        pass
 
 
 def _load_cubin(cubin: bytes, entry: str):
