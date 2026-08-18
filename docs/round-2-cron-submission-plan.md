@@ -11,9 +11,8 @@ are read back with `airace list` ("chấm: xong — ĐIỂM …" / "đang chạy
 
 Decision: the server runs continuously and is managed manually — the automation only
 **submits on a schedule** via cron. It autodetects the remaining daily attempts and stops
-at 0; `--submissions N` runs N sequential submissions per invocation. No config changes,
-no restarts, no failure orchestration (a `lỗi` result is just logged; the next tick
-proceeds normally).
+at 0; `--submissions N` runs N submissions, 3 min apart. No config changes, no restarts,
+no failure orchestration (a `lỗi` result is just logged; the next tick proceeds normally).
 
 airace cannot be driven remotely (interactive-TTY SSH only), so the script lives in the
 repo and is installed by hand on the VM.
@@ -21,21 +20,19 @@ repo and is installed by hand on the VM.
 ## The script: `scripts/vm/submit-cron.sh`
 
 - `submit-cron.sh` — one guarded submission (what cron calls hourly).
-- `submit-cron.sh --submissions N` — N submissions sequentially, polling `airace list`
-  between them (capped at 30 min each, a grading run's max) so runs never overlap.
+- `submit-cron.sh --submissions N` — N submissions, sleeping 3 min between each.
+  Submissions **queue on the judge** — this does not wait for a prior run to finish
+  grading before firing the next one.
 
 Guards, all purely budget-protective:
 
-1. `flock` — one invocation at a time.
-2. **Remaining-attempt autodetection**: freshest source is airace's own `Lượt còn lại: NN`
+1. **Remaining-attempt autodetection**: freshest source is airace's own `Lượt còn lại: NN`
    line cached from the last registration today (`~/submit-log/remaining-YYYY-MM-DD`);
    before any submission has run, it derives the count from `airace list` (registrations
    are stamped `[dd/mm hh:mm]` — count today's, subtract from 30). Manual submissions are
    counted automatically either way. Date-stamped cache ⇒ resets with the daily quota.
-3. `curl /v1/models` pre-flight — a dead endpoint still burns an attempt, so never
+2. `curl /v1/models` pre-flight — a dead endpoint still burns an attempt, so never
    register one.
-4. "đang chạy / đang chờ" check — never overlap grading runs (single-tick mode skips;
-   batch mode waits).
 
 Logs accumulate in `~/submit-log/submit-YYYY-MM-DD.log`; the latest `airace list`
 snapshot (with all scores) is always in `~/submit-log/airace-list-last.txt`.
@@ -59,9 +56,8 @@ someone can react. If airace refuses to run without a TTY under cron, wrap its c
 
 - Manual run prints `SUBMIT (remaining before: NN)`; `airace list` shows the new
   submission; `~/submit-log/` contains the day's log + cached remaining count.
-- Immediate second run prints `SKIP: a submission is still being graded` (attempt
-  preserved).
 - With the server stopped: `STOP: endpoint not answering, attempt preserved`.
-- `--submissions 2` shows `WAIT: grading in flight...` then the second `SUBMIT`.
+- `--submissions 2` shows two `SUBMIT` lines, 3 min apart, with no wait for grading
+  in between.
 - Quota exhausted: `STOP: no attempts left today`, no airace registration attempted.
 - Next day: the date-suffixed remaining-file rolls over automatically; no reset job needed.
