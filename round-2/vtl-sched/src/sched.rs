@@ -62,12 +62,13 @@ pub struct Params {
     pub burst_max_reqs: usize,
     /// A KV connector is live (`Config::connector`'s twin on the schedule-loop side).
     ///
-    /// The waiting arm needs NO branch of its own for it: a connector that only serves
-    /// SYNCHRONOUS hits changes nothing here, and an ASYNC load never reaches this loop —
-    /// `schedule_supported` refuses a scheduler with a connector attached, and the parked
-    /// request path lives entirely in Python (`Manager::allocate_external`). The field is
-    /// carried so the loop can refuse loudly rather than silently mis-schedule if that
-    /// ever changes.
+    /// Stage S made this load-bearing. It is the permission for the two things only a
+    /// connector can produce: a non-empty cache-hit PROBE in
+    /// [`ScheduleCore::schedule_phase1`], and a non-empty EXTERNAL slice in
+    /// [`ScheduleCore::schedule_phase2`]. Both refuse loudly when it is false, so a plugin
+    /// that sends connector work to a crate configured without one gets an error rather
+    /// than a silently mis-scheduled step. False is still the shipped connector-off value
+    /// and every path below is then exactly what it was before Stage S.
     pub connector: bool,
 }
 
@@ -90,6 +91,18 @@ pub struct Decisions {
     pub preempted: Vec<u32>,
     /// Final `waiting`-queue order (slots) after the SJF reorder, front first.
     pub waiting_order: Vec<u32>,
+    /// Stage S: `(slot, num_computed = local + external, num_external)` for every waiting
+    /// candidate this step PARKED on an async connector load (scheduler.py:948-967).
+    ///
+    /// Not scheduled and not admitted: the blocks are allocated and the local hit is
+    /// installed, but no tokens are computed for it this step. Python owns the rest of
+    /// stock's tail — `update_state_after_alloc`, the `WAITING_FOR_REMOTE_KVS` status, the
+    /// `num_computed_tokens` write, `_inflight_prefills.add` and the `skipped_waiting`
+    /// prepend — because every one of those touches a Python object.
+    ///
+    /// Always EMPTY without a connector, which is what keeps `decisions_dict` and every
+    /// consumer of it unchanged on a connector-off boot.
+    pub parked_external: Vec<(u32, usize, usize)>,
     pub num_common_prefix_blocks: Vec<usize>,
     /// May the step this decision describes carry an N-step burst, as far as the SCHEDULER
     /// can tell? The conjuncts are exactly the ones `nstep_decode._publish_ready` used to
@@ -114,6 +127,7 @@ impl Decisions {
         self.scheduled_admitted.clear();
         self.preempted.clear();
         self.waiting_order.clear();
+        self.parked_external.clear();
         self.num_common_prefix_blocks.clear();
         self.burst_eligible = false;
     }
@@ -162,6 +176,15 @@ pub struct ScheduleCore {
     waiting: Vec<SchedReq>,
     keys: Vec<(u8, usize, usize)>,
     reorder_buf: Vec<SchedReq>,
+    /// Stage S: the token budget, carried across the phase boundary.
+    ///
+    /// A local in the un-split loop; a field now, because the running arm (phase 1) spends
+    /// it and the waiting arm (phase 2) spends what is left, with a Python call — the
+    /// connector's `get_num_new_matched_tokens` — in between. Written at the top of every
+    /// phase 1, so a phase 2 that never saw its phase 1 cannot inherit a stale budget from
+    /// two steps ago; it inherits the LAST phase 1's, which is the closest thing to a
+    /// correct answer and is unreachable anyway (the wrapper calls them in pairs).
+    budget: usize,
 }
 
 impl Default for ScheduleCore {
@@ -179,6 +202,7 @@ impl ScheduleCore {
             waiting: Vec::with_capacity(256),
             keys: Vec::with_capacity(256),
             reorder_buf: Vec::with_capacity(256),
+            budget: 0,
         }
     }
 
@@ -226,14 +250,38 @@ impl ScheduleCore {
         waiting: &[SchedReq],
         params: &Params,
     ) -> Result<&Decisions, String> {
+        self.load_running(kv, running);
+        self.waiting.clear();
+        self.waiting.extend_from_slice(waiting);
+        self.run(kv, params)
+    }
+
+    /// The marshalled running load, shared by [`Self::schedule`] and
+    /// [`Self::schedule_phase1`] so the resync semantics cannot drift between them.
+    fn load_running(&mut self, kv: &mut Manager, running: &[SchedReq]) {
         self.running.clear();
         self.running.extend_from_slice(running);
         for r in running {
             kv.table_set(r.slot, *r);
         }
-        self.waiting.clear();
-        self.waiting.extend_from_slice(waiting);
-        self.run(kv, params)
+    }
+
+    /// The resident running load, shared by [`Self::schedule_resident`] and
+    /// [`Self::schedule_phase1_resident`].
+    fn load_running_resident(&mut self, kv: &Manager, running_slots: &[u32]) -> Result<(), String> {
+        self.running.clear();
+        self.running.reserve(running_slots.len());
+        for &slot in running_slots {
+            match kv.table_get(slot) {
+                Some(e) => self.running.push(e),
+                None => {
+                    return Err(format!(
+                        "slot {slot} has no resident entry; a full resync is required"
+                    ))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// R6b: the same loop, reading the running set out of the Rust-resident table instead
@@ -247,18 +295,7 @@ impl ScheduleCore {
         waiting: &[SchedReq],
         params: &Params,
     ) -> Result<&Decisions, String> {
-        self.running.clear();
-        self.running.reserve(running_slots.len());
-        for &slot in running_slots {
-            match kv.table_get(slot) {
-                Some(e) => self.running.push(e),
-                None => {
-                    return Err(format!(
-                        "slot {slot} has no resident entry; a full resync is required"
-                    ))
-                }
-            }
-        }
+        self.load_running_resident(kv, running_slots)?;
         self.waiting.clear();
         self.waiting.extend_from_slice(waiting);
         self.run(kv, params)
@@ -266,13 +303,121 @@ impl ScheduleCore {
 
     /// THE loop body, shared by both entry points so they cannot drift apart. `running`
     /// and `waiting` are already loaded.
+    ///
+    /// STAGE S: this is now literally `phase1_body` followed by `phase2_body` with an empty
+    /// probe and an empty external slice, in the same order, with nothing between them. It
+    /// is the PARITY ANCHOR for the split — a connector-off boot runs exactly the
+    /// instructions it ran before, and the two public phase entry points below differ from
+    /// it only in what they load and in the two slices they are allowed to be non-empty.
     fn run(&mut self, kv: &mut Manager, params: &Params) -> Result<&Decisions, String> {
         // Speculation's scope invariant (see `journal.rs`): the waiting half of the loop
         // reaches prefix-cache lookup paths that are deliberately not journaled. Refuse
-        // rather than approximate.
+        // rather than approximate. Deliberately still HERE and not in `phase1_body`: it has
+        // to be answered before `decisions.clear()` / `new_step_starts()` mutate anything,
+        // and only this level knows the waiting queue is already loaded.
         if kv.journal_armed() && !self.waiting.is_empty() {
             return Err("speculation refuses a non-empty waiting queue".into());
         }
+        self.phase1_body(kv, params, &[])?;
+        self.phase2_body(kv, params, &[], 0)
+    }
+
+    /// Stage S, phase 1 (marshalled running): the running arm and the connector's
+    /// cache-hit probe. See [`Self::schedule_phase2`] for why the step is cut here.
+    ///
+    /// `probe` is the waiting candidates whose local cache hit the connector needs BEFORE
+    /// it can answer `get_num_new_matched_tokens` — `num_computed_tokens == 0` candidates,
+    /// capped by the caller at the admission budget. Their hits are parked per slot in the
+    /// manager (`Manager::probe_hit`) and phase 2 consumes them instead of re-walking.
+    ///
+    /// The waiting queue is CLEARED here: the candidate list arrives with phase 2 (Python
+    /// cannot assemble it before the connector queries, which need this call's answer), so
+    /// anything left over from the previous step must not be scheduled off.
+    pub fn schedule_phase1(
+        &mut self,
+        kv: &mut Manager,
+        running: &[SchedReq],
+        params: &Params,
+        probe: &[SchedReq],
+    ) -> Result<(), String> {
+        Self::refuse_split_under_speculation(kv)?;
+        self.load_running(kv, running);
+        self.waiting.clear();
+        self.phase1_body(kv, params, probe)
+    }
+
+    /// [`Self::schedule_phase1`] with the running set read from the resident table, the
+    /// twin of [`Self::schedule_resident`].
+    pub fn schedule_phase1_resident(
+        &mut self,
+        kv: &mut Manager,
+        running_slots: &[u32],
+        params: &Params,
+        probe: &[SchedReq],
+    ) -> Result<(), String> {
+        Self::refuse_split_under_speculation(kv)?;
+        self.load_running_resident(kv, running_slots)?;
+        self.waiting.clear();
+        self.phase1_body(kv, params, probe)
+    }
+
+    /// Stage S, phase 2: the waiting arm and the epilogue, with the connector's answers.
+    ///
+    /// WHY THE STEP IS CUT IN TWO. `get_num_new_matched_tokens` is a Python call on the
+    /// connector, and it takes the request's LOCAL cache hit as its argument
+    /// (scheduler.py:735-741). The hit comes out of the crate and the answer goes back into
+    /// the crate's admission arithmetic, so somewhere between the two the GIL has to be
+    /// held and the crate lock released. That seam is this split: phase 1 ends with the
+    /// hits, Python asks the connector, phase 2 admits.
+    ///
+    /// `external` is `(slot, num_external_computed_tokens, is_async)` for the candidates
+    /// Python queried; a slot with no entry is an ordinary candidate. `base_reserved` is
+    /// `_inflight_prefill_reserved_blocks()` (scheduler.py:2400) computed over the prefills
+    /// that were ALREADY in flight — the loads this loop parks are added to it here, in
+    /// order, exactly as stock's `_inflight_prefills.add` makes the next iteration see them.
+    ///
+    /// The SJF reorder runs here rather than in phase 1 for the same reason the queue is
+    /// cleared there: the candidates do not exist yet at phase 1. That makes its two
+    /// memory-pressure keys (`usage`, `num_free_blocks`) read AFTER the running arm's
+    /// allocations instead of before — a deliberate, connector-only divergence from the
+    /// un-split loop (which is the parity anchor and keeps reading them before).
+    pub fn schedule_phase2(
+        &mut self,
+        kv: &mut Manager,
+        params: &Params,
+        waiting: &[SchedReq],
+        external: &[(u32, usize, bool)],
+        base_reserved: usize,
+    ) -> Result<&Decisions, String> {
+        Self::refuse_split_under_speculation(kv)?;
+        self.waiting.clear();
+        self.waiting.extend_from_slice(waiting);
+        if params.sjf_reorder {
+            self.reorder_waiting(kv, params);
+        }
+        self.phase2_body(kv, params, external, base_reserved)
+    }
+
+    /// The split entry points are the CONNECTOR path, and the connector path never runs on
+    /// the speculation worker (`spec.rs` only ever calls `schedule_resident` with an empty
+    /// waiting queue, and `rust_sched.py::spec_blocked` refuses to kick at all while a
+    /// connector is live). An armed journal here would mean the two have been wired
+    /// together, and half of what phase 1 does — the probe's cache-hit walk — is exactly
+    /// what `journal.rs` does not record.
+    fn refuse_split_under_speculation(kv: &Manager) -> Result<(), String> {
+        if kv.journal_armed() {
+            return Err("speculation refuses the connector phase split".into());
+        }
+        Ok(())
+    }
+
+    /// Phase 1's body: the running arm plus the connector probe. `running` is loaded.
+    fn phase1_body(
+        &mut self,
+        kv: &mut Manager,
+        params: &Params,
+        probe: &[SchedReq],
+    ) -> Result<(), String> {
         self.decisions.clear();
 
         kv.new_step_starts();
@@ -413,9 +558,62 @@ impl ScheduleCore {
                 return Err("speculation journal exceeded its soft cap".into());
             }
         }
+        // What the waiting arm has left to spend, whether it runs in this call (`run`) or
+        // in a later `schedule_phase2`.
+        self.budget = token_budget;
+
+        // ---- 1b. The connector's cache-hit probe (scheduler.py:687-721) ----
+        // Phase 2 consumes these instead of re-walking, so the hit the connector was asked
+        // about and the hit `allocate_slots` is given are the same walk — which matters
+        // because a walk is not idempotent in general (another candidate's admission can
+        // move blocks under it).
+        kv.probe_clear();
+        if !probe.is_empty() {
+            if !params.connector {
+                return Err("a cache-hit probe was requested without a live connector".into());
+            }
+            for r in probe {
+                if r.num_computed_tokens != 0 {
+                    // Stock only reaches the hit walk (and therefore the connector query)
+                    // on the `request.num_computed_tokens == 0` arm (scheduler.py:685); a
+                    // resumed request's KV is already local.
+                    return Err(
+                        "a probed candidate must have num_computed_tokens == 0".into()
+                    );
+                }
+                kv.probe_computed_blocks(
+                    r.slot,
+                    r.num_tokens,
+                    r.num_preemptions,
+                    r.skip_reading_prefix_cache,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 2's body: the waiting arm and the epilogue. `waiting` is loaded (and
+    /// reordered, if it was going to be).
+    fn phase2_body(
+        &mut self,
+        kv: &mut Manager,
+        params: &Params,
+        external: &[(u32, usize, bool)],
+        base_reserved: usize,
+    ) -> Result<&Decisions, String> {
+        let mut token_budget = self.budget;
+        if !external.is_empty() && !params.connector {
+            return Err("external computed tokens without a live connector".into());
+        }
 
         // ---- 2. WAITING requests (scheduler.py:636) ------------------------
         let mut admitted_from_waiting = 0usize;
+        // The in-loop half of `_inflight_prefill_reserved_blocks` (scheduler.py:2400):
+        // stock adds each parked load to `_inflight_prefills` immediately (`:966`), so the
+        // NEXT candidate's reservation already counts it. `base_reserved` carries the
+        // prefills that were in flight before this step; this carries the ones this loop
+        // parked.
+        let mut parked_reserved = 0usize;
         if self.decisions.preempted.is_empty() {
             while admitted_from_waiting < self.waiting.len() && token_budget > 0 {
                 if self.running.len() >= params.max_num_running_reqs {
@@ -423,32 +621,110 @@ impl ScheduleCore {
                 }
                 let request = self.waiting[admitted_from_waiting];
 
-                let (num_new_local_computed_tokens, use_pending_hit) =
+                // scheduler.py:684 zeroes the Marconi hint per iteration and only refills
+                // it (`:730`) right after a fresh `get_computed_blocks`. Reading the
+                // coordinator unconditionally would feed the PREVIOUS request's hint into
+                // `mamba_block_aligned_split` whenever num_computed_tokens != 0.
+                //
+                // Stage S: a candidate the PROBE already walked for (phase 1) consumes that
+                // walk instead of running a second one — same three numbers, and the blocks
+                // go back into `pending_hit` where `allocate_slots` reads them. Without a
+                // connector the store is always empty and this is the fresh walk it always
+                // was, in the same place, with the same coordinator read after it.
+                let (num_new_local_computed_tokens, use_pending_hit, uncached_common) =
                     if request.num_computed_tokens == 0 {
-                        let hit = kv.get_computed_blocks(
-                            request.slot,
-                            request.num_tokens,
-                            request.num_preemptions,
-                            request.skip_reading_prefix_cache,
-                        );
-                        (hit, true)
+                        match kv.take_probe_hit(request.slot) {
+                            Some((hit, uncached)) => (hit, true, uncached),
+                            None => {
+                                let hit = kv.get_computed_blocks(
+                                    request.slot,
+                                    request.num_tokens,
+                                    request.num_preemptions,
+                                    request.skip_reading_prefix_cache,
+                                );
+                                (hit, true, kv.coord.num_uncached_common_prefix_tokens)
+                            }
+                        }
                     } else {
-                        (0, false)
+                        (0, false, 0)
                     };
                 let num_computed_tokens = if request.num_computed_tokens == 0 {
                     num_new_local_computed_tokens
                 } else {
                     request.num_computed_tokens
                 };
-                // scheduler.py:684 zeroes this per iteration and only refills it (`:730`)
-                // right after a fresh `get_computed_blocks`. Reading the coordinator
-                // unconditionally would feed the PREVIOUS request's Marconi hint into
-                // `mamba_block_aligned_split` whenever num_computed_tokens != 0.
-                let uncached_common = if request.num_computed_tokens == 0 {
-                    kv.coord.num_uncached_common_prefix_tokens
-                } else {
-                    0
-                };
+
+                // ---- 2a. The parked async load (scheduler.py:797-967) ------
+                // Everything about it is decided before the ordinary arithmetic runs,
+                // because stock's `load_kv_async` branch sets `num_new_tokens = 0` and then
+                // skips the split, the encoder work and the lookahead slots outright.
+                if let Some(&(_, num_external, is_async)) = external
+                    .iter()
+                    .find(|e| e.0 == request.slot)
+                {
+                    if num_external > 0 && !is_async {
+                        // A SYNCHRONOUS external hit is a shape this port has never had a
+                        // path for: it would have to flow through the ordinary
+                        // `allocate_slots` call below with `delay_cache_blocks=false`, and
+                        // the OffloadingConnector does not produce it (its
+                        // `get_num_new_matched_tokens` returns `(n, True)` for a hit).
+                        return Err(
+                            "sync external tokens are unreachable for OffloadingConnector".into(),
+                        );
+                    }
+                    if is_async {
+                        if num_external == 0 {
+                            // scheduler.py:799 asserts exactly this.
+                            return Err(
+                                "an async KV load must carry external computed tokens".into(),
+                            );
+                        }
+                        if request.num_computed_tokens != 0 {
+                            // The connector is only ever queried on the `C == 0` arm, so a
+                            // parked load with a resumed request is a wiring bug upstream.
+                            return Err(
+                                "an async KV load needs num_computed_tokens == 0".into(),
+                            );
+                        }
+                        let total_computed = num_new_local_computed_tokens + num_external;
+                        if total_computed > request.num_tokens {
+                            // scheduler.py:757's assert.
+                            return Err(
+                                "external + local computed tokens exceed the request".into(),
+                            );
+                        }
+                        let ok = kv.allocate_external(
+                            request.slot,
+                            num_new_local_computed_tokens,
+                            num_external,
+                            request.num_tokens,
+                            request.status,
+                            !self.running.is_empty(),
+                            base_reserved + parked_reserved,
+                        )?;
+                        if !ok {
+                            // Stock breaks out of the whole waiting loop when
+                            // `allocate_slots` returns None (`:918`).
+                            break;
+                        }
+                        // The reservation this load now holds, for the candidates behind it
+                        // (`_request_remaining_blocks`, scheduler.py:2387 — read AFTER
+                        // `num_computed_tokens` was set, which is what `:965` does).
+                        parked_reserved +=
+                            kv.remaining_blocks(request.slot, request.num_tokens, total_computed);
+                        self.decisions.parked_external.push((
+                            request.slot,
+                            total_computed,
+                            num_external,
+                        ));
+                        // Consumed from the front of the queue exactly like an admission
+                        // (stock pops it and prepends it to `step_skipped_waiting`), so it
+                        // does not reappear in `waiting_order`. The token budget is
+                        // untouched: a parked load computes nothing this step.
+                        admitted_from_waiting += 1;
+                        continue;
+                    }
+                }
 
                 let mut num_new_tokens = request.num_tokens - num_computed_tokens;
                 if params.long_prefill_token_threshold > 0
@@ -487,9 +763,11 @@ impl ScheduleCore {
                     request.num_tokens,
                     request.status,
                     !self.running.is_empty(),
-                    // An ASYNC connector load is the only producer of these three, and it
-                    // never enters this loop (`Params::connector`). A synchronous connector
-                    // hit contributes no external tokens either.
+                    // Still all three at their inert defaults, now by ELIMINATION rather
+                    // than by the absence of a connector: an async load took the parked arm
+                    // above and returned, and a synchronous external hit is refused there.
+                    // What is left here computes tokens this step, so its blocks are cached
+                    // immediately and it reserves nothing for anyone.
                     0,
                     false,
                     0,
@@ -540,6 +818,11 @@ impl ScheduleCore {
         d.burst_eligible = params.burst_max_reqs > 0
             && d.preempted.is_empty()
             && d.scheduled_admitted.is_empty()
+            // Stage S: a parked load is an admission that has not happened yet — it is
+            // promoted (and then admitted) as soon as its transfer lands, and a burst would
+            // delay that by N-1 iterations. Same TTFT argument as `scheduled_admitted`.
+            // Always empty without a connector, so this changes no connector-off verdict.
+            && d.parked_external.is_empty()
             && !d.scheduled_running.is_empty()
             && d.scheduled_running.len() <= params.burst_max_reqs
             && d.scheduled_running.iter().all(|&(_, n)| n == 1);
@@ -1079,6 +1362,290 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Stage S: the phase split ---------------------------------------------------
+
+    /// A connector-off boot must not be able to tell that the loop was cut in two. The
+    /// unsplit `schedule()` and an explicit `schedule_phase1(probe=[]) ->
+    /// schedule_phase2(waiting, external=[])` are run against two managers built from the
+    /// same seed, and BOTH the decisions and the whole manager state have to match.
+    ///
+    /// `sjf_reorder` stays off here on purpose: the public `schedule_phase2` runs the
+    /// reorder itself (its candidates do not exist at phase 1), so its two memory-pressure
+    /// keys are read after the running arm's allocations rather than before. That is the
+    /// one documented divergence of the split, and it is connector-only — `run()` still
+    /// reorders where it always did, which the `sjf_reorder_*` test above pins.
+    #[test]
+    fn the_phase_split_is_bit_identical_to_the_unsplit_loop_without_a_connector() {
+        // A tiny LCG so the fixtures are varied and reproducible without a dev-dependency.
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        for scenario in 0..24u32 {
+            let blocks = 24 + next(200) as usize;
+            let n_run = next(4) as usize;
+            let n_wait = next(4) as usize;
+            let budget = 16 + 32 * next(8) as usize;
+            let mut p = params();
+            p.max_num_scheduled_tokens = budget;
+            p.max_num_running_reqs = 1 + next(5) as usize;
+            p.lean_decisions = next(2) == 1;
+
+            // The two fixtures are built by the same closure, so they are identical up to
+            // the entry point under test.
+            let build = |prompts: &[(usize, u8)]| {
+                let mut kv = Manager::new(cfg(blocks)).unwrap();
+                let mut reqs = Vec::new();
+                for (i, &(len, salt)) in prompts.iter().enumerate() {
+                    let slot = seed(&mut kv, &format!("r{i}"), len, salt);
+                    reqs.push(req(slot, len));
+                }
+                (kv, reqs)
+            };
+            let prompts: Vec<(usize, u8)> = (0..n_run + n_wait)
+                .map(|i| ((1 + next(6) as usize) * 32, (scenario as u8) * 8 + i as u8 + 1))
+                .collect();
+
+            let (mut kv_a, reqs_a) = build(&prompts);
+            let (mut kv_b, reqs_b) = build(&prompts);
+            // The running half is put in a decode-ish state; the waiting half is fresh.
+            let running = |reqs: &[SchedReq]| -> Vec<SchedReq> {
+                reqs[..n_run]
+                    .iter()
+                    .map(|r| {
+                        let mut r = *r;
+                        r.num_computed_tokens = r.num_tokens;
+                        r.num_tokens += 1;
+                        r.num_tokens_with_spec = r.num_tokens;
+                        r.status = STATUS_RUNNING;
+                        r.is_prefill_chunk = false;
+                        r
+                    })
+                    .collect()
+            };
+            let (run_a, run_b) = (running(&reqs_a), running(&reqs_b));
+            let (wait_a, wait_b) = (&reqs_a[n_run..], &reqs_b[n_run..]);
+
+            let mut core_a = ScheduleCore::new();
+            let unsplit = core_a
+                .schedule(&mut kv_a, &run_a, wait_a, &p)
+                .unwrap()
+                .clone();
+
+            let mut core_b = ScheduleCore::new();
+            core_b.schedule_phase1(&mut kv_b, &run_b, &p, &[]).unwrap();
+            let split = core_b
+                .schedule_phase2(&mut kv_b, &p, wait_b, &[], 0)
+                .unwrap()
+                .clone();
+
+            assert_eq!(unsplit, split, "scenario {scenario}: decisions");
+            assert_eq!(
+                kv_a.state_fingerprint(),
+                kv_b.state_fingerprint(),
+                "scenario {scenario}: manager state"
+            );
+            assert!(split.parked_external.is_empty(), "no connector, no parked loads");
+        }
+    }
+
+    /// The same equivalence for the RESIDENT entry point, which reads the running set out
+    /// of the table instead of a marshalled slice.
+    #[test]
+    fn the_resident_phase_split_is_bit_identical_to_schedule_resident() {
+        let p = params();
+        let mut kv_a = Manager::new(cfg(512)).unwrap();
+        let mut kv_b = Manager::new(cfg(512)).unwrap();
+        let mut core_a = ScheduleCore::new();
+        let mut core_b = ScheduleCore::new();
+        let (a, b) = (seed(&mut kv_a, "a", 64, 1), seed(&mut kv_b, "a", 64, 1));
+        // One marshalled step first, to populate both resident tables identically.
+        core_a.schedule(&mut kv_a, &[], &[req(a, 64)], &p).unwrap();
+        core_b.schedule(&mut kv_b, &[], &[req(b, 64)], &p).unwrap();
+        let w_a = seed(&mut kv_a, "w", 128, 9);
+        let w_b = seed(&mut kv_b, "w", 128, 9);
+
+        let unsplit = core_a
+            .schedule_resident(&mut kv_a, &[a], &[req(w_a, 128)], &p)
+            .unwrap()
+            .clone();
+        core_b
+            .schedule_phase1_resident(&mut kv_b, &[b], &p, &[])
+            .unwrap();
+        let split = core_b
+            .schedule_phase2(&mut kv_b, &p, &[req(w_b, 128)], &[], 0)
+            .unwrap()
+            .clone();
+        assert_eq!(unsplit, split);
+        assert_eq!(kv_a.state_fingerprint(), kv_b.state_fingerprint());
+    }
+
+    /// The probe's hit is what phase 2 allocates against — it must not walk the cache a
+    /// second time, and the blocks recorded in phase 1 have to reach `allocate_slots`.
+    #[test]
+    fn phase2_consumes_the_probe_hit_instead_of_re_walking() {
+        let mut p = params();
+        p.connector = true;
+        let mut c = cfg(512);
+        c.connector = true;
+        let mut kv = Manager::new(c).unwrap();
+        let mut core = ScheduleCore::new();
+        // `base` installs 64 tokens' worth of blocks in the prefix cache; `dup` re-sends
+        // the identical prompt, so its probe finds them.
+        let base = seed(&mut kv, "base", 64, 1);
+        core.schedule(&mut kv, &[], &[req(base, 64)], &p).unwrap();
+        let dup = seed(&mut kv, "dup", 64, 1);
+
+        core.schedule_phase1(&mut kv, &[], &p, &[req(dup, 64)]).unwrap();
+        let hits = kv.probe_hits();
+        assert_eq!(hits.len(), 1);
+        let (slot, hit) = hits[0];
+        assert_eq!(slot, dup);
+        assert!(hit > 0, "the identical prompt must hit the prefix cache");
+
+        let d = core
+            .schedule_phase2(&mut kv, &p, &[req(dup, 64)], &[], 0)
+            .unwrap()
+            .clone();
+        assert_eq!(d.scheduled_admitted.len(), 1);
+        assert_eq!(
+            d.scheduled_admitted[0].2, hit,
+            "num_computed_tokens is the probe's hit"
+        );
+        // Consumed: nothing is left behind for a later step to re-install.
+        assert!(kv.probe_hits().is_empty());
+    }
+
+    #[test]
+    fn phase2_parks_an_async_candidate_and_admits_the_next() {
+        let mut p = params();
+        p.connector = true;
+        let mut c = cfg(512);
+        c.connector = true;
+        let mut kv = Manager::new(c).unwrap();
+        let mut core = ScheduleCore::new();
+        let park = seed(&mut kv, "park", 128, 1);
+        let plain = seed(&mut kv, "plain", 64, 2);
+        let waiting = [req(park, 128), req(plain, 64)];
+
+        core.schedule_phase1(&mut kv, &[], &p, &waiting).unwrap();
+        // The connector claims 64 of the parked request's tokens, asynchronously.
+        let d = core
+            .schedule_phase2(&mut kv, &p, &waiting, &[(park, 64, true)], 0)
+            .unwrap()
+            .clone();
+
+        assert_eq!(d.parked_external, vec![(park, 64, 64)], "local hit is 0 here");
+        assert_eq!(
+            d.scheduled_admitted.len(),
+            1,
+            "the parked load does not stop the queue"
+        );
+        assert_eq!(d.scheduled_admitted[0].0, plain);
+        // A parked request is consumed from the queue: Python parks it in
+        // `skipped_waiting`, so it must not come back in `waiting_order`.
+        assert!(d.waiting_order.is_empty());
+        // ...and it holds blocks for the tokens the transfer will land.
+        assert!(kv.group_blocks(park, 0).len() >= 4);
+        assert!(!d.burst_eligible, "a parked load is an admission in waiting");
+    }
+
+    #[test]
+    fn phase2_refuses_synchronous_external_tokens() {
+        let mut p = params();
+        p.connector = true;
+        let mut c = cfg(512);
+        c.connector = true;
+        let mut kv = Manager::new(c).unwrap();
+        let mut core = ScheduleCore::new();
+        let a = seed(&mut kv, "a", 64, 1);
+        core.schedule_phase1(&mut kv, &[], &p, &[req(a, 64)]).unwrap();
+        let err = core
+            .schedule_phase2(&mut kv, &p, &[req(a, 64)], &[(a, 32, false)], 0)
+            .unwrap_err();
+        assert!(err.contains("sync external tokens"), "{err}");
+
+        // ...and an async load with nothing to load is stock's assert at :799.
+        core.schedule_phase1(&mut kv, &[], &p, &[req(a, 64)]).unwrap();
+        let err = core
+            .schedule_phase2(&mut kv, &p, &[req(a, 64)], &[(a, 0, true)], 0)
+            .unwrap_err();
+        assert!(err.contains("must carry external computed tokens"), "{err}");
+
+        // ...and external work at all without a live connector is a wiring bug.
+        let mut off = params();
+        off.connector = false;
+        let err = core
+            .schedule_phase2(&mut kv, &off, &[req(a, 64)], &[(a, 32, true)], 0)
+            .unwrap_err();
+        assert!(err.contains("without a live connector"), "{err}");
+    }
+
+    /// scheduler.py:966 adds each parked load to `_inflight_prefills` immediately, so the
+    /// NEXT candidate's `reserved_blocks` already counts it. The crate does that in-loop:
+    /// with a pool sized to hold exactly one of the two loads' reservations, the second
+    /// must be refused by the reserved gate — and admitted once the reservation is gone.
+    #[test]
+    fn parked_loads_accumulate_their_reservation_within_the_loop() {
+        let mut p = params();
+        p.connector = true;
+        let build = || {
+            // 26 usable blocks. A 256-token request parks on 9 (8 attention + 1 mamba for
+            // the 128 tokens the transfer will land) and RESERVES 9 more for the rest of
+            // its sequence, so the pool holds one load plus its reservation and no more.
+            let mut c = cfg(27);
+            c.connector = true;
+            let mut kv = Manager::new(c).unwrap();
+            let a = seed(&mut kv, "pa", 256, 1);
+            let b = seed(&mut kv, "pb", 256, 2);
+            (kv, a, b)
+        };
+
+        let (mut kv, a, b) = build();
+        let mut core = ScheduleCore::new();
+        let waiting = [req(a, 256), req(b, 256)];
+        eprintln!("free before {}", kv.num_free_blocks());
+        core.schedule_phase1(&mut kv, &[], &p, &waiting).unwrap();
+        let d = core
+            .schedule_phase2(&mut kv, &p, &waiting, &[(a, 128, true), (b, 128, true)], 0)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            d.parked_external.len(),
+            1,
+            "the first load's reservation must gate the second: {:?}",
+            d.parked_external
+        );
+        assert_eq!(d.parked_external[0].0, a);
+
+        // The same second candidate, alone, fits — so the refusal above was the
+        // RESERVATION and not the pool being out of blocks.
+        let (mut kv2, _a2, b2) = build();
+        let mut core2 = ScheduleCore::new();
+        let solo = [req(b2, 256)];
+        core2.schedule_phase1(&mut kv2, &[], &p, &solo).unwrap();
+        let d2 = core2
+            .schedule_phase2(&mut kv2, &p, &solo, &[(b2, 128, true)], 0)
+            .unwrap()
+            .clone();
+        assert_eq!(d2.parked_external.len(), 1);
+
+        // ...and `base_reserved` (the prefills already in flight when the step started) is
+        // the same gate from the other side: one whole pool's worth refuses even the first.
+        let (mut kv3, a3, _b3) = build();
+        let mut core3 = ScheduleCore::new();
+        let one = [req(a3, 256)];
+        core3.schedule_phase1(&mut kv3, &[], &p, &one).unwrap();
+        let d3 = core3
+            .schedule_phase2(&mut kv3, &p, &one, &[(a3, 128, true)], 64)
+            .unwrap()
+            .clone();
+        assert!(d3.parked_external.is_empty(), "base_reserved gates the first load");
     }
 
     #[test]

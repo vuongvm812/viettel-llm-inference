@@ -36,6 +36,29 @@ use crate::single_type::{cdiv, Kind, TypeManager};
 /// resync step cannot disagree about what a field means.
 pub use crate::sched::SchedReq as SchedEntry;
 
+/// Stage S: one waiting candidate's cache-hit state, recorded by the connector PROBE.
+///
+/// WHY IT HAS TO BE STORED AT ALL. `pending_hit` is ONE per-group buffer: every
+/// `get_computed_blocks` call overwrites it, and `allocate_slots` consumes whatever is in
+/// it at the moment it runs. The connector split walks the cache for several candidates in
+/// phase 1 (the hit length is an INPUT to `get_num_new_matched_tokens`, which is a Python
+/// call that cannot happen with the crate lock held), then allocates for them in phase 2 —
+/// so each walk's blocks have to survive the next walk. This is that survival, per slot.
+///
+/// `uncached_common` rides along for the same reason: `Coordinator::
+/// num_uncached_common_prefix_tokens` is a single slot on the coordinator that the NEXT
+/// walk overwrites, and scheduler.py:727 reads it for the candidate whose hit it belongs to
+/// (the crate's waiting arm mirrors that read; see `sched.rs`).
+#[derive(Clone, Debug, Default)]
+pub struct ProbeHit {
+    /// `num_new_local_computed_tokens` — what `get_computed_blocks*` returned.
+    pub hit: usize,
+    /// The per-group hit blocks, as `take_hit_blocks` left them in `pending_hit`.
+    pub blocks: Vec<Vec<u32>>,
+    /// `Coordinator::num_uncached_common_prefix_tokens` as of this walk.
+    pub uncached_common: usize,
+}
+
 /// Request status values the allocator's watermark branch cares about
 /// (`RequestStatus`, vllm/v1/request.py).
 pub const STATUS_WAITING: u8 = 0;
@@ -152,6 +175,15 @@ pub struct Manager {
     /// Last `get_computed_blocks` result, per request slot.
     pub(crate) hit_len: FxHashMap<u32, usize>,
 
+    /// Stage S: slot -> the cache-hit walk phase 1 ran for it, consumed by phase 2.
+    ///
+    /// STEP-SCOPED, and deliberately so: `probe_clear` empties it at the top of every
+    /// phase 1, and phase 2 REMOVES each entry as it consumes it, so nothing survives into
+    /// a step that did not record it. Empty for the whole life of a connector-off boot —
+    /// `schedule_phase1` is only ever called with a non-empty probe by the connector
+    /// wrapper — which is what keeps the split bit-identical without one.
+    pub(crate) probe_hit: FxHashMap<u32, ProbeHit>,
+
     /// R9: steps where `update_step_pack_store`'s `fold_cache` found a slot with no
     /// resident table entry (or a non-RUNNING one) and skipped its `cache_blocks` fold.
     /// `table_with`'s silent skip (`:315`) is correct-by-construction for the paths that
@@ -233,6 +265,7 @@ impl Manager {
             scratch_flat: Vec::with_capacity(256),
             common_prefix: Vec::with_capacity(n),
             hit_len: FxHashMap::default(),
+            probe_hit: FxHashMap::default(),
             cache_fold_skips: 0,
             cfg,
         })
@@ -285,6 +318,10 @@ impl Manager {
                 st.num_prompt_tokens = 0;
             }
             self.hit_len.remove(&id);
+            // Stage S: same reason as `hit_len` -- a recycled slot must never inherit the
+            // dead request's cache-hit blocks, which phase 2 would hand to `allocate_slots`
+            // as the new occupant's local hit.
+            self.probe_hit.remove(&id);
             self.stops.forget(id);
             // Phase 2: same reason as `stops` -- a recycled slot must not answer with the
             // dead request's pack-ok bit, which would let `decide()` skip a derivation the
@@ -627,6 +664,61 @@ impl Manager {
         }
         self.hit_len.insert(req, hit);
         hit
+    }
+
+    // ---- Stage S: the connector probe store -------------------------------
+
+    /// Drop every recorded probe. Called at the top of `ScheduleCore::schedule_phase1`.
+    pub fn probe_clear(&mut self) {
+        self.probe_hit.clear();
+    }
+
+    /// `get_computed_blocks` for one PROBE candidate, with the result kept per slot.
+    ///
+    /// Identical to the walk the waiting arm would run (same dispatch on `cfg.connector`,
+    /// same stats record, same `hit_len` write) — the only difference is that the answer
+    /// is also parked in [`Manager::probe_hit`] so the next candidate's walk cannot
+    /// clobber it. scheduler.py runs this walk and `get_num_new_matched_tokens` back to
+    /// back inside one loop iteration; the split has a Python call between them, and this
+    /// is what makes the two halves see the same numbers.
+    pub fn probe_computed_blocks(
+        &mut self,
+        req: u32,
+        num_tokens: usize,
+        num_preemptions: u32,
+        skip_reading_prefix_cache: bool,
+    ) -> usize {
+        let hit = self.get_computed_blocks(req, num_tokens, num_preemptions, skip_reading_prefix_cache);
+        self.probe_hit.insert(
+            req,
+            ProbeHit {
+                hit,
+                blocks: self.pending_hit.clone(),
+                uncached_common: self.coord.num_uncached_common_prefix_tokens,
+            },
+        );
+        hit
+    }
+
+    /// Consume one recorded probe: the blocks go back into `pending_hit` (where
+    /// `allocate_slots`' `use_pending_hit` arm reads them) and the two numbers come back.
+    ///
+    /// REMOVES the entry. A slot is admitted, parked or refused exactly once per step, and
+    /// leaving a consumed hit behind would let a later `allocate_slots` in the same step
+    /// re-install blocks the coordinator has already taken ownership of.
+    pub fn take_probe_hit(&mut self, req: u32) -> Option<(usize, usize)> {
+        let rec = self.probe_hit.remove(&req)?;
+        for (dst, src) in self.pending_hit.iter_mut().zip(rec.blocks.iter()) {
+            dst.clear();
+            dst.extend_from_slice(src);
+        }
+        Some((rec.hit, rec.uncached_common))
+    }
+
+    /// `(slot, hit_len)` for every recorded probe — what phase 1 hands back to Python so
+    /// it can call `get_num_new_matched_tokens(request, num_local_computed)`.
+    pub fn probe_hits(&self) -> Vec<(u32, usize)> {
+        self.probe_hit.iter().map(|(&r, h)| (r, h.hit)).collect()
     }
 
     /// Cache-hit walk that does NOT touch `prefix_cache_stats` — the read-only signal

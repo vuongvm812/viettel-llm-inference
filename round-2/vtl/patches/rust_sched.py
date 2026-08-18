@@ -47,7 +47,8 @@ Composition with the existing patches:
     dropped. Which of the two is active is logged at install.
 
 Refusal, not approximation: the port covers exactly two KV cache-spec kinds, full attention
-and mamba (``single_type.rs::Kind``). Anything else (KV/EC connectors, LoRA, encoder inputs,
+and mamba (``single_type.rs::Kind``). Anything else (unported KV connectors -- see the
+Stage-S exception below -- EC connectors, LoRA, encoder inputs,
 speculative decoding, priority policy, sliding-window / chunked-local / cross-attention
 specs, sparse prefix-cache retention, DCP/PCP, KV cache events) makes ``build_config`` /
 ``schedule_supported`` return a reason string, which is logged once and leaves stock vLLM
@@ -70,8 +71,17 @@ because ``schedule_supported`` sees it only once the Scheduler exists and by the
 pool is live. ``kv_connector_configured`` probes the config for every shape a connector can
 arrive in (``kv_transfer_config`` AND the ``--kv-offloading-*`` engine args), and authority
 mode STANDS DOWN to the stock manager when it finds one -- a connector and this port cannot
-share a block pool. Authority mode and KV offloading are therefore mutually exclusive
-configurations, and the serve line has to pick one.
+share a block pool.
+
+EXCEPT ONE. Stage S ports ``OffloadingConnector`` in the single configuration
+``offloading_connector_supported`` allow-lists (``CPUOffloadingSpec``, ``kv_both``, no
+offloaded ``block_size``, recompute-on-load-failure). For that one the stand-down does NOT
+fire: ``schedule()`` drives the connector protocol itself, in two crate calls with the
+connector's ``get_num_new_matched_tokens`` between them (``ScheduleCore::schedule_phase1`` /
+``schedule_phase2``), parks async loads in ``skipped_waiting`` and rebuilds
+``kv_connector_metadata`` every step. Every other connector -- and every other
+CONFIGURATION of this one -- still stands authority mode down, so the serve line still has
+to pick one stack unless it is exactly that shape.
 
 MODEL-AGNOSTIC, WITH ONE SHARP EDGE. Nothing here reads a model name or a layer count --
 the config is derived from ``kv_cache_config.kv_cache_groups`` at runtime, so a plain dense
@@ -205,6 +215,7 @@ _REQUIRE_KEYS = {
     "token_store": ("C", "Port-2 token store off for the rest of the boot"),
     "r9": ("C", "R9 collapsed FFI + residue loop off for the rest of the boot"),
     "nstep_burst": ("C", "nstep bursts off for the rest of the boot"),
+    "connector_sched": ("C", "a KV connector call raised inside schedule()"),
 }
 
 # key -> [consecutive demoted steps, last reason]. Only ever written under REQUIRE.
@@ -404,6 +415,174 @@ def kv_connector_configured(cfg=None):
     return False
 
 
+def _env_flag(name: str) -> bool:
+    """One ``vllm.envs`` boolean, read defensively, with the raw env var as the fallback.
+
+    ``vllm.envs`` resolves its flags lazily through a module ``__getattr__``, so a build
+    that renamed or dropped one raises ``AttributeError`` on access rather than at import.
+    The raw variable is the same thing vLLM itself parses (``bool(int(os.environ[...]))``
+    for these flags), so the fallback answers the same question one layer lower instead of
+    guessing.
+    """
+    try:
+        from vllm import envs
+
+        return bool(getattr(envs, name))
+    except Exception:
+        raw = os.environ.get(name, "").strip().lower()
+        return raw in _TRUTHY or raw.isdigit() and int(raw) != 0
+
+
+def _extra_config(cfg) -> dict:
+    tc = getattr(cfg, "kv_transfer_config", None)
+    return getattr(tc, "kv_connector_extra_config", None) or {}
+
+
+# EVERY assumption the Stage-S connector port makes about the connector, one clause each,
+# each returning the reason it FAILED or None. A positive allow-list, not a deny-list: the
+# port models ONE connector in ONE configuration (`OffloadingConnector` + `CPUOffloadingSpec`
+# at block_size_factor 1, async loads only, recompute-on-load-failure), and every other
+# shape -- a different spec, a different role, a bigger offloaded block, LMCache, the simple
+# CPU offload connector -- has code paths in `scheduler.py` this port does not implement.
+# The asymmetry from `kv_connector_configured` is total and points the same way: a clause
+# that wrongly FAILS costs the Rust stack for a boot, a clause that wrongly PASSES serves
+# wrong KV.
+#
+# Each clause is evaluated under its own try/except (see `offloading_connector_supported`)
+# so a config layout that does not carry a field answers "not this shape" instead of taking
+# the whole verdict down with an AttributeError.
+_OFFLOADING_CLAUSES = (
+    # config/vllm.py:796 -- the size is what ACTIVATES offloading; without it there is no
+    # connector to support (and `kv_connector_configured` would not have fired either).
+    ("kv_offloading_size", lambda cfg: (
+        None if getattr(cfg.cache_config, "kv_offloading_size", None) is not None
+        else "kv_offloading_size is not set"
+    )),
+    # config/vllm.py:804 -- "native" is the arm that installs OffloadingConnector.
+    ("kv_offloading_backend", lambda cfg: (
+        None if getattr(cfg.cache_config, "kv_offloading_backend", None) == "native"
+        else f"kv_offloading_backend is "
+             f"{getattr(cfg.cache_config, 'kv_offloading_backend', None)!r}, not 'native'"
+    )),
+    # config/vllm.py:807 -- the env var swaps in SimpleCPUOffloadConnector, which has a
+    # different scheduler-side contract entirely.
+    ("VLLM_USE_SIMPLE_KV_OFFLOAD", lambda cfg: (
+        "VLLM_USE_SIMPLE_KV_OFFLOAD selects SimpleCPUOffloadConnector"
+        if _env_flag("VLLM_USE_SIMPLE_KV_OFFLOAD") else None
+    )),
+    ("kv_connector", lambda cfg: (
+        None if getattr(cfg.kv_transfer_config, "kv_connector", None) == "OffloadingConnector"
+        else f"kv_connector is "
+             f"{getattr(cfg.kv_transfer_config, 'kv_connector', None)!r}, not 'OffloadingConnector'"
+    )),
+    # config/vllm.py:822 sets this for every offloading backend. Anything else is a P/D
+    # deployment: `kv_producer`/`kv_consumer` reach the remote-prefill paths (request
+    # handoff, `request_finished` block retention) that this port does not model.
+    ("kv_role", lambda cfg: (
+        None if getattr(cfg.kv_transfer_config, "kv_role", None) == "kv_both"
+        else f"kv_role is {getattr(cfg.kv_transfer_config, 'kv_role', None)!r}, not 'kv_both'"
+    )),
+    # v1/kv_offload/factory.py:57 -- the default spec. A custom spec can change the block
+    # geometry and the lookup semantics the port's block-record view assumes.
+    ("spec_name", lambda cfg: (
+        None if _extra_config(cfg).get("spec_name", "CPUOffloadingSpec") == "CPUOffloadingSpec"
+        else f"offloading spec is {_extra_config(cfg).get('spec_name')!r}"
+    )),
+    # v1/kv_offload/base.py:552-565 -- absent means `block_size_factor == 1`, i.e. one
+    # offloaded block per GPU block. A factor > 1 makes the connector's hit lengths and
+    # its block-record scan operate on a different grid than `_BlockRecordView` exposes.
+    ("block_size", lambda cfg: (
+        "kv_connector_extra_config carries an offloaded 'block_size' (block_size_factor > 1)"
+        if "block_size" in _extra_config(cfg) else None
+    )),
+    # scheduler.py:143 -- 'fail' turns a KV load failure into `finish_requests` plus an
+    # `evict_blocks` sweep over the failed blocks (`:2651`), driven from
+    # `_handle_invalid_blocks` over `skipped_waiting`. 'recompute' is the arm that just
+    # rewinds `num_computed_tokens` and lets the request prefill again, which is the only
+    # one whose scheduler-side effects this port has been walked through.
+    ("kv_load_failure_policy", lambda cfg: (
+        None if getattr(cfg.kv_transfer_config, "kv_load_failure_policy", None) == "recompute"
+        else "kv_load_failure_policy is "
+             f"{getattr(cfg.kv_transfer_config, 'kv_load_failure_policy', None)!r}, "
+             "not 'recompute'"
+    )),
+    # An EC connector is a second, independent connector on the same schedule loop
+    # (`ec_connector.ensure_cache_available` gates admission, scheduler.py:762) and is
+    # refused by `unsupported_features` in its own right; naming it here keeps the two
+    # answers consistent.
+    ("ec_transfer_config", lambda cfg: (
+        None if getattr(cfg, "ec_transfer_config", None) is None
+        else "an EC transfer config is configured"
+    )),
+)
+
+
+def offloading_connector_supported(cfg=None, connector=None) -> str | None:
+    """``None`` if this boot's KV connector is the one Stage S ported, else WHY it is not.
+
+    The positive counterpart to ``kv_connector_configured``: that one answers "is there a
+    connector at all" (and any answer but a clean ``False`` costs authority mode), this one
+    answers "is it EXACTLY the connector the port models". Two callers depend on the
+    difference -- ``authority_stand_down`` (stand down only for a connector we cannot
+    drive) and ``unsupported_features`` (refuse the schedule loop only for such a
+    connector).
+
+    ``cfg=None`` reads the ambient vLLM config, exactly like ``kv_connector_configured``.
+    An unreadable config is a REASON here, not an unknown: every caller treats a reason as
+    "not ported", which is the conservative direction (the pre-Stage-S behaviour).
+
+    ``connector`` is the live ``scheduler.connector`` object when there is one. It is
+    checked in addition to the config, never instead of it: the config decides which
+    connector vLLM was ASKED for, the object proves which one it BUILT.
+    """
+    if cfg is None:
+        try:
+            from vllm.config import get_current_vllm_config_or_none
+
+            cfg = get_current_vllm_config_or_none()
+        except Exception as exc:
+            return f"no readable vLLM config ({exc!r})"
+        if cfg is None:
+            return "no vLLM config in scope to check the connector against"
+    for name, clause in _OFFLOADING_CLAUSES:
+        try:
+            why = clause(cfg)
+        except Exception as exc:
+            # Unlike `kv_connector_configured`'s probes, an unreadable clause is a FAILURE
+            # here and not a skip: this is an allow-list, and "the field this port depends
+            # on does not exist in this build" is the strongest possible reason to refuse.
+            why = f"{name} could not be read ({exc!r})"
+        if why:
+            return why
+    if connector is not None:
+        return _offloading_connector_object_supported(connector)
+    return None
+
+
+def _offloading_connector_object_supported(connector) -> str | None:
+    """The two clauses that need the LIVE connector object.
+
+    ``SupportsHMA`` is the protocol whose presence tells `scheduler.py` the connector
+    understands per-group (hybrid memory allocator) block lists -- which is exactly the
+    shape `RustBlocks`' meta view hands to ``update_state_after_alloc``. A connector
+    without it takes the single-group path (`:2384`) and would be handed the wrong object.
+    """
+    name = type(connector).__name__
+    if name != "OffloadingConnector":
+        return f"the live connector is a {name}, not an OffloadingConnector"
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1 import SupportsHMA
+    except Exception as exc:
+        # Import failure: the type name matched, which is the strong signal; say so rather
+        # than refuse a connector this port does model.
+        log.warning("rust_sched: could not import SupportsHMA (%r); "
+                    "trusting the connector type name alone", exc)
+        return None
+    if not isinstance(connector, SupportsHMA):
+        return "the live OffloadingConnector does not implement SupportsHMA"
+    return None
+
+
 def modes() -> dict:
     """Resolve the gate combination. ``full`` implies ``authority``."""
     full = env_on("VTL_RUST_SCHED_FULL")
@@ -557,6 +736,14 @@ def ring_blocked(scheduler) -> str | None:
     pickled COPY, which is what makes the reuse invisible. `uni` hands the runner the very
     object the next step mutates, so it is refused.
     """
+    # Stage S: cheap future-proofing. The ring is already refused on this box (it needs the
+    # `mp` executor and compose runs `uni`), but a connector-live step is not replayable in
+    # principle: `build_connector_meta` is rebuilt from the SchedulerOutput every step
+    # (scheduler.py:1116), the parked/promoted requests mutate `skipped_waiting` between
+    # steps, and `ring_reuse`'s identity check leans on `_free_request` always deleting from
+    # the registry -- which a connector's `delay_free_blocks` breaks (`:2112`).
+    if getattr(scheduler, "connector", None) is not None:
+        return "a KV connector rebuilds its metadata from every SchedulerOutput"
     cfg = getattr(scheduler, "vllm_config", None)
     depth = getattr(cfg, "max_concurrent_batches", 0)
     if depth != 2:
@@ -752,23 +939,41 @@ def spec_signature(spec) -> str:
     return type(spec).__name__ + repr(sorted((k, repr(v)) for k, v in fields.items()))
 
 
-# Stage S flips this. Until then the crate is told "no connector" on both wires, which
-# keeps `Config::connector` / `Params::connector` false and every allocator path
-# bit-identical to the pre-connector build: the per-group cache-hit walk is never
-# dispatched to, and the three connector arguments to `allocate_slots` stay at their
-# inert defaults. One constant rather than two literals so the two wires cannot drift.
-CONNECTOR_LIVE = False
+def connector_live_from_config(cfg=None) -> bool:
+    """Stage S: is the PORTED connector configured, decided from config alone?
+
+    THE TIMING PROBLEM this exists for. The crate's ``Config::connector`` is fixed when the
+    ``KvManager`` is constructed -- inside ``KVCacheManager.__init__``, which runs inside
+    ``Scheduler.__init__``, i.e. BEFORE ``scheduler.connector`` exists. So the flag that
+    decides which cache-hit walk ``Manager::get_computed_blocks`` dispatches to cannot be
+    read off the live object; it has to be derived from the same config the Scheduler is
+    about to build the connector from.
+
+    Both halves are required, and they are the same two the stand-down consults, in the
+    same order: a connector must be configured at all, and it must be the ported one. An
+    unreadable config answers False -- the connector-off crate -- which the first
+    ``schedule()`` cross-checks against the live connector and refuses on mismatch, because
+    a crate built connector-off cannot serve a live connector correctly.
+    """
+    return kv_connector_configured(cfg) is True and offloading_connector_supported(cfg) is None
 
 
-def build_config(manager, radix: bool):
+def build_config(manager, radix: bool, connector: bool | None = None):
     """Flatten a live ``KVCacheManager`` into the plain data the crate accepts.
 
     Returns ``(config_dict, None)`` or ``(None, reason)``. Never raises.
+
+    ``connector`` is the crate's ``Config::connector``; ``None`` (the default, and what the
+    self-check passes) resolves it from the ambient config via
+    ``connector_live_from_config``.
     """
     try:
         from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
     except Exception as exc:  # pragma: no cover - vLLM always present in the engine
         return None, f"vllm import failed: {exc!r}"
+
+    if connector is None:
+        connector = connector_live_from_config()
 
     try:
         kv_cache_config = manager.kv_cache_config
@@ -820,8 +1025,10 @@ def build_config(manager, radix: bool):
             "radix": bool(radix),
             # Optional on the crate side; decides which cache-hit walk
             # `Manager::get_computed_blocks` dispatches to (kv_cache_coordinator.py:742
-            # vs the converging fixed point).
-            "connector": bool(CONNECTOR_LIVE),
+            # vs the converging fixed point) and permits the phase split's probe and
+            # external slices. CONFIG-based, not object-based -- see
+            # `connector_live_from_config` for why it cannot be the live connector here.
+            "connector": bool(connector),
             "groups": groups,
         }
         return cfg, None
@@ -836,8 +1043,23 @@ def unsupported_features(scheduler) -> tuple:
     instead of substring-matching the joined reason string -- ``"connector"`` is a prefix
     of ``"ec_connector"``, and the connector backstop must not confuse the two.
     """
+    # Stage S: a connector is only a blocking feature when it is NOT the one this port
+    # drives. `connector_unported` is computed once (it can log) and reused, and it keeps
+    # the "connector exists" conjunct so a scheduler without one never reaches the probe.
+    connector = getattr(scheduler, "connector", None)
+    connector_unported = connector is not None and (
+        offloading_connector_supported(
+            # The scheduler carries the config it was built with, which is strictly better
+            # than the ambient one (there may be none in scope by now -- that is the whole
+            # reason the first-schedule backstop below exists). `None` falls back to the
+            # ambient read inside the probe.
+            cfg=getattr(scheduler, "vllm_config", None),
+            connector=connector,
+        )
+        is not None
+    )
     checks = (
-        ("connector", getattr(scheduler, "connector", None) is not None),
+        ("connector", connector_unported),
         ("ec_connector", getattr(scheduler, "ec_connector", None) is not None),
         ("lora", getattr(scheduler, "lora_config", None) is not None),
         ("spec_decode", int(getattr(scheduler, "num_spec_tokens", 0) or 0) > 0),
@@ -1168,13 +1390,30 @@ def authority_stand_down(instance, base, cfg=None) -> bool:
     vLLM breaks that, standing down is impossible and a boot failure is the only honest
     answer, so the ``TypeError`` is converted into one rather than swallowed.
 
-    Returns True if it stood down. ``cfg`` is forwarded to ``kv_connector_configured``.
+    STAGE S NARROWED THIS. The paragraph above is the story for a connector this port
+    cannot drive, and it is still every connector but one: ``OffloadingConnector`` in the
+    exact configuration ``offloading_connector_supported`` allow-lists is now PORTED, and
+    for it standing down is the wrong move -- it would trade the whole Rust stack for a
+    connector the schedule wrapper can drive itself. So the stand-down is now the
+    conjunction: a connector is configured AND it is not the one we ported.
+
+    Returns True if it stood down. ``cfg`` is forwarded to both probes.
     """
     if kv_connector_configured(cfg) is not True:
         # Strictly True: `None` means the config was unreadable, and standing down on an
         # unknown is the false positive that costs the Rust stack on every normal boot.
         # The unknown is caught at the first schedule() instead.
         return False
+    why = offloading_connector_supported(cfg)
+    if why is None:
+        # The ported connector. Authority mode stays, and the schedule wrapper drives the
+        # connector's probe/park/meta protocol itself (`_install_full_schedule`).
+        log.info(
+            "rust_sched: KV connector is the ported OffloadingConnector configuration; "
+            "authority mode stays engaged"
+        )
+        return False
+    log.warning("rust_sched: KV connector is not the ported configuration -- %s", why)
     try:
         instance.__class__ = base
     except TypeError as exc:
@@ -1206,7 +1445,14 @@ def _install_authority(base, mirror_modes):
                 # engine, which is the one thing an A/B arm must not do silently.
                 refuse("a KV connector is configured (kv-offloading / kv_transfer)")
                 return
-            cfg, reason = build_config(self, mirror_modes["radix"])
+            # Stage S: resolved ONCE, here, and remembered on the instance. The crate's
+            # `Config::connector` is immutable after construction, so the first `schedule()`
+            # cross-checks this against the live `scheduler.connector` -- a crate built for
+            # the wrong answer cannot be corrected, only refused.
+            self._vtl_connector_cfg = connector_live_from_config()
+            cfg, reason = build_config(
+                self, mirror_modes["radix"], connector=self._vtl_connector_cfg
+            )
             if reason is not None:
                 raise RuntimeError(f"VTL_RUST_SCHED=1 but config unsupported: {reason}")
             self._rust = vtl_sched.KvManager(cfg)
@@ -1408,6 +1654,17 @@ def _install_authority(base, mirror_modes):
             # result to the STALE python `block_pool.free_blocks` (scheduler.py:2157).
             # Returning ints there is an AttributeError; returning anything is a permanent
             # leak from the Rust pool.
+            #
+            # STAGE S LEAVES THIS AS THE ONE REMAINING BOOT BLOCKER for a connector-live
+            # run, deliberately and loudly. `kv_role="kv_both"` makes the offloading config
+            # a KV CONSUMER, and with async scheduling (max_concurrent_batches == 2) stock
+            # sets `defer_block_free = True` (scheduler.py:150-152) -- so a request that
+            # finishes while its last scheduled step is still in flight reaches this raiser.
+            # Fixing it means porting the deferred-free queue itself: `pop_blocks_for_free`
+            # already exists on the crate (`Manager::pop_blocks_for_free`), but
+            # `_drain_deferred_frees` (`:2145`) returns the ids through the stale python
+            # pool and has to be re-pointed at the Rust one. That is a separate wrapper and
+            # a separate stage; raising here is the honest state until then.
             raise RuntimeError(
                 "VTL_RUST_SCHED=1 does not support deferred block freeing "
                 "(pop_blocks_for_free drains the stale python block pool)"
@@ -1597,20 +1854,132 @@ class PhaseTimers:
         log.info("rust_sched: schedule() timing over %d steps -- %s", self.EVERY, "  ".join(parts))
 
 
+# The one `RequestStatus` member this module tests by identity rather than by mapping it
+# to a small int (`status_code`'s `_STATUS_MAP`). Resolved on first use, like that map, and
+# cached in a one-slot list so the import cost is paid once per process.
+_WFRK: list = []
+
+
+def _is_waiting_for_remote_kvs(request) -> bool:
+    """``request.status is RequestStatus.WAITING_FOR_REMOTE_KVS``, import-shape tolerant.
+
+    The enum is the right test and is what stock uses (scheduler.py:657, `:2087`). The
+    string fallback exists because this predicate decides whether a step BAILS: an import
+    that fails here must not turn every connector step into a stock step silently, and the
+    member's name is stable across the versions this port targets.
+    """
+    if not _WFRK:
+        try:
+            from vllm.v1.request import RequestStatus
+
+            _WFRK.append(RequestStatus.WAITING_FOR_REMOTE_KVS)
+        except Exception:
+            _WFRK.append(None)
+    want = _WFRK[0]
+    status = getattr(request, "status", None)
+    if want is not None:
+        return status is want
+    return getattr(status, "name", str(status)) == "WAITING_FOR_REMOTE_KVS"
+
+
 def bail_reason(scheduler):
     """Per-step conditions the Rust loop does not model (scheduler.py:637-664).
 
     Module level because both wrappers consult it: the schedule() wrapper to decide the
     step, and the update_from_output() wrapper to decide whether kicking is safe.
+
+    THE SKIPPED_WAITING ARM, STAGE S. Before the connector port, ANY parked request was a
+    bail: the three blocked statuses all reach promotion paths (`scheduler.py:654`) the
+    Rust loop had no equivalent for. With the connector ported, one of the three IS the
+    port -- `WAITING_FOR_REMOTE_KVS` is the status this wrapper itself assigns when it
+    parks an async load, and `_try_promote_blocked_waiting_request` (stock, reused
+    verbatim) is what takes it back out. The other two are not:
+    `WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR` needs the grammar machinery
+    `unsupported_features` refuses outright, and `WAITING_FOR_STREAMING_REQ` holds a
+    model-runner slot that the loop's `max_num_running_reqs` arithmetic does not count
+    (which is what the streaming clause below is about). So the arm becomes: bail on a
+    parked request whose status is not the one we park.
     """
-    if getattr(scheduler, "skipped_waiting", None):
-        return "blocked requests are parked in skipped_waiting"
+    skipped = getattr(scheduler, "skipped_waiting", None)
+    if skipped:
+        if not getattr(scheduler, "_vtl_connector_live", False):
+            return "blocked requests are parked in skipped_waiting"
+        for request in skipped:
+            if not _is_waiting_for_remote_kvs(request):
+                return f"a request is parked in skipped_waiting as {request.status!s}"
     if getattr(scheduler, "num_waiting_for_streaming_input", 0):
         return "paused streaming sessions hold model-runner slots"
     pause = getattr(scheduler, "_pause_state", None)
     if pause is not None and getattr(pause, "name", str(pause)) != "UNPAUSED":
         return f"scheduler is paused ({pause})"
     return None
+
+
+def spec_blocked(scheduler) -> str | None:
+    """Why the SPECULATION worker must not be kicked for the next step, or None.
+
+    A strict superset of ``bail_reason``, and the split exists because Stage S made the two
+    questions different. A bail asks "can the Rust loop decide THIS step"; a kick asks "will
+    the next step's decisions still be valid when we get there", and a connector answers no
+    to the second in two cases the first now lets through:
+
+    * A PARKED async load. The worker speculates with an EMPTY waiting slice (`spec.rs`
+      invariant, `journal.rs`'s scope invariant), but a parked load is precisely a
+      candidate that is going to re-enter scheduling -- and the moment its transfer lands,
+      ``_try_promote_blocked_waiting_request`` runs ``cache_blocks`` against the crate and
+      moves the request into ``waiting``. A speculation computed before that is stale in a
+      way ``take_speculative``'s generation check cannot see, because the promotion happens
+      inside the next ``schedule()``, after the check.
+    * A PENDING PROMOTION (``finished_recving_kv_req_ids`` non-empty). Same mechanism, one
+      step earlier and certain rather than possible: the promotion mutates
+      ``num_computed_tokens`` and calls ``cache_blocks``, and both are invisible to a
+      speculative run that already happened.
+
+    STORE TRAFFIC IS DELIBERATELY NOT A BLOCKER. ``connector.has_pending_push_work()``
+    (scheduler.py:2193) is true for as long as any offload write is in flight, which on an
+    offloading boot is essentially always; and a store changes nothing the scheduler reads
+    -- no block is freed, no request moves queue, no counter advances. Blocking on it would
+    turn speculation off for the whole run in exchange for nothing.
+    """
+    why = bail_reason(scheduler)
+    if why is not None:
+        return why
+    if getattr(scheduler, "skipped_waiting", None):
+        return "an async KV load is parked"
+    if getattr(scheduler, "finished_recving_kv_req_ids", None):
+        return "a promotion is pending"
+    return None
+
+
+def assemble_candidates(skipped, waiting, is_blocked, promote):
+    """Merge the two waiting queues into ``(candidates, step_skipped)``. Pure -- self-checked.
+
+    The Stage-S replacement for stock's `_select_waiting_queue_for_scheduling` +
+    `_try_promote_blocked_waiting_request` dance (scheduler.py:640-664), lifted out of the
+    schedule closure so it can be driven directly by the self-check: the closure needs a
+    live vLLM Scheduler and this needs two lists and two callables.
+
+    ORDER IS FCFS AND THAT IS WHY IT IS A FLAT LOOP. Stock re-selects a queue on EVERY
+    iteration, but under FCFS `_select_waiting_queue_for_scheduling` (`:1866`) is
+    `self.skipped_waiting or self.waiting` -- the skipped queue is drained first, in its own
+    order, then the waiting queue. That is exactly this loop, and `unsupported_features`
+    refuses the PRIORITY policy, whose head-comparison version of the same function is a
+    genuinely different order.
+
+    ``promote`` is stock's own `_try_promote_blocked_waiting_request`, called for exactly
+    the requests stock calls it for: it is the only thing that can move a parked async load
+    back into play, it does that by calling `cache_blocks` / `free` (both ported), and a
+    request it refuses goes back to the skipped queue untouched.
+    """
+    candidates = []
+    step_skipped = []
+    for queue in (skipped, waiting):
+        for request in queue:
+            if is_blocked(request.status) and not promote(request):
+                step_skipped.append(request)
+                continue
+            candidates.append(request)
+    return candidates, step_skipped
 
 
 def kick_failure_is_transient(exc: BaseException) -> bool:
@@ -3407,7 +3776,10 @@ def _install_update_from_output(scheduler_cls, m: dict):
         if not self._vtl_ufo_clean:
             tbl.resync("a UFO per-request fallback ran this step")
             return
-        if tbl.dirty or self.waiting or bail_reason(self) is not None:
+        # `spec_blocked`, not `bail_reason`: a step the Rust loop can DECIDE is not
+        # automatically a step whose successor can be precomputed. See its docstring for
+        # the two connector cases that are exactly that difference.
+        if tbl.dirty or self.waiting or spec_blocked(self) is not None:
             return
         try:
             # `mirror.slot`, not a bare lookup: the tokens this step just appended may
@@ -3928,7 +4300,9 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         delay an admission by more than the one burst ``VTL_NSTEP_QUEUE_EMPTY_ONLY``
         already allows.
         """
-        if RUNNER_STEPS < 2 or self.waiting:
+        # Stage S: `skipped_waiting` counts as a non-empty queue for the same reason
+        # `self.waiting` does -- see `commit_burst`'s queue-empty guard below.
+        if RUNNER_STEPS < 2 or self.waiting or getattr(self, "skipped_waiting", None):
             return 1
         block_size = self.cache_config.block_size
         k = RUNNER_STEPS
@@ -3980,7 +4354,17 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             # `- 1`: num_computed_tokens as it was BEFORE _update_after_schedule advanced it.
             if n >= 2:
                 why = None
-                if NSTEP_QUEUE_EMPTY_ONLY and self.waiting:
+                # Stage S extends the queue-empty guard to `skipped_waiting`. THE TTFT
+                # ARGUMENT IS THE SAME ONE: a parked async KV load is a request whose
+                # prefill has not happened yet, and its transfer typically lands within a
+                # step or two -- at which point `_try_promote_blocked_waiting_request`
+                # moves it into `waiting` and the very next schedule admits it. A burst
+                # committed while one is parked delays that admission by N-1 iterations,
+                # which is exactly the cost the guard exists to refuse. Without a connector
+                # the queue is always empty and this conjunct is free.
+                if NSTEP_QUEUE_EMPTY_ONLY and (
+                    self.waiting or getattr(self, "skipped_waiting", None)
+                ):
                     why = "waiting queue is not empty"
                 else:
                     block_size = self.cache_config.block_size
@@ -4129,12 +4513,40 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 #
                 # Unreachable whenever the config probe works, which is the normal case;
                 # this is the belt to that suspenders.
+                #
+                # STAGE S narrowed WHICH connectors reach it: `unsupported_features` only
+                # reports "connector" for one this port cannot drive, so a supported
+                # OffloadingConnector falls through to the live path below instead.
                 raise RuntimeError(
                     "VTL_RUST_SCHED=1 installed the Rust KV authority, but this "
                     "scheduler has a KV connector (kv-offloading / kv_transfer) -- the "
                     "two cannot share a block pool and the connector's allocation and "
                     f"KV-transfer paths are not ported. {CONNECTOR_CONFLICT_REMEDIES}."
                 )
+            # Stage S: the ported connector, resolved ONCE from the live object, and
+            # cross-checked against the flag the crate was actually BUILT with. The crate's
+            # `Config::connector` is immutable after construction (it selects the cache-hit
+            # walk), so a disagreement is not something a later step can recover from: a
+            # crate built connector-off would run the converging walk and refuse every
+            # external token, and a crate built connector-on without a connector would run
+            # the per-group walk stock only uses when there is one. Both are wrong answers
+            # served confidently, which is the one outcome worth failing the boot over --
+            # and, like the backstop above, this is unreachable whenever the config probe
+            # works at KVCacheManager construction time.
+            connector_live = getattr(self, "connector", None) is not None and (
+                "connector" not in feats
+            )
+            if hasattr(kv, "_rust") and connector_live != bool(
+                getattr(kv, "_vtl_connector_cfg", False)
+            ):
+                raise RuntimeError(
+                    "VTL_RUST_SCHED=1 built its KV manager with connector="
+                    f"{bool(getattr(kv, '_vtl_connector_cfg', False))} but this scheduler "
+                    f"has connector_live={connector_live}; the crate's cache-hit walk is "
+                    "fixed at construction and cannot be corrected here. "
+                    f"{CONNECTOR_CONFLICT_REMEDIES}."
+                )
+            self._vtl_connector_live = connector_live
             reason = schedule_supported(self)
             if reason is not None or not hasattr(kv, "_rust"):
                 if not getattr(self, "_vtl_rust_warned", False):
@@ -4167,6 +4579,21 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             lean_why = "VTL_RUST_SCHED_LEAN off"
             arena_why = "VTL_SCHED_DECISIONS_ARENA off"
             ring_why = "VTL_SCHED_SO_RING off"
+            if connector_live and LEAN:
+                # THE DOCUMENTED SIMPLIFICATION of Stage S. The connector step is two crate
+                # calls with a Python connector query between them, and the arena's six
+                # persistent buffers would have to be split across that seam AND grow a
+                # seventh for `parked_external` (which `write_arena` refuses to drop
+                # silently). The dict path carries all of it with no new plumbing, and the
+                # step it belongs to already pays for a connector call per candidate, so
+                # what the arena saves is noise next to that. LEAN is refused with it
+                # because ARENA rides on LEAN and, separately, `lean_blocked`'s argument
+                # about dead `CachedRequestData` fields has not been re-derived for a
+                # connector-live boot.
+                LEAN = False
+                lean_check_left = 0
+                lean_why = "connector"
+                refuse("lean decisions refused -- connector", rung_only=True)
             if LEAN:
                 why = lean_blocked(self)
                 if why is None:
@@ -4240,10 +4667,11 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     # Scheduler this closure belongs to exists. 0 = no burst on this boot,
                     # which leaves the derivation in `burst_blocked_batch`.
                     "burst_max_reqs": int(nstep_mod.MAX_BURST_REQS) if NSTEP else 0,
-                    # Optional on the crate side too. False today: `schedule_supported`
-                    # refuses a scheduler with a connector attached, so this loop never
-                    # runs with one live (Stage S).
-                    "connector": bool(CONNECTOR_LIVE),
+                    # Stage S: the OBJECT-based answer (the connector exists by now), and
+                    # the twin of the config-based `Config::connector` the manager was
+                    # built with -- the two were cross-checked above, so they agree.
+                    # It permits the phase split's probe and external slices crate-side.
+                    "connector": bool(connector_live),
                 }
             )
             log.info(
@@ -4270,9 +4698,26 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             # contract; the line is then not printed, and the traceback says why.
             probe = getattr(self, "_vtl_r8_live", None)
             r8_on = bool(probe()) if probe is not None else False
+            # Stage S's cell is not a rung in the on/off sense -- a connector is a property
+            # of the CONFIG, not something this module enables -- so it names the connector
+            # it is driving, or why it is driving none. "off" is the ordinary answer on a
+            # boot with no `--kv-offloading-*` flags at all.
+            if connector_live:
+                connector_cell = "OffloadingConnector/native"
+            elif getattr(self, "connector", None) is not None:
+                connector_cell = rung(
+                    False,
+                    offloading_connector_supported(
+                        cfg=getattr(self, "vllm_config", None), connector=self.connector
+                    )
+                    or "unported",
+                )
+            else:
+                connector_cell = "off"
             log.info(
                 "rust_sched: RUNGS authority=%s full=%s table=%s spec=%s lean=%s "
-                "arena=%s ring=%s r8=%s r9=%s tokstore=%s runner=%s require=%s",
+                "arena=%s ring=%s r8=%s r9=%s tokstore=%s runner=%s connector=%s "
+                "require=%s",
                 rung(bool(m["authority"]), "VTL_RUST_SCHED off"),
                 rung(bool(m["full"]), "VTL_RUST_SCHED_FULL off"),
                 rung(TABLE, "VTL_RUST_SCHED_TABLE off"),
@@ -4284,6 +4729,7 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 rung(R9.live, "VTL_RUST_SCHED_R9 off or disabled"),
                 rung(TOK.live, "VTL_RUST_SCHED_TOKSTORE off or disabled"),
                 rung(RUNNER, "VTL_RUST_RUNNER off or not armed"),
+                connector_cell,
                 "on" if env_on("VTL_RUST_SCHED_REQUIRE") else "off",
             )
 
@@ -4298,10 +4744,19 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         # A dirty table means the marshalled call has to run anyway -- it IS the resync.
         resident = RESIDENT and tbl is not None and not tbl.off and not tbl.dirty
         mirror = kv._mirror
+        # Stage S: resolved at the first schedule and constant after it. Read through the
+        # instance (not a closure cell) because the module-level helpers -- `bail_reason`,
+        # `spec_blocked` -- have only the scheduler to go on.
+        connector_live = bool(getattr(self, "_vtl_connector_live", False))
         by_slot = {}
         running = []
         running_slots = []
         waiting = []
+        # Stage S: the candidate list, its slots in order, and the requests this step could
+        # not schedule and must hand back to `skipped_waiting`. All empty without a
+        # connector, where `waiting` is still built straight off `self.waiting`.
+        cand_slots = []
+        step_skipped = []
         if bail is None:
             try:
                 for request in self.running:
@@ -4313,13 +4768,46 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     running_slots.append(slot)
                     if not resident:
                         running.append(pack_req(slot, request))
-                for request in self.waiting:
-                    if request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
-                        bail = f"waiting request in status {request.status!s}"
-                        break
-                    slot = mirror.slot(request)
-                    by_slot[slot] = request
-                    waiting.append(pack_req(slot, request))
+                if connector_live:
+                    # THE CANDIDATE ASSEMBLY (scheduler.py:640-664), and everything in it
+                    # that can BAIL happens before the first crate call of the split --
+                    # once phase 1 has run, the step is half-applied inside the crate and
+                    # handing it to stock `schedule()` would strand the blocks the running
+                    # arm just allocated. `assemble_candidates` itself only promotes, which
+                    # stock would have done too, so a bail here is still a clean fallback.
+                    candidates, step_skipped = assemble_candidates(
+                        self.skipped_waiting,
+                        self.waiting,
+                        self._is_blocked_waiting_status,
+                        self._try_promote_blocked_waiting_request,
+                    )
+                    for request in candidates:
+                        if request.status not in (
+                            RequestStatus.WAITING,
+                            RequestStatus.PREEMPTED,
+                        ):
+                            # A promoted request is WAITING or PREEMPTED by construction
+                            # (scheduler.py:2452-2455) and an unpromotable one never gets
+                            # here, so this is the same invariant the non-connector arm
+                            # asserts -- and the reason `status_code` can never see
+                            # WAITING_FOR_REMOTE_KVS in `pack_req` below.
+                            bail = f"waiting request in status {request.status!s}"
+                            break
+                        slot = mirror.slot(request)
+                        by_slot[slot] = request
+                        cand_slots.append(slot)
+                        waiting.append(pack_req(slot, request))
+                else:
+                    for request in self.waiting:
+                        if request.status not in (
+                            RequestStatus.WAITING,
+                            RequestStatus.PREEMPTED,
+                        ):
+                            bail = f"waiting request in status {request.status!s}"
+                            break
+                        slot = mirror.slot(request)
+                        by_slot[slot] = request
+                        waiting.append(pack_req(slot, request))
             except NotImplementedError as exc:  # unported RequestStatus on a running req
                 bail = str(exc)
         if bail is not None:
@@ -4351,7 +4839,124 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         # marshallings of the SAME decisions (re-running schedule() would mutate twice).
         decisions = None
         counts = None
-        if resident:
+        # Stage S: what phase 2 parked, read back out of the decisions after they land.
+        parked_external = ()
+        if connector_live:
+            # ---- THE TWO-PHASE CONNECTOR STEP ------------------------------
+            # Order is the whole design (see `ScheduleCore::schedule_phase2`): the
+            # connector's `get_num_new_matched_tokens` takes the LOCAL cache hit as its
+            # argument and its answer feeds the admission, so the hit has to come out of
+            # the crate before the query and the answer has to go back in after it.
+            #
+            # SPECULATION STILL APPLIES TO THE PURE-DECODE STEP, which is most of them. A
+            # step with NO candidates at all -- nothing waiting, nothing parked, nothing
+            # skipped -- has no connector query to make, so phase 1 + phase 2 is exactly
+            # `run()` with both slices empty, which is exactly what the worker computed.
+            # Anything else re-runs the split for real; `spec_blocked` is what keeps the
+            # worker from being kicked for a step that will not be this shape.
+            if resident and SPEC and tbl.armed and not waiting and not step_skipped:
+                try:
+                    decisions = core.take_speculative(kv._rust, tbl.gen, running_slots)
+                except Exception as exc:
+                    tbl.resync(f"resident speculation refused ({exc!r})")
+                    decisions = None
+                except BaseException as exc:  # a crate panic
+                    tbl.fail("take_speculative", exc)
+                    decisions = None
+            if tbl is not None:
+                tbl.armed = False
+        if connector_live and decisions is None:
+            # The probe is capped by the admission budget for a reason beyond cost: every
+            # query the connector answers costs it a lookup AND a `_touch` of the offloaded
+            # blocks (offloading/scheduler.py:691), so probing candidates that cannot be
+            # admitted this step would churn the offload LRU on their behalf.
+            budget = max(0, self.max_num_running_reqs - len(self.running))
+            probe_slots = []
+            probe_reqs = []
+            for i, slot in enumerate(cand_slots):
+                if len(probe_reqs) >= budget:
+                    break
+                if by_slot[slot].num_computed_tokens == 0:
+                    probe_slots.append(slot)
+                    probe_reqs.append(waiting[i])
+            hits = None
+            if resident:
+                try:
+                    hits = core.schedule_phase1_resident(kv._rust, running_slots, probe_reqs)
+                except Exception as exc:
+                    tbl.resync(f"resident phase1 refused ({exc!r})")
+                    hits = None
+                except BaseException as exc:  # a crate panic
+                    tbl.fail("schedule_phase1_resident", exc)
+                    hits = None
+                if hits is None:
+                    running = [pack_req(s, by_slot[s]) for s in running_slots]
+            if hits is None:
+                # The marshalled phase 1 is the full resync, exactly as `schedule()` is on
+                # the non-connector path.
+                hits = core.schedule_phase1(kv._rust, running, probe_reqs)
+                if tbl is not None:
+                    require_watch("table_dirty", ok=True)
+                    tbl.dirty = False
+                    tbl.armed = False
+            hit_by_slot = dict(hits)
+            external = []
+            dropped = set()
+            try:
+                for slot in probe_slots:
+                    request = by_slot[slot]
+                    ext, is_async = self.connector.get_num_new_matched_tokens(
+                        request, hit_by_slot.get(slot, 0)
+                    )
+                    if ext is None:
+                        # "Ask me again later" (scheduler.py:743): the connector still has
+                        # in-flight transfers for this request. Stock pops it and prepends
+                        # it to `step_skipped_waiting`; so does the rebuild below.
+                        dropped.add(slot)
+                        step_skipped.append(request)
+                        continue
+                    if ext:
+                        external.append((slot, int(ext), bool(is_async)))
+            except BaseException as exc:
+                # NOT SWALLOWED, and the one site in this wrapper that re-raises. A
+                # connector query is not a pure read: `get_num_new_matched_tokens` clears
+                # and rebuilds the request's per-group block ids, records
+                # `num_locally_computed_tokens` and touches the offload LRU
+                # (offloading/scheduler.py:670-693). An exception part-way leaves that state
+                # unknown, and this step's phase 1 has already allocated -- there is no
+                # consistent state to fall back to, so the honest move is to latch the rung
+                # and let it out.
+                reraise_fatal(exc)
+                log.exception("rust_sched: the KV connector raised during schedule()")
+                if tbl is not None:
+                    tbl.fail("connector query", exc)
+                require_latch(
+                    "connector_sched",
+                    f"get_num_new_matched_tokens raised: {exc!r}",
+                    exc,
+                )
+                raise
+            if dropped:
+                waiting = [t for i, t in enumerate(waiting) if cand_slots[i] not in dropped]
+                cand_slots = [s for s in cand_slots if s not in dropped]
+            # `reserved_blocks` for the loads this step parks: the prefills that were
+            # ALREADY in flight (scheduler.py:2400). The ones parked inside phase 2 are
+            # added to it crate-side, in admission order.
+            base_reserved = 0
+            for request in self._inflight_prefills:
+                s = mirror._slots.get(request.request_id)
+                if s is None:
+                    continue
+                base_reserved += kv._rust.remaining_blocks(
+                    s, int(request.num_tokens), int(request.num_computed_tokens)
+                )
+            decisions = core.schedule_phase2(kv._rust, waiting, external, base_reserved)
+        if connector_live:
+            # `.get`: a consumed speculation is `run()`'s payload, which carries the key
+            # too -- but an older wheel's would not, and an empty tuple is the right
+            # reading of "this step parked nothing".
+            parked_external = decisions.get("parked_external", ())
+        if resident and not connector_live:
             try:
                 # The worker speculated with an EMPTY waiting slice (spec.rs), and
                 # `take_speculative` checks the generation and slot order but NOT the
@@ -4381,7 +4986,7 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 decisions = counts = None
             if decisions is None and counts is None:
                 running = [pack_req(s, by_slot[s]) for s in running_slots]
-        if decisions is None and counts is None:
+        if decisions is None and counts is None and not connector_live:
             if ARENA:
                 counts = core.schedule_arena(
                     kv._rust, running, waiting, arena_check_left > 0
@@ -4524,13 +5129,90 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 off += n
             req_to_new_blocks[request.request_id] = RustBlocks(tuple(groups))
 
+        # Stage S: the parked async loads, applied BEFORE any queue surgery so that the
+        # requests this loop moves to `step_skipped` cannot also be rebuilt into
+        # `self.waiting` below. Stock's tail for a parked load, in stock's order
+        # (scheduler.py:928-967) -- everything after `allocate_slots`, which phase 2
+        # already did.
+        if parked_external:
+            try:
+                for slot, num_computed, ext in parked_external:
+                    request = by_slot[slot]
+                    # `get_blocks_with_meta`, not `get_blocks`: the connector's boundary
+                    # scan reads `block.is_null` / `block.block_hash is None` off the
+                    # records (offloading/scheduler.py:711-761), and this manager's plain
+                    # `get_blocks` hands back raw ids. Stage R's block-record view is
+                    # exactly this call's argument.
+                    self.connector.update_state_after_alloc(
+                        request, kv.get_blocks_with_meta(request.request_id), ext
+                    )
+                    # scheduler.py:936-944. `local` is what the crate's local hit was:
+                    # phase 2 reported `num_computed = local + external`.
+                    local = num_computed - ext
+                    queries = request.num_tokens - local
+                    if self.connector_prefix_cache_stats is not None and queries != 0:
+                        self.connector_prefix_cache_stats.record(
+                            num_tokens=queries,
+                            num_hits=ext,
+                            preempted=request.num_preemptions > 0,
+                        )
+                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    # Not read anywhere until the transfer finishes (scheduler.py:952-962);
+                    # `_update_waiting_for_remote_kv` caches exactly this many tokens then.
+                    request.num_computed_tokens = num_computed
+                    step_skipped.append(request)
+                    self._inflight_prefills.add(request)
+            except BaseException as exc:
+                # Same argument as the query loop: the connector's per-request state is
+                # half-written and the blocks are already allocated, so there is nothing to
+                # fall back to.
+                reraise_fatal(exc)
+                log.exception("rust_sched: update_state_after_alloc raised")
+                if tbl is not None:
+                    tbl.fail("connector alloc post-pass", exc)
+                require_latch(
+                    "connector_sched", f"update_state_after_alloc raised: {exc!r}", exc
+                )
+                raise
+        # NOTE on the requests that were ADMITTED with no external tokens: stock calls
+        # `update_state_after_alloc(request, blocks, 0)` for them too (scheduler.py:929),
+        # and `OffloadingConnectorScheduler.update_state_after_alloc` returns immediately
+        # on `num_external_tokens == 0` (offloading/scheduler.py:698). For the one connector
+        # `offloading_connector_supported` allow-lists, the call is a no-op -- so it is not
+        # made, and the allow-list is what keeps that true.
+
         # Rebuild the waiting queue from the Rust core's view. This is NOT cosmetic: the
         # SJF reorder happens inside the core, so popping the Python deque's front would
         # drop the wrong requests. `waiting_order` is what is LEFT, in final order.
         # Skipped when both sides are empty -- clear-then-rebuild of empty-from-empty is
         # a provable no-op, and that is every steady decode step. Only THAT case: for a
         # non-empty queue the orders can match while the objects differ.
-        if waiting_order or self.waiting:
+        if connector_live:
+            # BOTH queues are rebuilt, every step. The candidate list was assembled by
+            # READING `skipped_waiting` and `waiting` without popping either (so that a
+            # bail before the first crate call could still hand a whole, untouched pair of
+            # queues to stock), which makes this the single place a request re-enters one.
+            #
+            # Where each request goes: `waiting_order` is what phase 2 left unscheduled --
+            # admitted and parked candidates are already gone from it -- and `step_skipped`
+            # is the unpromotable, the connector's "ask me later", and the parked. A
+            # promoted-but-unadmitted request lands in `waiting` rather than back in
+            # `skipped_waiting` (stock leaves it where it was); it keeps its place at the
+            # FRONT of the rebuilt queue, so the next step's FCFS assembly -- which reads
+            # skipped first, and `skipped_waiting` now holds only requests that cannot be
+            # scheduled anyway -- considers it in the same relative position.
+            remaining = [by_slot[s] for s in waiting_order]
+            self.waiting.clear()
+            for request in remaining:
+                self.waiting.add_request(request)
+            self.skipped_waiting.clear()
+            # scheduler.py:1014-1015. Stock builds `step_skipped_waiting` with
+            # `prepend_request` and then `prepend_requests` (`extendleft`) it, which
+            # reverses twice; `reversed()` over an encounter-ordered list is the same
+            # single reversal and lands the step's skips at the front in encounter order.
+            for request in reversed(step_skipped):
+                self.skipped_waiting.prepend_request(request)
+        elif waiting_order or self.waiting:
             remaining = [by_slot[s] for s in waiting_order]
             self.waiting.clear()
             for request in remaining:
@@ -4678,6 +5360,32 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             ),
             num_spec_tokens_to_schedule=self.num_spec_tokens,
         )
+        # Stage S: the connector's per-step metadata, in stock's place (scheduler.py:1115,
+        # between the SchedulerOutput and `_update_after_schedule`) and UNCONDITIONAL,
+        # including on a step that scheduled nothing at all. It is not a payload builder:
+        # `build_connector_meta` also runs `_update_req_states(scheduler_output)`, flushes
+        # store jobs for preempted requests and clears the connector's per-batch state
+        # (offloading/scheduler.py:1027-1060), so a step that skips it leaves the connector
+        # believing the previous step's batch is still current.
+        if self.connector is not None:
+            try:
+                builder = getattr(self, "_build_kv_connector_meta", None)
+                scheduler_output.kv_connector_metadata = (
+                    builder(self.connector, scheduler_output)
+                    if builder is not None
+                    else self.connector.build_connector_meta(scheduler_output)
+                )
+            except BaseException as exc:
+                # Third and last of the connector call sites, same reasoning: the connector
+                # has consumed part of this step's batch and there is no way back.
+                reraise_fatal(exc)
+                log.exception("rust_sched: build_connector_meta raised")
+                if tbl is not None:
+                    tbl.fail("connector meta", exc)
+                require_latch(
+                    "connector_sched", f"build_connector_meta raised: {exc!r}", exc
+                )
+                raise
         if self.defer_block_free and total > 0:
             self.sched_step_seq += 1
         self._update_after_schedule(scheduler_output)
@@ -4774,6 +5482,11 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     # step", which is what a bail (stock `schedule()`) leaves it at and what
     # `burst_blocked_batch` reads as "derive it in Python".
     scheduler_cls._vtl_burst_eligible = None
+    # Stage S: the class-level default, so the module-level helpers (`bail_reason`,
+    # `spec_blocked`) answer the pre-Stage-S way on any path that reaches them before the
+    # first schedule() has resolved it -- an install that never engages, or an
+    # `update_from_output` on a boot whose first schedule bailed.
+    scheduler_cls._vtl_connector_live = False
     scheduler_cls.schedule = mark_patched(schedule, wrapped)
 
 
@@ -5953,6 +6666,11 @@ def _self_check() -> None:
         "parallel_config": type("P", (), {"distributed_executor_backend": "uni"})(),
     })()
     assert "uni" in ring_blocked(rs), "uni hands the runner the object we mutate"
+    # Stage S: a connector is refused ahead of every other clause -- a replayed
+    # SchedulerOutput would rebuild no connector metadata for the step it is re-served on.
+    rs = RingSched()
+    rs.connector = object()
+    assert "KV connector" in ring_blocked(rs), ring_blocked(rs)
 
     # `ring_reuse` refuses before it mutates anything: a changed running set, an extra
     # token, or a set some downstream code dirtied.
@@ -6390,6 +7108,201 @@ def _self_check() -> None:
 
     assert schedule_supported(PlainSched()) is None
     assert unsupported_features(PlainSched()) == ()
+
+    # ---- Stage S: the OffloadingConnector allow-list ---------------------------------
+    # Every clause, both ways, off ONE base config that is the shape the ported serve line
+    # produces. A clause that cannot be flipped to a failure here is a clause that is not
+    # really gating anything.
+    def offload_cfg(**over):
+        """A VllmConfig-shaped stand-in carrying the full offloading configuration."""
+        extra = over.pop("extra", None)
+        transfer = type("FakeKVTransferConfig", (), {
+            "kv_connector": over.pop("kv_connector", "OffloadingConnector"),
+            "kv_role": over.pop("kv_role", "kv_both"),
+            "kv_load_failure_policy": over.pop("kv_load_failure_policy", "recompute"),
+            "kv_connector_extra_config": (
+                {"cpu_bytes_to_use": 1 << 36} if extra is None else extra
+            ),
+        })()
+        top = {"ec_transfer_config": over.pop("ec_transfer_config", None)}
+        top.update(over.pop("top", {}))
+        return fake_cfg(
+            transfer=transfer,
+            top=top,
+            kv_offloading_size=over.pop("kv_offloading_size", 64),
+            kv_offloading_backend=over.pop("kv_offloading_backend", "native"),
+            **over,
+        )
+
+    os.environ.pop("VLLM_USE_SIMPLE_KV_OFFLOAD", None)
+    assert offloading_connector_supported(offload_cfg()) is None, \
+        offloading_connector_supported(offload_cfg())
+    # ...and it is a connector, so the two probes agree on the shipped serve line.
+    assert kv_connector_configured(offload_cfg()) is True
+    for over, needle in (
+        ({"kv_offloading_size": None}, "kv_offloading_size"),
+        ({"kv_offloading_backend": "lmcache"}, "kv_offloading_backend"),
+        ({"kv_connector": "LMCacheMPConnector"}, "kv_connector"),
+        ({"kv_connector": None}, "kv_connector"),
+        ({"kv_role": "kv_consumer"}, "kv_role"),
+        ({"kv_load_failure_policy": "fail"}, "kv_load_failure_policy"),
+        ({"extra": {"spec_name": "MyOffloadingSpec"}}, "spec"),
+        ({"extra": {"block_size": 64}}, "block_size"),
+        ({"ec_transfer_config": object()}, "EC transfer config"),
+    ):
+        why = offloading_connector_supported(offload_cfg(**over))
+        assert why and needle in why, (over, why)
+    # The env var swaps the connector class out from under the config, so it is a clause
+    # even though nothing on the config object changes.
+    os.environ["VLLM_USE_SIMPLE_KV_OFFLOAD"] = "1"
+    try:
+        why = offloading_connector_supported(offload_cfg())
+        assert why and "SimpleCPUOffloadConnector" in why, why
+    finally:
+        os.environ.pop("VLLM_USE_SIMPLE_KV_OFFLOAD", None)
+    assert offloading_connector_supported(offload_cfg()) is None
+    # An unreadable field is a REFUSAL here (unlike `kv_connector_configured`, where an
+    # unknown layout just falls through to the next probe): this is an allow-list.
+    assert offloading_connector_supported(fake_cfg()) is not None
+    # No config at all (no `set_current_vllm_config` in scope) is likewise a refusal, which
+    # is what keeps the pre-Stage-S behaviour when the ambient config cannot be read.
+    assert offloading_connector_supported() is not None
+
+    # The live-object half. Without vLLM importable, `SupportsHMA` cannot be imported and
+    # the type-name check is the whole answer -- which is the documented fallback.
+    class OffloadingConnector:  # noqa: N801 - the NAME is the check
+        pass
+
+    logging.disable(logging.CRITICAL)  # the SupportsHMA-import warning is expected
+    try:
+        assert offloading_connector_supported(
+            offload_cfg(), connector=OffloadingConnector()
+        ) is None
+        why = offloading_connector_supported(offload_cfg(), connector=object())
+        assert why and "not an OffloadingConnector" in why, why
+    finally:
+        logging.disable(logging.NOTSET)
+
+    # The stand-down is now the CONJUNCTION: a connector is configured AND it is not the
+    # one this port drives. The supported one keeps authority mode.
+    stay = FakeAuthorityKV()
+    assert authority_stand_down(stay, FakeStockKV, cfg=offload_cfg()) is False
+    assert type(stay) is FakeAuthorityKV and stay.surface() == "rust"
+    # ...and one clause away from supported, it stands down exactly as it did before.
+    down = FakeAuthorityKV()
+    logging.disable(logging.CRITICAL)
+    try:
+        stood = authority_stand_down(
+            down, FakeStockKV, cfg=offload_cfg(kv_load_failure_policy="fail")
+        )
+    finally:
+        logging.disable(logging.NOTSET)
+    assert stood is True and type(down) is FakeStockKV
+
+    # `connector_live_from_config` is the flag the crate is BUILT with: both halves.
+    assert connector_live_from_config(offload_cfg()) is True
+    assert connector_live_from_config(offload_cfg(kv_role="kv_consumer")) is False
+    assert connector_live_from_config(fake_cfg()) is False
+
+    # `unsupported_features` follows the same split: the ported connector is not a
+    # blocking feature, an unported one still is.
+    class OffloadSched:
+        connector = OffloadingConnector()
+        vllm_config = offload_cfg()
+
+    logging.disable(logging.CRITICAL)
+    try:
+        assert "connector" not in unsupported_features(OffloadSched()), \
+            unsupported_features(OffloadSched())
+        assert schedule_supported(OffloadSched()) is None
+        bad = OffloadSched()
+        bad.vllm_config = offload_cfg(kv_connector="NixlConnector")
+        assert unsupported_features(bad) == ("connector",)
+    finally:
+        logging.disable(logging.NOTSET)
+
+    # ---- Stage S: bail_reason's skipped_waiting arm, all four shapes -----------------
+    class BailSched:
+        def __init__(self, skipped=(), connector_live=False):
+            self.skipped_waiting = list(skipped)
+            self._vtl_connector_live = connector_live
+            self.num_waiting_for_streaming_input = 0
+            self._pause_state = None
+            self.finished_recving_kv_req_ids = set()
+
+    class FakeStatus:
+        def __init__(self, name):
+            self.name = name
+
+        def __str__(self):
+            return self.name
+
+    parked = type("R", (), {"status": FakeStatus("WAITING_FOR_REMOTE_KVS")})()
+    grammar = type("R", (), {"status": FakeStatus("WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR")})()
+    # 1. No connector, a non-empty skipped queue: the pre-Stage-S bail, unchanged.
+    assert bail_reason(BailSched([parked])) == \
+        "blocked requests are parked in skipped_waiting"
+    # 2. Connector live, every parked request is one of OURS: no bail, the loop runs.
+    assert bail_reason(BailSched([parked, parked], connector_live=True)) is None
+    # 3. Connector live, one foreign status: bail, and the reason names it.
+    why = bail_reason(BailSched([parked, grammar], connector_live=True))
+    assert why and "WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR" in why, why
+    # 4. Empty queue either way.
+    assert bail_reason(BailSched()) is None
+    assert bail_reason(BailSched(connector_live=True)) is None
+
+    # ---- Stage S: spec_blocked is strictly stronger than bail_reason ----------------
+    # A step the loop can DECIDE is not automatically a step whose successor can be
+    # precomputed: a parked load and a pending promotion both mutate state the worker
+    # cannot see, and neither is a bail.
+    sb = BailSched([parked], connector_live=True)
+    assert bail_reason(sb) is None and spec_blocked(sb) == "an async KV load is parked"
+    sb = BailSched(connector_live=True)
+    sb.finished_recving_kv_req_ids = {"r1"}
+    assert bail_reason(sb) is None and spec_blocked(sb) == "a promotion is pending"
+    # ...a bail is still a bail, and reported as itself.
+    sb = BailSched([grammar], connector_live=True)
+    assert spec_blocked(sb) == bail_reason(sb) and spec_blocked(sb) is not None
+    # ...and a quiet step blocks neither.
+    assert spec_blocked(BailSched(connector_live=True)) is None
+
+    # ---- Stage S: candidate assembly is FCFS across both queues ---------------------
+    class Cand:
+        def __init__(self, name, status="WAITING"):
+            self.name = name
+            self.status = status
+
+        def __repr__(self):
+            return self.name
+
+    def is_blocked(status):
+        return status.startswith("WAITING_FOR_")
+
+    promoted = []
+
+    def promote(request):
+        promoted.append(request)
+        # Only the parked-load status can be promoted here; the grammar one cannot.
+        if request.status == "WAITING_FOR_REMOTE_KVS":
+            request.status = "WAITING"
+            return True
+        return False
+
+    s1 = Cand("s1")
+    s2 = Cand("s2", "WAITING_FOR_REMOTE_KVS")
+    s3 = Cand("s3", "WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR")
+    w1, w2 = Cand("w1"), Cand("w2")
+    cands, skipped_out = assemble_candidates([s1, s2, s3], [w1, w2], is_blocked, promote)
+    assert cands == [s1, s2, w1, w2], cands
+    assert skipped_out == [s3], skipped_out
+    assert promoted == [s2, s3], "promote() is called for blocked statuses only"
+    assert s2.status == "WAITING", "a promoted request is schedulable this step"
+    # The skipped queue is drained BEFORE the waiting queue -- that is stock's FCFS
+    # `_select_waiting_queue_for_scheduling` (scheduler.py:1866) unrolled.
+    cands, skipped_out = assemble_candidates([], [w1, w2], is_blocked, promote)
+    assert cands == [w1, w2] and skipped_out == []
+    cands, skipped_out = assemble_candidates([], [], is_blocked, promote)
+    assert cands == [] and skipped_out == []
 
     # The first-schedule backstop tests membership in this tuple, so "ec_connector" must
     # NOT read as "connector" -- which it would under a substring match on the reason.

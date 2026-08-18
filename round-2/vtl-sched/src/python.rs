@@ -1196,6 +1196,16 @@ impl Scheduler {
         d: &Decisions,
         check: bool,
     ) -> PyResult<ArenaCounts<'py>> {
+        // Stage S: the arena has six buffers and no slot for `parked_external`, and the
+        // connector path deliberately stays on the dict marshalling for exactly that reason
+        // (`rust_sched.py` refuses LEAN/ARENA while a connector is live). Reaching here with
+        // parked loads would DROP them — the requests would keep their blocks and never be
+        // told they are waiting on a transfer — so it is an error, not a silent omission.
+        if !d.parked_external.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "the decisions arena cannot carry parked_external; use the dict path",
+            ));
+        }
         let mut slot = self.arena.borrow_mut();
         let arena = slot.get_or_insert_with(Arena::new);
         let n_run = d.scheduled_running.len() * 2;
@@ -1296,6 +1306,52 @@ impl Scheduler {
         .map_err(err)
     }
 
+    /// Stage S, phase 1. Returns the PROBE hits, read under the SAME lock the phase ran
+    /// under — a separate `probe_hits()` getter would be a second crossing and a second
+    /// acquisition, with a window in between where another entry point could clear them.
+    fn run_schedule_phase1(
+        py: Python<'_>,
+        kv: &KvManager,
+        running: Option<&[SchedReq]>,
+        running_slots: &[u32],
+        probe: &[SchedReq],
+        p: &Params,
+    ) -> PyResult<Vec<(u32, usize)>> {
+        let shared = kv.shared.clone();
+        py.allow_threads(|| {
+            let mut sh = lock_shared(&shared);
+            sh.invalidate();
+            let Shared { manager, core, .. } = &mut *sh;
+            match running {
+                Some(r) => core.schedule_phase1(manager, r, p, probe)?,
+                None => core.schedule_phase1_resident(manager, running_slots, p, probe)?,
+            }
+            Ok(manager.probe_hits())
+        })
+        .map_err(err)
+    }
+
+    /// Stage S, phase 2. The decisions are cloned under the lock for the same reason
+    /// [`Self::run_schedule`] clones them.
+    fn run_schedule_phase2(
+        py: Python<'_>,
+        kv: &KvManager,
+        waiting: &[SchedReq],
+        external: &[(u32, usize, bool)],
+        base_reserved: usize,
+        p: &Params,
+    ) -> PyResult<Decisions> {
+        let shared = kv.shared.clone();
+        py.allow_threads(|| {
+            let mut sh = lock_shared(&shared);
+            sh.invalidate();
+            let Shared { manager, core, .. } = &mut *sh;
+            core.schedule_phase2(manager, p, waiting, external, base_reserved)
+                .cloned()
+        })
+        .map_err(err)
+    }
+
     fn run_take_speculative(
         py: Python<'_>,
         kv: &KvManager,
@@ -1360,6 +1416,10 @@ fn decisions_dict<'py>(py: Python<'py>, d: &Decisions) -> PyResult<Bound<'py, Py
     out.set_item("scheduled_admitted", d.scheduled_admitted.clone())?;
     out.set_item("preempted", d.preempted.clone())?;
     out.set_item("waiting_order", d.waiting_order.clone())?;
+    // Stage S. Always present (unlike `num_common_prefix_blocks`): the connector post-pass
+    // reads it every step and an empty list is the ordinary answer, so a missing key would
+    // be a wheel-version question on the hot path rather than a decision.
+    out.set_item("parked_external", d.parked_external.clone())?;
     // Empty ONLY under `lean_decisions` -- both non-lean arms of the epilogue push one
     // entry per KV group, and there is always at least one group. Omitting the key beats
     // sending a zero list: Python then reuses a shared module-level constant.
@@ -1445,6 +1505,63 @@ impl Scheduler {
         let running: Vec<SchedReq> = running.iter().map(unpack).collect();
         let waiting: Vec<SchedReq> = waiting.iter().map(unpack).collect();
         let d = Self::run_schedule(py, kv, &running, &waiting, &p)?;
+        decisions_dict(py, &d)
+    }
+
+    /// Stage S, phase 1 with a MARSHALLED running set (the resync path's twin).
+    ///
+    /// `probe` is the waiting candidates whose local cache hit the connector has to be
+    /// asked about; returns `[(slot, num_local_computed_tokens)]` for them. The step is
+    /// only half-done when this returns — `schedule_phase2` MUST follow on the same
+    /// engine thread, with no other crate entry point in between (the running set, the
+    /// token budget and the probe hits all live in the shared core until it runs).
+    fn schedule_phase1(
+        &self,
+        py: Python<'_>,
+        kv: &KvManager,
+        running: Vec<ReqTuple>,
+        probe: Vec<ReqTuple>,
+    ) -> PyResult<Vec<(u32, usize)>> {
+        let p = self.params()?;
+        let running: Vec<SchedReq> = running.iter().map(unpack).collect();
+        let probe: Vec<SchedReq> = probe.iter().map(unpack).collect();
+        Self::run_schedule_phase1(py, kv, Some(&running), &[], &probe, &p)
+    }
+
+    /// [`Self::schedule_phase1`] with the running set read from the resident table.
+    fn schedule_phase1_resident(
+        &self,
+        py: Python<'_>,
+        kv: &KvManager,
+        running_slots: Vec<u32>,
+        probe: Vec<ReqTuple>,
+    ) -> PyResult<Vec<(u32, usize)>> {
+        let p = self.params()?;
+        let probe: Vec<SchedReq> = probe.iter().map(unpack).collect();
+        Self::run_schedule_phase1(py, kv, None, &running_slots, &probe, &p)
+    }
+
+    /// Stage S, phase 2: the waiting arm with the connector's answers. Returns the same
+    /// decisions dict `schedule()` returns, plus `parked_external`.
+    ///
+    /// `external` is `[(slot, num_external_computed_tokens, is_async)]` and `base_reserved`
+    /// is the block reservation of the prefills that were already in flight
+    /// (`_inflight_prefill_reserved_blocks`, scheduler.py:2400) — the loads THIS call parks
+    /// are added to it crate-side, in admission order.
+    ///
+    /// Dict only, by design: the arena carries no `parked_external` slot and the connector
+    /// path is refused the LEAN/ARENA rungs for exactly that reason.
+    fn schedule_phase2<'py>(
+        &self,
+        py: Python<'py>,
+        kv: &KvManager,
+        waiting: Vec<ReqTuple>,
+        external: Vec<(u32, usize, bool)>,
+        base_reserved: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let p = self.params()?;
+        let waiting: Vec<SchedReq> = waiting.iter().map(unpack).collect();
+        let d = Self::run_schedule_phase2(py, kv, &waiting, &external, base_reserved, &p)?;
         decisions_dict(py, &d)
     }
 
