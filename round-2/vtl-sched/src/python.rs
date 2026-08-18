@@ -1216,6 +1216,13 @@ impl Scheduler {
                 "the decisions arena cannot carry parked_external; use the dict path",
             ));
         }
+        // Same argument for the stale-probe skips: dropping them would leave the requests
+        // consumed from the waiting queue and put back in neither queue, i.e. lost.
+        if !d.probe_stale.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "the decisions arena cannot carry probe_stale; use the dict path",
+            ));
+        }
         let mut slot = self.arena.borrow_mut();
         let arena = slot.get_or_insert_with(Arena::new);
         let n_run = d.scheduled_running.len() * 2;
@@ -1292,6 +1299,9 @@ impl Scheduler {
         py.allow_threads(|| {
             let mut sh = lock_shared(&shared);
             sh.invalidate();
+            // An unsplit schedule IS the whole step: whatever a phase 1 left behind is
+            // superseded here, so the window must not stay open for a later phase 2.
+            sh.close_phase_split();
             let Shared { manager, core, .. } = &mut *sh;
             core.schedule(manager, running, waiting, p).cloned()
         })
@@ -1309,6 +1319,8 @@ impl Scheduler {
         py.allow_threads(|| {
             let mut sh = lock_shared(&shared);
             sh.invalidate();
+            // Same as `run_schedule`: this call decides the whole step.
+            sh.close_phase_split();
             let Shared { manager, core, .. } = &mut *sh;
             core.schedule_resident(manager, running_slots, waiting, p)
                 .cloned()
@@ -1331,12 +1343,19 @@ impl Scheduler {
         py.allow_threads(|| {
             let mut sh = lock_shared(&shared);
             sh.invalidate();
+            // Shut first: a phase 1 that fails below must not leave a window open, and a
+            // previous step's unclosed one must not be inherited.
+            sh.close_phase_split();
             let Shared { manager, core, .. } = &mut *sh;
             match running {
                 Some(r) => core.schedule_phase1(manager, r, p, probe)?,
                 None => core.schedule_phase1_resident(manager, running_slots, p, probe)?,
             }
-            Ok(manager.probe_hits())
+            let hits = manager.probe_hits();
+            // Opened only now, with the probe state recorded and the lock still held: from
+            // here until phase 2 claims it, the speculation worker declines.
+            sh.open_phase_split();
+            Ok(hits)
         })
         .map_err(err)
     }
@@ -1354,6 +1373,10 @@ impl Scheduler {
         let shared = kv.shared.clone();
         py.allow_threads(|| {
             let mut sh = lock_shared(&shared);
+            // BEFORE `invalidate()`, which would roll back (and so hide) the speculative
+            // run that is the most likely thing to have closed the window. See
+            // `Shared::claim_phase_split`.
+            sh.claim_phase_split()?;
             sh.invalidate();
             let Shared { manager, core, .. } = &mut *sh;
             core.schedule_phase2(manager, p, waiting, external, base_reserved)
@@ -1430,6 +1453,9 @@ fn decisions_dict<'py>(py: Python<'py>, d: &Decisions) -> PyResult<Bound<'py, Py
     // reads it every step and an empty list is the ordinary answer, so a missing key would
     // be a wheel-version question on the hot path rather than a decision.
     out.set_item("parked_external", d.parked_external.clone())?;
+    // Stage S (C3). Always present, same argument as `parked_external`: Python reads it
+    // every connector step and an empty list is the ordinary answer.
+    out.set_item("probe_stale", d.probe_stale.clone())?;
     // Empty ONLY under `lean_decisions` -- both non-lean arms of the epilogue push one
     // entry per KV group, and there is always at least one group. Omitting the key beats
     // sending a zero list: Python then reuses a shared module-level constant.

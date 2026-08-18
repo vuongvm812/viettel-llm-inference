@@ -19,7 +19,7 @@
 //! prefill throttling, PP decode cadence, `scheduler_reserve_full_isl`. Their branches
 //! are therefore absent from this loop by construction, not by accident.
 
-use crate::manager::{Manager, STATUS_PREEMPTED, STATUS_RUNNING, STATUS_WAITING};
+use crate::manager::{Manager, ProbeTake, STATUS_PREEMPTED, STATUS_RUNNING, STATUS_WAITING};
 
 /// Mirror of the `Request` fields the scheduling loop reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -103,6 +103,25 @@ pub struct Decisions {
     /// Always EMPTY without a connector, which is what keeps `decisions_dict` and every
     /// consumer of it unchanged on a connector-off boot.
     pub parked_external: Vec<(u32, usize, usize)>,
+    /// Stage S: waiting candidates this step CONSUMED from the queue without deciding
+    /// anything for them, because the local cache hit phase 1 recorded for them no longer
+    /// holds (`Manager::take_probe_hit` -> `ProbeTake::Stale`) AND the connector had
+    /// already been told that hit length.
+    ///
+    /// WHY THEY CANNOT JUST BE ADMITTED ON A FRESH WALK. The connector's answer is keyed to
+    /// the hit it was asked about: `update_state_after_alloc` loads
+    /// `offload_keys[num_locally_computed_gpu_blocks..]` and asserts the local boundary it
+    /// finds in the block records matches `num_locally_computed_tokens`
+    /// (offloading/scheduler.py:711-761). Re-walking moves that boundary, so admitting
+    /// would either trip the assert or load the wrong key window into the wrong blocks.
+    ///
+    /// Python moves them to `skipped_waiting`, exactly as it does for the connector's own
+    /// "ask me again later" (scheduler.py:743) — which is safe for the same reason: the
+    /// next `get_num_new_matched_tokens` clears the request's per-group block ids and
+    /// re-runs the lookup from scratch (offloading/scheduler.py:670-691).
+    ///
+    /// Always empty without a connector: a probe is only ever recorded for one.
+    pub probe_stale: Vec<u32>,
     pub num_common_prefix_blocks: Vec<usize>,
     /// May the step this decision describes carry an N-step burst, as far as the SCHEDULER
     /// can tell? The conjuncts are exactly the ones `nstep_decode._publish_ready` used to
@@ -128,6 +147,7 @@ impl Decisions {
         self.preempted.clear();
         self.waiting_order.clear();
         self.parked_external.clear();
+        self.probe_stale.clear();
         self.num_common_prefix_blocks.clear();
         self.burst_eligible = false;
     }
@@ -620,6 +640,10 @@ impl ScheduleCore {
                     break;
                 }
                 let request = self.waiting[admitted_from_waiting];
+                // Read once, up here: the staleness arm below has to know whether the
+                // connector was told anything about this candidate before it decides what a
+                // stale probe costs.
+                let ext_entry = external.iter().find(|e| e.0 == request.slot).copied();
 
                 // scheduler.py:684 zeroes the Marconi hint per iteration and only refills
                 // it (`:730`) right after a fresh `get_computed_blocks`. Reading the
@@ -631,11 +655,42 @@ impl ScheduleCore {
                 // go back into `pending_hit` where `allocate_slots` reads them. Without a
                 // connector the store is always empty and this is the fresh walk it always
                 // was, in the same place, with the same coordinator read after it.
+                //
+                // AND a recorded walk can go STALE inside this very loop: the candidates
+                // ahead of this one have been allocating, and `get_new_blocks` evicts the
+                // cached-but-free blocks it pops. `ProbeTake::Stale` is that, and it splits
+                // by whether the connector already saw the number.
+                let recorded = if request.num_computed_tokens == 0 {
+                    kv.take_probe_hit(request.slot)
+                } else {
+                    None
+                };
+                if recorded == Some(ProbeTake::Stale)
+                    && ext_entry.is_some_and(|(_, num_external, _)| num_external > 0)
+                {
+                    // The connector's `keys_to_load` window is keyed to the hit it was
+                    // asked about; a fresh walk moves that boundary and admitting on the
+                    // new numbers corrupts the load. Consume the candidate from the queue
+                    // and hand it back to Python for `skipped_waiting` — see
+                    // `Decisions::probe_stale`. The budget is untouched: nothing was
+                    // scheduled and nothing was allocated for it.
+                    self.decisions.probe_stale.push(request.slot);
+                    admitted_from_waiting += 1;
+                    continue;
+                }
                 let (num_new_local_computed_tokens, use_pending_hit, uncached_common) =
                     if request.num_computed_tokens == 0 {
-                        match kv.take_probe_hit(request.slot) {
-                            Some((hit, uncached)) => (hit, true, uncached),
-                            None => {
+                        match recorded {
+                            Some(ProbeTake::Fresh {
+                                hit,
+                                uncached_common,
+                            }) => (hit, true, uncached_common),
+                            // No probe (a connector-off boot, or a candidate the cap did
+                            // not reach), or a stale one for a candidate the connector was
+                            // told nothing about: walk it now. That is exactly what stock
+                            // does for every candidate, and a stale probe's only cost here
+                            // is the duplicated walk.
+                            None | Some(ProbeTake::Stale) => {
                                 let hit = kv.get_computed_blocks(
                                     request.slot,
                                     request.num_tokens,
@@ -658,10 +713,7 @@ impl ScheduleCore {
                 // Everything about it is decided before the ordinary arithmetic runs,
                 // because stock's `load_kv_async` branch sets `num_new_tokens = 0` and then
                 // skips the split, the encoder work and the lookahead slots outright.
-                if let Some(&(_, num_external, is_async)) = external
-                    .iter()
-                    .find(|e| e.0 == request.slot)
-                {
+                if let Some((_, num_external, is_async)) = ext_entry {
                     if num_external > 0 && !is_async {
                         // A SYNCHRONOUS external hit is a shape this port has never had a
                         // path for: it would have to flow through the ordinary
@@ -1646,6 +1698,120 @@ mod tests {
             .unwrap()
             .clone();
         assert!(d3.parked_external.is_empty(), "base_reserved gates the first load");
+    }
+
+    /// C3. A frozen probe is only as good as the pool it was walked against, and phase 2
+    /// keeps allocating between the walk and the consume: an earlier candidate's
+    /// `get_new_blocks` evicts cached-but-free blocks as it pops them, and one of those can
+    /// be a block a later candidate's probe still lists. Consuming it would `touch` a block
+    /// the earlier candidate now owns -- two requests, one block.
+    ///
+    /// The two arms split on whether the CONNECTOR was told the stale number, because that
+    /// is what decides whether a fresh walk is still admissible.
+    fn stale_probe_fixture() -> (Manager, ScheduleCore, Params, u32, u32) {
+        // ONE full-attention group, so the block arithmetic below is exact. 19 usable
+        // blocks (block 0 is the null placeholder), laid out deliberately: the free queue's
+        // ORDER is what decides which blocks an allocation evicts, and the eviction has to
+        // land on a block the probe recorded.
+        let mut c = cfg(20);
+        c.groups.truncate(1);
+        c.connector = true;
+        let mut p = params();
+        p.connector = true;
+        p.need_mamba_block_aligned_split = false;
+
+        let mut kv = Manager::new(c).unwrap();
+        let mut core = ScheduleCore::new();
+        // `filler` takes 1..10 and KEEPS them: it spends the unhashed head of the queue, so
+        // everything freed below lands ahead of what is left.
+        let filler = seed(&mut kv, "filler", 160, 3);
+        core.schedule(&mut kv, &[], &[req(filler, 160)], &p).unwrap();
+        // `base` takes 11..14 and caches all four; `extra` takes 15,16.
+        let base = seed(&mut kv, "base", 64, 1);
+        core.schedule(&mut kv, &[], &[req(base, 64)], &p).unwrap();
+        let extra = seed(&mut kv, "extra", 32, 5);
+        core.schedule(&mut kv, &[], &[req(extra, 32)], &p).unwrap();
+        // Freed hashed blocks are APPENDED in eviction order (`TypeManager::free` reverses
+        // the request's list), so the queue is now 17,18,19, 14,13,12,11, 16,15 -- the
+        // three untouched blocks, then `base`'s, then `extra`'s.
+        kv.free(base);
+        kv.free(extra);
+
+        // `dup` re-sends `base`'s prompt: its probe hits 3 blocks (the walk caps the hit at
+        // `num_tokens - 1`), namely 11,12,13. `hog` needs 5 blocks and pops 17,18,19,14,13
+        // -- evicting 13 out from under `dup`'s recorded hit, and leaving 12,11,16,15 free,
+        // which is exactly what `dup` needs to be admitted on a re-walk.
+        let hog = seed(&mut kv, "hog", 80, 7);
+        let dup = seed(&mut kv, "dup", 64, 1);
+        let waiting = [req(hog, 80), req(dup, 64)];
+        core.schedule_phase1(&mut kv, &[], &p, &waiting).unwrap();
+        let hits: Vec<(u32, usize)> = kv.probe_hits();
+        let dup_hit = hits.iter().find(|h| h.0 == dup).unwrap().1;
+        assert_eq!(dup_hit, 48, "the probe recorded a 3-block hit");
+        (kv, core, p, hog, dup)
+    }
+
+    #[test]
+    fn a_stale_probe_is_skipped_when_the_connector_was_told_its_hit() {
+        let (mut kv, mut core, p, hog, dup) = stale_probe_fixture();
+        let waiting = [req(hog, 80), req(dup, 64)];
+        // The connector answered for `dup` against the 48-token hit; its `keys_to_load`
+        // window is keyed to that boundary, so a fresh walk cannot be substituted.
+        let d = core
+            .schedule_phase2(&mut kv, &p, &waiting, &[(dup, 16, true)], 0)
+            .unwrap()
+            .clone();
+        assert_eq!(d.scheduled_admitted.len(), 1, "the hog is admitted");
+        assert_eq!(d.scheduled_admitted[0].0, hog);
+        assert_eq!(d.probe_stale, vec![dup], "the stale candidate is handed back");
+        assert!(d.parked_external.is_empty(), "and NOT parked on the load");
+        assert!(
+            !d.waiting_order.contains(&dup),
+            "it was consumed from the queue: Python owns it now (skipped_waiting)"
+        );
+    }
+
+    #[test]
+    fn a_stale_probe_without_external_tokens_re_walks_to_the_smaller_hit() {
+        let (mut kv, mut core, p, hog, dup) = stale_probe_fixture();
+        let waiting = [req(hog, 80), req(dup, 64)];
+        // No connector answer for `dup`: nothing outside the crate has seen the stale
+        // number, so the honest fix is the walk stock would have done anyway.
+        let d = core
+            .schedule_phase2(&mut kv, &p, &waiting, &[], 0)
+            .unwrap()
+            .clone();
+        assert!(d.probe_stale.is_empty());
+        assert_eq!(d.scheduled_admitted.len(), 2, "both are admitted");
+        assert_eq!(d.scheduled_admitted[1].0, dup);
+        assert_eq!(
+            d.scheduled_admitted[1].2, 32,
+            "the third hit block was evicted, so the fresh walk stops at two"
+        );
+    }
+
+    /// The other half of the same guard: a probe nothing disturbed is NOT stale, so the
+    /// revalidation cannot be paying for itself by simply refusing every hit.
+    #[test]
+    fn an_undisturbed_probe_still_consumes_its_recorded_hit() {
+        let mut c = cfg(16);
+        c.groups.truncate(1);
+        c.connector = true;
+        let mut p = params();
+        p.connector = true;
+        p.need_mamba_block_aligned_split = false;
+        let mut kv = Manager::new(c).unwrap();
+        let mut core = ScheduleCore::new();
+        let base = seed(&mut kv, "base", 64, 1);
+        core.schedule(&mut kv, &[], &[req(base, 64)], &p).unwrap();
+        let dup = seed(&mut kv, "dup", 64, 1);
+        core.schedule_phase1(&mut kv, &[], &p, &[req(dup, 64)]).unwrap();
+        let d = core
+            .schedule_phase2(&mut kv, &p, &[req(dup, 64)], &[], 0)
+            .unwrap()
+            .clone();
+        assert!(d.probe_stale.is_empty());
+        assert_eq!(d.scheduled_admitted[0].2, 48, "the recorded hit was used as-is");
     }
 
     #[test]

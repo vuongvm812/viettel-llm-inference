@@ -26,7 +26,7 @@ use std::hash::{Hash, Hasher};
 use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 
-use crate::block_pool::BlockPool;
+use crate::block_pool::{BlockPool, HashKey};
 use crate::config::Config;
 use crate::coordinator::Coordinator;
 use crate::hash::Digest32;
@@ -57,8 +57,38 @@ pub struct ProbeHit {
     pub hit: usize,
     /// The per-group hit blocks, as `take_hit_blocks` left them in `pending_hit`.
     pub blocks: Vec<Vec<u32>>,
+    /// The hash each block in [`Self::blocks`] was cached under AT WALK TIME, same shape.
+    ///
+    /// WHY A FROZEN HIT NEEDS A RECEIPT. The blocks above are only meaningful while the
+    /// pool still maps them to the same content. Phase 2 allocates for the candidates in
+    /// admission order, and `get_new_blocks` evicts cached-but-free blocks as it pops them
+    /// (`BlockPool::maybe_evict_cached_block`) — so an earlier candidate's admission can
+    /// take a block a later candidate's probe still lists. Nothing downstream would notice:
+    /// `allocate_new_computed_blocks` -> `touch` re-refs a block id without re-checking
+    /// what it holds, and the two requests then share it. These keys are what
+    /// [`Manager::take_probe_hit`] re-checks before it hands the hit back.
+    ///
+    /// `None` for the mamba null placeholder (padding, never cached — see
+    /// `TypeManager::find_longest_cache_hit`), which the check skips.
+    pub keys: Vec<Vec<Option<HashKey>>>,
     /// `Coordinator::num_uncached_common_prefix_tokens` as of this walk.
     pub uncached_common: usize,
+}
+
+/// What [`Manager::take_probe_hit`] found when phase 2 came back for a recorded walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeTake {
+    /// The recorded walk still holds. Its blocks are back in `pending_hit`, where
+    /// `allocate_slots`' `use_pending_hit` arm reads them.
+    Fresh {
+        hit: usize,
+        uncached_common: usize,
+    },
+    /// At least one recorded block is no longer the pool's block for the hash it was
+    /// matched under. `pending_hit` is NOT installed — the caller must either re-walk
+    /// (an ordinary candidate) or skip the candidate for this step (one the connector was
+    /// already told the now-stale hit length for). See `ScheduleCore::phase2_body`.
+    Stale,
 }
 
 /// Request status values the allocator's watermark branch cares about
@@ -691,11 +721,23 @@ impl Manager {
         skip_reading_prefix_cache: bool,
     ) -> usize {
         let hit = self.get_computed_blocks(req, num_tokens, num_preemptions, skip_reading_prefix_cache);
+        // The receipt for the freeze: which hash each hit block was the pool's block FOR,
+        // read straight off the block. See `ProbeHit::keys`.
+        let keys = self
+            .pending_hit
+            .iter()
+            .map(|g| {
+                g.iter()
+                    .map(|&b| self.coord.pool.arena.get(b).hash)
+                    .collect()
+            })
+            .collect();
         self.probe_hit.insert(
             req,
             ProbeHit {
                 hit,
                 blocks: self.pending_hit.clone(),
+                keys,
                 uncached_common: self.coord.num_uncached_common_prefix_tokens,
             },
         );
@@ -705,16 +747,46 @@ impl Manager {
     /// Consume one recorded probe: the blocks go back into `pending_hit` (where
     /// `allocate_slots`' `use_pending_hit` arm reads them) and the two numbers come back.
     ///
-    /// REMOVES the entry. A slot is admitted, parked or refused exactly once per step, and
-    /// leaving a consumed hit behind would let a later `allocate_slots` in the same step
-    /// re-install blocks the coordinator has already taken ownership of.
-    pub fn take_probe_hit(&mut self, req: u32) -> Option<(usize, usize)> {
+    /// REVALIDATED FIRST, and that is not belt-and-braces. Between the walk (phase 1) and
+    /// this call, phase 2 has been allocating for the candidates ahead of this one, and
+    /// `get_new_blocks` evicts a cached-but-free block as it pops it — possibly one this
+    /// probe still lists. Nothing further down would catch it: `touch` re-refs a block id
+    /// without looking at what it now holds, so the two requests would read and write the
+    /// same KV. `ProbeTake::Stale` is that case; the caller decides what to do with it
+    /// (`ScheduleCore::phase2_body`), because the answer depends on whether the connector
+    /// has already been told this hit length.
+    ///
+    /// REMOVES the entry either way. A slot is admitted, parked, re-walked or skipped
+    /// exactly once per step, and leaving a consumed hit behind would let a later
+    /// `allocate_slots` in the same step re-install blocks the coordinator has already
+    /// taken ownership of.
+    pub fn take_probe_hit(&mut self, req: u32) -> Option<ProbeTake> {
         let rec = self.probe_hit.remove(&req)?;
+        for (g, blocks) in rec.blocks.iter().enumerate() {
+            for (i, &b) in blocks.iter().enumerate() {
+                // Mamba padding: never cached, never touched, nothing to validate.
+                if self.coord.pool.arena.get(b).is_null {
+                    continue;
+                }
+                let key = rec.keys.get(g).and_then(|k| k.get(i)).copied().flatten();
+                // An unhashed non-null block in a recorded hit is not a shape the walk can
+                // produce (every hit comes out of the index, and every indexed block owns a
+                // primary hash) -- so if one ever appears, it is unvalidatable and must be
+                // treated as stale rather than trusted.
+                let ok = key.is_some_and(|k| self.coord.pool.block_still_cached_as(b, &k));
+                if !ok {
+                    return Some(ProbeTake::Stale);
+                }
+            }
+        }
         for (dst, src) in self.pending_hit.iter_mut().zip(rec.blocks.iter()) {
             dst.clear();
             dst.extend_from_slice(src);
         }
-        Some((rec.hit, rec.uncached_common))
+        Some(ProbeTake::Fresh {
+            hit: rec.hit,
+            uncached_common: rec.uncached_common,
+        })
     }
 
     /// `(slot, hit_len)` for every recorded probe — what phase 1 hands back to Python so

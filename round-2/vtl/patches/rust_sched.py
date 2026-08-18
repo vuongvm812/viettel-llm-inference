@@ -107,6 +107,7 @@ submission, where serving-but-slower beats not serving. Supporting a new kind me
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 
@@ -389,6 +390,50 @@ _KV_CONNECTOR_PROBES = (
 )
 
 
+def ambient_vllm_config():
+    """The vLLM config in scope right now, or ``None`` if there is none / it cannot be read.
+
+    Named once because THREE things depend on the answer and the C1 fix made all three the
+    same question: ``kv_connector_configured``'s ambient read, the resolver read in
+    ``connector_hash_granularity_blocked``, and the boot log that says which way the
+    connector resolved. v0.25.0's ``EngineCore`` builds the Scheduler outside any
+    ``set_current_vllm_config`` context, so this answered ``None`` at KVCacheManager
+    construction on every boot until ``apply()``'s ``Scheduler.__init__`` wrapper started
+    entering the context itself -- see ``_scheduler_init_vllm_config``.
+    """
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        return get_current_vllm_config_or_none()
+    except Exception:
+        return None
+
+
+def _scheduler_init_vllm_config(args, kwargs):
+    """The ``VllmConfig`` a ``Scheduler.__init__(*args, **kwargs)`` call is about to use.
+
+    Pure -- self-checked. v0.25.0's signature (scheduler.py:69) is
+    ``__init__(self, vllm_config, kv_cache_config, structured_output_manager, block_size,
+    ...)``, so the config is the ``vllm_config`` keyword when the caller passes one and the
+    FIRST positional otherwise.
+
+    Duck-typed rather than ``isinstance``: the point is to hand
+    ``set_current_vllm_config`` something the config probes can actually read, and a build
+    whose signature moved must answer ``None`` (no context, the pre-C1 behaviour) instead of
+    installing a wrong object as the ambient config for the whole of ``__init__``.
+    """
+    cfg = kwargs.get("vllm_config")
+    if cfg is None and args:
+        cfg = args[0]
+    if cfg is None:
+        return None
+    # Both fields exist on every VllmConfig this port has been walked against, and both are
+    # read by the probes this context exists to feed.
+    if not (hasattr(cfg, "cache_config") and hasattr(cfg, "kv_transfer_config")):
+        return None
+    return cfg
+
+
 def kv_connector_configured(cfg=None):
     """``True``/``False`` if vLLM's config can be read, ``None`` if it cannot.
 
@@ -410,19 +455,16 @@ def kv_connector_configured(cfg=None):
     a FALSE NEGATIVE costs the boot. So every field shape that can carry a connector is
     probed (``_KV_CONNECTOR_PROBES``) and any hit is enough.
 
-    ``cfg=None`` means "read the ambient config"; v0.25.0 constructs the Scheduler outside
-    any ``set_current_vllm_config`` context, so that answers ``None`` more often than not
-    -- which is why the ``None`` case has its own backstop at the first ``schedule()``
-    (see ``_install_full_schedule``). Passing ``cfg`` explicitly is the testable form and
+    ``cfg=None`` means "read the ambient config". v0.25.0 constructs the Scheduler outside
+    any ``set_current_vllm_config`` context, so that answered ``None`` on every boot until
+    ``apply()``'s ``Scheduler.__init__`` wrapper started entering the context itself (C1) --
+    the ``None`` case still has its own backstop at the first ``schedule()`` (see
+    ``_install_full_schedule``), and that backstop is now the belt to the wrapper's braces
+    rather than the only thing standing. Passing ``cfg`` explicitly is the testable form and
     never answers ``None``.
     """
     if cfg is None:
-        try:
-            from vllm.config import get_current_vllm_config_or_none
-
-            cfg = get_current_vllm_config_or_none()
-        except Exception:
-            return None
+        cfg = ambient_vllm_config()
         if cfg is None:
             return None
     for name, probe in _KV_CONNECTOR_PROBES:
@@ -1051,10 +1093,14 @@ def connector_hash_granularity_blocked(manager) -> str | None:
             return None
         resolved = None
         try:
-            from vllm.config import get_current_vllm_config_or_none
             from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
-            vcfg = get_current_vllm_config_or_none()
+            # C1 also fixed THIS read. Before `apply()` wrapped `Scheduler.__init__` in the
+            # config context there was never an ambient config at this point, so the
+            # resolver clause was skipped on every boot and only the multiple-of clause ever
+            # ran -- i.e. the half of the interlock that catches an actual granularity
+            # DISAGREEMENT was dead code. It is live now.
+            vcfg = ambient_vllm_config()
             if vcfg is not None:
                 resolved = resolve_kv_cache_block_sizes(manager.kv_cache_config, vcfg)[1]
         except Exception:
@@ -1413,6 +1459,20 @@ class _BlockRecordView:
         return self._record(index)
 
 
+def block_view_meta(rust, slot, connector: bool):
+    """The ``meta`` argument for ``_blocks_of``: ``None``, or one ``(num_cached, null_id)``
+    per group. Module level and pure (given the crate handle) so the self-check can drive
+    the M1 decision with a fake one.
+
+    ``connector`` is the CONFIG answer (``_vtl_connector_cfg``), not the per-step one: the
+    shape has to be right on a step the Rust loop bails out of, where nothing in this module
+    runs at all. See ``get_blocks``.
+    """
+    if not connector:
+        return None
+    return tuple(rust.block_meta(slot, g) for g in range(rust.num_groups))
+
+
 class RustBlocks:
     """``KVCacheBlocks`` stand-in over Rust-owned block IDs.
 
@@ -1615,6 +1675,18 @@ def _install_authority(base, mirror_modes):
             # cross-checks this against the live `scheduler.connector` -- a crate built for
             # the wrong answer cannot be corrected, only refused.
             self._vtl_connector_cfg = connector_live_from_config()
+            # THE C1 PROOF LINE. Which way the connector resolved, and -- the part that
+            # matters when it resolves the wrong way -- whether there was an ambient config
+            # to resolve it FROM. Without `apply()`'s `Scheduler.__init__` context there is
+            # not, and every probe below silently answers "no connector" on a boot that has
+            # one; with it, this line and the first schedule()'s cross-check must agree.
+            # `kv_connector_configured` logs WHICH probe fired, just above this.
+            log.info(
+                "rust_sched: connector resolved from config at KV manager construction: "
+                "connector=%s (ambient vLLM config: %s)",
+                self._vtl_connector_cfg,
+                "in scope" if ambient_vllm_config() is not None else "ABSENT",
+            )
             if self._vtl_connector_cfg:
                 # U1b: the hash-granularity interlock, taken HERE -- the last point at
                 # which standing down is still possible (nothing Rust-side exists yet) and
@@ -1818,10 +1890,53 @@ def _install_authority(base, mirror_modes):
                 )
             )
 
+        def _slot_for_free(self, request_id):
+            """The slot to free for ``request_id``, WITHOUT interning one that is not there.
+
+            m6: ``RustMirror.slot(request)`` was the wrong primitive on both free paths. On
+            a mirror HIT it re-reads ``request.block_hashes`` and can push a block hash
+            across the FFI boundary for a request that is being destroyed; on a mirror MISS
+            it MINTS a slot (plus a ``num_hashes`` crossing) purely so the next line can
+            free it.
+
+            THE MIRROR IS NOT THE WHOLE TRUTH, which is why a miss is not simply an early
+            return. ``VTL_RUST_PREREG`` interns a request at ADD time, on the input thread,
+            through ``KvManager::set_request_meta`` -- a path ``RustMirror`` never sees. A
+            request aborted before it is ever scheduled therefore has a crate slot and no
+            mirror entry, and answering "nothing to free" would leak that slot and its
+            ``request_id -> slot`` mapping for the life of the boot (a later request reusing
+            the id would then answer with a dead request's state). So the crate is asked
+            second.
+
+            ``None`` -- the fast path this exists for -- means nothing anywhere holds it.
+            """
+            slot = self._mirror._slots.get(request_id)
+            if slot is not None:
+                return slot
+            return self._rust.lookup(request_id)
+
+        def _drop_slot(self, request_id):
+            """Recycle the slot, AFTER its blocks have gone back to the pool.
+
+            Order is load-bearing and is why this is not folded into ``_slot_for_free``:
+            ``Manager::forget`` pushes the slot onto the free list, and the input thread can
+            ``intern`` it for a new arrival at any moment -- so it must not happen while the
+            dying request's blocks are still attached to it.
+            """
+            if request_id in self._mirror._slots:
+                # `drop` owns the mirror-side recycling (pushed hashes, stop params, burst
+                # limit, pack-ok, batch cache) and calls `forget` itself.
+                self._mirror.drop(request_id)
+            else:
+                self._rust.forget(request_id)
+
         def free(self, request):
-            slot = self._mirror.slot(request)
+            rid = request.request_id
+            slot = self._slot_for_free(rid)
+            if slot is None:
+                return
             self._rust.free(slot)
-            self._mirror.drop(request.request_id)
+            self._drop_slot(rid)
 
         def cache_blocks(self, request, num_computed_tokens):
             self._rust.cache_blocks(self._mirror.slot(request), int(num_computed_tokens))
@@ -1858,9 +1973,14 @@ def _install_authority(base, mirror_modes):
             block list (``Manager::forget``), and this call has already emptied the ones
             the coordinator held.
             """
-            slot = self._mirror.slot(request)
+            rid = request.request_id
+            # m6: the same lookup-first rule as `free` -- and here a miss is genuinely
+            # nothing to do, because a request with no slot has no blocks to hand back.
+            slot = self._slot_for_free(rid)
+            if slot is None:
+                return []
             ids = self._rust.pop_blocks_for_free(slot)
-            self._mirror.drop(request.request_id)
+            self._drop_slot(rid)
             tbl = getattr(self, "_vtl_table", None)
             if tbl is not None:
                 # The request's blocks left the pool's bookkeeping without being freed and
@@ -1915,27 +2035,48 @@ def _install_authority(base, mirror_modes):
             return []
 
         def get_blocks(self, request_id):
-            slot = self._rust.lookup(request_id)
-            if slot is None:
-                return self._empty
-            return self._blocks_of(slot)
+            """``KVCacheManager.get_blocks`` (`:592`), over Rust-owned ids.
 
-        def get_blocks_with_meta(self, request_id):
-            """``get_blocks`` whose ``.blocks`` are BLOCK RECORDS, not raw ids.
+            M1: UNDER A CONNECTOR THIS IS THE META VIEW, unconditionally. The original
+            reading -- "only the connector post-pass wants records, so give it its own
+            method" -- was true for the RUST loop and false for the step the Rust loop bails
+            on. A bailed step runs STOCK ``schedule()``, and stock's admission path hands
+            this call's result straight to ``update_state_after_alloc``
+            (scheduler.py:929-934), whose boundary scan reads ``block.is_null`` and
+            ``block.block_hash`` off each element (offloading/scheduler.py:711-761). Raw
+            ints have neither, so a single bail -- a preemption, a spec-decode step, any
+            ``bail_reason`` -- would take the engine down with an ``AttributeError`` deep
+            inside the connector.
 
-            A separate method rather than a flag on ``get_blocks``: that one is on the
-            routed-experts path (and every other in-tree caller), all of which want the
-            plain id tuples, and a record view would break them. Only the connector
-            post-pass -- which runs right after ``allocate_slots(delay_cache_blocks=True)``
-            and before any ``cache_blocks`` -- asks for this shape.
+            Safe for every other caller because none of them reads ``.blocks``:
+            ``_update_req_states`` and the routed-experts map go through
+            ``get_block_ids()`` (scheduler.py:1052/1060/1202/1298), which reads the id
+            tuples the view was built from and never the records. The cost is one
+            ``block_meta`` crossing per group per call, on the connector path only.
             """
             slot = self._rust.lookup(request_id)
             if slot is None:
                 return self._empty
-            meta = tuple(
-                self._rust.block_meta(slot, g) for g in range(self._rust.num_groups)
+            return self._blocks_of(
+                slot,
+                block_view_meta(
+                    self._rust, slot, bool(getattr(self, "_vtl_connector_cfg", False))
+                ),
             )
-            return self._blocks_of(slot, meta)
+
+        def get_blocks_with_meta(self, request_id):
+            """``get_blocks`` whose ``.blocks`` are BLOCK RECORDS, not raw ids.
+
+            Kept as the NAME the connector post-pass calls: it says at the call site which
+            shape that path depends on, and it stays right if ``get_blocks`` ever has to go
+            back to raw ids for some caller. Since M1 it is an alias in practice -- both
+            answer with records whenever a connector is configured, which is the only boot
+            where the post-pass runs at all.
+            """
+            slot = self._rust.lookup(request_id)
+            if slot is None:
+                return self._empty
+            return self._blocks_of(slot, block_view_meta(self._rust, slot, True))
 
         def get_block_ids(self, request_id):
             slot = self._rust.lookup(request_id)
@@ -2137,13 +2278,30 @@ def bail_reason(scheduler):
     return None
 
 
+# The one reason speculation is off for a WHOLE connector boot, named once so the
+# `spec_blocked` answer and the RUNGS cell cannot drift apart.
+SPEC_CONNECTOR_WHY = "the phase-split schedule window admits no speculation under a connector"
+
+
 def spec_blocked(scheduler) -> str | None:
     """Why the SPECULATION worker must not be kicked for the next step, or None.
 
     A strict superset of ``bail_reason``, and the split exists because Stage S made the two
     questions different. A bail asks "can the Rust loop decide THIS step"; a kick asks "will
-    the next step's decisions still be valid when we get there", and a connector answers no
-    to the second in two cases the first now lets through:
+    the next step's decisions still be valid when we get there".
+
+    A LIVE CONNECTOR ANSWERS NO TO EVERY KICK, and that clause comes first because it is not
+    about validity at all -- it is about the WINDOW. Under a connector the step is
+    ``schedule_phase1`` -> the connector's ``get_num_new_matched_tokens`` -> ``schedule_phase2``,
+    and the crate lock is FREE for the whole middle. A worker that takes it there runs
+    ``schedule_resident`` on the same ``ScheduleCore``: ``decisions.clear()``,
+    ``Manager::probe_clear()`` and a fresh token budget, all of which phase 2 is about to
+    read. `spec.rs`'s ``Shared::phase_split_open`` is the crate-side half of this guard
+    (the worker declines, and a phase 2 whose window was closed underneath refuses); this
+    half is what keeps the worker from ever being offered the job.
+
+    The two cases below are what the connector answers no to even WITHOUT the window, and
+    they are kept because they are the reasons the clause above is not merely convenient:
 
     * A PARKED async load. The worker speculates with an EMPTY waiting slice (`spec.rs`
       invariant, `journal.rs`'s scope invariant), but a parked load is precisely a
@@ -2163,6 +2321,8 @@ def spec_blocked(scheduler) -> str | None:
     -- no block is freed, no request moves queue, no counter advances. Blocking on it would
     turn speculation off for the whole run in exchange for nothing.
     """
+    if getattr(scheduler, "_vtl_connector_live", False):
+        return SPEC_CONNECTOR_WHY
     why = bail_reason(scheduler)
     if why is not None:
         return why
@@ -5075,7 +5235,10 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             log.info(
                 "rust_sched: FULL schedule() loop active "
                 "(sjf=%s, table=%s, spec=%s, timing=%s)",
-                sjf_enabled, TABLE, SPEC, TIMING,
+                # C2: the EFFECTIVE answer, not the env gate -- `spec_blocked` refuses
+                # every kick under a connector, so `spec=True` here would be a lie the
+                # RUNGS line below then contradicts.
+                sjf_enabled, TABLE, SPEC and not connector_live, TIMING,
             )
             # THE RUNGS PROOF LINE. One line, once, always -- REQUIRE or not. Everything
             # else in this block logs a rung only when it has something to say, so the
@@ -5119,7 +5282,13 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 rung(bool(m["authority"]), "VTL_RUST_SCHED off"),
                 rung(bool(m["full"]), "VTL_RUST_SCHED_FULL off"),
                 rung(TABLE, "VTL_RUST_SCHED_TABLE off"),
-                rung(SPEC, "VTL_RUST_SCHED_SPEC off"),
+                # C2: a connector turns the rung OFF for the boot, not just for a step --
+                # `spec_blocked` refuses every kick while one is live, so a cell reading
+                # "on" here would be naming a gate that never fires.
+                rung(
+                    SPEC and not connector_live,
+                    "connector" if connector_live else "VTL_RUST_SCHED_SPEC off",
+                ),
                 rung(LEAN, lean_why),
                 rung(ARENA, arena_why),
                 rung(RING, ring_why),
@@ -5242,6 +5411,10 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         counts = None
         # Stage S: what phase 2 parked, read back out of the decisions after they land.
         parked_external = ()
+        # C3: the candidates phase 2 refused because their recorded local hit went stale
+        # under an earlier admission. M2: what the connector was asked, per slot.
+        probe_stale = ()
+        queried = {}
         if connector_live:
             # ---- THE TWO-PHASE CONNECTOR STEP ------------------------------
             # Order is the whole design (see `ScheduleCore::schedule_phase2`): the
@@ -5249,12 +5422,19 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             # argument and its answer feeds the admission, so the hit has to come out of
             # the crate before the query and the answer has to go back in after it.
             #
-            # SPECULATION STILL APPLIES TO THE PURE-DECODE STEP, which is most of them. A
-            # step with NO candidates at all -- nothing waiting, nothing parked, nothing
-            # skipped -- has no connector query to make, so phase 1 + phase 2 is exactly
-            # `run()` with both slices empty, which is exactly what the worker computed.
-            # Anything else re-runs the split for real; `spec_blocked` is what keeps the
-            # worker from being kicked for a step that will not be this shape.
+            # SPECULATION IS OFF FOR THE WHOLE BOOT UNDER A CONNECTOR (C2), so `tbl.armed`
+            # is never True here and this branch is unreachable. It is KEPT, unchanged and
+            # correct, because it is the arm that would consume a speculation if the guard
+            # were ever relaxed: a step with NO candidates at all -- nothing waiting,
+            # nothing parked, nothing skipped -- has no connector query to make, so phase 1
+            # + phase 2 is exactly `run()` with both slices empty, which is exactly what the
+            # worker computed, and `take_speculative` re-checks the generation and the slot
+            # order on top.
+            #
+            # What made the guard necessary is not this arm but the OTHER one: the crate
+            # lock is free between the two phases, and a worker running there rewrites the
+            # very state phase 2 is about to read. See `spec_blocked` and
+            # `spec.rs::Shared::phase_split_open`.
             if resident and SPEC and tbl.armed and not waiting and not step_skipped:
                 try:
                     decisions = core.take_speculative(kv._rust, tbl.gen, running_slots)
@@ -5267,19 +5447,40 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             if tbl is not None:
                 tbl.armed = False
         if connector_live and decisions is None:
-            # The probe is capped by the admission budget for a reason beyond cost: every
-            # query the connector answers costs it a lookup AND a `_touch` of the offloaded
-            # blocks (offloading/scheduler.py:691), so probing candidates that cannot be
-            # admitted this step would churn the offload LRU on their behalf.
+            # The probe is capped for a reason beyond cost: every query the connector
+            # answers costs it a lookup AND a `_touch` of the offloaded blocks
+            # (offloading/scheduler.py:691), so probing candidates that cannot be admitted
+            # this step would churn the offload LRU on their behalf. Stock never probes
+            # ahead at all -- it queries one candidate at a time, inside the admission loop,
+            # and stops the moment one does not fit.
+            #
+            # TWO CAPS, because the loop stops on either resource. The seat cap is exact;
+            # the token cap is an ESTIMATE, and deliberately the loose one: the running arm
+            # has not spent its share of the budget yet at this point (phase 1 has not run),
+            # so this measures the candidates against the WHOLE step budget. m1: the
+            # residual over-probe is bounded -- at most the candidates that fit in the
+            # running arm's spend, plus the one that crosses the line -- and each costs one
+            # connector lookup and one LRU touch, never a scheduling decision. It is visible
+            # too: an over-probed candidate is queried and then not reached by phase 2, so
+            # `connector_prefix_cache_stats` (which only records what phase 2 reached)
+            # counts neither a query nor a hit for it, and the hit rate stays honest.
             budget = max(0, self.max_num_running_reqs - len(self.running))
+            token_budget = int(self.max_num_scheduled_tokens)
             probe_slots = []
             probe_reqs = []
+            probe_tokens = 0
             for i, slot in enumerate(cand_slots):
-                if len(probe_reqs) >= budget:
+                if len(probe_reqs) >= budget or probe_tokens >= token_budget:
                     break
-                if by_slot[slot].num_computed_tokens == 0:
+                request = by_slot[slot]
+                if request.num_computed_tokens == 0:
                     probe_slots.append(slot)
                     probe_reqs.append(waiting[i])
+                    # What this candidate would ASK for if it were admitted whole. The local
+                    # hit would shrink it, but the hit is what phase 1 is being run to find
+                    # out -- so the cap uses the pre-hit number, which is the conservative
+                    # direction for a cap on how many to ASK about.
+                    probe_tokens += request.num_tokens - request.num_computed_tokens
             hits = None
             if resident:
                 try:
@@ -5303,11 +5504,16 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             hit_by_slot = dict(hits)
             external = []
             dropped = set()
+            # M2: `{slot: (local_hit, ext)}` for every candidate the connector ANSWERED for,
+            # misses included. Stock records a prefix-cache query for each of them (`:936`),
+            # not just for the ones that got a hit -- recording only the hits would report a
+            # 100% connector hit rate on any arm that reads this counter.
             try:
                 for slot in probe_slots:
                     request = by_slot[slot]
+                    local_hit = hit_by_slot.get(slot, 0)
                     ext, is_async = self.connector.get_num_new_matched_tokens(
-                        request, hit_by_slot.get(slot, 0)
+                        request, local_hit
                     )
                     if ext is None:
                         # "Ask me again later" (scheduler.py:743): the connector still has
@@ -5316,6 +5522,10 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                         dropped.add(slot)
                         step_skipped.append(request)
                         continue
+                    # Stock records the query for exactly the candidates that got past the
+                    # `ext is None` continue and then ALLOCATED; this is the first half of
+                    # that (the allocation half is the `reached` filter after phase 2).
+                    queried[slot] = (int(local_hit), int(ext))
                     if ext:
                         external.append((slot, int(ext), bool(is_async)))
             except BaseException as exc:
@@ -5357,6 +5567,7 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             # too -- but an older wheel's would not, and an empty tuple is the right
             # reading of "this step parked nothing".
             parked_external = decisions.get("parked_external", ())
+            probe_stale = decisions.get("probe_stale", ())
         if resident and not connector_live:
             try:
                 # The worker speculated with an EMPTY waiting slice (spec.rs), and
@@ -5547,16 +5758,6 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     self.connector.update_state_after_alloc(
                         request, kv.get_blocks_with_meta(request.request_id), ext
                     )
-                    # scheduler.py:936-944. `local` is what the crate's local hit was:
-                    # phase 2 reported `num_computed = local + external`.
-                    local = num_computed - ext
-                    queries = request.num_tokens - local
-                    if self.connector_prefix_cache_stats is not None and queries != 0:
-                        self.connector_prefix_cache_stats.record(
-                            num_tokens=queries,
-                            num_hits=ext,
-                            preempted=request.num_preemptions > 0,
-                        )
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     # Not read anywhere until the transfer finishes (scheduler.py:952-962);
                     # `_update_waiting_for_remote_kv` caches exactly this many tokens then.
@@ -5581,6 +5782,58 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         # on `num_external_tokens == 0` (offloading/scheduler.py:698). For the one connector
         # `offloading_connector_supported` allow-lists, the call is a no-op -- so it is not
         # made, and the allow-list is what keeps that true.
+
+        # C3: the candidates phase 2 consumed from the queue without deciding anything for
+        # them, because their frozen local hit no longer held and the connector had already
+        # been told the stale number (`Decisions::probe_stale`). They go where the
+        # connector's own "ask me again later" goes -- and for the same reason: the next
+        # `get_num_new_matched_tokens` rebuilds the request's per-group block ids and
+        # re-runs the lookup from scratch, so there is nothing to unwind. Applied HERE,
+        # before the queue rebuild below, exactly like the parked loads.
+        #
+        # Its status stays WAITING, so the NEXT step bails to stock `schedule()`
+        # (`bail_reason`'s skipped_waiting arm refuses any parked status but
+        # WAITING_FOR_REMOTE_KVS) and stock re-queries and admits it. That is already how
+        # this wrapper handles the connector's own "ask me again later" a few lines above --
+        # one stock step, then the Rust loop resumes -- and it is why M1 matters: that stock
+        # step calls `get_blocks` and hands the result to the connector.
+        for slot in probe_stale:
+            request = by_slot[slot]
+            step_skipped.append(request)
+            if not getattr(self, "_vtl_probe_stale_logged", False):
+                self._vtl_probe_stale_logged = True
+                log.warning(
+                    "rust_sched: a connector candidate's frozen cache hit went stale "
+                    "inside the step (an earlier admission evicted one of its hit "
+                    "blocks); it is re-queried next step. Logged once per boot."
+                )
+
+        # M2: stock records a connector prefix-cache query for EVERY candidate the connector
+        # answered for and whose allocation then succeeded -- misses included
+        # (scheduler.py:936-944, inside the `new_blocks is not None` path). "Allocation
+        # succeeded" is exactly "phase 2 reached it and decided something": an admission or
+        # a parked load. Everything else -- a candidate the loop never got to, one that did
+        # not fit, one whose probe went stale -- is not recorded by stock either, because
+        # stock `break`s out of the loop before the record.
+        if connector_live and queried and self.connector_prefix_cache_stats is not None:
+            # `sched_admitted` is a list on every connector step (the decisions arena has
+            # no slot for this path's payload and refuses it), but materialise it anyway:
+            # if it were ever the arena's one-shot `zip`, reading it here would silently
+            # empty it before the admission loop below.
+            sched_admitted = list(sched_admitted)
+            reached = {slot for slot, _, _ in parked_external}
+            reached.update(slot for slot, _, _ in sched_admitted)
+            for slot, (local, ext) in queried.items():
+                if slot not in reached:
+                    continue
+                request = by_slot[slot]
+                queries = request.num_tokens - local
+                if queries != 0:
+                    self.connector_prefix_cache_stats.record(
+                        num_tokens=queries,
+                        num_hits=ext,
+                        preempted=request.num_preemptions > 0,
+                    )
 
         # Rebuild the waiting queue from the Rust core's view. This is NOT cosmetic: the
         # SJF reorder happens inside the core, so popping the Python deque's front would
@@ -6066,20 +6319,74 @@ def apply() -> None:
     log.info("rust_sched: installed AUTHORITY manager (VTL_RUST_SCHED=1)")
 
     if m["authority"]:
-        # Newer vLLM defaults scheduler_reserve_full_isl=True; its stock schedule()
-        # then calls allocate_slots(full_sequence_must_fit=True), which the authority
-        # manager refuses (the admission-fit gate needs the python coordinator the Rust
-        # pool replaced). The Rust port models the pre-feature admission (first-chunk
-        # check), so force the flag off on the live scheduler: identical semantics to
-        # what the port was verified against, and schedule_supported() then lets the
-        # full Rust loop engage.
+        # ONE wrapper on `Scheduler.__init__`, two jobs, both of which have to happen
+        # around the SAME call:
+        #
+        #  * C1 -- run the init inside `set_current_vllm_config(vllm_config)` so the
+        #    KVCacheManager this call constructs can read the config it is being built
+        #    from. See the comment in `init`.
+        #  * the ISL flag -- newer vLLM defaults scheduler_reserve_full_isl=True; its
+        #    stock schedule() then calls allocate_slots(full_sequence_must_fit=True),
+        #    which the authority manager refuses (the admission-fit gate needs the python
+        #    coordinator the Rust pool replaced). The Rust port models the pre-feature
+        #    admission (first-chunk check), so force the flag off on the live scheduler:
+        #    identical semantics to what the port was verified against, and
+        #    schedule_supported() then lets the full Rust loop engage.
         from vllm.v1.core.sched.scheduler import Scheduler
 
         if not getattr(Scheduler.__init__, "__vtl_rust_isl__", False):
             orig_init = Scheduler.__init__
 
             def init(self, *args, **kwargs):
-                orig_init(self, *args, **kwargs)
+                # C1: RUN THE WHOLE INIT UNDER ITS OWN CONFIG. `EngineCore` builds the
+                # Scheduler outside any `set_current_vllm_config` context, and the
+                # KVCacheManager is constructed INSIDE this call -- so every config-based
+                # probe it makes (`connector_live_from_config`, `authority_stand_down`, the
+                # resolver read in `connector_hash_granularity_blocked`) was reading an
+                # ambient config that did not exist, and answering "unknown".
+                #
+                # WHAT THAT COST, on the shipped compose line: `_vtl_connector_cfg` resolved
+                # False, the crate was built connector=false, the hash interlock was skipped
+                # -- and then the FIRST schedule() saw `connector_live=True` off the live
+                # `scheduler.connector` object and raised the cross-check RuntimeError,
+                # killing the boot. The cross-check was right; the input was missing.
+                #
+                # The config is the one this Scheduler is about to build everything else
+                # from, so this is not "a" config, it is THE config -- entering the context
+                # makes the object-based and config-based answers the same answer by
+                # construction, which is exactly what the cross-check asserts.
+                cfg = _scheduler_init_vllm_config(args, kwargs)
+                with contextlib.ExitStack() as stack:
+                    entered = False
+                    if cfg is not None:
+                        try:
+                            # Defensive import: `set_current_vllm_config(cfg)` is a plain
+                            # contextmanager on v0.25.0 (config/vllm.py:2233), whose other
+                            # two arguments (`check_compile`, `prefix`) default to the inert
+                            # values -- with `check_compile=False` its exit path does
+                            # nothing but restore the previous config.
+                            from vllm.config import set_current_vllm_config
+
+                            stack.enter_context(set_current_vllm_config(cfg))
+                            entered = True
+                        except BaseException as exc:
+                            reraise_fatal(exc)
+                            log.warning(
+                                "rust_sched: could not enter set_current_vllm_config for "
+                                "Scheduler.__init__ (%r); the KV manager's config probes "
+                                "will answer 'unknown' and the first schedule() backstop "
+                                "is what decides",
+                                exc,
+                            )
+                    if not entered:
+                        log.warning(
+                            "rust_sched: no readable vllm_config in Scheduler.__init__ "
+                            "(args=%d, vllm_config kwarg=%s); the connector probes run "
+                            "WITHOUT an ambient config",
+                            len(args),
+                            "vllm_config" in kwargs,
+                        )
+                    orig_init(self, *args, **kwargs)
                 if getattr(self, "scheduler_reserve_full_isl", False) and hasattr(
                     self.kv_cache_manager, "_rust"
                 ):
@@ -6435,6 +6742,29 @@ def _self_check() -> None:
     g1 = mb.blocks[1]
     assert len(g1) == 1 and g1[0].block_hash is not None and not g1[0].is_null
     assert _boundary(g1, 1) == 1
+
+    # ---- M1: `get_blocks` answers with RECORDS whenever a connector is configured -----
+    # The bug this fixes is invisible in the Rust loop: it is stock `schedule()`, on a
+    # BAILED step, handing `get_blocks(...)`'s result to `update_state_after_alloc`
+    # (scheduler.py:929-934). Raw ints there are an AttributeError inside the connector.
+    class FakeRust:
+        num_groups = 2
+
+        def block_meta(self, slot, g):
+            return (3, 0) if g == 0 else (1, 0)
+
+    fake_rust = FakeRust()
+    assert block_view_meta(fake_rust, 5, False) is None, "no connector -> raw ids"
+    meta = block_view_meta(fake_rust, 5, True)
+    assert meta == ((3, 0), (1, 0))
+    # ...and the shape a connector actually indexes into, end to end.
+    live = RustBlocks(([NULL, NULL, 7, 9], [4]), meta)
+    assert live.blocks[0][0].block_id == NULL
+    assert live.blocks[0][3].block_hash is None and not live.blocks[0][3].is_null
+    # The id-only consumers on the same object are UNCHANGED, which is what makes this
+    # safe to do unconditionally: `_update_req_states` and the routed-experts map both
+    # read `get_block_ids()`, which never touches the records.
+    assert live.get_block_ids() == ([NULL, NULL, 7, 9], [4])
     log.setLevel(logging.NOTSET)
 
     # ---- C1a: the N-step burst gate + the num_computed_tokens arithmetic -------------
@@ -7604,6 +7934,28 @@ def _self_check() -> None:
     assert connector_live_from_config(offload_cfg()) is True
     assert connector_live_from_config(offload_cfg(kv_role="kv_consumer")) is False
     assert connector_live_from_config(fake_cfg()) is False
+    # ...and with NO ambient config it still refuses, which is the whole reason C1 exists:
+    # this answer is not a safe default, it is a WRONG one that the first schedule()'s
+    # cross-check then turns into a dead boot. `apply()` wraps `Scheduler.__init__` in
+    # `set_current_vllm_config` so this branch is not the one the engine takes.
+    assert ambient_vllm_config() is None, "no vLLM here, so nothing can be ambient"
+    assert connector_live_from_config() is False
+
+    # ---- C1: which argument of `Scheduler.__init__` the context is entered with -------
+    # scheduler.py:69 -- `(self, vllm_config, kv_cache_config, structured_output_manager,
+    # block_size, ...)`. Both call shapes, and the two refusals that keep a build whose
+    # signature moved from installing a wrong object as the ambient config.
+    class FakeVllmConfig:
+        cache_config = None
+        kv_transfer_config = None
+
+    vc = FakeVllmConfig()
+    assert _scheduler_init_vllm_config((vc, object(), object(), 16), {}) is vc
+    assert _scheduler_init_vllm_config((), {"vllm_config": vc}) is vc
+    assert _scheduler_init_vllm_config((object(), vc), {}) is None, (
+        "a first positional that is not a config must answer None, not be entered"
+    )
+    assert _scheduler_init_vllm_config((), {}) is None
 
     # `unsupported_features` follows the same split: the ported connector is not a
     # blocking feature, an unported one still is.
@@ -7652,20 +8004,32 @@ def _self_check() -> None:
     assert bail_reason(BailSched()) is None
     assert bail_reason(BailSched(connector_live=True)) is None
 
-    # ---- Stage S: spec_blocked is strictly stronger than bail_reason ----------------
+    # ---- Stage S / C2: spec_blocked is strictly stronger than bail_reason -----------
     # A step the loop can DECIDE is not automatically a step whose successor can be
-    # precomputed: a parked load and a pending promotion both mutate state the worker
-    # cannot see, and neither is a bail.
-    sb = BailSched([parked], connector_live=True)
-    assert bail_reason(sb) is None and spec_blocked(sb) == "an async KV load is parked"
+    # precomputed. C2 made the FIRST clause a whole-boot one: a live connector splits the
+    # step in two around a Python call, and the crate lock is free in between, so there is
+    # no such thing as a safe kick under one -- including on the quiet decode step, which is
+    # exactly the step the kick site would otherwise pick.
+    for skipped in ((), (parked,), (parked, parked), (grammar,)):
+        sb = BailSched(skipped, connector_live=True)
+        assert spec_blocked(sb) == SPEC_CONNECTOR_WHY, (skipped, spec_blocked(sb))
     sb = BailSched(connector_live=True)
     sb.finished_recving_kv_req_ids = {"r1"}
+    assert spec_blocked(sb) == SPEC_CONNECTOR_WHY
+    # ...and the RUNGS cell says the same thing, so a connector boot cannot report a spec
+    # rung that never fires (the cell's short form, the answer's long one).
+    assert rung(False, "connector") == "OFF(connector)"
+    # The two connector-only clauses BELOW that first one are unchanged and still reachable
+    # on their own terms -- kept as defence in depth for a boot that ever relaxes the clause
+    # above. A pending promotion is not a bail, and it still blocks a kick.
+    sb = BailSched()
+    sb.finished_recving_kv_req_ids = {"r1"}
     assert bail_reason(sb) is None and spec_blocked(sb) == "a promotion is pending"
-    # ...a bail is still a bail, and reported as itself.
-    sb = BailSched([grammar], connector_live=True)
+    # A bail is still a bail, and reported as itself.
+    sb = BailSched([grammar])
     assert spec_blocked(sb) == bail_reason(sb) and spec_blocked(sb) is not None
-    # ...and a quiet step blocks neither.
-    assert spec_blocked(BailSched(connector_live=True)) is None
+    # ...and a quiet step with no connector blocks neither.
+    assert spec_blocked(BailSched()) is None
 
     # ---- Stage S: candidate assembly is FCFS across both queues ---------------------
     class Cand:
