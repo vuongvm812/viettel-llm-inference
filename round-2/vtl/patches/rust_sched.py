@@ -1348,20 +1348,96 @@ def burst_steps(computed_before: int, n: int, block_size: int, lim: int,
     ))
 
 
+def burst_invariant_broken(request) -> bool:
+    """Is ``request`` outside the one shape a burst may extend?
+
+    THE SHAPE. Post-``_update_after_schedule``, a steady-decode request under async
+    scheduling satisfies ``num_computed_tokens == num_tokens + num_output_placeholders -
+    1`` with ``is_prefill_chunk`` false: the step advanced C by the one token it
+    scheduled, and ``AsyncScheduler`` bumped P for the token that step will produce. That
+    equality is not cosmetic -- ``sched.rs``'s running loop derives the next step's work
+    as ``num_tokens_with_spec + num_output_placeholders - num_computed_tokens`` in usize,
+    so ``C == T + P - 1`` IS "exactly one token, no wrap". At ``C > T + P`` the
+    subtraction wraps to an enormous count, the request is skipped for the rest of its
+    life (``continue`` without leaving ``running``), and the engine schedules empty steps
+    forever.
+
+    Anything else must not burst -- including the one legitimate state that used to reach
+    ``burst_commit``'s conditional arm: a budget-starved mid-prefill chunk that happened
+    to be scheduled exactly 1 token. It passes the crate's ``burst_eligible`` (one token,
+    nothing admitted, nothing preempted) and every ``_burst_gate`` clause, and bursting it
+    would compute tokens the prefill split deliberately deferred.
+    """
+    return bool(getattr(request, "is_prefill_chunk", False)) or (
+        request.num_computed_tokens
+        != request.num_tokens + request.num_output_placeholders - 1
+    )
+
+
+def burst_invariant_alarm(kv, request) -> None:
+    """Report a request that reached a burst gate off-shape, ONCE per boot, and stop
+    trusting the resident table.
+
+    Once, because the condition is per-step and per-request: a wedged decode batch would
+    otherwise write one line per request per step for as long as the engine runs, which
+    buries the first occurrence -- the only one that names the step where the skew was
+    born. The counters go in the line because the three of them together say WHICH skew
+    it is (C ahead of T + P is the wrap that hangs the crate loop; C behind it is a
+    prefill chunk or a lost placeholder bump).
+
+    The resync is not optional: Python's counters and the resident entry are the same
+    numbers marshalled twice, so a skew Python can see is a skew the table may already
+    have absorbed, and the table has no other way to find out.
+    """
+    if not burst_invariant_alarm.reported:
+        burst_invariant_alarm.reported = True
+        log.error(
+            "rust_sched: burst refused -- async counter invariant broken for %s: "
+            "num_computed_tokens=%d num_tokens=%d num_output_placeholders=%d "
+            "(expected num_computed_tokens == num_tokens + num_output_placeholders - 1)",
+            getattr(request, "request_id", "?"),
+            request.num_computed_tokens,
+            request.num_tokens,
+            request.num_output_placeholders,
+        )
+    tbl = getattr(kv, "_vtl_table", None)
+    if tbl is not None:
+        tbl.resync("burst refused: async counter invariant broken")
+
+
+burst_invariant_alarm.reported = False
+
+# The `why` a broken invariant hands to `skip_note`; distinct from every `_burst_gate`
+# reason so the first-reason-only log names this one on its own line.
+BURST_SKEW_WHY = "async counter invariant broken (C != T + P - 1)"
+
+
 def burst_commit(request, delta: int) -> None:
     """Advance one request by the ``delta`` extra tokens the burst will compute.
 
-    Byte-for-byte ``Scheduler._update_after_schedule`` + ``AsyncScheduler``'s placeholder
-    bump, applied a second time -- INCLUDING the ordering, which is load-bearing:
-    ``is_prefill_chunk`` is computed from the placeholder count BEFORE the bump. The Rust
-    resident table applies the same thing via ``Manager::table_burst`` -> ``sched::advance``.
+    ``Scheduler._update_after_schedule`` + ``AsyncScheduler``'s placeholder bump, applied
+    a second time -- INCLUDING the ordering, which is load-bearing: ``is_prefill_chunk``
+    is computed from the placeholder count BEFORE the bump. The Rust resident table
+    applies the same thing via ``Manager::table_burst`` -> ``sched::burst_advance``.
+
+    UNCONDITIONAL, where the ``_update_after_schedule`` it ports bumps the placeholders
+    only for a request that is no longer a prefill chunk. Every caller is gated by
+    ``burst_invariant_broken``, and on an entry that passes that gate the conditional
+    could never fire anyway: ``C == T + P - 1`` and ``delta >= 1`` give ``C + delta >=
+    T + P``, i.e. the recomputed flag is false. On an entry that does NOT pass it the
+    conditional was worse than dead -- it advanced ``num_computed_tokens`` while leaving
+    ``num_output_placeholders`` behind, so each step deepened the skew by ``delta`` until
+    the crate's usize ``T + P - C`` wrapped and the request was skipped forever. The gate
+    refuses those outright, which is what lets this be a straight-line write.
+
+    Straight-line also makes ``burst_uncommit(delta)`` an exact inverse on both counters,
+    which the rollback in ``burst_commit_all`` relies on.
     """
     request.num_computed_tokens += delta
     request.is_prefill_chunk = request.num_computed_tokens < (
         request.num_tokens + request.num_output_placeholders
     )
-    if not request.is_prefill_chunk:
-        request.num_output_placeholders += delta
+    request.num_output_placeholders += delta
 
 
 def burst_uncommit(request, short: int) -> None:
@@ -1382,6 +1458,47 @@ def burst_uncommit(request, short: int) -> None:
     request.is_prefill_chunk = request.num_computed_tokens < (
         request.num_tokens + request.num_output_placeholders
     )
+
+
+def burst_commit_all(by_slot, slots, delta, rust) -> None:
+    """Commit ``delta`` extra tokens to every request in the batch AND to the resident
+    table, or leave both exactly as they were found.
+
+    THE WINDOW THIS CLOSES. A committed burst is announced to the update side by
+    ``so.vtl_burst_n``, and the announcement is the only thing that ever gives the tokens
+    back: ``reconcile_burst`` / ``r9_apply`` compute ``short = vtl_burst_n - kept``, so a
+    step that mutated requests without reaching its stamp leaves ``vtl_burst_n`` at 1,
+    ``short <= 0`` for every kept count, and an unreconciled ``+delta`` in
+    ``num_computed_tokens`` for the rest of the request's life -- KV positions the model
+    never computed, claimed as computed and eventually fingerprinted into the prefix
+    cache. Every caller therefore needs "all or nothing", not "as far as it got".
+
+    Stamping ``so.vtl_burst_n`` FIRST and letting the update side unwind is not the same
+    trade: the update side reconciles the whole batch, so a failure partway through this
+    loop would hand back ``delta`` from requests that were never advanced -- the identical
+    skew, mirrored. The stamp belongs after this function returns, where it is a single
+    infallible attribute set.
+
+    The rollback is exact because ``burst_commit`` is unconditional: it moves both
+    counters by ``delta`` on every entry, so ``burst_uncommit(delta)`` restores both. Only
+    ``is_prefill_chunk`` needs saying explicitly -- ``burst_uncommit`` recomputes it from
+    the post-decrement counters (matching ``table_burst``'s negative arm, which the
+    reconcile path needs), and on a steady-decode entry that reads ``C < T + P``, i.e.
+    true. ``False`` is the pre-commit value by the gate's own precondition: a request with
+    ``is_prefill_chunk`` set never gets here.
+    """
+    done = 0
+    try:
+        for slot in slots:
+            burst_commit(by_slot[slot], delta)
+            done += 1
+        rust.table_burst(slots, delta)
+    except BaseException:
+        for slot in slots[:done]:
+            request = by_slot[slot]
+            burst_uncommit(request, delta)
+            request.is_prefill_chunk = False
+        raise
 
 
 def pack_req(slot: int, request) -> tuple:
@@ -2640,7 +2757,20 @@ def _install_update_from_output(scheduler_cls, m: dict):
                 # Resolved here, not before the loop: `short > 0` is the rare arm, so the
                 # two attribute lookups stay off the every-step path.
                 burst_uncommit(request, short)
-                self.kv_cache_manager._rust.table_burst([slot], -short)
+                kv = self.kv_cache_manager
+                # SLOT TENANCY, the same check `reconcile_burst` makes by reading the
+                # mirror instead of remembering: `slot` was recorded when the burst was
+                # stashed, and a request that finished and freed between then and here has
+                # handed the slot to whatever the next admission interned. Applying this
+                # request's give-back to that tenant would corrupt a live entry, so the
+                # table is dirtied instead -- the Python object is already correct, which
+                # is all a resync needs.
+                if kv._mirror._slots.get(request.request_id) == slot:
+                    kv._rust.table_burst([slot], -short)
+                else:
+                    tbl = getattr(kv, "_vtl_table", None)
+                    if tbl is not None:
+                        tbl.resync("burst reconcile: the slot changed tenant")
             if status == 0:
                 continue
             status_before = request.status
@@ -3016,7 +3146,16 @@ def _install_preempt_hook(scheduler_cls) -> None:
         mirror = getattr(self.kv_cache_manager, "_mirror", None)
         if mirror is not None:
             mirror._batch_cache = None
-        return wrapped(self, request, *args, **kwargs)
+        out = wrapped(self, request, *args, **kwargs)
+        # A preempted request keeps no placeholders: they count tokens the step it was
+        # evicted from will never produce, and a stale count survives into the waiting
+        # queue and back out through `pack_req`, where it wraps the crate's usize
+        # `num_tokens_with_spec + num_output_placeholders - num_computed_tokens`. Forced
+        # here rather than assumed: this hook is also the path for the bail routes and for
+        # `reset_prefix_cache`'s forced preemption, and it is idempotent where stock
+        # already zeroes it.
+        request.num_output_placeholders = 0
+        return out
 
     scheduler_cls._preempt_request = mark_patched(
         _preempt_request, wrapped, patch="rust_sched_tokstore"
@@ -3137,12 +3276,15 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         in-graph N=1 sampling needs neither (one token crosses no block boundary and delays
         no admission), so a step the burst refuses can still commit the cheaper rung. The
         shared predicates are ``burst_blocked_batch`` / ``_burst_gate`` (the latter interns
-        ``burst_sampler_blocked``'s request-immutable clauses per slot; see its docstring).
+        ``burst_sampler_blocked``'s request-immutable clauses per slot; see its docstring),
+        plus ``burst_invariant_broken``, which is the shape both rungs assume.
 
-        Silent no-op on every ineligible step. On ANY exception the burst is disabled for the
-        boot and the step is a plain one-token step: nothing has been mutated at that point
-        except, at worst, a partial request loop, which is why the request mutation happens
-        in a SECOND pass after every request has been checked.
+        Silent no-op on every ineligible step. On ANY exception the burst is disabled for
+        the boot and the step is a plain one-token step, and nothing has been mutated at
+        that point: the request/table mutation is the all-or-nothing window inside
+        ``burst_commit_all``, whose own handler rolls the batch back, retracts the runner
+        stash and dirties the table before re-raising into here. What reaches this handler
+        is therefore always a step that committed nothing.
         """
         n = nstep_mod.burst_factor(so.num_scheduled_tokens)
         one = nstep_mod.sample_in_graph_ready(so.num_scheduled_tokens)
@@ -3168,6 +3310,14 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     block_size = self.cache_config.block_size
                     for slot in slots:
                         request = by_slot[slot]
+                        # Ahead of `_burst_gate`, which is pure and stays that way: this
+                        # clause is the one that must also be LOUD, because a request
+                        # outside the steady-decode shape is a bug upstream, not a step
+                        # this batch happens not to suit.
+                        if burst_invariant_broken(request):
+                            why = BURST_SKEW_WHY
+                            burst_invariant_alarm(kv, request)
+                            break
                         why = _burst_gate(
                             mirror, slot, request, request.num_computed_tokens - 1, n,
                             self.max_model_len, block_size,
@@ -3180,17 +3330,46 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     # runner at all) leaves it at one burst, which the worker replays
                     # itself exactly as before; a granted `steps > 1` that the worker then
                     # cannot take is reconciled by `burst_uncommit`, same as a short burst.
+                    #
+                    # FIRST, because it is the one step of the commit that can raise while
+                    # nothing has been mutated yet. `granted` is the promise itself (0 =
+                    # none): a rollback has to retract it, and `steps` no longer says
+                    # whether there is one.
                     stash = getattr(self, "_vtl_runner_stash", None)
-                    steps = 1
+                    granted = 0
                     if stash is not None:
-                        steps = stash(
+                        granted = stash(
                             kv, so, by_slot, slots, n,
                             runner_steps(self, mirror, by_slot, slots, n),
-                        ) or 1
+                        )
+                    steps = granted or 1
                     delta = n * steps - 1
-                    for slot in slots:
-                        burst_commit(by_slot[slot], delta)
-                    kv._rust.table_burst(slots, delta)
+                    try:
+                        burst_commit_all(by_slot, slots, delta, kv._rust)
+                    except BaseException:
+                        # The requests and the table are back where they were, so the two
+                        # things OUTSIDE that window are what is left to undo.
+                        #
+                        # The stash promises that this scheduled step will be launched,
+                        # packed and applied by `r9_apply` against a burst budget that no
+                        # longer exists. It is popped by seq: `runner_seq` names THIS
+                        # SchedulerOutput, and a bare `take_step()` would just as happily
+                        # destroy the launch a later schedule stashed.
+                        if granted and runner_mod is not None:
+                            runner_mod.STATE.take_step_for(getattr(so, "vtl_runner_seq", 0))
+                        # A `table_burst` that half-applied across the batch before the
+                        # crate raised cannot be undone in place -- the negative arm
+                        # saturates, so replaying it on the slots that never took the
+                        # positive delta would invent a second skew. Dirty is the only
+                        # answer that is right for every partial state.
+                        tbl = getattr(kv, "_vtl_table", None)
+                        if tbl is not None:
+                            tbl.resync("burst commit rolled back")
+                        raise
+                    # THE STAMP, and nothing that can raise between it and the mutation
+                    # above: an attribute set on a plain object is infallible, and it is
+                    # what makes the commit visible to `reconcile_burst` / `r9_apply`.
+                    so.vtl_burst_n = n * steps
                     self._vtl_burst_commits = c = getattr(self, "_vtl_burst_commits", 0) + 1
                     if c == 1 or not c & 0x1FFF:
                         log.info(
@@ -3198,13 +3377,19 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                             "(n=%d, steps=%d, batch=%d)",
                             c, n, steps, len(slots),
                         )
-                    so.vtl_burst_n = n * steps
                     return
                 skip_note(self, why)
             if one:
                 why = None
                 for slot in slots:
                     request = by_slot[slot]
+                    # In-graph sampling mutates no counters, but it still samples N=1 for a
+                    # request whose counters say the batch is not the steady decode the
+                    # path assumes; the shape gate is the same one.
+                    if burst_invariant_broken(request):
+                        why = BURST_SKEW_WHY
+                        burst_invariant_alarm(kv, request)
+                        break
                     why = _burst_gate(
                         mirror, slot, request, request.num_computed_tokens - 1, 1,
                         self.max_model_len,
@@ -3566,6 +3751,18 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             self._inflight_prefills.discard(request)
             request.status = RequestStatus.PREEMPTED
             request.num_computed_tokens = 0
+            # The placeholders belong to tokens THIS step will no longer produce for this
+            # request, and nothing else clears them: they ride the request into the
+            # waiting queue, get re-marshalled by `pack_req` at every later step, and on
+            # re-admission make the crate's running loop compute `num_tokens_with_spec +
+            # num_output_placeholders - num_computed_tokens` against a placeholder count
+            # for a step that never happened. Zeroed here, `C == 0` and `P == 0` put a
+            # resumed request back on the plain prefill arithmetic.
+            request.num_output_placeholders = 0
+            # ...and with C back at 0, a request with any prompt at all IS a prefill chunk
+            # again. Computed rather than hardcoded so the empty-prompt degenerate case
+            # cannot be wrong.
+            request.is_prefill_chunk = request.num_computed_tokens < request.num_tokens
             request.num_preemptions += 1
             if self.log_stats:
                 request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
@@ -4381,6 +4578,95 @@ def _self_check() -> None:
     r = REQ(num_computed_tokens=1, num_output_placeholders=1)
     burst_uncommit(r, 1000)
     assert (r.num_computed_tokens, r.num_output_placeholders) == (0, 0)
+
+    # THE SHAPE GATE. `burst_invariant_broken` admits exactly the post-`_update_after_
+    # schedule` steady decode -- C == T + P - 1, not a prefill chunk -- because that
+    # equality is what makes the crate's usize `T + P - C` come out at 1 instead of
+    # wrapping and skipping the request for the rest of its life.
+    healthy = dict(num_tokens=100, num_computed_tokens=101, num_output_placeholders=2,
+                   is_prefill_chunk=False)
+    assert burst_invariant_broken(REQ(**healthy)) is False
+    assert burst_invariant_broken(REQ(**{**healthy, "is_prefill_chunk": True})) is True
+    assert burst_invariant_broken(REQ(**{**healthy, "num_computed_tokens": 102})) is True, \
+        "C above T + P - 1 is the skew that wraps the crate's subtraction"
+    assert burst_invariant_broken(REQ(**{**healthy, "num_computed_tokens": 100})) is True, \
+        "C below it is a prefill chunk or a lost placeholder bump"
+    # A request that never grew the attribute reads as not-a-chunk, same as vLLM's default.
+    assert "is_prefill_chunk" not in vars(REQ()) and burst_invariant_broken(REQ()) is False
+
+    # The commit is unconditional, which is what makes `burst_uncommit` its inverse on
+    # both counters -- on a healthy entry and on a skewed one alike.
+    r = REQ(**healthy)
+    burst_commit(r, 3)
+    burst_uncommit(r, 3)
+    assert (r.num_tokens, r.num_computed_tokens, r.num_output_placeholders) == (100, 101, 2)
+    # `is_prefill_chunk` is the one field the pair does NOT round-trip: `burst_uncommit`
+    # recomputes it from the POST-decrement counters, which is the value the reconcile
+    # path wants and the value `table_burst`'s negative arm writes into the resident
+    # entry, and on a steady decode `C < T + P` is true. The rollback in
+    # `burst_commit_all` restores it from the gate's precondition instead (below).
+    assert r.is_prefill_chunk is True
+    # A skewed entry: the placeholders move with C rather than being stranded by the old
+    # conditional, so the give-back cannot deepen the skew it was handed.
+    r = REQ(num_tokens=100, num_computed_tokens=95, num_output_placeholders=2)
+    assert burst_invariant_broken(r) is True
+    burst_commit(r, 3)
+    assert (r.num_computed_tokens, r.num_output_placeholders) == (98, 5), vars(r)
+    assert r.is_prefill_chunk is True, "98 < 100 + 2, computed before the bump"
+    burst_uncommit(r, 3)
+    assert (r.num_computed_tokens, r.num_output_placeholders) == (95, 2)
+
+    # ---- B1: `burst_commit_all` is all-or-nothing over the batch ---------------------
+    class RecordingRust:
+        def __init__(self):
+            self.calls = []
+
+        def table_burst(self, slots, delta):
+            self.calls.append((tuple(slots), delta))
+
+    class BoomRust:
+        def table_burst(self, slots, delta):
+            raise RuntimeError("crate panicked")
+
+    bslots = [3, 7, 9]
+    by_slot = {s: REQ(**healthy) for s in bslots}
+    rec = RecordingRust()
+    burst_commit_all(by_slot, bslots, 3, rec)
+    assert rec.calls == [((3, 7, 9), 3)], rec.calls
+    for s in bslots:
+        r = by_slot[s]
+        assert (r.num_computed_tokens, r.num_output_placeholders) == (104, 5), s
+        assert r.is_prefill_chunk is False, s
+
+    # The crate raising AFTER every request was advanced: all three go back, bit for bit,
+    # `is_prefill_chunk` included -- an unrolled `+delta` is never reconciled, because the
+    # step never reaches its `so.vtl_burst_n` stamp and the update side then computes
+    # `short = 1 - kept <= 0` for every kept count.
+    by_slot = {s: REQ(**healthy) for s in bslots}
+    before = {s: dict(vars(by_slot[s])) for s in bslots}
+    try:
+        burst_commit_all(by_slot, bslots, 3, BoomRust())
+    except RuntimeError as exc:
+        assert "crate panicked" in str(exc)
+    else:
+        raise AssertionError("the crate's exception must propagate to the caller")
+    for s in bslots:
+        assert vars(by_slot[s]) == before[s], (s, vars(by_slot[s]), before[s])
+
+    # ...and a failure PARTWAY through the loop rolls back exactly the slots it reached.
+    # Slot 9 is missing, so the third `by_slot[slot]` raises KeyError with two committed.
+    by_slot = {s: REQ(**healthy) for s in (3, 7)}
+    before = {s: dict(vars(by_slot[s])) for s in (3, 7)}
+    partial = RecordingRust()
+    try:
+        burst_commit_all(by_slot, bslots, 3, partial)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("a missing slot must not be swallowed")
+    for s in (3, 7):
+        assert vars(by_slot[s]) == before[s], s
+    assert partial.calls == [], "the table is never told about a batch that rolled back"
 
     # ---- C1b: commit_burst's per-slot eligibility intern (`_burst_gate`) --------------
     class FakeRustForget:

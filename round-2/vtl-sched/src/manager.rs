@@ -817,7 +817,7 @@ impl Manager {
     /// The Rust half of the post-schedule commit ([`crate::sched::ScheduleCore::commit`]'s
     /// `advance`) already moved each slot by the ONE token `num_scheduled_tokens` says was
     /// scheduled. A committed burst executes `delta` more in the same step, so both
-    /// counters move again and `is_prefill_chunk` is recomputed exactly as `advance` does.
+    /// counters move again and `is_prefill_chunk` is recomputed in the same order.
     ///
     /// `delta` is negative on the reconcile path -- a burst request that stopped (or whose
     /// runner produced fewer tokens than committed) gives the surplus back. Subtraction
@@ -830,9 +830,16 @@ impl Manager {
         for &slot in slots {
             self.table_with(slot, |e| {
                 if delta >= 0 {
-                    // Literally one more `_update_after_schedule` of `delta` tokens --
-                    // same function, so the placeholder-bump ordering cannot drift.
-                    crate::sched::advance(e, delta as usize, delta as usize);
+                    // The twin of Python's `burst_commit`, not of the generic
+                    // `_update_after_schedule`: a burst is only ever committed for a
+                    // request in the steady-decode shape, where the placeholder bump is
+                    // unconditional. `advance`'s condition belongs to the prefill chunks
+                    // it also serves, and taking it here would advance
+                    // `num_computed_tokens` past `num_output_placeholders` on exactly the
+                    // entries that are already skewed. The two arms are separate functions
+                    // and stay in step by contract: the positive arm moves both counters
+                    // by `delta`, the negative one moves both back.
+                    crate::sched::burst_advance(e, delta as usize);
                 } else {
                     let d = delta.unsigned_abs() as usize;
                     e.num_computed_tokens = e.num_computed_tokens.saturating_sub(d);
@@ -1447,6 +1454,39 @@ mod tests {
 
         // An unknown slot is skipped, not an error.
         m.table_burst(&[a + 9], 3);
+    }
+
+    #[test]
+    fn table_burst_round_trips_a_skewed_entry_on_both_counters() {
+        let mut m = Manager::new(hybrid_cfg(64)).unwrap();
+        let a = m.intern("a");
+        // A skew Python's burst gate refuses: num_computed sits BELOW num_tokens +
+        // placeholders, so this looks like a prefill chunk to the recompute. Nothing
+        // should ever burst it -- but if a delta does land, the give-back has to undo it
+        // exactly, or the reconcile turns a refusable skew into a permanent one.
+        let mut e = SchedEntry::default();
+        e.num_tokens = 100;
+        e.num_computed_tokens = 95;
+        e.num_output_placeholders = 2;
+        e.is_prefill_chunk = true;
+        m.table_set(a, e);
+
+        m.table_burst(&[a], 3);
+        let got = m.table_get(a).unwrap();
+        assert_eq!(got.num_computed_tokens, 98);
+        assert_eq!(
+            got.num_output_placeholders, 5,
+            "the placeholder bump is unconditional, chunk-looking entry or not"
+        );
+        assert!(got.is_prefill_chunk, "98 < 100 + 2 -- computed before the bump");
+
+        m.table_burst(&[a], -3);
+        let got = m.table_get(a).unwrap();
+        assert_eq!(
+            (got.num_computed_tokens, got.num_output_placeholders),
+            (95, 2),
+            "both counters exactly back, so a rolled-back burst adds no skew of its own"
+        );
     }
 
     #[test]

@@ -512,6 +512,18 @@ impl ScheduleCore {
             kv.table_with(slot, |e| {
                 e.status = STATUS_PREEMPTED;
                 e.num_computed_tokens = 0;
+                // The placeholders counted tokens the step this request was evicted from
+                // will not produce for it, and no later path clears them: they survive
+                // into the waiting queue and back into this table at re-admission, where
+                // the running loop's usize `num_tokens_with_spec + num_output_placeholders
+                // - num_computed_tokens` reads a promise for a step that never happened.
+                // Zeroed alongside `num_computed_tokens`, a resumed request is back on
+                // plain prefill arithmetic. Python's preempt loop does the same three
+                // writes (`rust_sched.py`, mirroring `_preempt_request`).
+                e.num_output_placeholders = 0;
+                // With C back at 0 this is true for any request with a prompt; computed
+                // rather than assumed so the degenerate empty-prompt case cannot be wrong.
+                e.is_prefill_chunk = e.num_computed_tokens < e.num_tokens;
                 e.num_preemptions += 1;
             });
         }
@@ -536,9 +548,11 @@ impl ScheduleCore {
 
 /// `_update_after_schedule`'s per-request arithmetic, both scheduler layers.
 ///
-/// `pub(crate)` so the N-step burst commit ([`crate::manager::Manager::table_burst`]) can
-/// apply the SAME function for its extra tokens instead of a second copy that could drift
-/// on the placeholder-bump ordering (`is_prefill_chunk` is computed BEFORE the bump).
+/// The generic port: it runs for real prefill chunks as well as decodes, which is why the
+/// placeholder bump keeps its condition -- a chunk that leaves `num_computed_tokens` short
+/// of `num_tokens + num_output_placeholders` produces no token this step and must not
+/// claim a placeholder for one. The burst commit has a narrower contract and its own
+/// function, [`burst_advance`].
 #[inline]
 pub(crate) fn advance(e: &mut SchedReq, num_new_tokens: usize, num_sampled_tokens_per_step: usize) {
     e.num_computed_tokens += num_new_tokens;
@@ -546,6 +560,28 @@ pub(crate) fn advance(e: &mut SchedReq, num_new_tokens: usize, num_sampled_token
     if !e.is_prefill_chunk {
         e.num_output_placeholders += num_sampled_tokens_per_step;
     }
+}
+
+/// The N-step burst's per-request commit -- the twin of `rust_sched.py`'s `burst_commit`,
+/// applied to the resident table by [`crate::manager::Manager::table_burst`].
+///
+/// Same three writes as [`advance`] in the same order (`is_prefill_chunk` is computed
+/// BEFORE the placeholder bump, and that ordering is load-bearing on both sides), with the
+/// bump made unconditional. Both twins are gated by Python's `burst_invariant_broken`,
+/// which admits only the steady-decode shape `C == T + P - 1` with `is_prefill_chunk`
+/// clear; on that shape `C + delta >= T + P` holds for every `delta >= 1`, so the
+/// condition can only ever be true for an entry the gate already refused -- and for such an
+/// entry taking it is the harm, not the safety: `C` advances while `P` does not, and the
+/// next step's `num_tokens_with_spec + num_output_placeholders - num_computed_tokens`
+/// wraps in usize and skips the request forever.
+///
+/// Unconditional is also what makes `table_burst`'s negative arm an exact inverse of its
+/// positive one on both counters, which the Python rollback depends on.
+#[inline]
+pub(crate) fn burst_advance(e: &mut SchedReq, delta: usize) {
+    e.num_computed_tokens += delta;
+    e.is_prefill_chunk = e.num_computed_tokens < e.num_tokens + e.num_output_placeholders;
+    e.num_output_placeholders += delta;
 }
 
 #[cfg(test)]

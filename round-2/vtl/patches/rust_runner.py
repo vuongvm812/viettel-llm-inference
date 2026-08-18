@@ -245,6 +245,25 @@ class _State:
         stash, self.step = self.step, None
         return stash
 
+    def take_step_for(self, seq) -> "_Stash | None":
+        """Pop the stash IFF it is the one written for scheduled step ``seq``.
+
+        A stash belongs to exactly one scheduled step -- the one whose ``SchedulerOutput``
+        carries its ``vtl_runner_seq`` -- and the only caller that knows a launch must not
+        happen is the scheduler half of that same step. By the time a stash is retracted,
+        a LATER schedule may already have written its own; popping that one blind (which
+        is what ``take_step()`` does, by design, for the launch site) would strand a step
+        that is still going to be launched.
+
+        ``seq`` of 0 is "no seq was ever stamped on this SchedulerOutput", which can name
+        no stash: seqs start at 1.
+        """
+        step = self.step
+        if seq and step is not None and step.seq == seq:
+            self.step = None
+            return step
+        return None
+
     def free_slot(self) -> "int | None":
         """The ring index no outstanding launch holds, or ``None`` when both are taken.
 
@@ -674,6 +693,15 @@ def _self_check() -> None:
     s.step = stash
     assert s.take_step() is stash
     assert s.take_step() is None and s.step is None
+
+    # `take_step_for` is the retraction: it pops only the stash written for the step that
+    # is retracting, so a stash a LATER schedule already wrote survives untouched.
+    s = _State()
+    s.step = stash                                  # stash.seq == 7
+    assert s.take_step_for(8) is None and s.step is stash, "another step's stash stays"
+    assert s.take_step_for(0) is None and s.step is stash, "0 names no scheduled step"
+    assert s.take_step_for(7) is stash and s.step is None
+    assert s.take_step_for(7) is None, "an empty stash pops nothing"
 
     # `inflight` is the ordering interlock: a launch is only legal when this step is the
     # only one not yet applied. The counter itself is scheduler-side; what has to hold
