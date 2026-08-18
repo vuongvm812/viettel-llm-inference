@@ -168,3 +168,60 @@ Ruled out for the hang:
    `VTL_SAMPLE_IN_GRAPH=0` → `VTL_NSTEP_MODE=eager`.
 3. **Fix Finding 1** (the `kick` borrow) regardless — it silently costs the
    resident-table and speculation wins on any boot where the race fires.
+
+---
+
+## Addendum (2026-08-18, follow-up investigation): confirmed mechanisms and fixes
+
+A deeper pass traced the complete burst lifecycle and landed fixes on this branch.
+The silent-wedge mechanism is confirmed: in `vtl-sched/src/sched.rs`'s running loop,
+a request that fails the scheduling guards is skipped with `continue` **without
+leaving `running`** — when every running request fails, `schedule()` returns empty
+steps forever (requests RUNNING, 0 tok/s, no exception). The guards fail when the
+async counter invariant `num_computed == num_tokens + num_output_placeholders - 1`
+breaks. The happy-path burst arithmetic is sound; these were the paths that broke
+the pairing, each now fixed:
+
+1. **`commit_burst` exception window** — requests and the resident table were
+   mutated *before* `so.vtl_burst_n` was stamped; a raise in the window left an
+   unannounced `+delta` the update side never reconciles. Now: gates and the runner
+   stash run first, the mutation is an all-or-nothing window
+   (`burst_commit_all`) with an exact rollback, and the stamp follows immediately.
+2. **`burst_commit`'s conditional placeholder bump** — on a skewed entry it
+   advanced `num_computed_tokens` without `num_output_placeholders` every step,
+   compounding. Now unconditional (Rust twin: `sched::burst_advance`), and both
+   commit arms refuse any request outside the steady-decode shape
+   (`burst_invariant_broken`) with a one-shot alarm + table resync.
+3. **Preemption left `num_output_placeholders` set** while zeroing
+   `num_computed_tokens` — the stale count re-marshalled through `pack_req` and
+   wrapped the crate's usize guard on re-admission (request skipped forever). All
+   preempt paths (Python loop, `_preempt_request` hook, `sched.rs` closure) now
+   zero it.
+4. **usize wraps** in the running loop (`C + 2 - P`, `T_spec + P - C`) — rewritten
+   in addition/checked form; a broken entry is counted
+   (`KvManager::inconsistent_skips`) and surfaced via a one-shot error + resync
+   probe on the empty-step branch instead of wedging silently.
+5. **Burst could land `C` exactly on `max_model_len`**, making the request
+   unschedulable one step before its length cap — the gate now caps at
+   `max_model_len - 1`.
+6. **Runner stash lifecycle** — `update_from_output`'s unconditional
+   `state.step = None` raced the worker's `sample(k)` and destroyed
+   `schedule(k)`'s stash (the runner rarely engaged); non-burst `sample_tokens`
+   exits leaked the stash for the boot. Stashes are now seq-owned
+   (`take_step_for` / `clear_step_upto`, seq carried via `_Burst.pending_seq`).
+7. **Multi-launch counts D2H race** — `nsampled_k`/`nrejected_k` were handed to
+   `SamplerOutput` as views of persistent buffers while the async copy was in
+   flight; a corrupted count produced `short < 0`, which the reconcile skips. Now
+   cloned, matching the existing `accum` clone rationale.
+8. **Eager arm replayed a stale `b.desc`** with no shape guard — now validated
+   (FULL, this padded batch, decode shape) with a 1-token shortfall fallback.
+9. **`ring_reuse` omitted AsyncScheduler's placeholder bump** (latent under the
+   `uni` executor, a guaranteed wedge under `mp`) — bump added.
+10. **The kick borrow race (Finding 1)** — fixed at the source: no pymethod or
+    argument takes `KvManager` exclusively any more (`driver` behind its own
+    mutex, scratch `Vec` in a `RefCell`), and `maybe_kick` treats a PyO3 borrow
+    refusal as skip-this-step instead of permanently marshalling.
+
+`stall_dump` now prints real `_Burst` fields plus the `rust_runner.STATE` line
+(the old field list named attributes that never existed), with a self-check that
+cross-checks the printed names against the live `__slots__`.
