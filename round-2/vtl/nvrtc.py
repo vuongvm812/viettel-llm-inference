@@ -28,6 +28,7 @@ server; a raised exception at model load is a dead one.
     VTL_NVRTC_SRC=/kernels   override the source dir (the dev-loop bind mount)
     VTL_NVRTC_CACHE=<dir>    override the cubin cache dir
     VTL_NVRTC_ARCH=90a       override the target arch (default: probe the device)
+    VTL_NVRTC_INCLUDE=<dir>  override the CUDA header dir passed as -I (default: probe)
 """
 
 from __future__ import annotations
@@ -84,6 +85,58 @@ def cache_key(src: str, defines: dict[str, object], arch: str, toolkit: str) -> 
 
 def cache_dir() -> Path:
     return Path(os.environ.get("VTL_NVRTC_CACHE", "").strip() or DEFAULT_CACHE)
+
+
+# The kernels #include <cuda_bf16.h>/<cuda_fp8.h>, and NVRTC searches NO directories by
+# default -- whether those resolve without -I depends on the headers bundled into the exact
+# libnvrtc build, which changed across the 12.x -> 13.x wheel generations (a driver-13.0 host
+# resolves an unpinned cuda-python to 13.x, whose NVRTC no longer resolves them:
+# "catastrophic error: could not open source file \"cuda_bf16.h\" (no directories in search
+# list)"). So find the real headers and pass them explicitly.
+def cuda_include_dir() -> Path | None:
+    """First directory holding ``cuda_bf16.h``: env override, toolkit dirs, then pip wheels."""
+    override = os.environ.get("VTL_NVRTC_INCLUDE", "").strip()
+    if override:
+        return Path(override)  # trust the operator even if the probe below would reject it
+    candidates: list[Path] = []
+    for base in (os.environ.get("CUDA_HOME"), os.environ.get("CUDA_PATH"), "/usr/local/cuda"):
+        if base and base.strip():
+            candidates.append(Path(base.strip()) / "include")
+    try:
+        import nvidia  # namespace package the pip CUDA wheels install under
+
+        for root in nvidia.__path__:
+            root = Path(root)
+            candidates.extend(sorted(root.glob("*/include")))    # nvidia/cuda_runtime/include (cu12)
+            candidates.extend(sorted(root.glob("*/*/include")))  # nvidia/cu13/... nesting
+    except Exception:
+        pass
+    for d in candidates:
+        try:
+            if (d / "cuda_bf16.h").is_file():
+                return d
+        except OSError:
+            continue
+    return None
+
+
+def headers_fingerprint(inc: Path | None) -> str:
+    """Identity of the CUDA headers a compile will see, for the cache key.
+
+    The headers come from a DIFFERENT component than libnvrtc (toolkit dir or a pip wheel vs
+    the nvrtc library), so they can change without ``nvrtcVersion()`` changing -- and a cubin
+    built against different headers is a different cubin. ``"noinc"`` when no dir was found.
+    """
+    if inc is None:
+        return "noinc"
+    h = hashlib.sha256()
+    for name in ("cuda_bf16.h", "cuda_fp16.h", "cuda_fp8.h"):
+        try:
+            h.update((inc / name).read_bytes())
+        except OSError:
+            h.update(b"absent")
+        h.update(b"\0")
+    return h.hexdigest()[:16]
 
 
 def device_arch() -> str | None:
@@ -173,7 +226,15 @@ def build_cubin(src: str, name: str, defines: dict[str, object], arch: str | Non
     except Exception:
         toolkit = "unknown"
 
-    key = cache_key(src, defines, arch, toolkit)
+    inc = cuda_include_dir()
+    if inc is None:
+        log.info(
+            "nvrtc: no CUDA include dir with cuda_bf16.h found; a kernel that includes CUDA "
+            "headers will fail to compile -- set VTL_NVRTC_INCLUDE to fix"
+        )
+
+    # Fold the header identity in next to the toolkit version -- see headers_fingerprint.
+    key = cache_key(src, defines, arch, f"{toolkit}+hdr:{headers_fingerprint(inc)}")
     path = cache_dir() / f"{name}-{key}.cubin"
     try:
         if path.is_file():
@@ -181,7 +242,8 @@ def build_cubin(src: str, name: str, defines: dict[str, object], arch: str | Non
     except Exception as exc:
         log.info("nvrtc: cache read failed (%r); recompiling", exc)
 
-    flags = BASE_FLAGS + (f"--gpu-architecture=compute_{arch}",) + render_defines(defines)
+    inc_flags = (f"-I{inc}",) if inc is not None else ()
+    flags = BASE_FLAGS + inc_flags + (f"--gpu-architecture=compute_{arch}",) + render_defines(defines)
     cubin = _nvrtc_compile(src, name, flags)
     if cubin is None:
         return None
@@ -364,6 +426,36 @@ def _self_check() -> None:
     assert cache_dir() == Path("/tmp/x")
     os.environ.pop("VTL_NVRTC_CACHE", None)
     assert cache_dir() == Path(DEFAULT_CACHE)
+
+    # -- CUDA include probing: override wins, then CUDA_HOME; fingerprint tracks contents --
+    saved_env = {k: os.environ.pop(k, None) for k in ("VTL_NVRTC_INCLUDE", "CUDA_HOME", "CUDA_PATH")}
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            inc = Path(d) / "include"
+            inc.mkdir()
+            (inc / "cuda_bf16.h").write_text("// bf16 v1")
+            os.environ["CUDA_HOME"] = d
+            assert cuda_include_dir() == inc, "CUDA_HOME/include holding cuda_bf16.h must be found"
+            os.environ["VTL_NVRTC_INCLUDE"] = "/elsewhere"
+            assert cuda_include_dir() == Path("/elsewhere"), "the override must win, unverified"
+            os.environ.pop("VTL_NVRTC_INCLUDE", None)
+
+            fp1 = headers_fingerprint(inc)
+            assert fp1 == headers_fingerprint(inc), "same headers must fingerprint the same"
+            (inc / "cuda_bf16.h").write_text("// bf16 v2")
+            assert headers_fingerprint(inc) != fp1, "changed header contents must change the key"
+        assert headers_fingerprint(None) == "noinc"
+        # An empty dir must NOT be picked (no cuda_bf16.h): point CUDA_HOME somewhere bare.
+        with tempfile.TemporaryDirectory() as bare:
+            os.environ["CUDA_HOME"] = bare
+            found = cuda_include_dir()
+            assert found is None or found != Path(bare) / "include", "a dir without cuda_bf16.h must be skipped"
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     assert "--use_fast_math" not in BASE_FLAGS, "would change the per-token scale"
 
