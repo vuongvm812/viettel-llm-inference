@@ -248,6 +248,23 @@ fn run_speculative(sh: &mut Shared, msg: KickMsg) {
     // and its journal must go back before a new one is armed.
     sh.invalidate();
 
+    // `ScheduleCore::inconsistent` is a DIAGNOSTIC counter, not scheduling state, so the
+    // journal does not record it and a rollback cannot put it back. Left alone, a
+    // speculative run that skips a broken entry bumps it, and the direct run that redoes
+    // the same step bumps it again — the probe in `rust_sched.py` would read two skips for
+    // one broken entry, on the one branch it can afford to sit on.
+    //
+    // Restored UNCONDITIONALLY, including on the hit path, and that undercounts exactly one
+    // case: a consumed speculation IS the real step (`take_speculative` drops the journal
+    // rather than replaying the loop), so its skips are never re-counted by anyone. That is
+    // the right trade for what the counter is for. It is a wedge probe, read only on steps
+    // that scheduled nothing at all, and an entry broken enough to be skipped stays broken
+    // — the next DIRECT run counts it. Speculation is also only ever kicked on a healthy
+    // quiet step (clean table, empty waiting queue, no bail), which is the least likely
+    // place for the skip to originate. Getting the arithmetic right on the rollback path
+    // matters more than the last count on the hit path.
+    let saved = sh.core.inconsistent;
+
     sh.manager.arm_journal();
     let res = sh
         .core
@@ -269,6 +286,7 @@ fn run_speculative(sh: &mut Shared, msg: KickMsg) {
             sh.spec.misses += 1;
         }
     }
+    sh.core.inconsistent = saved;
 }
 
 /// Lock the shared state, recovering from (and permanently disabling speculation after) a
@@ -294,6 +312,11 @@ pub fn lock_shared(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
 mod tests {
     use super::*;
 
+    use crate::config::{Config, GroupConfig};
+    use crate::manager::STATUS_RUNNING;
+    use crate::sched::SchedReq;
+    use crate::single_type::Kind;
+
     fn assert_send<T: Send>() {}
 
     #[test]
@@ -304,5 +327,106 @@ mod tests {
         assert_send::<ScheduleCore>();
         assert_send::<Shared>();
         assert_send::<Decisions>();
+    }
+
+    fn cfg() -> Config {
+        Config {
+            num_blocks: 512,
+            enable_caching: true,
+            max_model_len: 4096,
+            scheduler_block_size: 16,
+            hash_block_size: 16,
+            log_stats: false,
+            watermark: 0.0,
+            radix: false,
+            groups: vec![GroupConfig {
+                kind: Kind::FullAttention,
+                block_size: 16,
+                is_full_attention: true,
+                spec_signature: "full".into(),
+                mamba_align: false,
+                num_speculative_blocks: 0,
+                use_eagle: false,
+            }],
+        }
+    }
+
+    fn params() -> Params {
+        Params {
+            max_num_scheduled_tokens: 8192,
+            max_num_running_reqs: 64,
+            max_model_len: 4096,
+            num_sampled_tokens_per_step: 1,
+            long_prefill_token_threshold: 0,
+            enable_chunked_prefill: true,
+            need_mamba_block_aligned_split: false,
+            cache_block_size: 16,
+            num_lookahead_tokens: 0,
+            sjf_reorder: false,
+            sjf_usage_tight: 0.90,
+            lean_decisions: false,
+            burst_max_reqs: 0,
+        }
+    }
+
+    /// The `inconsistent` counter is a wedge probe, not scheduling state: the journal does
+    /// not record it, so a speculative run that bumps it and is then rolled back would leave
+    /// the bump behind and the direct re-run would count the SAME broken entry twice.
+    #[test]
+    fn a_speculative_run_does_not_double_count_an_inconsistent_entry() {
+        let mut kv = Manager::new(cfg()).unwrap();
+        let slot = kv.intern("broken");
+        // C past T + P is the skew `ScheduleCore::run`'s `checked_sub` refuses to schedule
+        // against: it counts the entry and skips it.
+        kv.table_set(
+            slot,
+            SchedReq {
+                slot,
+                num_tokens: 65,
+                num_tokens_with_spec: 65,
+                num_computed_tokens: 100,
+                num_output_placeholders: 0,
+                num_prompt_tokens: 64,
+                max_tokens: 128,
+                status: STATUS_RUNNING,
+                num_preemptions: 0,
+                is_prefill_chunk: false,
+                skip_reading_prefix_cache: false,
+            },
+        );
+        let mut sh = Shared::new(kv);
+
+        // A DIRECT run counts it -- that is the behaviour the Python probe reads.
+        sh.core
+            .schedule_resident(&mut sh.manager, &[slot], &[], &params())
+            .unwrap();
+        assert_eq!(sh.core.inconsistent, 1);
+
+        // A speculative run over the same entry must leave the count exactly where the
+        // direct runs put it, whether or not it is ever consumed.
+        run_speculative(
+            &mut sh,
+            KickMsg {
+                generation: 1,
+                running_slots: vec![slot],
+                params: params(),
+            },
+        );
+        assert_eq!(
+            sh.core.inconsistent, 1,
+            "a speculative run must not add to the skip count"
+        );
+        assert!(sh.spec.pending.is_some(), "the speculation itself still stands");
+
+        // ...and the rollback the miss path takes does not disturb it either.
+        sh.rollback_pending();
+        assert_eq!(sh.core.inconsistent, 1);
+
+        // The next direct run is what counts the still-broken entry again: the counter stays
+        // monotone and an entry that keeps being skipped keeps being reported.
+        sh.core
+            .schedule_resident(&mut sh.manager, &[slot], &[], &params())
+            .unwrap();
+        assert_eq!(sh.core.inconsistent, 2);
     }
 }

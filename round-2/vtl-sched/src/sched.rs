@@ -551,13 +551,17 @@ impl ScheduleCore {
                 e.status = STATUS_PREEMPTED;
                 e.num_computed_tokens = 0;
                 // The placeholders counted tokens the step this request was evicted from
-                // will not produce for it, and no later path clears them: they survive
-                // into the waiting queue and back into this table at re-admission, where
-                // the running loop's usize `num_tokens_with_spec + num_output_placeholders
-                // - num_computed_tokens` reads a promise for a step that never happened.
+                // will not produce for it, and no later path clears them. The admission
+                // arithmetic below never reads P (the waiting arm derives `num_tokens -
+                // num_computed_tokens`), so a stranded count costs nothing at re-admission
+                // and everything AFTER it: the running loop's `num_tokens_with_spec +
+                // num_output_placeholders - num_computed_tokens` is inflated by exactly
+                // that count for every later step, scheduling tokens no one promised.
                 // Zeroed alongside `num_computed_tokens`, a resumed request is back on
-                // plain prefill arithmetic. Python's preempt loop does the same three
-                // writes (`rust_sched.py`, mirroring `_preempt_request`).
+                // plain prefill arithmetic. The token still in flight for this slot drains
+                // against the zero in `update_step`, whose `saturating_sub` makes the drain
+                // total; Python's preempt loop does the same three writes and clamps the
+                // same way (`rust_sched.py`, mirroring `_preempt_request`).
                 e.num_output_placeholders = 0;
                 // With C back at 0 this is true for any request with a prompt; computed
                 // rather than assumed so the degenerate empty-prompt case cannot be wrong.

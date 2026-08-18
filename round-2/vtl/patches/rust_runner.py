@@ -218,6 +218,25 @@ class _State:
         raises -- the caller keeps the stock path. The latch is dropped and the crate-side
         runner disarmed BEFORE the raise, so even the raising arm leaves consistent state
         if something upstream swallows it.
+
+        ``self.step`` IS DELIBERATELY LEFT ALONE. A refusal can land in the middle of a
+        step -- ``runner_commit`` calls this from ``update_from_output(k)`` -- and the stash
+        sitting there at that moment usually belongs to ``schedule(k+1)``, whose
+        ``sample_tokens`` has not run yet. Blind-clearing it is the exact race
+        ``clear_step_upto`` was introduced to stop. Nothing needs the clear either, and both
+        halves of that were checked in code rather than assumed:
+
+          * the stash's owner still pops it. ``nstep_decode``'s ``sample_tokens`` calls
+            ``take_step_for(seq)`` unconditionally, before any ``live`` check, and the
+            launch site it hands the stash to declines on ``not state.live``. So the stash
+            is consumed and the launch does not happen -- which is the whole point.
+          * a stash that survives anyway is inert, not a blocker. ``rust_sched``'s
+            ``runner_stash`` refuses on ``not state.live`` BEFORE it looks at
+            ``state.step``, so a refused state stashes nothing regardless; and
+            ``update_from_output``'s ``clear_step_upto`` sweep still collects it once the
+            step it belongs to has been applied.
+
+        The stand-down itself is ``live``, ``refused`` and the dropped FIFO -- not the stash.
         """
         if self.live:
             log.error("vtl: rust runner disabled for this boot -- %s", why)
@@ -226,7 +245,6 @@ class _State:
         self.live = False
         self.refused = True
         self.why = why
-        self.step = None
         self.done = None
         # Dropping the pending launches is SAFE, and that is a property of update mode
         # rather than a hope: a launch commits nothing, so a step whose entry is dropped is
@@ -716,8 +734,14 @@ def _self_check() -> None:
     finally:
         logging.disable(logging.NOTSET)
     assert not s.live and s.why == "testing"
-    assert s.step is None and s.done is None, "a refusal must strand no handshake"
+    assert s.done is None, "a refusal must strand no finished launch"
     assert s.pending == [], "a dropped launch is committed by decide(); a stranded one is not"
+    # ...and the stash is NOT part of the stand-down: it usually belongs to the NEXT
+    # scheduled step, whose `sample_tokens` pops it unconditionally (and then declines the
+    # launch, because `live` is False). Destroying it here is the race `clear_step_upto`
+    # exists to prevent, and leaving it blocks nothing -- `runner_stash` refuses on `live`
+    # before it ever reads `step`, and the update-side sweep collects it in due course.
+    assert s.step is stash, "refuse() leaves the stash for its owner / the sweep"
 
     # `take_step_for` is the ONLY pop: it hands over the stash written for the step doing
     # the asking, so a stash a LATER schedule already wrote survives untouched. The stash IS

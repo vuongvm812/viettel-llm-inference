@@ -1165,6 +1165,21 @@ def kick_failure_is_transient(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and str(exc).startswith("Already ")
 
 
+def kick_failed(tbl, exc: BaseException) -> None:
+    """``maybe_kick``'s two-arm failure handling, module level so the self-check can drive
+    the SHIPPED code instead of a copy of it.
+
+    Transient (a refused pycell borrow): the crossing never happened, so the table is
+    exactly as valid as it was -- drop the arming, leave ``dirty`` and ``gen`` alone, and
+    let the next step try again. Anything else is ``fail()``: one log, then the marshalled
+    path for the rest of the boot.
+    """
+    if kick_failure_is_transient(exc):
+        tbl.armed = False
+        return
+    tbl.fail("kick", exc)
+
+
 # --------------------------------------------------------------------------
 # C1a -- N-step decode burst: the scheduler side
 # --------------------------------------------------------------------------
@@ -1238,17 +1253,22 @@ def burst_sampler_blocked(request, computed_before: int, n: int,
     boundary by construction, so the whole "the block tables the graph baked stay valid"
     argument is vacuous for it.
 
-    THE max_model_len ARM IS ``max_model_len - 1``, NOT ``max_model_len``. Every scheduled
-    count in a burst step is 1 (``num_sampled_tokens_per_step == 1``; the crate's
-    ``burst_eligible`` and ``burst_blocked_batch`` both require it), so stock's own running
-    loop -- which clamps the step to ``max_model_len - num_computed_tokens -
-    num_sampled_tokens_per_step`` -- never advances ``num_computed_tokens`` past
-    ``max_model_len - 1``. A burst that commits ``C == max_model_len`` leaves that clamp at
-    0 for every later step, so the request is skipped while it is still RUNNING and nothing
-    ever finishes it: no token, no ``_update_request_with_output``, no length stop. Refusing
-    one step earlier costs the burst its last iteration and lands the request on the
-    ``num_prompt_tokens + max_tokens`` arm instead, where the stock decode path finishes it
-    at update time exactly as it always has.
+    THE max_model_len ARM IS ``max_model_len - 1``, NOT ``max_model_len``, and it is a
+    conservative tightening rather than a wedge fix. Every scheduled count in a burst step
+    is 1 (``num_sampled_tokens_per_step == 1``; the crate's ``burst_eligible`` and
+    ``burst_blocked_batch`` both require it), so stock's own running loop -- which clamps
+    the step to ``max_model_len - num_computed_tokens - num_sampled_tokens_per_step`` --
+    never advances ``num_computed_tokens`` past ``max_model_len - 1``. Matching that ceiling
+    keeps the crate's next-step budget ``max_model_len - C - 1`` nonnegative and meaningful
+    instead of pinned at the saturating floor.
+
+    NOT because ``C == max_model_len`` strands the request: the tokens a burst landing there
+    committed still arrive at the next update, and the length stop fires on
+    ``num_tokens >= max_model_len``, so the request finishes exactly as it always has. The
+    one skipped step the saturating clamp produces in between is the ordinary async pattern,
+    not a hang. What the ``- 1`` buys is one token of margin on the model-length-bound tail:
+    the last burst iteration is refused, the request lands on the
+    ``num_prompt_tokens + max_tokens`` arm, and stock's decode path carries it home.
     """
     sp = request.sampling_params
     if sp is None or request.pooling_params is not None:
@@ -1329,12 +1349,15 @@ def _burst_gate(mirror, slot: int, request, computed_before: int, n: int,
     ``block_size`` is given), the placeholder count, and the length-cap arithmetic
     against the cached ``lim``.
 
-    ``max_model_len - 1``, not ``max_model_len``: committing ``C == max_model_len`` wedges
-    the request permanently, because the crate's next-step clamp is ``max_model_len -
-    num_computed_tokens - num_sampled_tokens_per_step`` and that is 0 from then on -- the
-    request is skipped while still RUNNING and never reaches the update-side length stop.
-    See ``burst_sampler_blocked``'s docstring for the full argument; the two limits are the
-    same expression and must stay that way.
+    ``max_model_len - 1``, not ``max_model_len``: it keeps the crate's next-step budget
+    ``max_model_len - num_computed_tokens - num_sampled_tokens_per_step`` nonnegative and
+    meaningful rather than pinned at the saturating floor, and it is stock's own ceiling --
+    stock's running loop never advances ``num_computed_tokens`` past ``max_model_len - 1``
+    either. A strictly conservative one-token tightening on the model-length-bound tail, not
+    a wedge fix: a burst landing on ``C == max_model_len`` still has its tokens applied at
+    the next update and still hits the length stop. See ``burst_sampler_blocked``'s
+    docstring for the full argument; the two limits are the same expression and must stay
+    that way.
 
     ``block_size is None`` skips the align gate -- the N=1 in-graph path doesn't need
     it (one token crosses no block boundary; see ``burst_sampler_blocked``'s
@@ -1371,8 +1394,8 @@ def burst_steps(computed_before: int, n: int, block_size: int, lim: int,
     the WHOLE span has to stay inside the KV block the first launch started in. ``lim`` is
     the ``min(max_model_len - 1, num_prompt_tokens + max_tokens)`` cap ``_burst_gate``
     interned for the slot, so a multi-burst step cannot run past ``max_tokens`` -- nor onto
-    the ``C == max_model_len`` position that would make the request unschedulable while
-    still RUNNING (see ``burst_sampler_blocked``).
+    the ``C == max_model_len`` position, which is stock's own ceiling and the one that keeps
+    the crate's next-step budget meaningful (see ``burst_sampler_blocked``).
 
     Never returns 0: this is only ever asked about a request whose SINGLE-burst gate
     already passed, and the two answers agree by construction -- ``(block_size -
@@ -1415,22 +1438,29 @@ def burst_invariant_broken(request) -> bool:
 
 
 def burst_invariant_alarm(kv, request) -> None:
-    """Report a request that reached a burst gate off-shape, ONCE per boot, and stop
-    trusting the resident table.
+    """Report a request that reached a burst gate off-shape. ONE full report per boot, ONE
+    resync per boot, and a throttled count of everything after.
 
-    Once, because the condition is per-step and per-request: a wedged decode batch would
-    otherwise write one line per request per step for as long as the engine runs, which
-    buries the first occurrence -- the only one that names the step where the skew was
-    born. The counters go in the line because the three of them together say WHICH skew
-    it is (C ahead of T + P is the wrap that hangs the crate loop; C behind it is a
-    prefill chunk or a lost placeholder bump).
+    THE ERROR LINE IS ONE-SHOT because the condition is per-step and per-request: a wedged
+    decode batch would otherwise write one line per request per step for as long as the
+    engine runs, burying the first occurrence -- the only one that names the step where the
+    skew was born. The counters go in the line because the three of them together say WHICH
+    skew it is (C ahead of T + P is the wrap that hangs the crate loop; C behind it is a
+    prefill chunk or a lost placeholder bump). Later occurrences are counted and reported
+    every 0x1FFF, so a skew that never clears is visible without being a firehose.
 
-    The resync is not optional: Python's counters and the resident entry are the same
-    numbers marshalled twice, so a skew Python can see is a skew the table may already
-    have absorbed, and the table has no other way to find out.
+    THE RESYNC IS ALSO ONE-SHOT, and that is the correction this function needed. Python's
+    counters and the resident entry are the same numbers marshalled twice, so the FIRST
+    occurrence is worth a resync: the table may have absorbed the same skew and has no
+    other way to find out. After that it is the wrong tool. ``TableState.resync`` marks the
+    table dirty and bumps the generation, and the schedule() wrapper recomputes
+    ``resident = ... and not tbl.dirty`` every step -- so an alarm that fires every step
+    (which is exactly what a wedged batch does) would pin the engine on the marshalled path
+    for the rest of the boot behind a single log line. The gate's refusal of the burst is
+    the actual protection here; the resident path stays live.
     """
-    if not burst_invariant_alarm.reported:
-        burst_invariant_alarm.reported = True
+    burst_invariant_alarm.seen = c = burst_invariant_alarm.seen + 1
+    if c == 1:
         log.error(
             "rust_sched: burst refused -- async counter invariant broken for %s: "
             "num_computed_tokens=%d num_tokens=%d num_output_placeholders=%d "
@@ -1440,12 +1470,19 @@ def burst_invariant_alarm(kv, request) -> None:
             request.num_tokens,
             request.num_output_placeholders,
         )
-    tbl = getattr(kv, "_vtl_table", None)
-    if tbl is not None:
-        tbl.resync("burst refused: async counter invariant broken")
+    elif not c & 0x1FFF:
+        log.warning(
+            "rust_sched: async counter invariant still broken -- %d burst refusals", c
+        )
+    if not burst_invariant_alarm.resynced:
+        burst_invariant_alarm.resynced = True
+        tbl = getattr(kv, "_vtl_table", None)
+        if tbl is not None:
+            tbl.resync("burst refused: async counter invariant broken")
 
 
-burst_invariant_alarm.reported = False
+burst_invariant_alarm.seen = 0
+burst_invariant_alarm.resynced = False
 
 # The `why` a broken invariant hands to `skip_note`; distinct from every `_burst_gate`
 # reason so the first-reason-only log names this one on its own line.
@@ -1472,12 +1509,23 @@ def burst_commit(request, delta: int) -> None:
 
     Straight-line also makes ``burst_uncommit(delta)`` an exact inverse on both counters,
     which the rollback in ``burst_commit_all`` relies on.
+
+    READ EVERYTHING, THEN WRITE EVERYTHING, and that split is load-bearing for
+    ``burst_commit_all``'s rollback contract rather than a style choice: its handler
+    un-commits ``slots[:done]`` and NOT the request that raised, so a raise landing between
+    two of these writes would leak a half-committed request no one gives back. ``num_tokens``
+    is a property on stock ``Request`` (and on the Port-2 facade), i.e. a call that can
+    raise; every read is hoisted above the first write so the only outcomes are "nothing
+    written" and "all three written". Semantics are unchanged -- ``is_prefill_chunk`` is
+    still computed against the PRE-bump placeholder count, exactly as
+    ``_update_after_schedule`` orders it.
     """
-    request.num_computed_tokens += delta
-    request.is_prefill_chunk = request.num_computed_tokens < (
-        request.num_tokens + request.num_output_placeholders
-    )
-    request.num_output_placeholders += delta
+    computed = request.num_computed_tokens + delta
+    chunk = computed < (request.num_tokens + request.num_output_placeholders)
+    placeholders = request.num_output_placeholders + delta
+    request.num_computed_tokens = computed
+    request.is_prefill_chunk = chunk
+    request.num_output_placeholders = placeholders
 
 
 def burst_uncommit(request, short: int) -> None:
@@ -1552,7 +1600,10 @@ def pack_req(slot: int, request) -> tuple:
         # lookup that is a property call on both the facade and stock `Request`.
         int(request.num_tokens),
         int(request.num_computed_tokens),
-        int(request.num_output_placeholders),
+        # `max(0, ...)`: the update of an in-flight step can drain a preempt-zeroed P below
+        # zero, and the crate's field is an unsigned usize whose own drain saturates
+        # (`manager.rs::update_step`) -- so the clamp is the parity choice, not a mask.
+        max(0, int(request.num_output_placeholders)),
         int(request.num_prompt_tokens),
         int(getattr(request, "max_tokens", 0) or 0),
         status_code(request),
@@ -2892,10 +2943,9 @@ def _install_update_from_output(scheduler_cls, m: dict):
         try:
             tbl.armed = bool(core.kick(kv._rust, tbl.gen, slots))
         except BaseException as exc:
-            if kick_failure_is_transient(exc):
-                tbl.armed = False
-                return
-            tbl.fail("kick", exc)
+            # Both arms return from here -- this is the tail of the function, so the
+            # transient arm's "skip this step's speculation" needs no `return` of its own.
+            kick_failed(tbl, exc)
 
     def update_from_output(self, scheduler_output, model_runner_output):
         self._vtl_ufo = None
@@ -3046,8 +3096,25 @@ def _install_update_from_output(scheduler_cls, m: dict):
         if self._vtl_burst_n > 1:
             kept, stopped = _urwo_inner(self, request, new_token_ids)
             reconcile_burst(self, request, len(kept))
-            return kept, stopped
-        return _urwo_inner(self, request, new_token_ids)
+        else:
+            kept, stopped = _urwo_inner(self, request, new_token_ids)
+        # THE OTHER HALF OF THE PREEMPT-TIME ZEROING. A request preempted at schedule(k)
+        # had a token in flight from step k-1; the zeroing at that site is what stops a
+        # stale positive P from inflating the crate's running loop after re-admission, and
+        # the drain of that in-flight token then has nothing left to take. The crate's own
+        # drain saturates (`manager.rs::update_step`'s `saturating_sub`), so Python
+        # saturating too is parity, not a mask -- and `pack_req` clamps the same way at the
+        # crossing. One compare per request per step.
+        #
+        # WHAT THIS CAN AND CANNOT SEE: the patch is installed on the BASE `Scheduler`, so
+        # this body runs INSIDE `AsyncScheduler._update_request_with_output`, i.e. BEFORE
+        # its own `num_output_placeholders -= len(new_token_ids)`. It therefore repairs a
+        # count that was already negative on entry, never the subtraction happening
+        # immediately after it returns -- `pack_req`'s clamp is what keeps that one out of
+        # the crate's unsigned tuple field.
+        if request.num_output_placeholders < 0:
+            request.num_output_placeholders = 0
+        return kept, stopped
 
     def _urwo_inner(self, request, new_token_ids):
         decided = self._vtl_ufo
@@ -3210,12 +3277,19 @@ def _install_preempt_hook(scheduler_cls) -> None:
             mirror._batch_cache = None
         out = wrapped(self, request, *args, **kwargs)
         # A preempted request keeps no placeholders: they count tokens the step it was
-        # evicted from will never produce, and a stale count survives into the waiting
-        # queue and back out through `pack_req`, where it wraps the crate's usize
-        # `num_tokens_with_spec + num_output_placeholders - num_computed_tokens`. Forced
-        # here rather than assumed: this hook is also the path for the bail routes and for
-        # `reset_prefix_cache`'s forced preemption, and it is idempotent where stock
-        # already zeroes it.
+        # evicted from will never produce. The damage a stale count does is DEFERRED, not
+        # immediate -- the crate's admission arithmetic never reads P (`sched.rs`'s waiting
+        # arm derives `num_tokens - num_computed_tokens`), so the count rides the request
+        # through the waiting queue and only bites after re-admission, where the running
+        # loop's `num_tokens_with_spec + num_output_placeholders - num_computed_tokens`
+        # reads a promise for a step that never happened and schedules phantom tokens for
+        # every step from then on. Forced here rather than assumed: this hook is also the
+        # path for the bail routes and for `reset_prefix_cache`'s forced preemption.
+        #
+        # ZEROING IS TOTAL, not lossy: the token still in flight from the step before this
+        # one is applied by a later `_update_request_with_output`, whose drain would take
+        # the zeroed count below zero -- absorbed by the clamps there and in `pack_req`,
+        # which is exactly what `manager.rs::update_step`'s `saturating_sub` does crate-side.
         request.num_output_placeholders = 0
         return out
 
@@ -3814,12 +3888,16 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             request.status = RequestStatus.PREEMPTED
             request.num_computed_tokens = 0
             # The placeholders belong to tokens THIS step will no longer produce for this
-            # request, and nothing else clears them: they ride the request into the
-            # waiting queue, get re-marshalled by `pack_req` at every later step, and on
-            # re-admission make the crate's running loop compute `num_tokens_with_spec +
-            # num_output_placeholders - num_computed_tokens` against a placeholder count
-            # for a step that never happened. Zeroed here, `C == 0` and `P == 0` put a
-            # resumed request back on the plain prefill arithmetic.
+            # request, and nothing else clears them. The crate's admission arithmetic does
+            # not read them (the waiting arm derives `num_tokens - num_computed_tokens`),
+            # so a stale count is not an admission bug -- it is a RUNNING-loop bug, one
+            # step later: `num_tokens_with_spec + num_output_placeholders -
+            # num_computed_tokens` then inflates by exactly the stranded count for every
+            # step after re-admission. Zeroed here, `C == 0` and `P == 0` put a resumed
+            # request back on the plain prefill arithmetic. The token still in flight from
+            # the previous step drains against the zero and is clamped at 0 by
+            # `_update_request_with_output` / `pack_req`, matching the crate's own
+            # `saturating_sub`.
             request.num_output_placeholders = 0
             # ...and with C back at 0, a request with any prompt at all IS a prefill chunk
             # again. Computed rather than hardcoded so the empty-prompt degenerate case
@@ -3981,6 +4059,14 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             # of wrapping on. The two look identical from here -- 0 tok/s, no exception --
             # and the counter is what tells them apart. Off the hot path by construction:
             # every step that scheduled anything at all skips it.
+            #
+            # ATTRIBUTION CAVEAT: `inconsistent` is monotone for the life of the boot and
+            # only ever READ here, on an empty step. An increase since the last read
+            # therefore says "the crate skipped a broken entry at some point since the last
+            # empty step", not "this step". That is fine for the response: the symptom being
+            # acted on is the one in hand -- a step that scheduled nothing while requests
+            # are RUNNING -- and a full marshalled resync is the only thing that can repair
+            # an entry the table has absorbed either way.
             try:
                 rust = kv._rust
                 if hasattr(rust, "inconsistent_skips"):
@@ -4005,8 +4091,14 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                             # and a full marshalled schedule is its only way back.
                             tbl.resync("scheduler skipped an inconsistent entry")
             except BaseException as exc:
-                # A diagnostic must never be the reason a step fails.
+                # A diagnostic must never be the reason a step fails -- but it must not be
+                # silent about failing either: a probe that always raises would look exactly
+                # like a wedge that never happens. One-shot, same idiom as the prereg hook's
+                # `_vtl_warned`, because the failing condition is per-step.
                 reraise_fatal(exc)
+                if not getattr(self, "_vtl_inconsistent_probe_failed", False):
+                    self._vtl_inconsistent_probe_failed = True
+                    log.exception("rust_sched: inconsistent-skip probe failed")
         if TIMING:
             t_exit = ns()
             timers.add("apply", t_exit - t_rust)
@@ -4459,16 +4551,23 @@ def _self_check() -> None:
     assert kick_failure_is_transient(KeyboardInterrupt()) is False
     # The transient arm must cost the kick and NOTHING else: a table that was clean and
     # armed stays live, stays clean and keeps its generation, so the next step can arm
-    # again. (Contrast fail(), asserted above, which is off-forever.)
+    # again. (Contrast fail(), asserted above, which is off-forever.) Driven through
+    # `kick_failed` -- the function `maybe_kick`'s except clause actually calls -- so this
+    # cannot pass against a copy of the arm that has drifted from the shipped one.
     tbl = TableState()
     tbl.dirty, tbl.armed = False, True
-    exc = RuntimeError("Already borrowed")
-    if kick_failure_is_transient(exc):
-        tbl.armed = False
-    else:  # pragma: no cover
-        tbl.fail("kick", exc)
+    kick_failed(tbl, RuntimeError("Already borrowed"))
     assert tbl.off is False and tbl.armed is False
     assert tbl.dirty is False and tbl.gen == 0, "a refused borrow does not stale the table"
+    # ...and anything else is the permanent fallback.
+    tbl = TableState()
+    tbl.dirty, tbl.armed = False, True
+    logging.disable(logging.CRITICAL)  # fail() logs the traceback; expected here
+    try:
+        kick_failed(tbl, RuntimeError("boom"))
+    finally:
+        logging.disable(logging.NOTSET)
+    assert tbl.off is True and tbl.armed is False and tbl.dirty is True
 
     # PhaseTimers: p50/p95 off a sorted ring, and the ring is drained each report.
     pt = PhaseTimers()
@@ -4692,6 +4791,27 @@ def _self_check() -> None:
     burst_uncommit(r, 1000)
     assert (r.num_computed_tokens, r.num_output_placeholders) == (0, 0)
 
+    # A PREEMPT-ZEROED P THAT THE IN-FLIGHT STEP DRAINED BELOW ZERO. The preempt sites zero
+    # P while the token from the step before is still in flight; stock's
+    # `num_output_placeholders -= len(new_token_ids)` then takes the zero to -1. Two clamps
+    # make that drain total: the object clamp in the patched `_update_request_with_output`,
+    # and `pack_req`'s -- `int(-1)` into the crate's unsigned tuple field is an
+    # OverflowError raised out of a `core.schedule` call that nothing wraps.
+    r = REQ(num_output_placeholders=0)
+    r.num_output_placeholders -= 1              # stock's drain against the zeroed count
+    if r.num_output_placeholders < 0:           # ...and the clamp, verbatim
+        r.num_output_placeholders = 0
+    assert r.num_output_placeholders == 0
+    # pack_req is total on its own, for a request no clamp has reached yet.
+    _STATUS_MAP["PREEMPTED"] = _ST_PREEMPTED
+    try:
+        packed = pack_req(3, REQ(num_output_placeholders=-1, num_preemptions=1,
+                                 status="PREEMPTED", skip_reading_prefix_cache=False))
+    finally:
+        _STATUS_MAP.clear()                     # the real map is built from RequestStatus
+    assert packed[4] == 0, packed
+    assert (packed[0], packed[7], packed[8]) == (3, _ST_PREEMPTED, 1), packed
+
     # THE SHAPE GATE. `burst_invariant_broken` admits exactly the post-`_update_after_
     # schedule` steady decode -- C == T + P - 1, not a prefill chunk -- because that
     # equality is what makes the crate's usize `T + P - C` come out at 1 instead of
@@ -4706,6 +4826,36 @@ def _self_check() -> None:
         "C below it is a prefill chunk or a lost placeholder bump"
     # A request that never grew the attribute reads as not-a-chunk, same as vLLM's default.
     assert "is_prefill_chunk" not in vars(REQ()) and burst_invariant_broken(REQ()) is False
+
+    # THE ALARM. One error line, ONE resync, and a count for everything after. The resync
+    # latch is the load-bearing half: `TableState.resync` dirties the table and the
+    # schedule() wrapper recomputes `resident = ... and not tbl.dirty` every step, so an
+    # alarm that resynced on every occurrence -- which is what a wedged batch produces --
+    # would pin the whole boot on the marshalled path behind one log line.
+    class FakeTbl:
+        def __init__(self):
+            self.resyncs = []
+
+        def resync(self, why):
+            self.resyncs.append(why)
+
+    class FakeKv:
+        def __init__(self, tbl):
+            self._vtl_table = tbl
+
+    skewed = REQ(**{**healthy, "num_computed_tokens": 102})
+    fake_tbl = FakeTbl()
+    fake_kv = FakeKv(fake_tbl)
+    logging.disable(logging.CRITICAL)  # the one-shot error line is expected
+    try:
+        burst_invariant_alarm(fake_kv, skewed)
+        assert len(fake_tbl.resyncs) == 1 and burst_invariant_alarm.seen == 1
+        burst_invariant_alarm(fake_kv, skewed)
+    finally:
+        logging.disable(logging.NOTSET)
+    assert len(fake_tbl.resyncs) == 1, "the second occurrence must NOT resync"
+    assert burst_invariant_alarm.seen == 2, "...but it is still counted"
+    burst_invariant_alarm.seen, burst_invariant_alarm.resynced = 0, False
 
     # The commit is unconditional, which is what makes `burst_uncommit` its inverse on
     # both counters -- on a healthy entry and on a skewed one alike.
