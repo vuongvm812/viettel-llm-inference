@@ -225,3 +225,45 @@ the pairing, each now fixed:
 `stall_dump` now prints real `_Burst` fields plus the `rust_runner.STATE` line
 (the old field list named attributes that never existed), with a self-check that
 cross-checks the printed names against the live `__slots__`.
+
+---
+
+## Second incident (2026-08-18 evening): first-prefill hang / NotImplementedError crash under the shipped compose
+
+The serve line gained `--kv-offloading-size=64 --kv-offloading-backend=native`
+(judge-specified 2026-08-17, commit 3823158). Those two flags configure a vLLM V1 **KV
+connector** — the boot log shows `Initializing KVConnectorBase_V1` and an
+`OffloadingSpec` — and a connector cannot coexist with the Rust KV authority: they would
+share no block pool, and the connector's allocation and KV-transfer paths are not ported.
+
+The boot guard that was supposed to catch this missed it twice over. It probed only
+`cfg.kv_transfer_config`, which the offloading connector does not use (it arrives through
+the engine args), and it is tri-state: the `None` it returns when no ambient `VllmConfig`
+is in scope was read by `if kv_transfer_configured():` as "no connector". Authority mode
+installed anyway. `schedule_supported()` *did* detect it later, off
+`scheduler.connector` — that is the reliable signal, and it only exists after the
+Scheduler is built, i.e. after the KVCacheManager already decided.
+
+Two outcomes were observed from the same cause: a **hang** in the first prefill wave
+(stall dump showed a launch-queue-blocked stack in whatever op happened to be running —
+the `nvrtc_block_quant` frame was a bystander, exonerated by reproducing the hang with
+`VTL_ENABLE_NVRTC_BLOCK_QUANT=0`), and a **crash** ~30 s in with
+`rust_sched.py NotImplementedError: VTL_RUST_SCHED=1 does not support connector /
+encoder / full-sequence-admission allocation paths`, raised from stock
+`Scheduler.schedule` → `allocate_slots` on the connector path.
+
+Fix on this branch, in `round-2/vtl/patches/rust_sched.py`: (1) `kv_connector_configured()`
+probes every field shape a connector can arrive in (`kv_transfer_config`, a kv-offloading
+config object, and the raw offloading knobs on either `cfg` or `cfg.cache_config`), each
+probe independent so an unknown layout degrades instead of raising; (2) on a detected
+connector the authority manager **stands down** — `self.__class__ = base` after
+`super().__init__`, which sheds every override and every `_refuse_unported` raiser at once
+— and the boot serves the stock scheduler + offloading rather than refusing to start;
+(3) a backstop at the first `schedule()` raises immediately if a connector is present and
+the KV manager is still Rust-backed (the `None`-detection case), because by then the Rust
+pool is live and standing down would split-brain it.
+
+**Open config decision:** connector XOR Rust stack. With the flags as shipped,
+`VTL_RUST_SCHED_FULL`, the resident table, the N-step burst and the Rust runner are all
+inactive and none of their measurements apply. Either drop the `--kv-offloading-*` flags
+or set `VTL_RUST_SCHED=0` and own the choice.

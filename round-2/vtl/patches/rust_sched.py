@@ -55,6 +55,14 @@ in charge.
 
     VTL_RUST_SCHED_REQUIRE=1  turn that refusal into a BOOT FAILURE.
 
+A KV connector is the one refusal that has to be taken BEFORE the manager is in service,
+because ``schedule_supported`` sees it only once the Scheduler exists and by then the Rust
+pool is live. ``kv_connector_configured`` probes the config for every shape a connector can
+arrive in (``kv_transfer_config`` AND the ``--kv-offloading-*`` engine args), and authority
+mode STANDS DOWN to the stock manager when it finds one -- a connector and this port cannot
+share a block pool. Authority mode and KV offloading are therefore mutually exclusive
+configurations, and the serve line has to pick one.
+
 MODEL-AGNOSTIC, WITH ONE SHARP EDGE. Nothing here reads a model name or a layer count --
 the config is derived from ``kv_cache_config.kv_cache_groups`` at runtime, so a plain dense
 model (one full-attention group, unitary path) works with no changes, and so does an
@@ -131,23 +139,80 @@ def reraise_fatal(exc: BaseException) -> None:
         raise exc
 
 
-def kv_transfer_configured():
-    """``True``/``False`` if vLLM's ambient config can be read, ``None`` if it cannot.
+# Every way a V1 KV connector can be requested, as (probe name, predicate). A LIST of
+# independent probes, not one `or` expression: each entry is evaluated under its own
+# try/except, so a config layout that does not carry a given field degrades to the
+# remaining probes instead of taking the whole answer down with an AttributeError.
+#
+# The offloading knobs (``--kv-offloading-size`` / ``--kv-offloading-backend``) land in
+# different places across vLLM builds -- a dedicated config object on the top-level config,
+# the same object hanging off ``cache_config``, or the two raw values on either -- so every
+# one of those shapes gets a probe. An extra probe is free; a missing one is not (see
+# ``kv_connector_configured``).
+_KV_CONNECTOR_PROBES = (
+    ("kv_transfer_config",
+     lambda cfg: getattr(cfg, "kv_transfer_config", None) is not None),
+    ("kv_offloading_config",
+     lambda cfg: getattr(cfg, "kv_offloading_config", None) is not None),
+    ("cache_config.kv_offloading_config",
+     lambda cfg: getattr(cfg.cache_config, "kv_offloading_config", None) is not None),
+    ("cache_config.kv_offloading_size",
+     lambda cfg: bool(getattr(cfg.cache_config, "kv_offloading_size", None))),
+    ("cache_config.kv_offloading_backend",
+     lambda cfg: bool(getattr(cfg.cache_config, "kv_offloading_backend", None))),
+    ("kv_offloading_size",
+     lambda cfg: bool(getattr(cfg, "kv_offloading_size", None))),
+    ("kv_offloading_backend",
+     lambda cfg: bool(getattr(cfg, "kv_offloading_backend", None))),
+)
 
-    A KV connector is fatal for authority mode (see ``VtlRustKVCacheManager.__init__``),
-    but v0.25.0 constructs the Scheduler outside any ``set_current_vllm_config`` context,
-    so this answers ``None`` more often than not. It is the cheap outer layer; the hard
-    one is ``pop_blocks_for_free`` refusing outright.
+
+def kv_connector_configured(cfg=None):
+    """``True``/``False`` if vLLM's config can be read, ``None`` if it cannot.
+
+    Any V1 KV connector is fatal for authority mode (see ``authority_stand_down``), and
+    ``scheduler.connector`` -- which ``schedule_supported`` reads -- is the only fully
+    reliable signal. It exists too late: the KVCacheManager is built inside the
+    Scheduler's ``__init__``, before the caller can see the finished Scheduler. So this
+    probes the CONFIG instead, and it has to probe all of it.
+
+    WHY THE SET IS DELIBERATELY BROAD (2026-08-18 incident). A ``kv_transfer_config``-only
+    probe answers ``False`` for a serve line carrying
+    ``--kv-offloading-size=64 --kv-offloading-backend=native``: that connector is
+    configured through the offloading ENGINE ARGS and never touches
+    ``kv_transfer_config``, so authority mode installed itself next to a live
+    ``OffloadingSpec`` connector. The two outcomes were a hang in the first prefill wave
+    (the connector's KV-transfer waits are never satisfied because nothing in this port
+    drives them) and a ``NotImplementedError`` out of ``allocate_slots``' connector path
+    ~30 s in. The asymmetry is total: a FALSE POSITIVE costs the Rust stack for one boot,
+    a FALSE NEGATIVE costs the boot. So every field shape that can carry a connector is
+    probed (``_KV_CONNECTOR_PROBES``) and any hit is enough.
+
+    ``cfg=None`` means "read the ambient config"; v0.25.0 constructs the Scheduler outside
+    any ``set_current_vllm_config`` context, so that answers ``None`` more often than not
+    -- which is why the ``None`` case has its own backstop at the first ``schedule()``
+    (see ``_install_full_schedule``). Passing ``cfg`` explicitly is the testable form and
+    never answers ``None``.
     """
-    try:
-        from vllm.config import get_current_vllm_config_or_none
-
-        cfg = get_current_vllm_config_or_none()
-    except Exception:
-        return None
     if cfg is None:
-        return None
-    return getattr(cfg, "kv_transfer_config", None) is not None
+        try:
+            from vllm.config import get_current_vllm_config_or_none
+
+            cfg = get_current_vllm_config_or_none()
+        except Exception:
+            return None
+        if cfg is None:
+            return None
+    for name, probe in _KV_CONNECTOR_PROBES:
+        try:
+            hit = bool(probe(cfg))
+        except Exception:
+            # An unknown config layout answers "not this shape", never "no connector".
+            continue
+        if hit:
+            log.info("rust_sched: KV connector configured -- detected via %s", name)
+            return True
+    return False
 
 
 def modes() -> dict:
@@ -563,8 +628,13 @@ def build_config(manager, radix: bool):
         return None, f"config extraction failed: {exc!r}"
 
 
-def schedule_supported(scheduler) -> str | None:
-    """Reason the Rust schedule() loop cannot run for this scheduler, or None."""
+def unsupported_features(scheduler) -> tuple:
+    """The names of the live scheduler features the Rust schedule() loop does not port.
+
+    Split out of ``schedule_supported`` so a caller can ask about ONE feature by name
+    instead of substring-matching the joined reason string -- ``"connector"`` is a prefix
+    of ``"ec_connector"``, and the connector backstop must not confuse the two.
+    """
     checks = (
         ("connector", getattr(scheduler, "connector", None) is not None),
         ("ec_connector", getattr(scheduler, "ec_connector", None) is not None),
@@ -579,7 +649,12 @@ def schedule_supported(scheduler) -> str | None:
             str(getattr(getattr(scheduler, "policy", None), "value", "fcfs")) != "fcfs",
         ),
     )
-    bad = [name for name, hit in checks if hit]
+    return tuple(name for name, hit in checks if hit)
+
+
+def schedule_supported(scheduler) -> str | None:
+    """Reason the Rust schedule() loop cannot run for this scheduler, or None."""
+    bad = unsupported_features(scheduler)
     return ("unsupported scheduler features: " + ", ".join(bad)) if bad else None
 
 
@@ -760,6 +835,70 @@ def _refuse_unported(cls, base) -> None:
         setattr(cls, name, make_raiser(name))
 
 
+STAND_DOWN_WARNING = (
+    "rust_sched: a KV connector is configured (kv-offloading / kv_transfer); "
+    "VTL_RUST_SCHED authority mode stands down for this boot -- stock KVCacheManager + "
+    "stock scheduler serve. The Rust scheduler, resident table, N-step burst and Rust "
+    "runner are all inactive. Remove the --kv-offloading-* flags (or set "
+    "VTL_RUST_SCHED=0 explicitly) to choose one stack deliberately."
+)
+
+# Both remedies, in the two places that have to name them. Authority mode and a KV
+# connector are mutually exclusive in this build; the config has to pick one.
+CONNECTOR_CONFLICT_REMEDIES = (
+    "remove --kv-offloading-size / --kv-offloading-backend (and any "
+    "--kv-transfer-config) to keep the Rust stack, or set VTL_RUST_SCHED=0 to keep the "
+    "connector"
+)
+
+
+def authority_stand_down(instance, base, cfg=None) -> bool:
+    """Turn a half-built authority manager back into a plain ``base`` instance.
+
+    THE CONFLICT. With a KV connector live, scheduler.py binds the (now stale) python
+    block_pool into the connector (`:280`) and, when ``defer_block_free`` is on, drains
+    ``pop_blocks_for_free``'s result through ``block_pool.free_blocks`` (`:2157`) -- which
+    leaks every deferred block out of the Rust pool for good. The connector also owns
+    allocation paths this port refuses outright (``allocate_slots``'
+    ``num_external_computed_tokens`` / ``delay_cache_blocks``) and KV-transfer waits
+    nothing here drives. There is no partial coexistence to negotiate.
+
+    WHY A CLASS SWAP AND NOT A RAISE. The judge box runs the shipped compose as-is: a boot
+    that serves with the stock scheduler plus the connector beats one that refuses to
+    start. A raise from here is a dead engine, and half-measures are not available either
+    -- ``_refuse_unported`` has stubbed every unported public method ON THE SUBCLASS with a
+    raiser, so an instance that keeps this class and skips the Rust construction cannot
+    serve at all. Rebinding ``__class__`` is what sheds the whole authority layer in one
+    move: every override and every raiser lives on the subclass, so after the assignment
+    the object IS a stock manager.
+
+    It is sound at exactly one point in ``__init__``: after ``super().__init__`` has fully
+    initialized the base state (the coordinator, the block pool and the per-request block
+    lists are all real and untouched) and before any Rust-side state exists (no
+    ``_rust``, no ``_mirror``, nothing registered with shm_ipc, no runner rendezvous). The
+    caller must keep it there. The assignment itself requires no ``__slots__`` anywhere in
+    the chain, which holds for stock ``KVCacheManager`` and for vtl's subclass; if a future
+    vLLM breaks that, standing down is impossible and a boot failure is the only honest
+    answer, so the ``TypeError`` is converted into one rather than swallowed.
+
+    Returns True if it stood down. ``cfg`` is forwarded to ``kv_connector_configured``.
+    """
+    if kv_connector_configured(cfg) is not True:
+        # Strictly True: `None` means the config was unreadable, and standing down on an
+        # unknown is the false positive that costs the Rust stack on every normal boot.
+        # The unknown is caught at the first schedule() instead.
+        return False
+    try:
+        instance.__class__ = base
+    except TypeError as exc:
+        raise RuntimeError(
+            "VTL_RUST_SCHED=1 is not compatible with a KV connector, and this build "
+            f"cannot stand down to {base.__name__} ({exc}). {CONNECTOR_CONFLICT_REMEDIES}."
+        ) from exc
+    log.warning("%s", STAND_DOWN_WARNING)
+    return True
+
+
 def _install_authority(base, mirror_modes):
     """Rust becomes the source of truth for the KVCacheManager surface."""
     import vtl_sched
@@ -769,16 +908,17 @@ def _install_authority(base, mirror_modes):
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            if kv_transfer_configured():
-                # Split brain: with a KV connector, scheduler.py binds the (now stale)
-                # python block_pool into the connector (`:280`) and, when
-                # `defer_block_free` is on, drains `pop_blocks_for_free`'s result through
-                # `block_pool.free_blocks` (`:2157`) -- which would leak every deferred
-                # block out of the Rust pool for good.
-                raise RuntimeError(
-                    "VTL_RUST_SCHED=1 is not compatible with a KV connector "
-                    "(kv_transfer_config is set)"
-                )
+            # FIRST thing after the base state is complete, and before one byte of Rust
+            # state exists: everything below this line (the KvManager, the mirror, the
+            # shm_ipc registration, the runner's arming rendezvous) is what a stand-down
+            # must not have started. See `authority_stand_down` for why the class swap is
+            # the only working shape and why it beats raising.
+            if authority_stand_down(self, base):
+                # Still routed through `refuse`, so VTL_RUST_SCHED_REQUIRE=1 turns this
+                # into the boot failure a bench arm needs: a stand-down measures a stock
+                # engine, which is the one thing an A/B arm must not do silently.
+                refuse("a KV connector is configured (kv-offloading / kv_transfer)")
+                return
             cfg, reason = build_config(self, mirror_modes["radix"])
             if reason is not None:
                 raise RuntimeError(f"VTL_RUST_SCHED=1 but config unsupported: {reason}")
@@ -3557,6 +3697,30 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         kv = self.kv_cache_manager
         core = getattr(self, "_vtl_rust_core", None)
         if core is None:
+            feats = unsupported_features(self)
+            rust_kv = getattr(kv, "__vtl_rust_authority__", False) or hasattr(kv, "_rust")
+            if "connector" in feats and rust_kv:
+                # THE BACKSTOP for the one case the config probe cannot answer. A KV
+                # connector and authority mode cannot coexist (`authority_stand_down`), and
+                # `scheduler.connector` is the reliable signal -- but it only exists once
+                # the Scheduler is built, i.e. after the KVCacheManager already decided.
+                # When `kv_connector_configured()` answered None (no ambient config in
+                # scope) the Rust manager is here anyway, and by now it OWNS the block pool:
+                # swapping classes at this point would leave the connector holding the stale
+                # python pool while Rust holds the live one, i.e. a split-brain pool. So the
+                # only safe move left is to fail, and to fail at the FIRST schedule() --
+                # effectively still boot -- instead of the two outcomes this replaces: a
+                # silent hang in the first prefill wave, or `allocate_slots` raising
+                # NotImplementedError minutes into the run.
+                #
+                # Unreachable whenever the config probe works, which is the normal case;
+                # this is the belt to that suspenders.
+                raise RuntimeError(
+                    "VTL_RUST_SCHED=1 installed the Rust KV authority, but this "
+                    "scheduler has a KV connector (kv-offloading / kv_transfer) -- the "
+                    "two cannot share a block pool and the connector's allocation and "
+                    f"KV-transfer paths are not ported. {CONNECTOR_CONFLICT_REMEDIES}."
+                )
             reason = schedule_supported(self)
             if reason is not None or not hasattr(kv, "_rust"):
                 if not getattr(self, "_vtl_rust_warned", False):
@@ -5559,8 +5723,81 @@ def _self_check() -> None:
     else:  # pragma: no cover
         raise AssertionError("unported base methods must refuse")
 
-    # No vLLM here, so the ambient-config probe must answer "unknown", not crash.
-    assert kv_transfer_configured() is None
+    # ---- the KV-connector probe and the authority stand-down --------------------------
+    # No vLLM here, so the AMBIENT probe must answer "unknown", not crash, and not False:
+    # False here would be the exact bug this pair replaces (an undetected connector).
+    assert kv_connector_configured() is None
+
+    def fake_cfg(transfer=None, top=(), **cache):
+        """A VllmConfig-shaped stand-in: `cache_config` plus optional top-level fields."""
+        cc = type("FakeCacheConfig", (), dict(cache))()
+        fields = {"kv_transfer_config": transfer, "cache_config": cc}
+        fields.update(top)
+        return type("FakeVllmConfig", (), fields)()
+
+    # Truth table. Each row is one of the shapes a build can carry the connector in; the
+    # offloading rows are the incident (`--kv-offloading-size=64 --kv-offloading-backend=
+    # native` reached the engine while the kv_transfer_config-only probe said False).
+    assert kv_connector_configured(fake_cfg(transfer=object())) is True
+    assert kv_connector_configured(fake_cfg(kv_offloading_backend="native")) is True
+    assert kv_connector_configured(fake_cfg(kv_offloading_size=64)) is True
+    assert kv_connector_configured(fake_cfg(kv_offloading_config=object())) is True
+    assert kv_connector_configured(
+        fake_cfg(top={"kv_offloading_size": 64})
+    ) is True
+    assert kv_connector_configured(fake_cfg()) is False
+    # Zeroed knobs are "no connector", not "the field exists".
+    assert kv_connector_configured(
+        fake_cfg(kv_offloading_size=0, kv_offloading_backend="")
+    ) is False
+
+    # An unknown layout must degrade to the OTHER probes rather than take the answer down.
+    class ExplodingCfg:
+        cache_config = None  # the cache_config probes find nothing on it
+
+        @property
+        def kv_transfer_config(self):
+            raise RuntimeError("this build does not have that field")
+
+    assert kv_connector_configured(ExplodingCfg()) is False
+    bad = ExplodingCfg()
+    bad.kv_offloading_backend = "native"  # a surviving probe still finds the connector
+    assert kv_connector_configured(bad) is True
+
+    # authority_stand_down: the instance must become the STOCK class wholesale, which is
+    # what sheds `_refuse_unported`'s raisers and every authority override at once. This is
+    # the same helper VtlRustKVCacheManager.__init__ calls -- not a re-implementation of it.
+    class FakeStockKV:
+        def surface(self):
+            return "stock"
+
+    class FakeAuthorityKV(FakeStockKV):
+        __vtl_rust_authority__ = True
+
+        def surface(self):
+            return "rust"
+
+    inst = FakeAuthorityKV()
+    logging.disable(logging.CRITICAL)  # the stand-down warning is expected here
+    try:
+        stood = authority_stand_down(
+            inst, FakeStockKV, cfg=fake_cfg(kv_offloading_backend="native")
+        )
+    finally:
+        logging.disable(logging.NOTSET)
+    assert stood is True
+    assert type(inst) is FakeStockKV, type(inst)
+    assert inst.surface() == "stock"
+    assert not getattr(inst, "__vtl_rust_authority__", False), \
+        "the backstop keys off this marker; the swap must shed it"
+    # ...and a clean config leaves authority mode alone.
+    keep = FakeAuthorityKV()
+    assert authority_stand_down(keep, FakeStockKV, cfg=fake_cfg()) is False
+    assert type(keep) is FakeAuthorityKV and keep.surface() == "rust"
+    # An unreadable ambient config is NOT a stand-down: `None` is answered by the first
+    # schedule() backstop, because standing down on an unknown would cost every boot.
+    assert authority_stand_down(keep, FakeStockKV) is False
+    assert type(keep) is FakeAuthorityKV
 
     # build_config degrades to a reason string instead of raising when vLLM is absent.
     cfg, reason = build_config(object(), False)
@@ -5574,11 +5811,21 @@ def _self_check() -> None:
 
     reason = schedule_supported(Sched())
     assert "connector" in reason and "lora" in reason, reason
+    assert unsupported_features(Sched())[0] == "connector"
 
     class PlainSched:
         pass
 
     assert schedule_supported(PlainSched()) is None
+    assert unsupported_features(PlainSched()) == ()
+
+    # The first-schedule backstop tests membership in this tuple, so "ec_connector" must
+    # NOT read as "connector" -- which it would under a substring match on the reason.
+    class EcSched:
+        ec_connector = object()
+
+    assert unsupported_features(EcSched()) == ("ec_connector",)
+    assert "connector" not in unsupported_features(EcSched())
 
     # ---- refuse(): warn by default, RAISE under VTL_RUST_SCHED_REQUIRE=1 ----
     # The default must never raise: a submission that cannot use the Rust scheduler still

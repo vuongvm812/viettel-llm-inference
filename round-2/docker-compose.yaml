@@ -73,6 +73,19 @@ services:
       # is layered on via VTL_W4A8_FROM_FP8 / VTL_ENABLE_MOE_DECODE_GEMV below and degrades
       # to the stock fp8 path per-layer; bench/eval_quality.py is the accuracy gate.
       - --kv-cache-dtype=fp8_e4m3
+      # KV offloading: judge-specified 2026-08-17 (commit 3823158).
+      # THESE TWO FLAGS CONFIGURE A vLLM V1 KV CONNECTOR (boot logs
+      # "Initializing KVConnectorBase_V1" + an OffloadingSpec), and a connector is mutually
+      # exclusive with the Rust KV/scheduler stack in this build: schedule_supported()
+      # refuses connectors outright, and authority mode STANDS DOWN when it detects one
+      # (rust_sched.py::kv_connector_configured / authority_stand_down). So while these
+      # flags are present the box serves the STOCK scheduler + offloading, and
+      # VTL_RUST_SCHED / VTL_RUST_SCHED_FULL, the resident table, the N-step burst and the
+      # Rust runner below are ALL INACTIVE regardless of what they are set to -- the boot
+      # logs one loud stand-down warning and keeps serving.
+      # Decide deliberately: keep the offloading connector, or delete these two lines and
+      # keep the Rust stack. Not both. (The flags are left AS SPECIFIED here; changing them
+      # is the team's call, not this comment's.)
       - --kv-offloading-size=64
       - --kv-offloading-backend=native
       # MTP speculative decoding: PERMITTED for round-2 (user-confirmed 2026-08-16; the
