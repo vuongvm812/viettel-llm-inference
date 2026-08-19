@@ -344,3 +344,142 @@ boot stands authority mode down and serves stock + offloading.
 | F | SIMPLE offload stand-down: `-e VLLM_USE_SIMPLE_KV_OFFLOAD=1` must log the stand-down and serve stock. |
 | G | NIXL stand-down: `--kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_both"}` must stand down, not hang or raise. |
 | H | Abort/preempt soak: cancel requests mid-prefill and mid-decode under load, and force preemption (small `--max-num-seqs`) — this is the arm that exercises `pop_blocks_for_free` + the deferred drain, so watch `usage`/free-block count for a leak over ~10 min. |
+
+---
+
+## Third incident (2026-08-19): `make warm` / `make up` wedge at the first mixed decode+prefill wave, connector-live boot
+
+First on-box run of the shipped compose with the connector port active (the
+`--kv-transfer-config={"kv_load_failure_policy": "recompute"}` line landed with stage S/U1,
+so this boot is validation arm A's first actual execution). The server boots, warms up
+line 0 of the trace normally (~30 tok/s single-stream decode), then wedges the moment the
+5-wide warmup burst (`VTL_WARMUP_CONCURRENCY=5`) transitions from prefill into its first
+decode steps. All 5 warmup POSTs time out at 20 s, the RustFrontend auto-aborts their
+dropped streams, and the engine never recovers — `make warm` and `make up` both fail on it.
+
+### Reading the stall dump
+
+```
+STALL -- 5 running request(s) made no progress for 20s (waiting=0)
+STALL req=...1db02510 status=RUNNING num_tokens=2145 computed=2146 placeholders=2 output=0 prefill_chunk=False
+STALL req=...39c4e8f9 status=RUNNING num_tokens=2143 computed=2143 placeholders=1 output=0 prefill_chunk=False
+STALL req=...83f13c60 status=RUNNING num_tokens=2144 computed=2144 placeholders=1 output=0 prefill_chunk=False
+STALL req=...265fdc41 status=RUNNING num_tokens=2145 computed=2145 placeholders=1 output=0 prefill_chunk=False
+STALL req=...0f409366 status=RUNNING num_tokens=2602 computed=1759 placeholders=0 output=0 prefill_chunk=True
+STALL BURST: armed=True ready=False key=() n=4 mode='graph' pending=0 pending1=False pending_seq=0 rust_steps=8
+STALL RUNNER: live=False refused=True why='nstep captured no unroll graphs; there is nothing launchable' inflight=2 pending=0 stash_seq=None
+```
+
+**The scheduler-side bookkeeping is CLEAN.** Every request satisfies the async invariant
+`C == T + P - 1` exactly (2146 = 2145+2−1, 2143 = 2143+1−1, 2144, 2145; the prefill chunk
+carries P=0 by design — chunks claim no placeholder, `rust_sched.py:899-918`). This is
+**not** the second-incident wedge (`schedule()` returning empty steps against guard-failing
+entries): steps were being scheduled right up to the freeze. The placeholder pattern
+(2,1,1,1,0) plus `RUNNER inflight=2` decodes as exactly the normal depth-2 batch queue:
+
+* step *k−1*: request `...1db02510` (first of the wave to finish prefill) takes its first
+  decode token, the other four run their final/next prefill chunks (no placeholders);
+* step *k*: all four finished requests decode (placeholders 1 each, `...1db02510` now 2),
+  `...0f409366` continues chunking (843 tokens left of 2602).
+
+Both steps are executed but neither is applied (`inflight=2` — incremented per
+`schedule()`, decremented only in `update_from_output`, `rust_sched.py:5040`/`:4271`),
+because the engine thread never returns from `sample_tokens` of the older one.
+
+**Where the engine thread actually is.** The main-thread stack bottoms out at
+`nstep_decode.py:1315` — the *non-burst* path (`out = original(...)`; no burst was
+committed for this step) — then stock sampling, then:
+
+```
+File ".../vtl/patches/step0_eos_ban.py", line 88 in __call__
+```
+
+Line 88 is `idx = torch.from_numpy(rows).to(logits.device)`. That `.to()` is a *blocking*
+pageable H2D copy: torch's `copy_` with `non_blocking=False` ends in a stream
+synchronize, so this line waits for the **entire current stream to drain** — including the
+whole forward of the step being sampled and the next step's forward already enqueued
+behind it. It sat there for the full 20 s window with the progress signature frozen.
+`rows is not None` (prefill rows present in the sampled batch) is consistent with step
+*k−1*'s shape — decode row + final prefill chunks.
+
+**Conclusion on mechanism:** the `step0_eos_ban` frame is a *bystander* (same class as the
+second incident's `nvrtc_block_quant` frame — it is just the first host call that has to
+wait for the stream). The real wedge is **device-side: GPU work enqueued by the first
+mixed decode+prefill batch of the boot never completes** (a spinning/garbage-length kernel,
+or a cross-stream event that never fires). Everything host-side downstream (sampling,
+AsyncOutput D2H, update, abort processing) is queued behind it, which is why even the
+frontend's aborts at 01:20:02 change nothing.
+
+### What is new on this boot (suspect list, ranked)
+
+1. **Connector + Rust authority both live for the first time.** This exact compose
+   (offloading flags + the `recompute` line + the S/U1 port) had never run on-box; the
+   validation arms A–H above were written *to be run*. By the wedge point the connector has
+   real work in flight for the first time: line 0's ~2.1k-token prefix has been offloaded,
+   and the 5 wave requests (which share that prefix) are the first candidates that can
+   probe/hit the CPU cache and the first concurrent offload writes. A block-id or
+   event-ordering disagreement between the port's allocation/metadata
+   (`allocate_external`, `RustBlocks` view, `build_connector_meta` inputs) and the
+   connector worker's GPU⇄CPU transfer streams is the same *class* of failure as the
+   second incident's split-brain hang — moved from the first prefill wave to the first
+   offload/hit activity.
+2. **First mixed decode+prefill batch of the boot.** Line 0 only ever presented pure
+   prefill then pure batch-1 decode. Step *k−1* is the first batch mixing decode rows with
+   prefill chunks — the shape `jit_monitor` flagged 2 s before the freeze
+   (`Triton kernel JIT compilation during inference: fused_moe_kernel`). Decode-band
+   kernels (`gdn_decode_step`, `moe_decode_gemv`, fused argmax) and the GDN align-mode
+   chunking all see this composition for the first time; a garbage seq-len/state index fed
+   to a data-dependent-loop kernel (FA3 with `max_seqlen_k` baked at `max_model_len`, the
+   FLA chunk kernels) is indistinguishable from a hang.
+3. The JIT compile itself is *not* the wedge (the warning logs after compilation; a
+   compile blocks the host, and the host was seen blocked in sampling, not in Triton).
+
+### Secondary findings (not the wedge, but fix/collect anyway)
+
+* **`RUNNER refused: 'nstep captured no unroll graphs'`** — a degrade, not a failure: the
+  Rust runner stands down (`rust_runner.py:544`) and Python keeps the step. But it means
+  the prologue and/or unroll rung failed capture at boot (`mode='graph'` proves body
+  graphs captured; `demote("fold")` on a prologue failure also clears the unroll rung,
+  `nstep_decode.py:252-259`). The boot log has the exact lines: look for
+  `vtl: nstep <what> capture failed at num_reqs=...` (with traceback) /
+  `vtl: nstep <rung> disabled for this boot` and the summary
+  `vtl: nstep captured N burst body graph(s) ... prologue=[...] unroll=[...]`. Collect them
+  — on the last known-good boot the runner presumably armed, so this may be a second
+  regression riding along.
+* **`BURST ... rust_steps=8` in the dump is cosmetic**: `demote()` clears the graphs but
+  not `rust_steps`; it no longer means multi-launch steps are possible.
+* **`rust_sched: token store step fallback (first time) -- step is not numpy-packable`**
+  is expected on a connector-live boot (tokstore is a declared connector exclusion;
+  `store_take_over` refuses per request and every step then takes the object path) — but
+  the logged reason is misleading: the step is "not packable" because the store never took
+  the requests over, not because of the step's shape. Consider logging the tokstore
+  stand-down reason instead when `TOK.off_why` is set.
+* `BURST armed=True ready=False key=()` is correct behaviour here: no pure-decode
+  steady-state step had happened yet, so no burst was ever committed — the wedge is
+  upstream of everything nstep does at runtime.
+
+### Next steps (in information-value order)
+
+1. **Collect, from the failing box**: (a) the full boot stderr (`docker compose logs`)
+   for the nstep capture lines and any connector/rust_sched warnings — especially the
+   `RUNGS authority=... connector=...` line proving which mode actually served; (b) the
+   *second* stall dump (the watchdog re-fires every 120 s) — an identical stack proves a
+   blocked host thread (GPU wedge), a moving one would mean spinning; (c) `nvidia-smi`
+   during the wedge — SM util pinned at 100 % = runaway kernel, ~0 % = launch-queue /
+   event deadlock.
+2. **Bracket the connector port** (the two arms answer different questions):
+   * delete all three `--kv-offloading*/--kv-transfer-config` lines (doc arm E): full Rust
+     stack, no connector. Warm passes ⇒ the wedge involves the connector.
+   * keep the flags, set `VTL_RUST_SCHED=0`: connector on stock scheduler. Warm passes ⇒
+     the wedge is in the port, not the connector per se.
+3. **`VTL_NSTEP=0` + `VTL_ENABLE_NSTEP_DECODE=0`** — expected *no change* (the burst never
+   engaged); if the wedge disappears, that finding invalidates the analysis above and
+   points back at capture-time state corruption.
+4. **Kernel candidates for the mixed batch**, one at a time:
+   `VTL_ENABLE_GDN_DECODE_STEP=0`, `VTL_ENABLE_MOE_DECODE_GEMV=0`,
+   `VTL_ENABLE_GREEDY_ARGMAX=0`/`VTL_V2_GREEDY_ARGMAX_KERNEL=0`, `VTL_NVRTC=0`.
+5. `VTL_ENABLE_STEP0_EOS_BAN=0` only to confirm the bystander status (the block should
+   move to the next sync point, e.g. AsyncOutput's D2H). Independent of this incident,
+   `step0_eos_ban`'s per-prefill-step `torch.from_numpy(rows).to(logits.device)` is a
+   hidden full-stream sync on the hot path and is worth replacing with a persistent
+   device-side index buffer.
