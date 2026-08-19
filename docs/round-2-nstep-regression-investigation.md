@@ -483,3 +483,42 @@ frontend's aborts at 01:20:02 change nothing.
    `step0_eos_ban`'s per-prefill-step `torch.from_numpy(rows).to(logits.device)` is a
    hidden full-stream sync on the hot path and is worth replacing with a persistent
    device-side index buffer.
+
+### Resolution of the bisect (2026-08-19, on-box)
+
+`VTL_ENABLE_RUST_SCHED=0` with everything else unchanged — connector flags included —
+**serves cleanly; the wedge is gone.** That one arm settles the suspect ranking:
+
+* **The kernels are exonerated.** With rust_sched off, the exact same first-time shapes ran
+  (mixed decode+prefill wave, the JIT'd `fused_moe_kernel` config, `gdn_decode_step`,
+  `moe_decode_gemv`, the fused argmax) under the same connector, and nothing hung. The
+  device-side never-completing work is *induced by what the Rust scheduler feeds the step*,
+  not by a kernel bug in isolation.
+* **The wedge needs the rust_sched patch.** Combined with the fact that the Rust stack
+  served fine on every connector-less boot before the port, the failure localizes to the
+  **stage S/U1 port × connector interplay** — the phase-split schedule / external
+  allocation / block-record view / deferred-free paths that this boot exercised for the
+  first time. (Caveat for the root-cause hunt: the arm disabled the *whole* patch, not just
+  the port, so a latent rust_sched bug that only this workload timing reaches is not
+  formally excluded — but the port is the only untested code on the path.)
+
+**Mitigation shipped** on this branch: compose pins `VTL_ENABLE_RUST_SCHED: 0` with a
+pointer back to this section. Consequences, so nobody reads the next bench as the stack's:
+authority mode, FULL schedule, the resident table, speculation, tokstore, R8/R9, the nstep
+burst (its commit half lives in rust_sched) and the Rust runner are all inert; the boot is
+stock scheduler + offloading connector + the kernel/quant/IPC patches.
+
+### Root-causing the port (when the stack is turned back on)
+
+1. Re-run the finer brackets from the plan above: connector lines deleted + full Rust stack
+   (arm 1). If that passes too, the defect is strictly in the interplay, not in the S/U1
+   code paths that also run connector-less.
+2. Instrument the first wave under the wedge config: log `build_connector_meta` inputs
+   (block ids per group, `keys_to_load` windows), `allocate_external` grants, and the
+   deferred-free drains for the five wave requests; diff the block-id streams against a
+   `VTL_ENABLE_RUST_SCHED=0` boot of the same trace. A wrong id/length handed to the
+   connector worker's GPU⇄CPU copies is the leading concrete mechanism for a stream that
+   never drains.
+3. `nvidia-smi` during a reproduced wedge still discriminates cheaply: ~0 % SM util says
+   copy/event deadlock (transfer path), 100 % says a compute kernel looping on
+   garbage metadata (schedule outputs).
