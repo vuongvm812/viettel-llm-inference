@@ -122,6 +122,66 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _ST_WAITING, _ST_RUNNING, _ST_PREEMPTED = 0, 1, 2
 
 
+# ---------------------------------------------------------------------------------------
+# Scheduler flight recorder (third-incident diagnostics, 2026-08-19).
+#
+# The connector-live wedge presents as GPU work that never completes, which means the
+# stall dump's thread stacks can only ever show a bystander host call blocked on a stream
+# sync -- the interesting state is WHAT THE LAST FEW schedule() CALLS FED THE STEP (token
+# counts, block-id ranges, the zeroing list, deferred-free traffic). This ring records
+# exactly that, host-side, a few ints per step, and `stall_dump` prints it when a wedge
+# fires. Same philosophy as stall_dump itself: the engine carries its own recorder because
+# the box is not always attachable.
+#
+#   VTL_SCHED_FLIGHT=0   turn the recorder off (default on; the cost is one small dict
+#                        append per schedule() plus min/max over that step's new-block list)
+# ---------------------------------------------------------------------------------------
+
+from collections import deque as _flight_ring
+from time import monotonic as _flight_now
+
+FLIGHT: "_flight_ring[tuple[float, str, dict]]" = _flight_ring(maxlen=48)
+_flight_on: "bool | None" = None
+
+
+def flight_enabled() -> bool:
+    """Lazy env resolve, like the other gates. Default ON -- this exists for the wedge."""
+    global _flight_on
+    if _flight_on is None:
+        _flight_on = os.environ.get("VTL_SCHED_FLIGHT", "1").strip().lower() in _TRUTHY
+    return _flight_on
+
+
+def flight_note(kind: str, **fields) -> None:
+    """Append one entry. Never raises -- a recorder must not be the reason a step fails."""
+    if not flight_enabled():
+        return
+    try:
+        FLIGHT.append((_flight_now(), kind, fields))
+    except Exception:
+        pass
+
+
+def flight_lines(limit: int = 12) -> list:
+    """The most recent entries, formatted for the stall dump. Never raises; called from
+    the watchdog thread against a process that may be wedged, so it only READS."""
+    try:
+        now = _flight_now()
+        out = []
+        for ts, kind, fields in list(FLIGHT)[-limit:]:
+            body = " ".join(f"{k}={v!r}" for k, v in fields.items())
+            out.append(f"FLIGHT t-{now - ts:.1f}s {kind}: {body}")
+        return out
+    except Exception:
+        return ["FLIGHT: unreadable"]
+
+
+def _ids_span(ids) -> tuple:
+    """``(count, min, max)`` of a block-id list -- the wedge question is 'were any ids
+    insane', and a span answers it without recording hundreds of ints per step."""
+    return (len(ids), min(ids), max(ids)) if ids else (0, -1, -1)
+
+
 def env_on(name: str) -> bool:
     """Env gate parsing. Pure python, exercised by the self-check without the crate."""
     return os.environ.get(name, "").strip().lower() in _TRUTHY
@@ -1980,6 +2040,7 @@ def _install_authority(base, mirror_modes):
             if slot is None:
                 return []
             ids = self._rust.pop_blocks_for_free(slot)
+            flight_note("pop_free", rid=rid[-9:], slot=slot, ids=_ids_span(ids))
             self._drop_slot(rid)
             tbl = getattr(self, "_vtl_table", None)
             if tbl is not None:
@@ -1997,7 +2058,9 @@ def _install_authority(base, mirror_modes):
             ``Manager::free_block_ids`` for why that differs from the per-group reverse
             ``free()`` uses and why both are correct.
             """
-            self._rust.free_block_ids([int(b) for b in blocks])
+            ids = [int(b) for b in blocks]
+            flight_note("drain", ids=_ids_span(ids))
+            self._rust.free_block_ids(ids)
 
         def remaining_blocks(self, request):
             """``Scheduler._request_remaining_blocks`` (scheduler.py:2387), over Rust state.
@@ -3265,7 +3328,14 @@ def store_step_fallback(kv, sampled, batch, why: str) -> None:
         tok_materialize(kv, request)
     if not TOK.warned:
         TOK.warned = True
-        log.info("rust_sched: token store step fallback (first time) -- %s", why)
+        # `off_why` set means the store never took the requests over (e.g. the connector
+        # exclusion) -- say so, or this line reads as a per-step shape problem when it is
+        # really a boot-wide stand-down (it misdirected the third-incident triage once).
+        log.info(
+            "rust_sched: token store step fallback (first time) -- %s%s",
+            why,
+            f" [tokstore off for this boot: {TOK.off_why}]" if TOK.off_why else "",
+        )
 
 
 def store_full_fallback(scheduler, kv, scheduler_output, model_runner_output) -> None:
@@ -5395,6 +5465,7 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             if bail not in seen:
                 seen.add(bail)
                 log.warning("rust_sched: this step falls back to vLLM -- %s", bail)
+            flight_note("bail", step=getattr(self, "current_step", -1), why=bail)
             return wrapped(self, *args, **kwargs)
 
         # The class-B reset for "bail": past this point the Rust loop decides this step.
@@ -6122,6 +6193,39 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 if not getattr(self, "_vtl_inconsistent_probe_failed", False):
                     self._vtl_inconsistent_probe_failed = True
                     log.exception("rust_sched: inconsistent-skip probe failed")
+        if flight_enabled():
+            # The step's whole shape, host-side, for the wedge dump: what was scheduled
+            # for whom (post-`_update_after_schedule` counters, so C/P are the values the
+            # NEXT step's guards read), the span of the new-block ids and of the zeroing
+            # list (an insane id here is the OOB-write lead), and the connector-path
+            # counts. `reqs` rows are (rid tail, num_new, C, P).
+            try:
+                flight_note(
+                    "sched",
+                    step=self.current_step,
+                    seq=int(getattr(self, "sched_step_seq", -1)),
+                    total=total,
+                    reqs=[
+                        (
+                            r.request_id[-9:],
+                            num_scheduled_tokens.get(r.request_id, 0),
+                            int(r.num_computed_tokens),
+                            int(r.num_output_placeholders),
+                        )
+                        for r in (scheduled_running_reqs + scheduled_new_reqs)[:8]
+                    ],
+                    nb=_ids_span(flat),
+                    zero=_ids_span(scheduler_output.new_block_ids_to_zero),
+                    adm=len(scheduled_new_reqs),
+                    pre=len(preempted),
+                    park=len(parked_external),
+                    stale=len(probe_stale),
+                    asked=len(queried),
+                )
+            except Exception:
+                if not getattr(self, "_vtl_flight_failed", False):
+                    self._vtl_flight_failed = True
+                    log.exception("rust_sched: flight-recorder note failed")
         if TIMING:
             t_exit = ns()
             timers.add("apply", t_exit - t_rust)
@@ -8488,6 +8592,26 @@ def _self_check() -> None:
     assert rung(False, "a\nb  c") == "OFF(a b c)", "RUNGS is one line or it is nothing"
     long = rung(False, "x" * 200)
     assert len(long) == _RUNG_WHY_MAX + len("OFF()") and long.endswith("…)"), long
+
+    # ---- the flight recorder: gate, note, span, formatting -------------------------
+    global _flight_on
+    FLIGHT.clear()
+    _flight_on = None
+    os.environ["VTL_SCHED_FLIGHT"] = "0"
+    flight_note("sched", step=1)
+    assert not FLIGHT, "a disabled recorder must record nothing"
+    _flight_on = None
+    os.environ.pop("VTL_SCHED_FLIGHT")
+    assert flight_enabled(), "the recorder defaults ON -- it exists for the wedge"
+    flight_note("sched", step=7, total=5, reqs=[("abc", 1, 10, 1)])
+    flight_note("drain", ids=_ids_span([9, 4, 7]))
+    assert len(FLIGHT) == 2
+    lines = flight_lines()
+    assert len(lines) == 2 and "sched" in lines[0] and "drain" in lines[1], lines
+    assert "(3, 4, 9)" in lines[1], "the span is (count, min, max)"
+    assert _ids_span([]) == (0, -1, -1) and _ids_span(None) == (0, -1, -1)
+    assert flight_lines(limit=1) == lines[1:], "limit keeps the newest entries"
+    FLIGHT.clear()
 
     try:
         import vtl_sched  # noqa: F401

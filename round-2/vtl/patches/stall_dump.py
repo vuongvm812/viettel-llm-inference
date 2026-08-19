@@ -172,6 +172,19 @@ def _dump(sched) -> None:
             )
         for line in _burst_state().splitlines():
             log.warning("vtl: STALL %s", line)
+        # The scheduler flight recorder (rust_sched.FLIGHT): what the last few schedule()
+        # calls fed the step -- token counts, block-id spans, the zeroing list, deferred
+        # frees. The third-incident wedge is GPU work that never completes, so the thread
+        # stacks below only ever catch a bystander host call blocked on the stream; THIS
+        # is the state that names the step that enqueued the wedge. Same `sys.modules.get`
+        # discipline as `_burst_state`: never import from the watchdog.
+        try:
+            rs = sys.modules.get("vtl.patches.rust_sched")
+            lines = rs.flight_lines() if hasattr(rs, "flight_lines") else ()
+            for line in lines:
+                log.warning("vtl: STALL %s", line)
+        except Exception:
+            log.exception("vtl: stall flight readout failed")
         faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
     except Exception:
         log.exception("vtl: stall dump itself failed")

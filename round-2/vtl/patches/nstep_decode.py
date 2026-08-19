@@ -247,8 +247,13 @@ class _Burst:
         if rung == "unroll":
             self.unroll = False
             self.unroll_graphs = {}
-            # The Rust runner launches the unroll exec, so it cannot outlive it either.
+            # The Rust runner launches the unroll exec, so it cannot outlive it either --
+            # and neither can the multi-launch ceiling it advertised: leaving `rust_steps`
+            # at its env value made the third-incident stall dump claim 8-launch steps on
+            # a boot whose runner had stood down. Diagnostic honesty only; every consumer
+            # of a multi-launch step is already gated on the graphs cleared above.
             self.continue_graphs = {}
+            self.rust_steps = 1
         elif rung == "fold":
             self.fold = False
             self.sample1 = False
@@ -257,6 +262,7 @@ class _Burst:
             self.unroll = False
             self.unroll_graphs = {}
             self.continue_graphs = {}
+            self.rust_steps = 1
 
 
 BURST = _Burst()
@@ -1629,25 +1635,29 @@ def _self_check() -> None:
 
     # The in-graph ladder demotes ONE rung at a time, and `fold` takes `unroll` with it
     # (the unrolled graph CONTAINS the prologue, so it cannot outlive it).
-    saved_ladder = (b.fold, b.unroll, b.sample1)
+    saved_ladder = (b.fold, b.unroll, b.sample1, b.rust_steps)
     try:
         log.disabled = True
         b.fold = b.unroll = b.sample1 = True
+        b.rust_steps = 8
         b.unroll_graphs = {1: object()}
         b.continue_graphs = {1: object()}
         b.demote("unroll", "test")
         assert not b.unroll and b.unroll_graphs == {}
         assert b.continue_graphs == {}, "the runner launches the unroll exec"
+        assert b.rust_steps == 1, "a demoted unroll has no multi-launch ceiling to advertise"
         assert b.fold and b.sample1, "an unroll failure must not cost the prologue"
         b.unroll = True
+        b.rust_steps = 8
         b.pro_graphs = {1: object()}
         b.continue_graphs = {1: object()}
         b.demote("fold", "test")
         assert not b.fold and not b.sample1 and not b.unroll
         assert b.pro_graphs == {} and b.unroll_graphs == {} and b.continue_graphs == {}
+        assert b.rust_steps == 1
     finally:
         log.disabled = False
-        b.fold, b.unroll, b.sample1 = saved_ladder
+        b.fold, b.unroll, b.sample1, b.rust_steps = saved_ladder
         b.pro_graphs, b.unroll_graphs, b.continue_graphs = {}, {}, {}
 
     assert _int("VTL_NOT_SET_ANYWHERE", 4) == 4
