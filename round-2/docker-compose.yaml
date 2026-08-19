@@ -453,6 +453,22 @@ services:
       VTL_RUST_SCHED_TABLE: 1
       VTL_RUST_SCHED_SPEC: 1
       VTL_SCHED_TIMING: 0 # diagnostic: schedule-phase p50/p95 every 500 steps
+      # Most waiting requests admitted on a step that ALREADY carries running (decode)
+      # rows. 0 = unlimited, which is stock behaviour; 1 is set here to remove the batch
+      # shape every engine wedge on this branch has needed (see
+      # docs/round-2-nstep-regression-investigation.md, incidents 3-5): a GDN batch that is
+      # mixed -- num_decodes > 0 AND num_prefills > 0 -- carrying three concurrent
+      # multi-thousand-token prefills. The 02:59 flight ring holds the control that pins it:
+      # 5201 tokens of PURE prefill served fine, and the next step (2 decode + 3 prefill,
+      # 7805 tokens) wedged in the GDN prefill branch. With the cap the deferred prefills
+      # land on the following step(s), where they are pure prefill or mixed with fewer rows.
+      #
+      # Costs a little TTFT in an arrival burst and nothing at steady state; it does NOT
+      # drop or reorder anything (the withheld tail goes back on the queue ahead of the next
+      # step, FCFS preserved). Keeps VTL_RUST_SCHED_FULL=1 -- i.e. the whole Rust stack --
+      # which is what makes it preferable to the FULL=0 / VTL_ENABLE_RUST_SCHED=0 reverts.
+      # Set to 0 to restore stock admission.
+      VTL_SCHED_MIXED_PREFILL_CAP: 1
 
       # ---- Hot path: micro-opts, output collapse, N-step burst -------------------------
       # INERT UNTIL THE FORK IMAGE IS REBUILT: VTL_HOTPATH_MICROOPT and VTL_STREAM_PER_TOKEN
