@@ -266,6 +266,46 @@ def _rms_impl(result, input, weight, scale, epsilon, scale_ub, residual,
     )
 
 
+def _gq_reject_reason(input, output_q, output_s, group_size, scale_ue8m0) -> str:
+    """WHICH envelope predicate refused ``_gq_impl``, for the one-shot warning.
+
+    Called ONLY on the ``not ok`` arm, so the accepted path pays nothing and its
+    predicate list above is untouched. Order mirrors that expression; the first failure
+    is the one reported.
+
+    This exists because the eager fallback is not a cosmetic degrade: it is pure
+    PyTorch, it allocates fp32 temporaries proportional to the batch, and under a tight
+    ``--gpu-memory-utilization`` every one of those allocations can drive the caching
+    allocator into a ``cudaFree``, i.e. an implicit device synchronize. At decode widths
+    that is invisible; on a multi-thousand-token prefill batch it is the difference
+    between a 30 ms step and a step slow enough to trip the stall watchdog. "Outside
+    compiled envelope" alone never said which of ten predicates to go fix.
+    """
+    import torch
+
+    if _state["launchers"] is None:
+        return "the NVRTC kernels never compiled (see the arming log above)"
+    if scale_ue8m0:
+        return "scale_ue8m0=True (the shipped kernel emits e4m3 scales only)"
+    if input.dtype != torch.bfloat16:
+        return f"input dtype {input.dtype} (kernel is bf16-only)"
+    if output_q.dtype != torch.float8_e4m3fn:
+        return f"out dtype {output_q.dtype} (kernel is fp8e4m3-only)"
+    if int(group_size) != _state["group"]:
+        return f"group_size {int(group_size)} != compiled {_state['group']}"
+    if not input.is_contiguous():
+        return "input is not contiguous"
+    if not output_q.is_contiguous():
+        return "output_q is not contiguous"
+    if output_s.dtype != torch.float32:
+        return f"scale dtype {output_s.dtype} (kernel writes f32)"
+    if output_s.dim() != 2:
+        return f"scale is {output_s.dim()}-D (kernel addresses a 2-D scale)"
+    if input.numel() % int(group_size):
+        return f"numel {input.numel()} not a multiple of group {int(group_size)}"
+    return "unknown (the predicate list and this reporter disagree)"
+
+
 def _gq_impl(input, output_q, output_s, group_size, eps, fp8_min, fp8_max,
              scale_ue8m0, dummy_is_scale_transposed, dummy_is_tma_aligned) -> None:
     import torch
@@ -285,8 +325,18 @@ def _gq_impl(input, output_q, output_s, group_size, eps, fp8_min, fp8_max,
         and input.numel() % int(group_size) == 0
     )
     if not ok:
-        _warn_once("gq_eager", "vtl: %s call outside compiled envelope; eager fallback",
-                   GQ_OP)
+        # The shape is in the message on purpose: the cost of this path scales with it,
+        # and a fallback that only ever fires on wide prefill batches looks like a hang
+        # rather than a slowdown.
+        _warn_once(
+            "gq_eager",
+            "vtl: %s call outside compiled envelope (%s); EAGER FALLBACK for the rest "
+            "of the boot -- pure-PyTorch quant, cost scales with the batch (this call: "
+            "%s). A wide prefill batch pays it in full.",
+            GQ_OP,
+            _gq_reject_reason(input, output_q, output_s, group_size, scale_ue8m0),
+            tuple(input.shape),
+        )
         _eager_gq(input, output_q, output_s, group_size, eps, fp8_min, fp8_max,
                   scale_ue8m0)
         return

@@ -529,3 +529,105 @@ Also landed, diagnostics-honesty fixes from this incident's triage: `nstep demot
 resets `rust_steps` to 1 (the stall dump advertised 8-launch steps on a boot whose runner
 had stood down), and the token-store fallback log names `TOK.off_why` when the store was
 off for the whole boot (the bare "step is not numpy-packable" misdirected triage once).
+
+---
+
+## Fourth dump (2026-08-19 02:20): the flight recorder names the trigger step
+
+First wedge captured with the recorder armed. It is the same wedge, and the recorder
+answers the question the thread stacks structurally could not.
+
+### What the ring shows
+
+```
+t-20.6s .. t-20.4s  sched step=896..904  total=5   (5-row decode, num_new=1 each)
+t-20.4s             sched step=905       total=2
+t-20.4s             sched step=906       total=3059  adm=1 asked=1 zero=(1, 8, 8)
+t-20.2s             sched step=907       total=7803  adm=3 asked=3 zero=(3, 1, 20)
+                    <nothing for 20 s>
+```
+
+**The trigger is step 907: 2 decode rows + THREE simultaneous unchunked prefills**
+(2146 + 2600 + 3055 = 7801 tokens) for **7803 total**, against
+`--max-num-batched-tokens=8192`. The eleven steps before it ran in ~0.4 s (**~36 ms per
+5-token decode step**); step 907's forward then consumed **the entire 20 s window and did
+not return**.
+
+That ratio is the finding. 7803 tokens is ~1560x a decode step's token count, but this is
+a 122B-A10B MoE on an H200 — a healthy 7.8k-token prefill belongs in the few-hundred-
+milliseconds range, so **step 907 is one to two orders of magnitude slower than it should
+be**. This is not (or not only) a deadlock; it is a path whose cost explodes with batch
+width, which is exactly why every wedge so far has landed on the first wide mixed batch of
+the boot and never on the decode steps before it.
+
+### Scheduler bookkeeping: clean again, and the admission is stock-legal
+
+Every request satisfies the async invariant `C == T + P - 1` (3059 = 3058+2-1,
+2146 = 2146+1-1, 2600, 3055, and the decode row 318 = 317+2-1). The admission itself is
+what stock would do: 7803 fits the 8192 budget, and the in-flight-prefill reservation that
+could have throttled it is — in stock (`scheduler.py:895-901`) — applied **only on the
+`load_kv_async` arm**, which this step does not take (`park=0`). The port passes the same
+`base_reserved` only into `allocate_external`. **So "the Rust scheduler over-admitted" is
+ruled out: this batch is legal and stock-shaped.**
+
+### Where the forward is stuck
+
+```
+nvrtc_block_quant.py:180 _eager_gq   <- vtl's EAGER FALLBACK
+nvrtc_block_quant.py:290 _gq_impl
+fp8_utils.py:637 per_token_group_quant_fp8
+fused_moe/utils.py:148 _fp8_quantize -> no_dp_ep.prepare -> modular_kernel.apply
+fp8.py:844 apply
+moe_decode_gemv.py:755 moe_apply     (M=7803 > VTL_MOE_GEMV_MAX_M=8 -> stock apply)
+... qwen3_next.py:589 forward ... model_runner.py:1380 execute_model
+```
+
+`_gq_impl` is vtl's override of the `_C` block-quant op, and it took **`_eager_gq`** — the
+pure-PyTorch fallback taken whenever the call falls outside the compiled envelope. That
+path is fully vectorised (no Python loop), so being caught there means the host is blocked
+in it, not spinning — and what blocks in it is allocation: it materialises fp32 temporaries
+proportional to the batch (~100 MB per call at this width), and at
+`--gpu-memory-utilization=0.95` the caching allocator has little headroom, so those
+allocations drive `cudaFree` — **an implicit device synchronize** — repeatedly, per MoE
+layer.
+
+That single mechanism explains every observation on record: invisible at decode widths,
+catastrophic on the first wide batch, and it is why the *previous* dump was caught in
+`step0_eos_ban`'s `torch.from_numpy(rows).to(device)` — another allocation-and-sync on the
+same starved allocator. Both frames are bystanders of the same starvation.
+
+### The tension to resolve, stated plainly
+
+This does not by itself explain the `VTL_ENABLE_RUST_SCHED=0` result, because
+`nvrtc_block_quant` installs independently of the scheduler. Three readings survive, and
+the arms below separate them: (a) the stock-scheduler run never built a batch this wide,
+so it never paid the cliff; (b) the stock scheduler chunks these three prefills across
+steps where the Rust loop packs them into one; (c) two contributing factors. Note the
+scheduler is a *trigger* under all three — the batch width is what detonates the path.
+
+### Landed on this branch
+
+* **The envelope refusal now names its cause.** `vtl: <op> call outside compiled envelope
+  (<which predicate>); EAGER FALLBACK ... (this call: <shape>)` — ten predicates could
+  refuse and the old message named none of them, so one boot line now says which to fix.
+  The accepted path is untouched (the reason is computed only on the refusing arm).
+* **Recorder sharpened**: the dump prints 24 ring entries instead of 12 (12 was exactly
+  consumed by a run of decode steps, hiding any `pop_free`/`drain` behind them), and the
+  kv-zeroing list is recorded **verbatim** instead of as a `(count, min, max)` span — a
+  span cannot answer "is this id one a live request still reads", which is the collision
+  the field exists to detect. In this dump step 906 zeroed id 8 for a request still live
+  at 907, whose span was `(3, 1, 20)`: the span cannot say whether 8 was re-issued.
+
+### Next arms, in order
+
+1. **`VTL_ENABLE_NVRTC_BLOCK_QUANT=0`, full Rust stack ON.** The single highest-value
+   test: if warm passes, the eager fallback is the wedge and the scheduler only supplied
+   the batch width.
+2. **Grep the boot log for `outside compiled envelope`.** With the change above, one line
+   names the failing predicate and the shape. If it never appears, the fallback is *not*
+   firing and hypothesis 1 is dead — check instead whether the whole boot ran eagerly from
+   the start (`launchers is None`, i.e. the NVRTC compile failed).
+3. Re-run the wedge with the sharpened recorder and read the verbatim `zero=` ids against
+   the live request set.
+4. `nvidia-smi` during the wedge: pinned ~100 % SM with the host in `_eager_gq` is
+   consistent with allocator-sync starvation; ~0 % points at a copy/event deadlock instead.

@@ -162,7 +162,7 @@ def flight_note(kind: str, **fields) -> None:
         pass
 
 
-def flight_lines(limit: int = 12) -> list:
+def flight_lines(limit: int = 24) -> list:
     """The most recent entries, formatted for the stall dump. Never raises; called from
     the watchdog thread against a process that may be wedged, so it only READS."""
     try:
@@ -174,6 +174,17 @@ def flight_lines(limit: int = 12) -> list:
         return out
     except Exception:
         return ["FLIGHT: unreadable"]
+
+
+def _zero_ids(ids) -> list:
+    """The kv-zeroing list VERBATIM (capped). One block per newly admitted sequence --
+    the GDN/mamba state block -- so this is 1-3 entries on the served config, and the
+    question it exists to answer is whether an id handed to a new sequence is one a LIVE
+    request is still reading. A ``(count, min, max)`` span cannot answer that."""
+    if not ids:
+        return []
+    out = [int(b) for b in list(ids)[:8]]
+    return out + ["..."] if len(ids) > 8 else out
 
 
 def _ids_span(ids) -> tuple:
@@ -6215,7 +6226,7 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                         for r in (scheduled_running_reqs + scheduled_new_reqs)[:8]
                     ],
                     nb=_ids_span(flat),
-                    zero=_ids_span(scheduler_output.new_block_ids_to_zero),
+                    zero=_zero_ids(scheduler_output.new_block_ids_to_zero),
                     adm=len(scheduled_new_reqs),
                     pre=len(preempted),
                     park=len(parked_external),
@@ -8611,6 +8622,12 @@ def _self_check() -> None:
     assert "(3, 4, 9)" in lines[1], "the span is (count, min, max)"
     assert _ids_span([]) == (0, -1, -1) and _ids_span(None) == (0, -1, -1)
     assert flight_lines(limit=1) == lines[1:], "limit keeps the newest entries"
+    # The zeroing list is recorded VERBATIM: a span cannot answer "is this id one a live
+    # request still reads", which is the whole question it is there for.
+    assert _zero_ids([]) == [] and _zero_ids(None) == []
+    assert _zero_ids([8]) == [8] and _zero_ids((1, 20, 4)) == [1, 20, 4]
+    assert _zero_ids(range(12))[-1] == "...", "a long list is capped, visibly"
+    assert len(_zero_ids(range(12))) == 9
     FLIGHT.clear()
 
     try:
