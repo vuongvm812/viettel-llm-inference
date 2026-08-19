@@ -864,3 +864,60 @@ Levers if TTFT now looks worse than it should:
 `cap=1` remains the proven-safe setting: mixed batches with **one** prefill are on record
 as fine (run A step 906: 1 prefill + 1 decode), and only the three-prefill mixed shape has
 ever wedged.
+
+---
+
+## Scored submissions: cap=1 measured (2026-08-19 11:34)
+
+| Metric | Previous | cap=1 | Δ |
+| --- | --- | --- | --- |
+| **final_score** | **89.86** | **83.61** | **−7.0 %** |
+| **n_scored** | **165** | **88** | **−46.7 %** |
+| p90_tpot_ms | 13.4 | 17.9 | +33.6 % |
+| p95_tpot_ms | 14.5 | 20.2 | +39.3 % |
+| p99_tpot_ms | 89.7 | 137.2 | +53.0 % |
+| p90_ttft_ms | 1306.7 | 1124.1 | **−14.0 %** |
+| p95_ttft_ms | 1888.3 | 1379.1 | **−27.0 %** |
+| p99_ttft_ms | 3099.1 | 3254.2 | +5.0 % |
+
+Both runs are 900 s at concurrency 5, same seed.
+
+### Reading it
+
+**TTFT improved and TPOT/throughput paid for it.** That direction is exactly what the cap
+does mechanically: a newly admitted request gets a prefill step largely to itself instead of
+sharing one with two other prefills, so it reaches its first token sooner — while the work
+those steps no longer share has to be paid somewhere else.
+
+**`n_scored` is the headline, not TPOT.** By Little's law at concurrency 5 over 900 s, mean
+request latency went 27.3 s → 51.1 s. The p90 TPOT rise alone accounts for only ~36 s of
+that, so roughly 15 s per request comes from the tail — consistent with `p99_tpot` at
+137 ms and with more requests left unfinished at the 900 s cutoff (which removes them from
+`n_scored` twice over: slower *and* truncated).
+
+### Two costs, only one of them fixed
+
+1. **The burst/residency gates (fixed in `da32c4b`, and this run predates it).** Withheld
+   requests parked on `self.waiting` turned off the N-step burst and clamped the runner to a
+   single launch on every step that withheld anything. This is the bulk of the p90/p95 TPOT
+   rise, and the fix targets it directly.
+
+2. **Prefill fragmentation (NOT fixed, and irreducible for a given cap).** One 7.8 k-token
+   prefill step becomes three ~2.6 k-token steps. That is worse GPU efficiency per token
+   *and* it triples the number of steps on which a decode row is stuck behind a prefill —
+   which is precisely what `p99_tpot` +53 % is measuring. No gate fix removes this; only a
+   larger cap does.
+
+### Next measurement, in order
+
+1. **Rebuild with `da32c4b` and re-run at `cap=1`.** Cost 1 disappears; cost 2 remains. This
+   isolates how much of the −6.25 points was the gate bug.
+2. **Sweep `VTL_SCHED_MIXED_PREFILL_CAP=2` — env only, no rebuild.** `mixed_prefill_cap()`
+   reads the environment on every call, so the cap can be swept against an image that
+   already carries the gate fix. Two prefills per mixed step halves the fragmentation while
+   still never building the three-prefill mixed batch that every wedge on record required.
+   A 2-prefill mixed batch is unobserved, so this is the one arm that trades safety margin —
+   run it before trusting it.
+
+Given the scoring weights throughput this heavily, and TTFT now has ~180 ms of headroom
+against the previous submission at p90, spending TTFT to buy TPOT is the right direction.
