@@ -172,6 +172,38 @@ def flight_note(kind: str, **fields) -> None:
         pass
 
 
+def mixed_prefill_cap() -> int:
+    """``VTL_SCHED_MIXED_PREFILL_CAP``: most waiting requests admitted on a step that
+    already carries running (decode) rows. 0 = unlimited, which is stock behaviour and the
+    DEFAULT.
+
+    WHY THIS EXISTS, and why it is opt-in. Every wedge captured on this branch has needed
+    the same batch shape: a GDN batch that is mixed (decode rows AND prefill rows) with
+    THREE concurrent multi-thousand-token prefills. The 02:59 dump carries the control that
+    makes that precise -- step 605 ran 5201 tokens of PURE prefill fine, and step 606
+    (2 decode + 3 prefill, 7805 tokens) wedged. `num_decodes > 0 and num_prefills > 0` is
+    also exactly the branch `gdn_attn.py:340` takes to peel decodes off the front and
+    rebase the prefill cu_seqlens, and `qwen_gdn_linear_attn.py:1513` -- the frame the host
+    is parked in -- is one statement inside it.
+
+    Capping admissions on a step that already has decode rows removes that shape: the
+    prefills land on the next step(s) instead, where they are either pure prefill or
+    mixed with fewer rows. It costs a little TTFT under a burst and nothing at steady state.
+
+    It is NOT a claim about the root cause, which is why it is off by default: the port has
+    been verified faithful to stock on every scheduling rule that could produce this batch
+    (token budget, the in-flight-prefill reservation, `_mamba_block_aligned_split` and its
+    inputs, the mamba+connector prefix-cache branch, and the V2 runner's own decode-first
+    sort at model_runner.py:858). Stock can build this batch too; it simply gets fewer
+    chances to. Prefer the `VTL_RUST_SCHED_FULL=0` arm first -- it needs no rebuild.
+    """
+    try:
+        n = int(os.environ.get("VTL_SCHED_MIXED_PREFILL_CAP", "0").strip() or 0)
+    except ValueError:
+        return 0
+    return max(0, n)
+
+
 def flight_params(**fields) -> None:
     """Record the once-per-boot scheduling parameters. Never raises."""
     if not flight_enabled():
@@ -5445,6 +5477,12 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         # connector, where `waiting` is still built straight off `self.waiting`.
         cand_slots = []
         step_skipped = []
+        # Candidates held back by `mixed_prefill_cap` this step. They were never handed to
+        # the crate, so they appear in NO decision list -- and the queue rebuild below
+        # clears `self.waiting` wholesale from `waiting_order`, so anything not put back
+        # explicitly is a LOST REQUEST. Both rebuild arms re-add them, in order, after the
+        # crate's leftovers: they were the tail of the queue, so that is their place.
+        withheld = []
         if bail is None:
             try:
                 for request in self.running:
@@ -5469,6 +5507,14 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                         self._is_blocked_waiting_status,
                         self._try_promote_blocked_waiting_request,
                     )
+                    # The cap, applied to the ASSEMBLED list so promotion still happens
+                    # for everyone (stock promotes before it admits) and only the admission
+                    # is deferred. Nothing here has mutated a queue yet, so a bail below
+                    # still hands stock an untouched pair.
+                    _cap = mixed_prefill_cap() if self.running else 0
+                    if _cap and len(candidates) > _cap:
+                        withheld = candidates[_cap:]
+                        candidates = candidates[:_cap]
                     for request in candidates:
                         if request.status not in (
                             RequestStatus.WAITING,
@@ -5486,7 +5532,12 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                         cand_slots.append(slot)
                         waiting.append(pack_req(slot, request))
                 else:
-                    for request in self.waiting:
+                    _queue = list(self.waiting)
+                    _cap = mixed_prefill_cap() if self.running else 0
+                    if _cap and len(_queue) > _cap:
+                        withheld = _queue[_cap:]
+                        _queue = _queue[:_cap]
+                    for request in _queue:
                         if request.status not in (
                             RequestStatus.WAITING,
                             RequestStatus.PREEMPTED,
@@ -5978,6 +6029,9 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             self.waiting.clear()
             for request in remaining:
                 self.waiting.add_request(request)
+            # ...then the ones the cap withheld, behind the crate's leftovers.
+            for request in withheld:
+                self.waiting.add_request(request)
             self.skipped_waiting.clear()
             # scheduler.py:1014-1015. Stock builds `step_skipped_waiting` with
             # `prepend_request` and then `prepend_requests` (`extendleft`) it, which
@@ -5985,10 +6039,12 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
             # single reversal and lands the step's skips at the front in encounter order.
             for request in reversed(step_skipped):
                 self.skipped_waiting.prepend_request(request)
-        elif waiting_order or self.waiting:
+        elif waiting_order or self.waiting or withheld:
             remaining = [by_slot[s] for s in waiting_order]
             self.waiting.clear()
             for request in remaining:
+                self.waiting.add_request(request)
+            for request in withheld:
                 self.waiting.add_request(request)
 
         for slot in preempted:
@@ -8667,6 +8723,30 @@ def _self_check() -> None:
     assert len(_zero_ids(range(12))) == 9
     # The static header always leads, so a dump carries the parameters its rolling entries
     # have to be read against even after those entries have aged out.
+    # ---- the mixed-prefill cap: parsing, and the no-request-lost invariant ----------
+    assert mixed_prefill_cap() == 0, "unlimited by default -- stock behaviour"
+    for raw, want in (("1", 1), ("3", 3), ("0", 0), ("", 0), ("junk", 0), ("-2", 0)):
+        os.environ["VTL_SCHED_MIXED_PREFILL_CAP"] = raw
+        assert mixed_prefill_cap() == want, raw
+    os.environ.pop("VTL_SCHED_MIXED_PREFILL_CAP")
+
+    # The truncate-then-restore arithmetic the schedule wrapper performs. The property that
+    # matters is TOTAL PRESERVATION with FCFS order: `self.waiting` is cleared wholesale
+    # from the crate's `waiting_order`, so a withheld request that is not re-added is gone
+    # for good. Modelled here exactly as the wrapper does it.
+    def _split_restore(queue, cap, admitted):
+        held = queue[cap:] if cap and len(queue) > cap else []
+        seen = queue[:cap] if held else list(queue)
+        left = [r for r in seen if r not in admitted]   # the crate's waiting_order
+        return left + held
+    q = ["a", "b", "c", "d", "e"]
+    assert _split_restore(q, 0, set()) == q, "cap off changes nothing"
+    assert _split_restore(q, 2, set()) == q, "nothing admitted -> queue intact, in order"
+    assert _split_restore(q, 2, {"a"}) == ["b", "c", "d", "e"], "admitted leaves, rest hold"
+    assert _split_restore(q, 2, {"a", "b"}) == ["c", "d", "e"]
+    assert _split_restore(q, 9, set()) == q, "a cap past the queue withholds nothing"
+    assert sorted(_split_restore(q, 1, {"a"})) == ["b", "c", "d", "e"], "no request lost"
+
     FLIGHT_PARAMS.clear()
     assert not flight_lines()[0].startswith("FLIGHT params"), "absent until recorded"
     flight_params(block=2048, mamba_align=True)

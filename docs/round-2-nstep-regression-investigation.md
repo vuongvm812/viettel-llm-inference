@@ -731,3 +731,74 @@ parameters cannot drift. The next dump answers the question without another roun
    mitigation that keeps the stack.
 4. Only then: instrument the GDN metadata (`num_prefills`, `num_decodes`,
    `prefill_query_start_loc`, `chunk_indices` extents) for the wedged step.
+
+---
+
+## Sixth pass (2026-08-19): full audit of the scheduler against v0.25.0 — what is eliminated, and the fix
+
+No new run. This pass reads the wedged path end to end against the pinned vLLM source and
+settles what the port can and cannot be responsible for.
+
+### Eliminated, each verified against v0.25.0 source
+
+| Hypothesis | Verdict |
+| --- | --- |
+| Bookkeeping skew | `C == T + P - 1` holds for all five requests in every dump. |
+| Over-admission | 7805 ≤ 8192; stock's in-flight-prefill reservation applies **only** on the `load_kv_async` arm (`scheduler.py:895-901`), and `park=0`. |
+| Mamba block-aligned split | The crate mirrors `Scheduler._mamba_block_aligned_split` (`scheduler.py:338-394`) statement for statement, on the same `cache_config.block_size` and the same flag. **And it is derivably a no-op here**: for a 3058-token prefill to be scheduled whole — which the ring shows — `block_size` must exceed 3058, and at that size stock schedules it whole too. |
+| `max_num_partial_prefills` | Defaults to 1 but is **not enforced anywhere in V1** (`grep` over `vllm/v1/` is empty), so it is not a divergence. |
+| Batch ordering (decodes must precede prefills) | The V2 runner sorts: `req_ids = sorted(num_tokens_per_req, key=...)` (`gpu/model_runner.py:858`). Decodes land first for **any** scheduler output. `_may_reorder_batch` exists only in the V1 runner and is not on this path. |
+| GDN metadata construction | `gdn_attn.py:333-403` builds `chunk_indices`/`chunk_offsets` from the same rebased `prefill_query_start_loc_cpu` it passes as `cu_seqlens`, and slices `has_initial_state[num_decodes:]` to match. Self-consistent. |
+| GDN decode branch | `qwen_gdn_linear_attn.py:1480-1499` sizes the recurrent kernel from `cu_seqlens[:num_decodes+1]` and 2-token `q`; the full `ssm_state_indices` it also passes is indexed only over those rows. Correct. |
+| `vtl` GDN patches | `gdn_decode_step` refuses any batch with `num_prefills != 0` (`:150`); `gdn_prefill_backend` at the shipped `auto` is **not installed at all**; `gdn_kernels` touches the output norm, not the scan. |
+| `decode_fastpath` | Its predicate excludes new/finished requests, multi-token requests and a non-empty zeroing list — all present at the wedge step — so it stands down and re-primes. |
+| `nvrtc_block_quant` | Disabled for the 02:59 run; still wedges. |
+
+**The port is faithful on every scheduling rule that could produce this batch.** Stock can
+build the same batch; it simply gets fewer chances to. That is why the honest framing is
+"the Rust loop is the trigger, not necessarily the defect".
+
+### The confirmed trigger, stated exactly
+
+Every wedge needs a GDN batch that is **mixed** (`num_decodes > 0 and num_prefills > 0`)
+**and carries three concurrent multi-thousand-token prefills**. The 02:59 ring supplies the
+control: step 605 = 5201 tokens of *pure* prefill → fine; step 606 = 2 decode + 3 prefill,
+7805 tokens → wedge. `num_decodes > 0 and num_prefills > 0` is precisely the condition at
+`gdn_attn.py:340` that peels decodes off and rebases the prefill `cu_seqlens`, and the
+frame the host parks in (`qwen_gdn_linear_attn.py:1513`) sits one statement inside that
+branch. Pure-decode steps (hundreds of them) and pure-prefill steps both pass.
+
+### The fix, in the order to try it
+
+**1. `VTL_RUST_SCHED_FULL=0` — env only, no rebuild, try this first.**
+This is the documented revert ladder's first rung (`FULL->0 -> RUST->0 -> ENABLE->0`). It
+hands `schedule()` back to stock Python while **keeping** the Rust KV authority, the
+resident table, the hasher, shm-IPC, the kernels and the quant track — far more of the
+stack than `VTL_ENABLE_RUST_SCHED=0` retains. It also splits the remaining hypothesis
+space in one run: serves ⇒ the defect is in the Rust `schedule()` decisions; still wedges ⇒
+it is in the KV authority's block/state-id allocation (note `gdn_attn.py:219`,
+`non_spec_state_indices_tensor = block_table_tensor[:, 0]` — the GDN state slot **is** the
+first block of the mamba group's block table, so a wrong id there is read straight into the
+kernel).
+
+**2. `VTL_SCHED_MIXED_PREFILL_CAP=1` — new on this branch, needs a rebuild.**
+Caps how many waiting requests may be admitted on a step that already carries running
+(decode) rows, which removes the trigger shape directly: the prefills land on the following
+step(s), where they are either pure prefill or mixed with fewer rows. Costs a little TTFT
+in a burst, nothing at steady state, and keeps `VTL_RUST_SCHED_FULL=1`.
+
+Default **0 (off, = stock)**, deliberately: it is a shape mitigation, not a root-cause fix,
+and the audit above says the port is not provably wrong here. The dangerous part is
+bookkeeping, not policy — a withheld candidate appears in no crate decision list while the
+rebuild clears `self.waiting` wholesale from `waiting_order`, so anything not re-added is a
+lost request. Both rebuild arms re-add the withheld tail behind the crate's leftovers,
+preserving FCFS, and `_self_check` models the truncate-then-restore arithmetic and asserts
+total preservation.
+
+**3. `VTL_ENABLE_RUST_SCHED=0`** remains the last-resort mitigation already in hand.
+
+### What would still settle the root cause
+
+Only two observations, neither of which this branch can produce on its own: `nvidia-smi`
+during a wedge (~100 % SM = a kernel looping on its chunk metadata; ~0 % = a copy/event
+deadlock or allocator starvation), and the `FLIGHT params` line now emitted in every dump.
