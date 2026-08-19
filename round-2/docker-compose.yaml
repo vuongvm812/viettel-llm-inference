@@ -442,18 +442,7 @@ services:
       # folded in). RADIX selects the radix prefix index over the flat map -- an implementation
       # selector, not an additive feature; both are parity-asserted.
       # Revert ladder: FULL->0 -> RUST->0 -> ENABLE->0 (all-Python).
-      #
-      # !! MITIGATION (2026-08-19): ENABLE pinned to 0. The first connector-live boot (the
-      # kv-transfer recompute line + the stage S/U1 port) wedged the GPU at the warmup
-      # burst's first mixed decode+prefill wave (docs/round-2-nstep-regression-
-      # investigation.md, third incident). A/B on the box: identical boot with
-      # VTL_ENABLE_RUST_SCHED=0 serves cleanly -- same kernels, same connector -- so the
-      # hang needs the rust_sched patch, and a connector-less Rust-stack boot was fine
-      # before the port, which localizes it to the port x connector interplay. With ENABLE=0
-      # every VTL_RUST_SCHED_*/tokstore/R8/R9 knob below is inert and the nstep burst never
-      # commits (its scheduler half lives here); the stock scheduler drives the offloading
-      # connector. Flip back to 1 only together with a fix for the third incident.
-      VTL_ENABLE_RUST_SCHED: 0
+      VTL_ENABLE_RUST_SCHED: 1
       VTL_RUST_SCHED: 1
       VTL_RUST_SCHED_FULL: 1
       VTL_RUST_SCHED_RADIX: 1
