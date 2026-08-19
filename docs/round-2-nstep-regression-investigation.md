@@ -483,3 +483,49 @@ frontend's aborts at 01:20:02 change nothing.
    `step0_eos_ban`'s per-prefill-step `torch.from_numpy(rows).to(logits.device)` is a
    hidden full-stream sync on the hot path and is worth replacing with a persistent
    device-side index buffer.
+
+### Bisect result (2026-08-19, on-box) and what it does and does not prove
+
+`VTL_ENABLE_RUST_SCHED=0` with everything else unchanged — connector flags included —
+**serves the warmup wave cleanly** (mitigation applied locally on the box; the repo compose
+is unchanged). Two conclusions and one open split:
+
+* **The kernels are exonerated.** With the patch off, the exact same first-time shapes ran
+  (the mixed decode+prefill wave, the freshly JIT'd `fused_moe_kernel` config,
+  `gdn_decode_step`, `moe_decode_gemv`, the fused argmax) under the same live connector,
+  and nothing hung. The never-completing GPU work is *induced by what the Rust scheduler
+  feeds the step*, not by a kernel bug in isolation. Consistent mechanism: a wrong block
+  id or count from the scheduler becomes an out-of-bounds/aliased device write (the
+  zeroing list, a block-table row, a slot mapping), which corrupts unrelated device state,
+  and a later kernel loops on the garbage.
+* **The hang needs the rust_sched patch.** But the single arm cannot split two remaining
+  hypotheses, because the round-2 connector commits (`ec48f4e`..`cb21b98`) changed shared
+  crate/py code as well as connector-only code:
+    * **H1 — port × connector interplay** (stage S/U1: phase-split protocol, probe
+      consumption, external allocation, deferred frees, `build_connector_meta` inputs);
+    * **H2 — a regression in shared rust_sched code** from the same commits, reachable
+      without a connector (the last known-good connector-less boot predates `ec48f4e`).
+  **The decisive arm:** delete the three `--kv-offloading*/--kv-transfer-config` lines and
+  boot with the full Rust stack on. Passes ⇒ H1; hangs ⇒ H2.
+
+### Scheduler flight recorder (landed on this branch)
+
+Because the wedge is enqueued GPU work, the stall dump's thread stacks can only ever catch
+a bystander host call blocked on a stream sync — the state that names the culprit is what
+the last few `schedule()` calls fed the step. `rust_sched` now carries a small host-side
+ring (`FLIGHT`, 48 entries, `VTL_SCHED_FLIGHT=0` to disable, negligible cost) recording
+per step: the scheduled `(request, num_new, C, P)` rows, the **span (count, min, max) of
+the new-block ids and of the `new_block_ids_to_zero` list**, admission/preemption/parked/
+probe-stale counts, plus `pop_blocks_for_free` / deferred-free `drain` events and `bail`
+steps. `stall_dump` prints the ring in every wedge dump (`vtl: STALL FLIGHT ...` lines).
+
+On the next wedge repro, read the last two `sched` entries against the request counters:
+an id span past the pool size, a zeroing span covering another request's blocks, a `drain`
+overlapping a live allocation, or a `num_new` that disagrees with `C/T/P` names the
+failing sub-path directly. Collect `nvidia-smi` during the wedge in the same run
+(~0 % SM = copy/event deadlock, pinned 100 % = compute kernel on garbage metadata).
+
+Also landed, diagnostics-honesty fixes from this incident's triage: `nstep demote()` now
+resets `rust_steps` to 1 (the stall dump advertised 8-launch steps on a boot whose runner
+had stood down), and the token-store fallback log names `TOK.off_why` when the store was
+off for the whole boot (the bare "step is not numpy-packable" misdirected triage once).
