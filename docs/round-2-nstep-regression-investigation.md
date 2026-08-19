@@ -802,3 +802,65 @@ total preservation.
 Only two observations, neither of which this branch can produce on its own: `nvidia-smi`
 during a wedge (~100 % SM = a kernel looping on its chunk metadata; ~0 % = a copy/event
 deadlock or allocator starvation), and the `FLIGHT params` line now emitted in every dump.
+
+---
+
+## Seventh pass (2026-08-19): the cap works, but it cost TPOT — and why
+
+`VTL_SCHED_MIXED_PREFILL_CAP=1` stops the wedge, and decode throughput fell sharply. That
+regression is not a property of capping admissions; it is a **gate interaction the cap
+walked into**, and it is fully explained by two lines.
+
+### Mechanism
+
+The cap parks the requests it withholds back on `self.waiting` (it must — anything not
+re-added there is a lost request). Two guards read that queue as a plain truthiness test:
+
+* `commit_burst` — `if NSTEP_QUEUE_EMPTY_ONLY and (self.waiting or skipped_waiting)` →
+  **the N-step burst is skipped**, so the step emits 1 token instead of `VTL_NSTEP_N` (4).
+* `runner_steps` — `if RUNNER_STEPS < 2 or self.waiting or skipped_waiting: return 1` →
+  **the Rust runner's multi-launch residency clamps to 1**, from up to
+  `VTL_RUST_RUNNER_STEPS` (8).
+
+So every step that withholds anything runs decode at **one token per engine step with a
+single launch** — the two largest decode wins on this stack, both off. And with a
+continuously-arriving trace a cap of 1 means the queue is *never* empty, so they are off
+essentially always. The cap turned "drain the queue in one step, then burst for the whole
+decode phase" into "dribble one admission per step, never burst".
+
+### Fix (landed)
+
+`schedule()` publishes `self._vtl_withheld_n` after the queue rebuild, and both guards now
+test `len(self.waiting) > self._vtl_withheld_n` instead of truthiness — a queue holding
+nothing but the cap's own deferral still bursts.
+
+This is sound because of **what those guards protect**. They refuse a burst while an
+admission is *starving*, so a newly arrived request waits one iteration instead of N
+(`burst_blocked`'s docstring). A cap-withheld request is not starving: the scheduler itself
+deferred it by exactly one scheduling step for batch-shape safety, and it sits at the head
+of the queue for the very next `schedule()`. It is the scheduler's own decision, not
+backpressure, and must not also be read as a reason to abandon the burst.
+
+Deliberately left conservative: `maybe_kick`'s speculation guard (`:4322`) — speculation is
+refused under a live connector anyway — and `ring_reuse`'s (`RING` self-refuses without the
+`mp` executor, and replaying a cached `SchedulerOutput` while work waits would be wrong).
+
+### The residual trade, stated honestly
+
+Bursting while a withheld request waits does delay that admission by up to `N-1` decode
+iterations, so with `cap=1` a burst of `k` arrivals costs roughly `k` steps × `VTL_NSTEP_N`
+token-times of TTFT rather than `k` single-token steps. That is the cost the guard was
+written to avoid, accepted here in exchange for keeping decode at full rate; it is bounded
+and it is paid only during an arrival burst.
+
+Levers if TTFT now looks worse than it should:
+
+| Lever | Effect |
+| --- | --- |
+| `VTL_SCHED_MIXED_PREFILL_CAP=2` | Queue drains in half the steps. Never builds the 3-prefill mixed batch every wedge needed — but a 2-prefill mixed batch is **unobserved**, so this trades a little safety margin. |
+| `VTL_NSTEP_N=2` | Halves the per-burst admission delay, halves the burst's decode win. |
+| `VTL_SCHED_MIXED_PREFILL_CAP=0` | Back to stock admission — and back to the wedge. |
+
+`cap=1` remains the proven-safe setting: mixed batches with **one** prefill are on record
+as fine (run A step 906: 1 prefill + 1 decode), and only the three-prefill mixed shape has
+ever wedged.

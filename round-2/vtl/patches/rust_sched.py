@@ -4986,7 +4986,12 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
         """
         # Stage S: `skipped_waiting` counts as a non-empty queue for the same reason
         # `self.waiting` does -- see `commit_burst`'s queue-empty guard below.
-        if RUNNER_STEPS < 2 or self.waiting or getattr(self, "skipped_waiting", None):
+        # `_vtl_withheld_n` is discounted: see where it is published in `schedule`.
+        if (
+            RUNNER_STEPS < 2
+            or len(self.waiting) > getattr(self, "_vtl_withheld_n", 0)
+            or getattr(self, "skipped_waiting", None)
+        ):
             return 1
         block_size = self.cache_config.block_size
         k = RUNNER_STEPS
@@ -5047,7 +5052,8 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 # which is exactly the cost the guard exists to refuse. Without a connector
                 # the queue is always empty and this conjunct is free.
                 if NSTEP_QUEUE_EMPTY_ONLY and (
-                    self.waiting or getattr(self, "skipped_waiting", None)
+                    len(self.waiting) > getattr(self, "_vtl_withheld_n", 0)
+                    or getattr(self, "skipped_waiting", None)
                 ):
                     why = "waiting queue is not empty"
                 else:
@@ -6046,6 +6052,21 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                 self.waiting.add_request(request)
             for request in withheld:
                 self.waiting.add_request(request)
+        # THE COUNT THE BURST GATES HAVE TO DISCOUNT. `withheld` is back on `self.waiting`
+        # by now, and both queue-empty guards (`commit_burst`, `runner_steps`) read that
+        # queue -- so without this a cap of 1 silently turns the N-step burst AND the
+        # runner's multi-launch residency off for every step that withholds anything. On a
+        # continuously-arriving trace that is every step, which is exactly the TPOT
+        # collapse the cap was first measured to cause.
+        #
+        # Discounting is sound because of WHAT those guards protect: they refuse a burst
+        # while an admission is STARVING, so that a new request waits one iteration instead
+        # of N (`burst_blocked`'s docstring). A cap-withheld request is not starving -- the
+        # scheduler chose to defer it by exactly one scheduling step for batch-shape safety,
+        # and it is at the head of the queue for the very next `schedule()`. It is the
+        # scheduler's own decision, not backpressure, so it must not also be read as a
+        # reason to abandon the burst.
+        self._vtl_withheld_n = len(withheld)
 
         for slot in preempted:
             request = by_slot[slot]
@@ -6349,6 +6370,10 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
     # first schedule() has resolved it -- an install that never engages, or an
     # `update_from_output` on a boot whose first schedule bailed.
     scheduler_cls._vtl_connector_live = False
+    # Requests `mixed_prefill_cap` held back on the last step, discounted by the two
+    # queue-empty burst guards. 0 on any path that never reached the queue rebuild (a bail,
+    # or an install that never engages), which is the conservative reading.
+    scheduler_cls._vtl_withheld_n = 0
     scheduler_cls.schedule = mark_patched(schedule, wrapped)
 
 
@@ -7003,6 +7028,21 @@ def _self_check() -> None:
     # The waiting queue only blocks when the TTFT guard is on.
     assert burst_blocked(SO(), True, True, 8) == "waiting queue is not empty"
     assert burst_blocked(SO(), True, False, 8) is None
+
+    # The live guards pass `len(self.waiting) > withheld_n` as `waiting_nonempty`, so that
+    # a queue holding NOTHING BUT cap-withheld requests still bursts. Modelled here exactly
+    # as `commit_burst` / `runner_steps` compute it -- without the discount a cap of 1 turns
+    # the burst and the runner residency off on every step that withholds, which is the TPOT
+    # collapse the cap was measured to cause.
+    def _nonempty(n_waiting, withheld_n):
+        return n_waiting > withheld_n
+
+    assert _nonempty(0, 0) is False, "empty queue bursts"
+    assert _nonempty(3, 3) is False, "queue is ONLY the cap's own deferral -> still bursts"
+    assert _nonempty(4, 3) is True, "one genuinely waiting request still blocks the burst"
+    assert _nonempty(1, 0) is True, "no cap in play -> unchanged behaviour"
+    assert burst_blocked(SO(), _nonempty(2, 2), True, 8) is None
+    assert burst_blocked(SO(), _nonempty(3, 2), True, 8) == "waiting queue is not empty"
     # ...and the split the N=1 in-graph sampling commit uses does NOT see the queue at all:
     # one token delays no admission, so the TTFT argument that blocks a burst is vacuous.
     assert burst_blocked_batch(SO(), 8) is None
