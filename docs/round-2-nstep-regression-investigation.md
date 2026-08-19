@@ -631,3 +631,103 @@ scheduler is a *trigger* under all three — the batch width is what detonates t
    the live request set.
 4. `nvidia-smi` during the wedge: pinned ~100 % SM with the host in `_eager_gq` is
    consistent with allocator-sync starvation; ~0 % points at a copy/event deadlock instead.
+
+---
+
+## Fifth dump (2026-08-19 02:59): `VTL_ENABLE_NVRTC_BLOCK_QUANT=0` still wedges — the eager-fallback theory is dead
+
+The arm was run and the server still hangs, so the block-quant eager fallback is **not**
+the wedge. The dump is the most informative yet, because with that patch out of the way the
+blocked frame moved to **stock vLLM code**:
+
+```
+qwen_gdn_linear_attn.py:1513 _forward_core      <- initial_state = ssm_state[prefill_state_indices]
+qwen_gdn_linear_attn.py:1731 qwen_gdn_attention_core
+... qwen3_next.py:589 forward ... model_runner.py:1380 execute_model
+```
+
+Line 1513 is the GDN state gather on the **prefill** branch (`num_prefills > 0`), one
+statement before `chunk_gated_delta_rule` — the FLA chunked scan. Three dumps have now
+been caught at three different frames (`step0_eos_ban`'s `.to(device)`, `_eager_gq`'s fp32
+temporaries, and now this gather); all three are **allocation sites**, which is what a host
+parks on when the device is not draining. The frames are bystanders; the device is.
+
+### The recorder now isolates the trigger to a batch SHAPE
+
+The 24-entry ring caught the whole approach, and it contains the control case this
+investigation had been missing:
+
+```
+step=583..602  total=5      5-row decode          20 steps in ~0.3 s (~15 ms/step)
+step=603       total=3
+step=604       total=0      (drained)
+step=605       total=5201   adm=2  zero=[17, 13]   2 prefills, NO decode rows  -> FINE
+step=606       total=7805   adm=3  zero=[9, 5, 4]  3 prefills + 2 decode rows  -> WEDGE
+               <nothing for 21.4 s>
+```
+
+**Step 605 is the control.** 5201 tokens of pure prefill completed normally; step 606 —
+2 decode rows plus three fresh full prefills (2145 + 2600 + 3058) — never returned. The
+previous run's wedge was the same shape (step 907: 2 decode + 3 prefill, 7803 tokens), and
+so was the first incident's. The trigger is therefore **not batch width alone** but a
+**mixed decode+prefill GDN batch with three concurrent prefills** — which is exactly the
+case where the GDN metadata builder peels decodes off the front and builds a separate
+prefill tail (`prefill_state_indices` / `prefill_has_initial_state` / `chunk_indices`,
+qwen_gdn_linear_attn.py:1506-1508).
+
+The verbatim zeroing ids also clear a hypothesis: `[17, 13]` then `[9, 5, 4]` — five
+distinct GDN state blocks, no id re-issued to a second live sequence.
+
+### What is now ruled out, by audit against the v0.25.0 source
+
+* **Bookkeeping** — `C == T + P - 1` holds for all five requests, again.
+* **Over-admission** — 7805 fits the 8192 budget, and stock's in-flight-prefill
+  reservation applies **only** on the `load_kv_async` arm (`scheduler.py:895-901`), which
+  this step does not take (`park=0`).
+* **The mamba block-aligned split** — the crate's `mamba_block_aligned_split` mirrors
+  `Scheduler._mamba_block_aligned_split` (scheduler.py:338-394) statement for statement,
+  including the Marconi clause, and is fed the same `cache_config.block_size` and the same
+  `need_mamba_block_aligned_split` flag from the live scheduler.
+* **The mamba+connector prefix-cache special case** (scheduler.py:687-726, where stock
+  swaps the converging walk for `find_longest_cache_hit_per_group` and takes
+  `max(per_group_hits)`) — the crate models both walks and selects on `Config::connector`,
+  and in any case the run reports **0.0 % local and 0.0 % external prefix-cache hit rate**,
+  so no hit path is producing a number at all.
+* **`nvrtc_block_quant`** — disabled for this run; still wedges.
+
+### The one scheduler-side input still unresolved
+
+Stock truncates every prefill chunk to `num_tokens - num_tokens % block_size`. That is a
+**no-op when `block_size` exceeds the request** and a **real truncation when it does not**:
+at `block_size = 4096` a 2145-token prefill is scheduled whole (what the ring shows), but
+at `block_size = 2048` stock would have scheduled 2048 and left the tail for the next step
+— i.e. it would never have built step 606 at all. The port mirrors the arithmetic, so the
+verdict rests entirely on the live `cache_config.block_size`, and that value appears in no
+dump and no log line this investigation has.
+
+**Landed for it:** the flight ring now carries a static header, emitted as its first line
+forever (rolling entries age out in about a second of decode steps, these never change):
+
+```
+FLIGHT params: block=<cache_config.block_size> mamba_align=<bool> max_tok=8192 max_seqs=5
+               long_prefill=<n> chunked=True connector=<bool>
+```
+
+It is populated from the very dict handed to the crate, so the header and the crate's
+parameters cannot drift. The next dump answers the question without another round trip.
+
+### Next arms
+
+1. **Re-run and read the `FLIGHT params` line.** If `block` is smaller than the prefills
+   (~2.1k-3.1k), stock would have split them and the port did not — a port bug, and the
+   fix is in the split's call site. If `block` is larger, the split is a no-op for both and
+   the scheduler is exonerated on this point.
+2. **`nvidia-smi` during the wedge** — still the cheapest bisect of the remaining space,
+   and still not collected: pinned ~100 % SM = a kernel looping on bad chunk metadata;
+   ~0 % = a copy/event deadlock or allocator starvation.
+3. **Shrink the trigger directly**: `--max-num-batched-tokens=4096` (or `--max-num-seqs=3`)
+   caps concurrent prefills below the three that every wedge has needed. If that alone
+   serves cleanly with the full Rust stack on, it both confirms the shape and is a shippable
+   mitigation that keeps the stack.
+4. Only then: instrument the GDN metadata (`num_prefills`, `num_decodes`,
+   `prefill_query_start_loc`, `chunk_indices` extents) for the wedged step.

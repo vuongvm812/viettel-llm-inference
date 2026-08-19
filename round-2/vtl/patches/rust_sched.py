@@ -142,6 +142,16 @@ from time import monotonic as _flight_now
 
 FLIGHT: "_flight_ring[tuple[float, str, dict]]" = _flight_ring(maxlen=48)
 _flight_on: "bool | None" = None
+#: The scheduling parameters the rolling entries have to be read AGAINST, recorded once and
+#: emitted as the ring's first line forever. A rolling entry ages out in about a second of
+#: decode steps; these never change, and without `cache_block_size` +
+#: `need_mamba_block_aligned_split` a dump cannot answer the one question that separates
+#: "the Rust loop scheduled what stock would have" from "it did not": stock truncates every
+#: prefill chunk to `num_tokens - num_tokens % block_size`
+#: (`Scheduler._mamba_block_aligned_split`), which is a NO-OP when `block_size` exceeds the
+#: request and a real truncation when it does not. The port mirrors that arithmetic exactly,
+#: so the flag and the block size are the whole answer -- and neither is in any other log.
+FLIGHT_PARAMS: dict = {}
 
 
 def flight_enabled() -> bool:
@@ -162,12 +172,27 @@ def flight_note(kind: str, **fields) -> None:
         pass
 
 
+def flight_params(**fields) -> None:
+    """Record the once-per-boot scheduling parameters. Never raises."""
+    if not flight_enabled():
+        return
+    try:
+        FLIGHT_PARAMS.update(fields)
+    except Exception:
+        pass
+
+
 def flight_lines(limit: int = 24) -> list:
     """The most recent entries, formatted for the stall dump. Never raises; called from
     the watchdog thread against a process that may be wedged, so it only READS."""
     try:
         now = _flight_now()
         out = []
+        if FLIGHT_PARAMS:
+            out.append(
+                "FLIGHT params: "
+                + " ".join(f"{k}={v!r}" for k, v in FLIGHT_PARAMS.items())
+            )
         for ts, kind, fields in list(FLIGHT)[-limit:]:
             body = " ".join(f"{k}={v!r}" for k, v in fields.items())
             out.append(f"FLIGHT t-{now - ts:.1f}s {kind}: {body}")
@@ -5313,6 +5338,18 @@ def _install_full_schedule(scheduler_cls, sjf_enabled: bool, m: dict):
                     "connector": bool(connector_live),
                 }
             )
+            # The dump has to be readable without the boot log: these are the inputs the
+            # per-step entries are meaningless without. Sourced from the very dict handed
+            # to the crate above, so a drift between the two is not expressible.
+            flight_params(
+                block=int(self.cache_config.block_size),
+                mamba_align=bool(self.need_mamba_block_aligned_split),
+                max_tok=int(self.max_num_scheduled_tokens),
+                max_seqs=int(self.max_num_running_reqs),
+                long_prefill=int(self.scheduler_config.long_prefill_token_threshold or 0),
+                chunked=bool(self.scheduler_config.enable_chunked_prefill),
+                connector=bool(connector_live),
+            )
             log.info(
                 "rust_sched: FULL schedule() loop active "
                 "(sjf=%s, table=%s, spec=%s, timing=%s)",
@@ -8628,6 +8665,14 @@ def _self_check() -> None:
     assert _zero_ids([8]) == [8] and _zero_ids((1, 20, 4)) == [1, 20, 4]
     assert _zero_ids(range(12))[-1] == "...", "a long list is capped, visibly"
     assert len(_zero_ids(range(12))) == 9
+    # The static header always leads, so a dump carries the parameters its rolling entries
+    # have to be read against even after those entries have aged out.
+    FLIGHT_PARAMS.clear()
+    assert not flight_lines()[0].startswith("FLIGHT params"), "absent until recorded"
+    flight_params(block=2048, mamba_align=True)
+    head = flight_lines()[0]
+    assert head == "FLIGHT params: block=2048 mamba_align=True", head
+    FLIGHT_PARAMS.clear()
     FLIGHT.clear()
 
     try:
