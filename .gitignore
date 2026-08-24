@@ -51,3 +51,7 @@ mistral.rs/
 
 *.pem
 .env
+/.pgo-hfmodel-ctx/
+
+# Generated grading-shaped replay trace (make trace-weka)
+round-2/data/input/trace-weka.jsonl

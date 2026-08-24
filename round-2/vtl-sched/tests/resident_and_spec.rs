@@ -10,7 +10,7 @@
 //! in `Resident` mode reproduces R6b. If the Rust-side post-schedule commit disagrees with
 //! Python's bookkeeping by one token anywhere, the two streams diverge and the test says so.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use vtl_sched::config::{Config, GroupConfig};
 use vtl_sched::hash::{Digest32, HASH_LEN};
@@ -34,6 +34,7 @@ fn cfg(num_blocks: usize, radix: bool) -> Config {
         log_stats: false,
         watermark: 0.0,
         radix,
+        connector: false,
         groups: vec![
             GroupConfig {
                 kind: Kind::FullAttention,
@@ -74,6 +75,7 @@ fn params() -> Params {
         // The burst gate is a `rust_sched.py` handshake, not part of the resident/spec
         // parity this suite covers; 0 keeps `burst_eligible` false throughout.
         burst_max_reqs: 0,
+        connector: false,
     }
 }
 
@@ -121,6 +123,11 @@ struct Harness {
     /// exist only as a count. A harness that applied the output synchronously would never
     /// exercise that field, and every placeholder bug would sail through.
     inflight: Vec<u32>,
+    /// Slots that were preempted and have not been re-admitted since. Their table entries
+    /// stay resident (`Manager::free` deliberately does not clear the table), and nothing
+    /// else reads them until re-admission — so they are exactly where a preempt-time field
+    /// write can rot unnoticed. `assert_table_matches` walks them alongside `running`.
+    preempted: FxHashSet<u32>,
 }
 
 impl Harness {
@@ -137,6 +144,7 @@ impl Harness {
             names: FxHashMap::default(),
             next_id: 0,
             inflight: Vec::new(),
+            preempted: FxHashSet::default(),
         }
     }
 
@@ -192,6 +200,7 @@ impl Harness {
         self.num_output_tokens.remove(&slot);
         self.running.retain(|&s| s != slot);
         self.waiting.retain(|&s| s != slot);
+        self.preempted.remove(&slot);
         // A dead request's in-flight frame is dropped, exactly as `update_from_output`
         // skips `self.requests.get(req_id) is None`.
         self.inflight.retain(|&s| s != slot);
@@ -233,11 +242,22 @@ impl Harness {
             let r = self.reqs.get_mut(&slot).unwrap();
             r.status = STATUS_PREEMPTED;
             r.num_computed_tokens = 0;
+            // The placeholders count tokens the step this request was evicted from will
+            // never produce for it. Production Python zeroes them at both preempt sites
+            // (`rust_sched.py`'s `_preempt_request` hook and the crate-driven preempt loop)
+            // and `sched::ScheduleCore::commit` does the same to the table, so a harness
+            // that left them standing would model the PRE-fix Python and pass a crate that
+            // had quietly stopped zeroing.
+            r.num_output_placeholders = 0;
+            // ...and with C back at 0 any request with a prompt is a prefill chunk again.
+            r.is_prefill_chunk = r.num_computed_tokens < r.num_tokens;
             r.num_preemptions += 1;
             self.waiting.insert(0, slot);
+            self.preempted.insert(slot);
         }
         for &(slot, _, num_computed) in &d.scheduled_admitted {
             self.running.push(slot);
+            self.preempted.remove(&slot);
             let r = self.reqs.get_mut(&slot).unwrap();
             r.status = STATUS_RUNNING;
             r.num_computed_tokens = num_computed;
@@ -292,7 +312,12 @@ impl Harness {
             let r = self.reqs.get_mut(&slot).unwrap();
             r.num_tokens += acc;
             r.num_tokens_with_spec += acc;
-            r.num_output_placeholders -= acc;
+            // SATURATING, because a preempt lands between the schedule that promised this
+            // token and the update that delivers it: the preempt arm above zeroed P while
+            // the token was still in flight, and the drain then has nothing left to take.
+            // `Manager::update_step` clamps the same way (`saturating_sub`), as do
+            // `rust_sched.py`'s `pack_req` and `_update_request_with_output`.
+            r.num_output_placeholders = r.num_output_placeholders.saturating_sub(acc);
             *self.num_output_tokens.get_mut(&slot).unwrap() += acc;
             if v.status != 0 {
                 finished.push(slot);
@@ -306,6 +331,14 @@ impl Harness {
     /// In `Resident` mode the table IS the running set — assert it never drifts from what
     /// Python believes, so a failure points at the exact field rather than a diff of
     /// scheduling decisions ten steps later.
+    ///
+    /// PREEMPTED SLOTS ARE CHECKED TOO. Their entries stay resident and a re-admission
+    /// overwrites them wholesale from the marshalled waiting queue, so a preempt-time field
+    /// the crate stopped writing would never show up in a scheduling decision — but it
+    /// would rot in the table for as long as the request sits in the queue, and anything
+    /// reading the table directly (`table_get`, `table_fingerprint`, an update landing on
+    /// the in-flight token) sees the stale value. Walking them is what makes the placeholder
+    /// zeroing in `ScheduleCore::commit`'s preempt closure load-bearing for this suite.
     fn assert_table_matches(&self) {
         if self.mode != Mode::Resident {
             return;
@@ -314,6 +347,14 @@ impl Harness {
             let want = self.reqs[&slot];
             let got = self.kv.table_get(slot).expect("running slot must be resident");
             assert_eq!(got, want, "resident table drifted on slot {slot}");
+        }
+        for &slot in &self.preempted {
+            let want = self.reqs[&slot];
+            let got = self
+                .kv
+                .table_get(slot)
+                .expect("a preempted slot keeps its entry (`free` does not clear the table)");
+            assert_eq!(got, want, "resident table drifted on preempted slot {slot}");
         }
     }
 
@@ -530,11 +571,16 @@ fn max_tokens_tail_drains_only_the_accepted_tokens() {
     assert_eq!((e.num_tokens, e.num_output_placeholders), (18, 2));
 }
 
-/// `_preempt_request`'s three field writes, applied to the table.
+/// `_preempt_request`'s field writes, applied to the table.
 ///
-/// Not observable through the parity harness — a preempted request re-enters through the
-/// MARSHALLED waiting queue, which overwrites its entry wholesale — but the table must
-/// never report a stale RUNNING request to anyone who reads it directly.
+/// Not observable through the parity harness's DECISIONS — a preempted request re-enters
+/// through the MARSHALLED waiting queue, which overwrites its entry wholesale — but the
+/// table must never report a stale RUNNING request to anyone who reads it directly, and the
+/// placeholder count is the field with no other witness at all: nothing in the admission
+/// arithmetic reads it, so a preempt closure that stopped zeroing it would cost nothing
+/// until the step AFTER re-admission. This test is where that write is pinned down with a
+/// token genuinely in flight (P == 1); `assert_table_matches`'s preempted-slot walk covers
+/// the rest of the entry on every randomized step.
 #[test]
 fn preempted_slots_are_stamped_in_the_table() {
     // 12 usable blocks; each 64-token request holds 4 attention + 1 mamba block, and a
@@ -553,6 +599,20 @@ fn preempted_slots_are_stamped_in_the_table() {
     assert_eq!(e.status, STATUS_PREEMPTED);
     assert_eq!(e.num_computed_tokens, 0);
     assert_eq!(e.num_preemptions, 1);
+    // The placeholder the victim carried for the token step 1 put in flight goes with it.
+    // Left standing it would inflate the running loop's `num_tokens_with_spec +
+    // num_output_placeholders - num_computed_tokens` for every step AFTER re-admission —
+    // the admission arithmetic itself never reads P, which is why nothing else catches it.
+    assert_eq!(e.num_output_placeholders, 0, "the preempt closure must zero P");
+    assert!(e.is_prefill_chunk, "C back at 0 makes it a prefill chunk again");
+    // ...and Python's half of the same three writes, compared against the table entry.
+    // This is the one place the comparison happens with a placeholder actually in flight:
+    // the randomized parity harness only ever preempts requests that are still prefilling
+    // (P == 0), so its `assert_table_matches` walk cannot reach this state on its own.
+    let victim_before = h.reqs[&victim];
+    assert_eq!(victim_before.num_output_placeholders, 1, "a token was in flight for it");
+    h.apply_schedule(&d);
+    h.assert_table_matches();
     // ... and the survivor is still RUNNING with its tokens advanced.
     let (kept, n) = d.scheduled_running[0];
     let e = h.kv.table_get(kept).unwrap();

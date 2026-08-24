@@ -507,8 +507,15 @@ make verify     # includes "rms_quant_fusion Replaced N patterns"; N=0 means it 
 
 ### 4.4 Rules of thumb
 
-- **Default off.** Every new kernel gets `@register_patch(..., default=False)` and an env
-  gate. A model it does not fit must degrade, not fail.
+- **Default off while unproven.** Every *new* kernel gets `@register_patch(..., default=False)`
+  and an env gate. A model it does not fit must degrade, not fail. Flip the default to `True`
+  only once the degrade path is the real safety story rather than the gate — which is what
+  happened on 2026-08-17 to the seven Qwen3.5 kernel patches (`gdn_kernels`,
+  `gdn_prefill_backend`, `nvrtc_block_quant`, `gdn_decode_step`, `w4a8_from_fp8`,
+  `moe_decode_gemv`, `greedy_argmax`): each has a per-op fallback ladder
+  (NVRTC → AOT → stock), and `greedy_argmax` additionally registers nothing until a boot
+  parity gate matches `torch.argmax` bit for bit. Their `VTL_ENABLE_*` lines in
+  `docker-compose.yaml` now restate the code default instead of overriding it.
 - **Size the prize before writing it.** A wall-clock A/B beats a profiler's call count;
   small-call profiling overstates dispatch overhead badly.
 - **Numerics are part of the contract.** The fp8 kernels round twice on purpose — matching
@@ -632,6 +639,12 @@ grading** (it predates spec §3.1). Its numbers remain useful as a *relative* re
 signal, but final tuning decisions — scheduler settings, `--max-num-seqs`, speculative
 decoding, anything traded against ERS — must be justified on `bench-aiperf` runs.
 
+**`make warm` and the vllm-fork PGO/BOLT stages no longer replay the synthetic trace.**
+They consume `data/input/trace-weka.jsonl` (`make trace-weka`, generated from the real
+Weka corpus by `bench/build_trace_weka.py` — see `bench/README.md`), so baked compile
+caches and the frontend's profile-guided layout are trained on grading-shaped traffic
+(long contexts, decode-heavy, real prefix-reuse topology).
+
 ### 6.4 Serving-config implications (open items)
 
 - **Blocking**: `docker-compose.yaml` still pins the LFM2.5 boot placeholder with
@@ -639,8 +652,9 @@ decoding, anything traded against ERS — must be justified on `bench-aiperf` ru
   `submission_valid: false`. A valid `bench-aiperf` run (and any real submission) needs
   the round-2 model literals landed first (§3.1 of this handoff).
 - `--max-num-seqs=32`'s comment cites "peak trace concurrency ~6" — that was the dead
-  synthetic trace. Re-measure concurrency under aiperf (5 trees + subagent fan-out) before
-  trusting the cap or the cudagraph capture sizes.
+  synthetic trace (whose role in warm/PGO the Weka-derived trace has since taken over).
+  Re-measure concurrency under aiperf (5 trees + subagent fan-out) before trusting the
+  cap or the cudagraph capture sizes.
 - `ignore_eos:true` means every request decodes its full recorded length: EOS-dependent
   early-stop logic (e.g. `VTL_ENABLE_STEP0_EOS_BAN`) is inert under grading, and the
   decode:prefill ratio is far higher than the prefill-biased synthetic trace assumed.

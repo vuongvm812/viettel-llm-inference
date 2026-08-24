@@ -48,6 +48,24 @@ void dynamic_per_token_scaled_fp8_quant(torch::Tensor& result, torch::Tensor con
 void silu_and_mul_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor& scale,
                                           torch::Tensor const& input,
                                           std::optional<torch::Tensor> const& scale_ub);
+
+// GDN (linear-attention) per-head gated RMSNorm family (vtl/csrc/gdn_gated_rmsnorm.cu).
+// vllm_cuda-only ops; wired in Python by vtl/patches/gdn_kernels.py behind
+// VTL_ENABLE_GDN_KERNELS. The per_group variant is the round-2 fusion target (checkpoint
+// quantizes activations per (token, 128-group)); the per_token one is round-1.1 parity/A-B.
+void gated_rmsnorm(torch::Tensor& result, torch::Tensor const& input, torch::Tensor const& gate,
+                   torch::Tensor const& weight, double epsilon, bool gate_is_silu);
+
+void gated_rmsnorm_per_group_quant(torch::Tensor& result, torch::Tensor& scale,
+                                   torch::Tensor const& input, torch::Tensor const& gate,
+                                   torch::Tensor const& weight, double epsilon,
+                                   int64_t num_heads, int64_t group_size, bool gate_is_silu);
+
+void gated_rmsnorm_dynamic_per_token_quant(torch::Tensor& result, torch::Tensor& scale,
+                                           torch::Tensor const& input, torch::Tensor const& gate,
+                                           torch::Tensor const& weight, double epsilon,
+                                           int64_t num_heads, bool gate_is_silu,
+                                           std::optional<torch::Tensor> const& scale_ub);
 }  // namespace vtl
 
 TORCH_LIBRARY(vllm_cuda, m) {
@@ -61,6 +79,17 @@ TORCH_LIBRARY(vllm_cuda, m) {
   m.def(
       "silu_and_mul_dynamic_per_token_quant(Tensor! result, Tensor! scale, "
       "Tensor input, Tensor? scale_ub) -> ()");
+  m.def(
+      "gated_rmsnorm(Tensor! result, Tensor input, Tensor gate, Tensor weight, "
+      "float epsilon, bool gate_is_silu) -> ()");
+  m.def(
+      "gated_rmsnorm_per_group_quant(Tensor! result, Tensor! scale, Tensor input, "
+      "Tensor gate, Tensor weight, float epsilon, int num_heads, int group_size, "
+      "bool gate_is_silu) -> ()");
+  m.def(
+      "gated_rmsnorm_dynamic_per_token_quant(Tensor! result, Tensor! scale, Tensor input, "
+      "Tensor gate, Tensor weight, float epsilon, int num_heads, bool gate_is_silu, "
+      "Tensor? scale_ub) -> ()");
   // Shape/capacity predicates belong here rather than in the CUDA block below: with no tensor
   // arguments they cannot be dispatched by device key, so they register as catch-alls, e.g.
   //   m.def("my_kernel_supported(int dim) -> bool", TORCH_FN(vtl::my_kernel_supported));
@@ -74,6 +103,10 @@ TORCH_LIBRARY_IMPL(vllm_cuda, CUDA, m) {
          TORCH_FN(vtl::dynamic_per_token_scaled_fp8_quant));
   m.impl("silu_and_mul_dynamic_per_token_quant",
          TORCH_FN(vtl::silu_and_mul_dynamic_per_token_quant));
+  m.impl("gated_rmsnorm", TORCH_FN(vtl::gated_rmsnorm));
+  m.impl("gated_rmsnorm_per_group_quant", TORCH_FN(vtl::gated_rmsnorm_per_group_quant));
+  m.impl("gated_rmsnorm_dynamic_per_token_quant",
+         TORCH_FN(vtl::gated_rmsnorm_dynamic_per_token_quant));
 }
 
 // Overrides of vLLM's own _C ops (schemas defined by vllm._C_stable_libtorch, imported first).

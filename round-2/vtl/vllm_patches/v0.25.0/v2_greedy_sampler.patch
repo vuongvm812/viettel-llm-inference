@@ -67,9 +67,9 @@
 +        # kill-switches are wired in docker-compose (default on); flip to 0 for an
 +        # A/B against the stock sampler with no file edit.
 +        self.vtl_greedy_fastpath = _vtl_env_on("VTL_V2_GREEDY_FASTPATH")
-+        # ponytail: torch.argmax is already a single fused reduction; the custom
-+        # kernel only helps if a profile proves it a bottleneck (it won't at
-+        # batch<=8 / vocab 65k). Default off in compose until the .cu lands.
++        # ponytail: torch.argmax is already a fused multi-CTA reduction, so the .cu
++        # wins on the launch envelope (-DVOCAB, no TensorIterator), not on the math;
++        # a few us/step at batch<=5 over the 248320 vocab. Compose turns it on.
 +        self.vtl_greedy_argmax_kernel = _vtl_env_on(
 +            "VTL_V2_GREEDY_ARGMAX_KERNEL", default="0"
 +        )

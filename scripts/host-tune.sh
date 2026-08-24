@@ -4,6 +4,9 @@
 #   sudo scripts/host-tune.sh apply     # or: make host-tune
 #   sudo scripts/host-tune.sh reset     # or: make host-tune-reset
 #   scripts/host-tune.sh show           # read-only, no root needed
+#   scripts/host-tune.sh cpuset         # or: make host-tune-cpuset
+#                                       #   read-only: print the GPU-local `cpuset:` compose line
+#                                       #   (`--cpuset` is kept as an alias for older muscle memory)
 #
 # WHY THIS EXISTS, AND WHY IT IS NOT AN OPTIMIZATION. None of this makes the submitted
 # container faster -- the judge runs `docker compose up` on their own host and none of these
@@ -31,6 +34,130 @@ need_root() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# --- NUMA / cpuset advice ------------------------------------------------------------------
+# READ-ONLY host inspection: it opens sysfs and procfs and changes nothing, so it cannot
+# disturb apply/reset state. It prints the `cpuset:` line to paste under the `model` service
+# in round-2/docker-compose.yaml, where it ships COMMENTED.
+#
+# WHY: an H200 hangs off one socket's PCIe root complex. Left unpinned, the container's
+# threads -- the OMP pool, the tokio runtimes, and above all the per-step pinned staging
+# buffers behind every H2D/D2H copy -- get scheduled on whichever cores are free, so a copy
+# can cross the interconnect on its way to the GPU. Pinning to the GPU's own node removes
+# that. Pinning to the WRONG node makes every copy remote, which is worse than not pinning
+# at all, and the judge box's topology is not ours to guess: hence commented-by-default.
+
+# Collapse a newline-separated CPU list into compact ranges: 0 1 2 5 -> "0-2,5".
+_ranges() {
+  sort -n | awk '
+    function emit() { out = out (out == "" ? "" : ",") (start == prev ? start : start "-" prev) }
+    NR == 1 { start = prev = $1; next }
+    $1 == prev + 1 { prev = $1; next }
+    { emit(); start = prev = $1 }
+    END { if (NR) { emit(); print out } }'
+}
+
+# The nvidia driver names its procfs directories after the PCI BDF (domain included), which
+# is the authoritative answer and needs no tooling installed. lspci is the fallback.
+_gpu_bdf() {
+  local d b
+  for d in /proc/driver/nvidia/gpus/*/; do
+    [ -r "${d}information" ] || continue
+    b=$(basename "$d")
+    case "$b" in *:*:*.*) echo "$b"; return 0 ;; esac
+  done
+  # -D forces the domain prefix; /sys/bus/pci/devices paths are keyed on the full form.
+  have lspci && lspci -D -d 10de: 2>/dev/null | awk '/VGA|3D controller/ { print $1; exit }'
+}
+
+# nvidia-smi's own CPU-affinity column, used only when lscpu and the node sysfs are absent.
+# The row's first field that looks like a CPU range IS the CPU Affinity column: everything
+# before it is "GPU0" and the link-type matrix ("X", "PIX", ...), and the NUMA Affinity
+# column that could also match a bare number comes after it.
+_topo_affinity() {
+  have nvidia-smi || return 0
+  nvidia-smi topo -m 2>/dev/null | awk '
+    /^GPU0/ {
+      for (i = 2; i <= NF; i++)
+        if ($i ~ /^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$/) { print $i; exit }
+    }'
+}
+
+cpuset() {
+  local bdf node cores src
+  echo "== GPU / NUMA affinity"
+
+  bdf=$(_gpu_bdf)
+  if [ -z "${bdf:-}" ]; then
+    log "gpu pci bdf" "not found (no nvidia driver, no lspci) -- cannot advise"
+    return 0
+  fi
+  log "gpu pci bdf" "$bdf"
+
+  node=""
+  [ -r "/sys/bus/pci/devices/$bdf/numa_node" ] && node=$(cat "/sys/bus/pci/devices/$bdf/numa_node")
+  if [ -z "${node:-}" ]; then
+    log "numa_node" "unreadable (/sys/bus/pci/devices/$bdf/numa_node)"
+    node="-1"
+  else
+    log "numa_node" "$node"
+  fi
+
+  # -1 is what the kernel reports on a single-node box, and on VMs/hypervisors that do not
+  # expose PCI locality at all. Either way there is no node to prefer.
+  if [ "$node" = "-1" ]; then
+    echo
+    echo "  no NUMA pinning needed -- the GPU reports no node affinity (single-node host,"
+    echo "  or a hypervisor that hides PCI locality). Leave cpuset commented out."
+    return 0
+  fi
+
+  cores=""
+  if have lscpu; then
+    cores=$(lscpu -p=CPU,NODE 2>/dev/null | awk -F, -v n="$node" '!/^#/ && $2 == n { print $1 }' | _ranges)
+    src="lscpu -p=CPU,NODE"
+  fi
+  if [ -z "${cores:-}" ] && [ -r "/sys/devices/system/node/node$node/cpulist" ]; then
+    cores=$(cat "/sys/devices/system/node/node$node/cpulist")
+    src="/sys/devices/system/node/node$node/cpulist"
+  fi
+  if [ -z "${cores:-}" ]; then
+    cores=$(_topo_affinity)
+    src="nvidia-smi topo -m (CPU Affinity)"
+  fi
+  if [ -z "${cores:-}" ]; then
+    log "node $node cpus" "could not be resolved -- leave cpuset commented out"
+    return 0
+  fi
+  log "node $node cpus" "$cores  [$src]"
+
+  # Count the cores in the range list (e.g. "0-2,5" -> 4) so the safety advice below can be
+  # concrete instead of generic. A narrowed set with stacked threads is how a pinned box ends
+  # up SLOWER -- and, combined with realtime scheduling, how a host hard-locks.
+  ncores=$(echo "$cores" | awk -F, '{ n=0; for (i=1;i<=NF;i++) { if (split($i,r,"-")==2) n+=r[2]-r[1]+1; else n+=1 } print n }')
+
+  echo
+  echo "  Paste under the \`model\` service in round-2/docker-compose.yaml (it ships commented):"
+  echo
+  echo "    cpuset: \"$cores\""
+  echo
+  echo "  DEV/BENCH BOXES ONLY. This is host-specific: a compose file carrying one host's core"
+  echo "  list is a compose file that pins the judge's container to the wrong socket."
+  echo
+  echo "  SAFETY RULES (breaking these has crashed real hosts -- see the compose cpuset note):"
+  echo "    1. Never add an rtprio ulimit while this cpuset is active: one SCHED_FIFO thread"
+  echo "       stacked on a narrowed core starves the kernel's own threads and can hard-lock"
+  echo "       the HOST. The compose deliberately ships no rtprio; keep it that way."
+  echo "    2. This list has $ncores cores. The container runs ~23 runnable-capable threads"
+  echo "       (8 OMP + 6 tokio + 4 zmq + 4 request + engine); below 16 cores, do NOT pin."
+  echo "    3. Keep OMP_NUM_THREADS / MKL_NUM_THREADS / TOKIO_WORKER_THREADS each <= $((ncores > 2 ? ncores - 2 : 1)),"
+  echo "       leaving >= 2 cores of slack for the kernel, IRQs and the healthcheck."
+  if [ "$ncores" -lt 16 ]; then
+    echo
+    echo "  WARNING: only $ncores GPU-local cores -- pinning is NOT recommended on this host."
+    echo "  Leave cpuset commented out; the unpinned scheduler will do better than a stacked set."
+  fi
+}
+
 # --- read current state -------------------------------------------------------------------
 show() {
   echo "== GPU"
@@ -54,6 +181,8 @@ show() {
   done
   echo "== State"
   if [ -f "$STATE" ]; then log "saved state" "$STATE"; else log "saved state" "(none -- not applied)"; fi
+  echo "== NUMA"
+  log "gpu-local cpuset" "run '$0 cpuset' for the compose line"
 }
 
 # --- apply --------------------------------------------------------------------------------
@@ -194,5 +323,6 @@ case "${1:-show}" in
   apply) apply ;;
   reset) reset ;;
   show)  show ;;
-  *) echo "usage: $0 {apply|reset|show}" >&2; exit 2 ;;
+  cpuset|--cpuset) cpuset ;;
+  *) echo "usage: $0 {apply|reset|show|cpuset}   (--cpuset is an alias for cpuset)" >&2; exit 2 ;;
 esac

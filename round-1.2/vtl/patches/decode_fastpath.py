@@ -199,7 +199,7 @@ def _classify(runner):  # noqa: ANN001
                 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
                 if NULL_BLOCK_ID != 0:
-                    log.info("vtl: decode_fastpath off -- NULL_BLOCK_ID=%d != 0", NULL_BLOCK_ID)
+                    log.warning("vtl: decode_fastpath off -- NULL_BLOCK_ID=%d != 0", NULL_BLOCK_ID)
                     return False
                 mamba.append((b, group_id, spec.block_size))
                 continue

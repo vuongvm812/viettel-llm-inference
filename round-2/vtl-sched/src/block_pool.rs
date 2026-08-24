@@ -522,6 +522,27 @@ impl BlockPool {
         true
     }
 
+    /// Stage S: is `block_id` STILL the pool's block for `key`?
+    ///
+    /// The staleness primitive the connector phase split needs. A probe recorded in phase 1
+    /// lists blocks that were cache hits AT THAT MOMENT; between the phases (and inside
+    /// phase 2, between two candidates) an allocation can evict one of them --
+    /// [`Self::get_new_blocks`] calls [`Self::maybe_evict_cached_block`] on every block it
+    /// pops, which clears `Block::hash` and pops the index entry -- and hand it to another
+    /// request. Consuming such a hit would `touch` a block a second owner already holds.
+    ///
+    /// BOTH halves are checked because both move independently: eviction clears the block's
+    /// own key, and the index entry is what a different block cached under the same hash
+    /// would take over.
+    ///
+    /// `key` is the block's PRIMARY hash as of the walk (`Block::hash`). A block that was
+    /// matched under a SECONDARY key (`cached_by_block`, the partial-block alias) still
+    /// answers correctly: `_remove_cached_block_hashes` pops the primary and every alias
+    /// together, so the primary key going away is exactly the event this test is for.
+    pub fn block_still_cached_as(&self, block_id: u32, key: &HashKey) -> bool {
+        self.arena.get(block_id).hash == Some(*key) && self.cached.contain(key, block_id)
+    }
+
     /// Record the pre-mutation mapping of `key` when a speculative run is in flight.
     #[inline]
     fn journal_index(&mut self, key: &HashKey) {

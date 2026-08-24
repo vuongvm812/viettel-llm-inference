@@ -51,17 +51,28 @@ ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:${PATH}
 ENV RUSTFLAGS="-C target-cpu=x86-64"
 # The toolchain install mirrors Dockerfile.vllm-fork's rust-builder (same rustup one-liner, same
 # -o Dir::Etc::sourceparts=-). Best-effort as a whole: any step of it failing is a network fact.
+RUN apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
+  && apt-get install -y --no-install-recommends build-essential curl ca-certificates
+
+COPY proxy-ca.crt /usr/local/share/ca-certificates/build-proxy-ca.crt
+RUN update-ca-certificates
+
+ARG HTTPS_PROXY
+ENV PIP_PROXY=${HTTPS_PROXY}
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+
+# The toolchain install mirrors Dockerfile.vllm-fork's rust-builder (same rustup one-liner, same
+# -o Dir::Etc::sourceparts=-). Best-effort as a whole: any step of it failing is a network fact.
 RUN mkdir -p /wheels; \
-    { apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
-      && apt-get install -y --no-install-recommends build-essential curl ca-certificates \
-      && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-           | sh -s -- -y --default-toolchain "${VTL_SCHED_RUST_TOOLCHAIN}" --profile minimal \
-      && pip install --no-cache-dir "maturin>=1.5,<2.0" \
-      && touch /tmp/toolchain-ok; }; \
-    rm -rf /var/lib/apt/lists/*; \
-    [ -f /tmp/toolchain-ok ] \
-      || echo "vtl_sched: MISSING (network) -- apt/rustup/PyPI unreachable, no Rust toolchain; \
-the wheel will not be built and the engine keeps the Python scheduler"
+  {  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --default-toolchain "${VTL_SCHED_RUST_TOOLCHAIN}" --profile minimal \
+  && pip install --no-cache-dir "maturin>=1.5,<2.0" \
+  && touch /tmp/toolchain-ok; }; \
+  rm -rf /var/lib/apt/lists/*; \
+  [ -f /tmp/toolchain-ok ] \
+  || echo "vtl_sched: MISSING (network) -- apt/rustup/PyPI unreachable, no Rust toolchain; \
+  the wheel will not be built and the engine keeps the Python scheduler"
 COPY vtl-sched /src/vtl-sched
 # `cargo test` here is the compile-time correctness gate: free-queue LRU order, refcounts,
 # eviction order, the pickle golden vectors, the hybrid mamba clamp rules and the CUDA-graph
@@ -73,15 +84,15 @@ COPY vtl-sched /src/vtl-sched
 # without this line a break in that half would first surface in `maturin build` below, after
 # the tests have already reported green.
 RUN if [ ! -f /tmp/toolchain-ok ]; then \
-      echo "vtl_sched: SKIPPED (no toolchain) -- /wheels stays empty"; \
-    else \
-      cd /src/vtl-sched \
-      && cargo test --release --quiet \
-      && cargo test --release --quiet --features cuda --no-run \
-      && maturin build --release --out /wheels \
-      && ls -la /wheels \
-      && echo "vtl_sched: OK"; \
-    fi
+  echo "vtl_sched: SKIPPED (no toolchain) -- /wheels stays empty"; \
+  else \
+  cd /src/vtl-sched \
+  && cargo test --release --quiet \
+  && cargo test --release --quiet --features cuda --no-run \
+  && maturin build --release --out /wheels \
+  && ls -la /wheels \
+  && echo "vtl_sched: OK"; \
+  fi
 
 FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 
@@ -107,19 +118,19 @@ FROM --platform=linux/amd64 ${VLLM_IMAGE} AS runtime
 # here by design (compose pins the command).
 ARG JEMALLOC_MIRROR=http://azure.archive.ubuntu.com/ubuntu
 RUN JE=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2; \
-    for attempt in 1 2 3; do \
-      if [ -f "$JE" ]; then break; fi; \
-      if [ "$attempt" = 3 ]; then \
-        echo "jemalloc: archive.ubuntu.com unreachable, trying ${JEMALLOC_MIRROR}"; \
-        sed -i "s|http://archive.ubuntu.com/ubuntu|${JEMALLOC_MIRROR}|g" /etc/apt/sources.list; \
-      fi; \
-      apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
-        && apt-get install -y --no-install-recommends libjemalloc2 \
-        || { echo "jemalloc: attempt $attempt failed"; sleep 5; }; \
-    done; \
-    rm -rf /var/lib/apt/lists/*; \
-    if [ -f "$JE" ]; then echo "jemalloc: OK"; \
-    else echo "jemalloc: MISSING -- this image will run on glibc malloc (slower, still correct)"; fi
+  for attempt in 1 2 3; do \
+  if [ -f "$JE" ]; then break; fi; \
+  if [ "$attempt" = 3 ]; then \
+  echo "jemalloc: archive.ubuntu.com unreachable, trying ${JEMALLOC_MIRROR}"; \
+  sed -i "s|http://archive.ubuntu.com/ubuntu|${JEMALLOC_MIRROR}|g" /etc/apt/sources.list; \
+  fi; \
+  apt-get update -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
+  && apt-get install -y --no-install-recommends libjemalloc2 \
+  || { echo "jemalloc: attempt $attempt failed"; sleep 5; }; \
+  done; \
+  rm -rf /var/lib/apt/lists/*; \
+  if [ -f "$JE" ]; then echo "jemalloc: OK"; \
+  else echo "jemalloc: MISSING -- this image will run on glibc malloc (slower, still correct)"; fi
 
 # Route the pinned `python -m ...api_server` entrypoint into vLLM's Rust frontend
 # when VLLM_USE_RUST_FRONTEND=1 (see the patch header). Applied here (not only in
@@ -127,15 +138,23 @@ RUN JE=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2; \
 # unset. dry-run first so a drifted patch fails the build loudly, not at the judge's run.
 COPY vtl/vllm_patches/v0.25.0/api_server_rust_frontend.patch /tmp/rustfe.patch
 RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))") \
- && F="$SITE/vllm/entrypoints/openai/api_server.py" \
- && if grep -q run_multi_api_server "$F"; then \
-      echo "rust-frontend routing already present (fork base carries it); skipping"; \
-    else \
-      patch -p1 -d "$SITE" --dry-run < /tmp/rustfe.patch \
-      && patch -p1 -d "$SITE" < /tmp/rustfe.patch; \
-    fi \
- && rm /tmp/rustfe.patch \
- && python3 -c "import vllm.entrypoints.openai.api_server; print('rust-frontend routing patch OK')"
+  && F="$SITE/vllm/entrypoints/openai/api_server.py" \
+  && if grep -q run_multi_api_server "$F"; then \
+  echo "rust-frontend routing already present (fork base carries it); skipping"; \
+  else \
+  patch -p1 -d "$SITE" --dry-run < /tmp/rustfe.patch \
+  && patch -p1 -d "$SITE" < /tmp/rustfe.patch; \
+  fi \
+  && rm /tmp/rustfe.patch \
+  && python3 -c "import vllm.entrypoints.openai.api_server; print('rust-frontend routing patch OK')"
+
+COPY proxy-ca.crt /usr/local/share/ca-certificates/build-proxy-ca.crt
+RUN update-ca-certificates
+
+ARG HTTPS_PROXY
+ENV PIP_PROXY=${HTTPS_PROXY}
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
 # iceoryx2 Python bindings for the opt-in zero-copy shm data plane between the Rust frontend
 # and EngineCore (vtl/patches/shm_ipc.py, VTL_SHM_IPC=1; default off). The version MUST equal
@@ -151,10 +170,10 @@ RUN SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(vll
 # does not import (wrong glibc, wrong abi3 tag) is the same situation as no wheel at all, and
 # must degrade the same way rather than fail the build.
 RUN if pip install --no-cache-dir iceoryx2==0.9.3 && python3 -c "import iceoryx2"; then \
-      echo "iceoryx2: OK"; \
-    else \
-      echo "iceoryx2: MISSING -- VTL_SHM_IPC will stay on ZMQ (still correct, just not zero-copy)"; \
-    fi
+  echo "iceoryx2: OK"; \
+  else \
+  echo "iceoryx2: MISSING -- VTL_SHM_IPC will stay on ZMQ (still correct, just not zero-copy)"; \
+  fi
 
 # cuda-python: the NVRTC + driver bindings behind vtl/nvrtc.py, which compiles kernels from
 # vtl/kernels/*.cu at model load, specialized to the shapes the loaded model actually has.
@@ -164,11 +183,21 @@ RUN if pip install --no-cache-dir iceoryx2==0.9.3 && python3 -c "import iceoryx2
 # hiccup costs an optimization, not the image (a failed build scores ZERO). The base image
 # often already ships cuda-python as a vLLM dependency, in which case this is a no-op.
 # Grep the build log for "cuda-python:" to see which happened.
-RUN if python3 -c "from cuda.bindings import nvrtc, driver" 2>/dev/null; then \
-      echo "cuda-python: OK (already in the base image)"; \
-    elif pip install --no-cache-dir "cuda-python>=12.3" \
+# Pinned to the IMAGE's CUDA major (torch reports it), not left floating: on a driver-13.0
+# host an unpinned install resolves to cuda-python 13.x, whose libnvrtc.so.13 is a different
+# toolkit than the image's 12.x -- every warmed cubin misses (toolkit is in the cache key),
+# the recompiles see 13.x NVRTC header behavior instead of what was A/B'd, and 13.x SASS can
+# be rejected by an older driver at load (CUDA_ERROR_INVALID_IMAGE). A base-shipped
+# cuda-python is held to the same standard: "it imports" is not enough, its nvrtc major must
+# MATCH the image's CUDA major, else it is force-reinstalled at the pin (--force-reinstall
+# without --no-deps so the cuda-bindings dep it delegates to is downgraded along with it).
+RUN CU_MAJOR="$(python3 -c 'import torch; print(torch.version.cuda.split(".")[0])' 2>/dev/null || echo 12)"; \
+    if python3 -c "import sys; from cuda.bindings import nvrtc, driver; \
+sys.exit(0 if nvrtc.nvrtcVersion()[1] == int(sys.argv[1]) else 1)" "$CU_MAJOR" 2>/dev/null; then \
+      echo "cuda-python: OK (already in the base image, nvrtc matches CUDA ${CU_MAJOR}.x)"; \
+    elif pip install --no-cache-dir --force-reinstall "cuda-python==${CU_MAJOR}.*" \
          && python3 -c "from cuda.bindings import nvrtc, driver"; then \
-      echo "cuda-python: OK (installed)"; \
+      echo "cuda-python: OK (installed, pinned to CUDA ${CU_MAJOR}.x)"; \
     else \
       echo "cuda-python: MISSING -- VTL_NVRTC will be inert, kernels stay AOT (still correct)"; \
     fi
@@ -211,36 +240,36 @@ ARG CUTLASS_URL=https://github.com/NVIDIA/cutlass/archive/refs/tags/v${CUTLASS_V
 # does today. Grep the build log for "cutlass:" to see which happened. python3 rather than
 # curl/wget: it is the one download tool this image is guaranteed to have.
 RUN python3 -c "import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1], '/tmp/cutlass.tar.gz')" "${CUTLASS_URL}" \
-      && mkdir -p /opt/cutlass \
-      && tar -xzf /tmp/cutlass.tar.gz -C /opt/cutlass --strip-components=1 \
-           "cutlass-${CUTLASS_VERSION}/include" "cutlass-${CUTLASS_VERSION}/tools/util/include" \
-      && echo "cutlass: v${CUTLASS_VERSION} headers OK" \
-      || echo "cutlass: fetch failed -- vtl._C_w4a8 will NOT be built (stock W4A8 only)"; \
-    rm -f /tmp/cutlass.tar.gz; \
-    [ -d /opt/cutlass/include/cutlass ] || rm -rf /opt/cutlass; \
-    TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
-    CUTLASS_DIR="$([ -d /opt/cutlass/include/cutlass ] && echo /opt/cutlass || true)" \
-    pip install --no-cache-dir --no-build-isolation --no-deps /src \
-    && rm -rf /src /opt/cutlass
+  && mkdir -p /opt/cutlass \
+  && tar -xzf /tmp/cutlass.tar.gz -C /opt/cutlass --strip-components=1 \
+  "cutlass-${CUTLASS_VERSION}/include" "cutlass-${CUTLASS_VERSION}/tools/util/include" \
+  && echo "cutlass: v${CUTLASS_VERSION} headers OK" \
+  || echo "cutlass: fetch failed -- vtl._C_w4a8 will NOT be built (stock W4A8 only)"; \
+  rm -f /tmp/cutlass.tar.gz; \
+  [ -d /opt/cutlass/include/cutlass ] || rm -rf /opt/cutlass; \
+  TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
+  CUTLASS_DIR="$([ -d /opt/cutlass/include/cutlass ] && echo /opt/cutlass || true)" \
+  pip install --no-cache-dir --no-build-isolation --no-deps /src \
+  && rm -rf /src /opt/cutlass
 
 # Fail the build, not the judge's run.
 RUN python3 -c "import importlib.metadata as m; \
-eps = {e.name: e.value for e in m.entry_points(group='vllm.general_plugins')}; \
-assert eps.get('vtl') == 'vtl.plugin:register', f'plugin NOT registered: {eps}'; \
-print('plugin entry point ok:', eps)"
+  eps = {e.name: e.value for e in m.entry_points(group='vllm.general_plugins')}; \
+  assert eps.get('vtl') == 'vtl.plugin:register', f'plugin NOT registered: {eps}'; \
+  print('plugin entry point ok:', eps)"
 
 # The CUDA kernel must be in the wheel. Importing it needs a driver, so only check the
 # .so landed -- vtl/patches/rms_norm_quant.py imports it for real at server start.
 # Also print the embedded cubins/PTX: a .so with the wrong SM builds and imports fine and
 # only fails at the first kernel launch, so this is the last place to catch it.
 RUN python3 -c "import importlib.util as u; \
-s = u.find_spec('vtl._C'); \
-assert s is not None, 'vtl._C did not build'; \
-print('vtl._C built:', s.origin)" \
- && SO=$(python3 -c "import importlib.util as u; print(u.find_spec('vtl._C').origin)") \
- && echo "vtl._C device code:" \
- && cuobjdump --list-elf "$SO" | sed 's/^/  /' \
- && { cuobjdump --list-ptx "$SO" | sed 's/^/  /' || echo "  (no PTX: no JIT fallback)"; }
+  s = u.find_spec('vtl._C'); \
+  assert s is not None, 'vtl._C did not build'; \
+  print('vtl._C built:', s.origin)" \
+  && SO=$(python3 -c "import importlib.util as u; print(u.find_spec('vtl._C').origin)") \
+  && echo "vtl._C device code:" \
+  && cuobjdump --list-elf "$SO" | sed 's/^/  /' \
+  && { cuobjdump --list-ptx "$SO" | sed 's/^/  /' || echo "  (no PTX: no JIT fallback)"; }
 
 # Same check for the optional second extension, with one asymmetry: ABSENT is fine (the CUTLASS
 # fetch is best-effort and the feature is default-off), PRESENT BUT WRONG-ARCH is fatal. This
@@ -249,14 +278,14 @@ print('vtl._C built:', s.origin)" \
 # judge's. Import is not attempted here: it needs a driver, same as vtl._C above; the real
 # import + a probe mm happen at model load (vtl/patches/quant_w4a8.py).
 RUN SO=$(python3 -c "import importlib.util as u; s = u.find_spec('vtl._C_w4a8'); print(s.origin if s else '')") \
- && if [ -z "$SO" ]; then \
-      echo "vtl._C_w4a8: not built (no CUTLASS headers) -- VTL_W4A8_SCHEDULE_V2 will be inert"; \
-    else \
-      echo "vtl._C_w4a8 built: $SO" \
-      && cuobjdump --list-elf "$SO" | sed 's/^/  /' \
-      && cuobjdump --list-elf "$SO" | grep -q sm_90a \
-      || { echo "vtl._C_w4a8 has NO sm_90a cubin -- it would fail at the first launch"; exit 1; }; \
-    fi
+  && if [ -z "$SO" ]; then \
+  echo "vtl._C_w4a8: not built (no CUTLASS headers) -- VTL_W4A8_SCHEDULE_V2 will be inert"; \
+  else \
+  echo "vtl._C_w4a8 built: $SO" \
+  && cuobjdump --list-elf "$SO" | sed 's/^/  /' \
+  && cuobjdump --list-elf "$SO" | grep -q sm_90a \
+  || { echo "vtl._C_w4a8 has NO sm_90a cubin -- it would fail at the first launch"; exit 1; }; \
+  fi
 
 # WS4: the Rust scheduler core. Wheel only -- no toolchain lands in the served image.
 # Importing it has no effect until VTL_RUST_SCHED or VTL_RUST_SCHED_FULL is set AND
@@ -266,24 +295,24 @@ RUN SO=$(python3 -c "import importlib.util as u; s = u.find_spec('vtl._C_w4a8');
 # and then fails to install or import is still fatal -- that one is our code.
 COPY --from=vtl-sched-builder /wheels /tmp/wheels
 RUN if ls /tmp/wheels/*.whl >/dev/null 2>&1; then \
-      pip install --no-cache-dir --no-deps /tmp/wheels/*.whl \
-      && python3 -c "import vtl_sched; print('vtl_sched ok:', vtl_sched.__version__)"; \
-    else \
-      echo "vtl_sched: MISSING (not built) -- VTL_RUST_SCHED* stays on the Python scheduler"; \
-    fi \
- && rm -rf /tmp/wheels
+  pip install --no-cache-dir --no-deps /tmp/wheels/*.whl \
+  && python3 -c "import vtl_sched; print('vtl_sched ok:', vtl_sched.__version__)"; \
+  else \
+  echo "vtl_sched: MISSING (not built) -- VTL_RUST_SCHED* stays on the Python scheduler"; \
+  fi \
+  && rm -rf /tmp/wheels
 
 ENV VLLM_PLUGINS=vtl \
-    VLLM_USE_AOT_COMPILE=1 \
-    VLLM_USE_STANDALONE_COMPILE=1 \
-    VLLM_USE_FLASHINFER_SAMPLER=1 \
-    VLLM_CACHE_ROOT=/opt/vtl/cache/vllm \
-    TORCHINDUCTOR_CACHE_DIR=/opt/vtl/cache/inductor \
-    TRITON_CACHE_DIR=/opt/vtl/cache/triton \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512 \
-    CUDA_MODULE_LOADING=LAZY \
-    OMP_NUM_THREADS=1 \
-    PYTHONHASHSEED=0
+  VLLM_USE_AOT_COMPILE=1 \
+  VLLM_USE_STANDALONE_COMPILE=1 \
+  VLLM_USE_FLASHINFER_SAMPLER=1 \
+  VLLM_CACHE_ROOT=/opt/vtl/cache/vllm \
+  TORCHINDUCTOR_CACHE_DIR=/opt/vtl/cache/inductor \
+  TRITON_CACHE_DIR=/opt/vtl/cache/triton \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512 \
+  CUDA_MODULE_LOADING=LAZY \
+  OMP_NUM_THREADS=1 \
+  PYTHONHASHSEED=0
 
 # jemalloc, latency-tuned (NOT RSS-tuned). decay:-1 never returns pages to the OS: freed
 # memory stays mapped/hot for instant reuse, so there are no purge syscalls on the alloc
@@ -294,7 +323,7 @@ ENV VLLM_PLUGINS=vtl \
 # container OOM-kills (unscoreable). percpu_arena keys arenas off the host CPUs visible under
 # the CFS quota, so narenas:3 may not bind on a many-core host -- watch RSS.
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
-    MALLOC_CONF=background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1,tcache:true,lg_tcache_max:16,percpu_arena:percpu,narenas:3,metadata_thp:always
+  MALLOC_CONF=background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1,tcache:true,lg_tcache_max:16,percpu_arena:percpu,narenas:3,metadata_thp:always
 
 # Warm torch.compile / Triton / FlashInfer caches, produced by `make warm` on a GPU
 # box. Empty on a cold build -- the server still boots, it just pays the compile
@@ -310,7 +339,7 @@ COPY docker/cache/ /opt/vtl/cache/
 # count here, not in the script. Priming is best-effort (see vtl/warmup_healthcheck.py).
 COPY vtl/warmup_healthcheck.py /opt/vtl/
 RUN --mount=type=bind,source=data/input/trace-round2.jsonl,target=/tmp/trace.jsonl \
-    head -n 15 /tmp/trace.jsonl > /opt/vtl/warmup_requests.jsonl
+  head -n 15 /tmp/trace.jsonl > /opt/vtl/warmup_requests.jsonl
 
 # No ENTRYPOINT: the compose file pins
 # `python3 -m vllm.entrypoints.openai.api_server` to stay diffable against baseline.

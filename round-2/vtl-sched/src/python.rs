@@ -167,12 +167,26 @@ pub struct KvManager {
     /// The mutable core, shared with the `vtl-sched-spec` worker (`spec.rs`).
     pub(crate) shared: Arc<Mutex<Shared>>,
     /// Spawned on the first `kick`; `None` means speculation was never asked for.
-    driver: Option<SpecDriver>,
+    ///
+    /// Behind its own mutex so the lazy spawn happens through `&self`. Taking the manager
+    /// as `&mut KvManager` — the only other way to assign the field — is an EXCLUSIVE
+    /// pycell borrow, and this pyclass is reachable from two threads: the input thread's
+    /// [`KvManager::set_request_meta`] holds a SHARED borrow of it for as long as it is
+    /// parked on the crate mutex inside `allow_threads`. An exclusive borrow taken by the
+    /// engine thread in that window fails with `RuntimeError: Already borrowed`. Same rule
+    /// the [`Scheduler::arena`] comment states for `&mut self` pymethods, one step
+    /// further: it applies to `&mut` pyclass ARGUMENTS too.
+    driver: Mutex<Option<SpecDriver>>,
     /// One persistent numpy buffer per KV cache group; block IDs are written here and
     /// Python takes a zero-copy `[:n]` view. Outside the mutex — GIL-protected.
     bufs: Vec<Py<PyArray1<i64>>>,
     buf_cap: usize,
-    flat: Vec<u32>,
+    /// Scratch for the two block-id list builders, recycled instead of reallocated.
+    /// Interior-mutable for the same reason as `driver`: `&mut self` would be an exclusive
+    /// pycell borrow racing the input thread's shared one. A `RefCell` is enough here —
+    /// unlike `driver` the borrow never spans an `allow_threads`, so it is only ever
+    /// observed by GIL-holding code and cannot be seen concurrently.
+    flat: RefCell<Vec<u32>>,
     n_groups: usize,
 }
 
@@ -249,6 +263,13 @@ impl KvManager {
                 .map(|v| v.extract::<bool>())
                 .transpose()?
                 .unwrap_or(false),
+            // Optional key: a plugin older than this wheel does not send it, and false is
+            // the shipped behaviour (the converging cache-hit walk).
+            connector: config
+                .get_item("connector")?
+                .map(|v| v.extract::<bool>())
+                .transpose()?
+                .unwrap_or(false),
             groups,
         };
         cfg.validate().map_err(PyValueError::new_err)?;
@@ -268,10 +289,10 @@ impl KvManager {
             .collect();
         Ok(KvManager {
             shared: Arc::new(Mutex::new(Shared::new(inner))),
-            driver: None,
+            driver: Mutex::new(None),
             bufs,
             buf_cap,
-            flat: Vec::with_capacity(256),
+            flat: RefCell::new(Vec::with_capacity(256)),
             n_groups,
         })
     }
@@ -817,6 +838,9 @@ impl KvManager {
         num_request_tokens: usize,
         status: u8,
         has_scheduled_reqs: bool,
+        num_external_computed_tokens: usize,
+        delay_cache_blocks: bool,
+        reserved_blocks: usize,
     ) -> PyResult<bool> {
         self.w()
             .manager
@@ -830,8 +854,64 @@ impl KvManager {
                 num_request_tokens,
                 status,
                 has_scheduled_reqs,
+                num_external_computed_tokens,
+                delay_cache_blocks,
+                reserved_blocks,
             )
             .map_err(err)
+    }
+
+    /// `allocate_slots(request, 0, ..., delay_cache_blocks=True)` — the parked async
+    /// connector load (scheduler.py:903 under `load_kv_async`). Mutates, so it takes the
+    /// `w()` guard like `allocate_slots` does; `&self` for the same reason every other
+    /// pymethod here is `&self` (a `&mut self` pymethod is an EXCLUSIVE pycell borrow and
+    /// this pyclass is reachable from the input thread).
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_external(
+        &self,
+        slot: u32,
+        num_local_computed_tokens: usize,
+        num_external_computed_tokens: usize,
+        num_request_tokens: usize,
+        status: u8,
+        has_scheduled_reqs: bool,
+        reserved_blocks: usize,
+    ) -> PyResult<bool> {
+        self.w()
+            .manager
+            .allocate_external(
+                slot,
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+                num_request_tokens,
+                status,
+                has_scheduled_reqs,
+                reserved_blocks,
+            )
+            .map_err(err)
+    }
+
+    /// `Scheduler._request_remaining_blocks` (scheduler.py:2387), summed by the caller into
+    /// the `reserved_blocks` an async load is gated on.
+    fn remaining_blocks(
+        &self,
+        slot: u32,
+        full_num_tokens: usize,
+        num_computed_tokens: usize,
+    ) -> usize {
+        self.w()
+            .manager
+            .remaining_blocks(slot, full_num_tokens, num_computed_tokens)
+    }
+
+    /// `(num_cached_block, null_block_id)` for one group — everything a block-record view
+    /// needs beyond the ids themselves (`RustBlocks._meta` in `rust_sched.py`).
+    ///
+    /// READ guard, not `w()`: the one caller is the connector post-pass that runs
+    /// immediately after `allocate_slots`, whose `w()` already rolled back any in-flight
+    /// speculation, so there is nothing pending for this read to see through.
+    fn block_meta(&self, slot: u32, group: usize) -> (usize, u32) {
+        self.r().manager.block_meta(slot, group)
     }
 
     /// Blocks newly allocated by the last `allocate_slots`, per group.
@@ -894,16 +974,29 @@ impl KvManager {
         self.w().manager.free(slot)
     }
 
-    fn pop_blocks_for_free<'py>(&mut self, py: Python<'py>, slot: u32) -> Bound<'py, PyList> {
-        let mut out = std::mem::take(&mut self.flat);
+    fn pop_blocks_for_free<'py>(&self, py: Python<'py>, slot: u32) -> Bound<'py, PyList> {
+        // Taken out of the cell rather than borrowed across the body: the crate mutex is
+        // acquired below, and a `RefCell` borrow spanning a lock acquisition is the shape
+        // that turns a lock wait into a borrow error.
+        let mut out = std::mem::take(&mut *self.flat.borrow_mut());
         out.clear();
         {
             let mut sh = self.w();
             sh.manager.pop_blocks_for_free(slot, &mut out);
         }
         let list = PyList::new_bound(py, out.iter().map(|&b| b as i64));
-        self.flat = out;
+        *self.flat.borrow_mut() = out;
         list
+    }
+
+    /// U1a: `Scheduler._drain_deferred_frees`' pool call (scheduler.py:2157), re-pointed
+    /// at the Rust pool. `ids` is the flat list a previous `pop_blocks_for_free` returned;
+    /// the reverse stock applies to it happens crate-side (see `Manager::free_block_ids`).
+    ///
+    /// `w()` and `&self`, like every other mutating pymethod here: a `&mut self` pymethod
+    /// is an EXCLUSIVE pycell borrow and this pyclass is reachable from the input thread.
+    fn free_block_ids(&self, ids: Vec<u32>) {
+        self.w().manager.free_block_ids(&ids)
     }
 
     fn remove_skipped_blocks(&self, slot: u32, total_computed_tokens: usize) {
@@ -949,6 +1042,20 @@ impl KvManager {
         self.r().manager.cache_fold_skips
     }
 
+    /// B4: count of running entries the schedule loop refused because their
+    /// `num_computed_tokens` had run past `num_tokens_with_spec + num_output_placeholders`
+    /// (`sched.rs`'s `checked_sub`). Should stay 0 forever; a rise is the async counter
+    /// invariant broken somewhere upstream, and `rust_sched.py` reads it on the one branch
+    /// that can observe the consequence -- a step that scheduled nothing while requests are
+    /// still RUNNING -- to name the cause and force a table resync.
+    ///
+    /// `r()`, not `w()`: a monotonic diagnostic counter cannot be wrong through a pending
+    /// speculation (the worker only ever adds to it), and a probe that invalidated would
+    /// make the diagnosis change the thing being diagnosed.
+    fn inconsistent_skips(&self) -> u64 {
+        self.r().core.inconsistent
+    }
+
     fn take_prefix_cache_stats<'py>(
         &self,
         py: Python<'py>,
@@ -967,15 +1074,17 @@ impl KvManager {
         Ok(Some(d))
     }
 
-    fn take_new_block_ids<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyList> {
-        let mut out = std::mem::take(&mut self.flat);
+    fn take_new_block_ids<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
+        // See `pop_blocks_for_free`: the scratch leaves the cell before the crate mutex is
+        // acquired and goes back after the list is built.
+        let mut out = std::mem::take(&mut *self.flat.borrow_mut());
         out.clear();
         {
             let mut sh = self.w();
             sh.manager.take_new_block_ids(&mut out);
         }
         let list = PyList::new_bound(py, out.iter().map(|&b| b as i64));
-        self.flat = out;
+        *self.flat.borrow_mut() = out;
         list
     }
 
@@ -1097,6 +1206,23 @@ impl Scheduler {
         d: &Decisions,
         check: bool,
     ) -> PyResult<ArenaCounts<'py>> {
+        // Stage S: the arena has six buffers and no slot for `parked_external`, and the
+        // connector path deliberately stays on the dict marshalling for exactly that reason
+        // (`rust_sched.py` refuses LEAN/ARENA while a connector is live). Reaching here with
+        // parked loads would DROP them — the requests would keep their blocks and never be
+        // told they are waiting on a transfer — so it is an error, not a silent omission.
+        if !d.parked_external.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "the decisions arena cannot carry parked_external; use the dict path",
+            ));
+        }
+        // Same argument for the stale-probe skips: dropping them would leave the requests
+        // consumed from the waiting queue and put back in neither queue, i.e. lost.
+        if !d.probe_stale.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "the decisions arena cannot carry probe_stale; use the dict path",
+            ));
+        }
         let mut slot = self.arena.borrow_mut();
         let arena = slot.get_or_insert_with(Arena::new);
         let n_run = d.scheduled_running.len() * 2;
@@ -1173,6 +1299,9 @@ impl Scheduler {
         py.allow_threads(|| {
             let mut sh = lock_shared(&shared);
             sh.invalidate();
+            // An unsplit schedule IS the whole step: whatever a phase 1 left behind is
+            // superseded here, so the window must not stay open for a later phase 2.
+            sh.close_phase_split();
             let Shared { manager, core, .. } = &mut *sh;
             core.schedule(manager, running, waiting, p).cloned()
         })
@@ -1190,8 +1319,67 @@ impl Scheduler {
         py.allow_threads(|| {
             let mut sh = lock_shared(&shared);
             sh.invalidate();
+            // Same as `run_schedule`: this call decides the whole step.
+            sh.close_phase_split();
             let Shared { manager, core, .. } = &mut *sh;
             core.schedule_resident(manager, running_slots, waiting, p)
+                .cloned()
+        })
+        .map_err(err)
+    }
+
+    /// Stage S, phase 1. Returns the PROBE hits, read under the SAME lock the phase ran
+    /// under — a separate `probe_hits()` getter would be a second crossing and a second
+    /// acquisition, with a window in between where another entry point could clear them.
+    fn run_schedule_phase1(
+        py: Python<'_>,
+        kv: &KvManager,
+        running: Option<&[SchedReq]>,
+        running_slots: &[u32],
+        probe: &[SchedReq],
+        p: &Params,
+    ) -> PyResult<Vec<(u32, usize)>> {
+        let shared = kv.shared.clone();
+        py.allow_threads(|| {
+            let mut sh = lock_shared(&shared);
+            sh.invalidate();
+            // Shut first: a phase 1 that fails below must not leave a window open, and a
+            // previous step's unclosed one must not be inherited.
+            sh.close_phase_split();
+            let Shared { manager, core, .. } = &mut *sh;
+            match running {
+                Some(r) => core.schedule_phase1(manager, r, p, probe)?,
+                None => core.schedule_phase1_resident(manager, running_slots, p, probe)?,
+            }
+            let hits = manager.probe_hits();
+            // Opened only now, with the probe state recorded and the lock still held: from
+            // here until phase 2 claims it, the speculation worker declines.
+            sh.open_phase_split();
+            Ok(hits)
+        })
+        .map_err(err)
+    }
+
+    /// Stage S, phase 2. The decisions are cloned under the lock for the same reason
+    /// [`Self::run_schedule`] clones them.
+    fn run_schedule_phase2(
+        py: Python<'_>,
+        kv: &KvManager,
+        waiting: &[SchedReq],
+        external: &[(u32, usize, bool)],
+        base_reserved: usize,
+        p: &Params,
+    ) -> PyResult<Decisions> {
+        let shared = kv.shared.clone();
+        py.allow_threads(|| {
+            let mut sh = lock_shared(&shared);
+            // BEFORE `invalidate()`, which would roll back (and so hide) the speculative
+            // run that is the most likely thing to have closed the window. See
+            // `Shared::claim_phase_split`.
+            sh.claim_phase_split()?;
+            sh.invalidate();
+            let Shared { manager, core, .. } = &mut *sh;
+            core.schedule_phase2(manager, p, waiting, external, base_reserved)
                 .cloned()
         })
         .map_err(err)
@@ -1261,6 +1449,13 @@ fn decisions_dict<'py>(py: Python<'py>, d: &Decisions) -> PyResult<Bound<'py, Py
     out.set_item("scheduled_admitted", d.scheduled_admitted.clone())?;
     out.set_item("preempted", d.preempted.clone())?;
     out.set_item("waiting_order", d.waiting_order.clone())?;
+    // Stage S. Always present (unlike `num_common_prefix_blocks`): the connector post-pass
+    // reads it every step and an empty list is the ordinary answer, so a missing key would
+    // be a wheel-version question on the hot path rather than a decision.
+    out.set_item("parked_external", d.parked_external.clone())?;
+    // Stage S (C3). Always present, same argument as `parked_external`: Python reads it
+    // every connector step and an empty list is the ordinary answer.
+    out.set_item("probe_stale", d.probe_stale.clone())?;
     // Empty ONLY under `lean_decisions` -- both non-lean arms of the epilogue push one
     // entry per KV group, and there is always at least one group. Omitting the key beats
     // sending a zero list: Python then reuses a shared module-level constant.
@@ -1317,6 +1512,13 @@ impl Scheduler {
                 .map(|v| v.extract::<usize>())
                 .transpose()?
                 .unwrap_or(0),
+            // Optional for the same reason. false = no connector, which is the shipped
+            // behaviour and the only one `schedule_supported` currently admits.
+            connector: params
+                .get_item("connector")?
+                .map(|v| v.extract::<bool>())
+                .transpose()?
+                .unwrap_or(false),
         });
         Ok(())
     }
@@ -1339,6 +1541,63 @@ impl Scheduler {
         let running: Vec<SchedReq> = running.iter().map(unpack).collect();
         let waiting: Vec<SchedReq> = waiting.iter().map(unpack).collect();
         let d = Self::run_schedule(py, kv, &running, &waiting, &p)?;
+        decisions_dict(py, &d)
+    }
+
+    /// Stage S, phase 1 with a MARSHALLED running set (the resync path's twin).
+    ///
+    /// `probe` is the waiting candidates whose local cache hit the connector has to be
+    /// asked about; returns `[(slot, num_local_computed_tokens)]` for them. The step is
+    /// only half-done when this returns — `schedule_phase2` MUST follow on the same
+    /// engine thread, with no other crate entry point in between (the running set, the
+    /// token budget and the probe hits all live in the shared core until it runs).
+    fn schedule_phase1(
+        &self,
+        py: Python<'_>,
+        kv: &KvManager,
+        running: Vec<ReqTuple>,
+        probe: Vec<ReqTuple>,
+    ) -> PyResult<Vec<(u32, usize)>> {
+        let p = self.params()?;
+        let running: Vec<SchedReq> = running.iter().map(unpack).collect();
+        let probe: Vec<SchedReq> = probe.iter().map(unpack).collect();
+        Self::run_schedule_phase1(py, kv, Some(&running), &[], &probe, &p)
+    }
+
+    /// [`Self::schedule_phase1`] with the running set read from the resident table.
+    fn schedule_phase1_resident(
+        &self,
+        py: Python<'_>,
+        kv: &KvManager,
+        running_slots: Vec<u32>,
+        probe: Vec<ReqTuple>,
+    ) -> PyResult<Vec<(u32, usize)>> {
+        let p = self.params()?;
+        let probe: Vec<SchedReq> = probe.iter().map(unpack).collect();
+        Self::run_schedule_phase1(py, kv, None, &running_slots, &probe, &p)
+    }
+
+    /// Stage S, phase 2: the waiting arm with the connector's answers. Returns the same
+    /// decisions dict `schedule()` returns, plus `parked_external`.
+    ///
+    /// `external` is `[(slot, num_external_computed_tokens, is_async)]` and `base_reserved`
+    /// is the block reservation of the prefills that were already in flight
+    /// (`_inflight_prefill_reserved_blocks`, scheduler.py:2400) — the loads THIS call parks
+    /// are added to it crate-side, in admission order.
+    ///
+    /// Dict only, by design: the arena carries no `parked_external` slot and the connector
+    /// path is refused the LEAN/ARENA rungs for exactly that reason.
+    fn schedule_phase2<'py>(
+        &self,
+        py: Python<'py>,
+        kv: &KvManager,
+        waiting: Vec<ReqTuple>,
+        external: Vec<(u32, usize, bool)>,
+        base_reserved: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let p = self.params()?;
+        let waiting: Vec<SchedReq> = waiting.iter().map(unpack).collect();
+        let d = Self::run_schedule_phase2(py, kv, &waiting, &external, base_reserved, &p)?;
         decisions_dict(py, &d)
     }
 
@@ -1434,16 +1693,31 @@ impl Scheduler {
     ///
     /// Returns False when speculation is unavailable (thread spawn failed, or it was
     /// permanently disabled by a worker panic).
-    fn kick(&self, kv: &mut KvManager, generation: u64, running_slots: Vec<u32>) -> PyResult<bool> {
+    ///
+    /// `kv` is SHARED on purpose even though the lazy spawn writes to it. This runs on the
+    /// engine thread while the input thread may be parked inside
+    /// [`KvManager::set_request_meta`], which holds a shared pycell borrow of the same
+    /// object across its `allow_threads`; a `&mut KvManager` here is an exclusive borrow
+    /// that PyO3 refuses in that window with `RuntimeError: Already borrowed` — the rule
+    /// the [`Scheduler::arena`] comment states for `&mut self`. Python treats a kick
+    /// failure as a dead resident table, so the error would cost far more than the kick.
+    /// [`KvManager::driver`] carries its own mutex instead.
+    fn kick(&self, kv: &KvManager, generation: u64, running_slots: Vec<u32>) -> PyResult<bool> {
         let p = self.params()?;
+        // The crate mutex is taken and RELEASED here: `SpecDriver::spawn` hands the worker
+        // that same `Arc<Mutex<Shared>>`, and the driver mutex below is held while the
+        // spawned thread may already be reaching for the crate one. Nesting the two in the
+        // other order on any path would close a cycle.
         if kv.r().spec.disabled {
             return Ok(false);
         }
-        if kv.driver.is_none() {
-            let shared = kv.shared.clone();
-            match SpecDriver::spawn(shared) {
-                Ok(d) => kv.driver = Some(d),
+        let mut slot = kv.driver.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            match SpecDriver::spawn(kv.shared.clone()) {
+                Ok(d) => *slot = Some(d),
                 Err(e) => {
+                    // Dropped before the crate mutex is taken, for the ordering above.
+                    drop(slot);
                     kv.r().spec.disabled = true;
                     return Err(PyRuntimeError::new_err(format!(
                         "could not spawn the vtl-sched-spec thread: {e}"
@@ -1451,7 +1725,7 @@ impl Scheduler {
                 }
             }
         }
-        let driver = kv.driver.as_ref().unwrap();
+        let driver = slot.as_ref().unwrap();
         if driver.is_disabled() {
             return Ok(false);
         }

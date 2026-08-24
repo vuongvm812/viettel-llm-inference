@@ -33,6 +33,13 @@ pub struct Config {
     pub watermark: f64,
     /// `VTL_RUST_SCHED_RADIX=1` — alternate index implementation, same answers.
     pub radix: bool,
+    /// A KV connector is live on this engine. The ONLY thing it changes inside the crate
+    /// is which cache-hit walk `Manager::get_computed_blocks` dispatches to: the per-group
+    /// one (kv_cache_coordinator.py:742) that scheduler.py:698 uses when a connector is
+    /// attached to a mamba-hybrid model, instead of the converging fixed point. Every
+    /// other connector-shaped argument (external tokens, delayed caching, reserved blocks)
+    /// is passed per call, so `connector == false` leaves every existing path bit-identical.
+    pub connector: bool,
     pub groups: Vec<GroupConfig>,
 }
 

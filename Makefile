@@ -32,7 +32,7 @@ TARGET ?= http://localhost:8000
 PLATFORM ?= linux/amd64
 # SM archs baked into vtl._C. A wrong arch fails at the first kernel launch, not at import.
 # Narrow to '9.0+PTX' for the submission build. See the ARG in Dockerfile.
-CUDA_ARCHS ?= 8.0;8.6;8.9;9.0+PTX
+CUDA_ARCHS ?= 9.0+PTX
 # Cap parallel nvcc so the CUDA build does not OOM a small box (see ARG in Dockerfile).
 # Bump on a big-RAM CI host: make build MAX_JOBS=28.
 MAX_JOBS ?= 4
@@ -52,26 +52,36 @@ VLLM_FORK_IMAGE ?= traitimbanggia/slowleveling
 # latest@a44447ac is a byte-identical mirror of the old unseenablefuture/vllm-fork
 # v0.25.0-tree@a41d4237 pin (all 38 layer digests verified equal; only the manifest digest
 # changed, as re-pushing re-serializes it). Account move, not a content change.
-VLLM_FORK_TAG ?= latest@sha256:a44447acf529bb7c5a48ee454bd36bebfb4f727f92e13c80c25ffecb5dec7dc4
+VLLM_FORK_TAG ?= latest@sha256:f92d99748a320fe0268620e77ba4a3718e05c7455b5517674139ecf6e84f4dca
 # Base image the MAIN image builds FROM. Defaults to the fork above so build/up/warm run the
 # tree-spec vLLM. Stock build (or the round-1.1 baseline): make ... VLLM_IMAGE=$(VLLM_STOCK)
 VLLM_IMAGE ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
+VLLM_IMAGE_FORK ?= $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)
 # 1 = the fork's rust-builder stage does a profile-guided-optimization build of vllm-rs
 # (CPU-only training run against the mock engine). 0 = plain optimized (fat-LTO) build.
 VLLM_RS_PGO ?= 1
 # Tokenizer the PGO training run boots the frontend with. Defaults to the local model
-# (hf-model/, bind-mounted at /model in the fork's PGO stage — only tokenizer/config are
-# read, the mock fakes the forward pass so the 5.9 GB of weights are never loaded).
+# (hf-model/, bind-mounted at /model in the fork's PGO stage — only the tokenizer/config
+# JSONs are read, the mock fakes the forward pass so the round-2 checkpoint's 127.2 GB of
+# weights are never loaded).
 # Override with a HF repo id to fetch a stand-in over the network, e.g. PGO_MODEL=Qwen/Qwen3-0.6B.
 PGO_MODEL ?= /model
-# Host path to the local model dir mounted at /model for the PGO training run.
-PGO_HFMODEL ?= ../hf-model
-# -Ctarget-cpu for the vllm-rs binary (plain AND PGO builds). Default native: full host
-# codegen (AVX-512 on an H200 host CPU). Bakes in the BUILD box's ISA — build on the deploy
-# CPU (the H200) for the full win; an older build box (Mac under Rosetta ≈ AVX2) yields a
-# portable subset that still runs on H200. For an emulated build, override PGO_TARGET_CPU=
-# x86-64-v3 or empty (a native/AVX2 instrumented binary can crash the PGO training replay).
-PGO_TARGET_CPU ?= native
+# Host path to the local model dir the PGO training run reads. NOT passed to buildx
+# directly: the Dockerfile's `RUN --mount=type=bind,from=hfmodel` mounts the context ROOT,
+# so buildx would sync the whole directory into BuildKit — on a GPU host after a full
+# `make model-fetch` that ships all 127.2 GB of weights into the build cache for a stage
+# that reads ~25 MB of JSONs. The pgo-hfmodel-ctx target stages the metadata subset (same
+# patterns as fetch-model.sh --meta-only) into $(PGO_HFMODEL_CTX) and buildx gets THAT.
+PGO_HFMODEL ?= /home/team17/Qwen3.5-122B-A10B-FP8
+# Staged metadata-only build context (recreated on every PGO build; gitignored).
+PGO_HFMODEL_CTX ?= ../.pgo-hfmodel-ctx
+# -Ctarget-cpu for the vllm-rs binary (plain AND PGO builds). Default sapphirerapids: the
+# round-2 deploy host is a Xeon Platinum 8558 (Emerald Rapids; sapphirerapids is the newest
+# LLVM target that ISA fully covers — AVX-512 + AMX). Pinning the target instead of `native`
+# means the same optimized binary comes out of ANY build box, including an emulated one.
+# For an emulated build that must stay portable, override PGO_TARGET_CPU=x86-64-v3 or empty
+# (a too-new instrumented binary can crash the PGO training replay on an older build CPU).
+PGO_TARGET_CPU ?= sapphirerapids
 
 # All paths below are relative to the selected round. `IN` cd's into it so docker-compose build
 # contexts, relative volume mounts, and `docker cp` cache paths all resolve inside the round.
@@ -93,7 +103,7 @@ AIPERF_ART ?= bench-aiperf
 # docker-compose.yaml is the SUBMISSION artifact and the single source of truth for every
 # serve flag and env var; the three overlays only carry their differences (dev image tag,
 # local build+mount, judge-box resource caps). Order matters -- later -f wins.
-COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml -f docker-compose.cpucap.yaml
+COMPOSE_FILES := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.localtest.yaml #-f docker-compose.cpucap.yaml
 DC := docker compose $(COMPOSE_FILES)
 
 # CI bench lifecycle (remote runner). No build step — image is the pinned digest from ci-build,
@@ -110,7 +120,7 @@ IMAGE_DIGEST ?=
 CIBENCH_COMPOSE := -f docker-compose.yaml -f docker-compose-optimized.yaml -f docker-compose.ci-bench.yaml
 _CI_IMAGE = $(if $(IMAGE_DIGEST),$(IMAGE)@$(IMAGE_DIGEST),$(IMAGE):$(TAG))
 
-.PHONY: check stats build up down warm push bench bench-aiperf sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show
+.PHONY: pgo-hfmodel-ctx check stats build up down warm trace-weka push bench bench-aiperf sweep-schedule sweep-schedule-micro profile test-kernel bench-kernel debug-kernel verify vllm-fork ci-build ci-digest ci-watch ci-status ci-up ci-down ci-bench ci-bootstrap host-tune host-tune-reset host-tune-show host-tune-cpuset model-fetch model-fetch-meta vllm-src
 
 ## Host-level latency tuning for the DEV/BENCH box. NOT part of any submission -- the judge
 ## runs `docker compose up` on their host and none of these knobs are reachable from a
@@ -124,6 +134,48 @@ host-tune-reset:
 	sudo scripts/host-tune.sh reset
 host-tune-show:
 	@scripts/host-tune.sh show
+## Read-only: print the GPU-local `cpuset:` line to paste into round-2/docker-compose.yaml.
+## Keep OMP_NUM_THREADS/MKL_NUM_THREADS/TOKIO_WORKER_THREADS <= the size of the list it prints.
+host-tune-cpuset:
+	@scripts/host-tune.sh cpuset
+
+## Per-host setup: model weights + pristine vLLM source. Both land at repo root (gitignored:
+## /hf-model/ and vllm/) so rounds share one copy; the compose overlays bind-mount hf-model/
+## at /model and PGO_HFMODEL defaults to it.
+##
+## model-fetch is for the GPU host ONLY -- the round-2 checkpoint (Qwen3.5-122B-A10B-FP8) is
+## 127.2 GB / 39 shards and the script refuses to start without 140 GB free. model-fetch-meta
+## grabs just the ~25 MB of config/tokenizer JSONs, which is all that trace building, planning
+## and the PGO frontend boot need -- it runs anywhere. Resumable; override MODEL_ID /
+## HF_MODEL_DIR / HF_MAX_WORKERS in the environment (see scripts/fetch-model.sh).
+model-fetch:
+	scripts/fetch-model.sh
+model-fetch-meta:
+	scripts/fetch-model.sh --meta-only
+
+## Grading-shaped replay trace derived from the REAL round-2 grading corpus (the
+## SemiAnalysis Weka Claude Code sessions aiperf replays -- HANDOFF §6.2). Generated, not
+## committed: consumed by `make warm` and the vllm-fork PGO/BOLT stages. The synthetic
+## trace-round2.jsonl stays for `make bench`/CI. Streams the corpus from HF (stops early;
+## no 1.85 GB download) and sizes blocks tokenizer-exactly when hf-model/ metadata exists
+## (`make model-fetch-meta`), else falls back to a word-count heuristic.
+WEKA_TRACE ?= data/input/trace-weka.jsonl
+trace-weka:
+	$(IN) python3 bench/build_trace_weka.py --out $(WEKA_TRACE) \
+	  $(if $(wildcard $(PGO_HFMODEL)/tokenizer.json),--tokenizer $(PGO_HFMODEL))
+
+## Pristine vLLM v0.25.0 source tree at repo-root vllm/ (gitignored). This is the REFERENCE
+## tree that $(ROUND)/vtl/vllm_patches/gen.sh diffs against (its V025=... path) when
+## regenerating patches -- never edit it, never build from it; the runnable engine is the
+## $(VLLM_STOCK) image. Idempotent: re-running verifies the checkout matches the v0.25.0 tag.
+vllm-src:
+	@if [ -d vllm/.git ]; then \
+	  tag=$$(git -C vllm describe --tags --exact-match 2>/dev/null || git -C vllm rev-parse --short HEAD); \
+	  if [ "$$tag" = "v0.25.0" ]; then echo "vllm/ already present at v0.25.0 -- nothing to do"; \
+	  else echo "WARN vllm/ exists but is at '$$tag', not v0.25.0 -- remove it and re-run"; exit 1; fi; \
+	else \
+	  git clone --depth 1 --branch v0.25.0 https://github.com/vllm-project/vllm vllm; \
+	fi
 
 ## Self-checks. Run anywhere: no GPU, no vLLM, no running server. Adapts to the round's patch set
 ## (round-1.1 has the GDN patches; round-1.2 does not) by globbing rather than hardcoding names.
@@ -138,11 +190,40 @@ check:
 	@# NVRTC harness (round-2+). The pure half only -- cache keys, gating, arg packing.
 	@# The compile+numerics half is bench/test_nvrtc.py under `make test-kernel` (needs a GPU).
 	$(IN) if [ -f vtl/nvrtc.py ]; then PYTHONPATH=. python3 bench/test_nvrtc.py --self-check; fi
+	@# GDN gated-RMSNorm harness (rounds that ship the GDN kernels). Same split: the pure half
+	@# (NVRTC define/cache-key contract, the two quant oracles' shape+eps contracts) here, the
+	@# kernel parity half under `make test-kernel`.
+	@# grep-guarded as well as -f guarded: round-1.1 ships this file WITHOUT a --self-check half.
+	$(IN) if [ -f bench/test_gdn_gated_rmsnorm.py ] && grep -q -- --self-check bench/test_gdn_gated_rmsnorm.py; then \
+	  PYTHONPATH=. python3 bench/test_gdn_gated_rmsnorm.py --self-check; fi
+	@# The two NVRTC production consumers (round-2+): group-128 block quant, and the fused
+	@# GDN decode step. Pure half here -- kernel<->patch define agreement, cubin cache-key
+	@# distinctness, the engage predicate, and that the patch imports and stays OFF without
+	@# vLLM. The parity halves need a GPU and run under `make test-kernel`.
+	$(IN) if [ -f bench/test_nvrtc_block_quant.py ]; then \
+	  PYTHONPATH=. python3 bench/test_nvrtc_block_quant.py --self-check; fi
+	$(IN) if [ -f bench/test_gdn_decode_step.py ]; then \
+	  PYTHONPATH=. python3 bench/test_gdn_decode_step.py --self-check; fi
+	@# Fused greedy argmax (round-2+). Pure half here -- kernel entry <-> op name <-> the
+	@# name the forked V2 sampler resolves, nstep's three call sites going through _ARGMAX,
+	@# and cubin cache-key distinctness across {VOCAB, THREADS}. Bit-parity against
+	@# torch.argmax needs a GPU and runs under `make test-kernel`.
+	$(IN) if [ -f bench/test_greedy_argmax.py ]; then \
+	  PYTHONPATH=. python3 bench/test_greedy_argmax.py --self-check; fi
+	@# The int4 track (round-2+): the fp8-block -> int4 requant of the dense layers, and the
+	@# MoE decode grouped-GEMV. Pure half here -- the double-quantization error bound in numpy,
+	@# the (token, slot) bookkeeping, and cubin cache-key distinctness across the int4/fp8
+	@# weight arms. The kernel parity halves need a GPU and run under `make test-kernel`.
+	$(IN) if [ -f bench/test_w4a8_from_fp8.py ]; then \
+	  PYTHONPATH=. python3 bench/test_w4a8_from_fp8.py --self-check; fi
+	$(IN) if [ -f bench/test_moe_decode.py ]; then \
+	  PYTHONPATH=. python3 bench/test_moe_decode.py --self-check; fi
 	$(IN) python3 bench/trace_stats.py --self-check
 	$(IN) python3 bench/metrics.py
 	$(IN) python3 bench/sweep_report.py --selfcheck
 	@# aiperf -> repo-schema converter. Parses files only, so it runs off-box without aiperf.
 	$(IN) if [ -f bench/aiperf_adapter.py ]; then python3 bench/aiperf_adapter.py --selfcheck; fi
+	$(IN) if [ -f bench/build_trace_weka.py ]; then python3 bench/build_trace_weka.py --self-check; fi
 	$(IN) python3 bench/eval_quality.py --self-check
 	$(IN) python3 bench/profile_trace.py --self-check
 	@# if-form, not `[ -f x ] && cmd || true`: that swallows the script's OWN failure as well as
@@ -151,6 +232,20 @@ check:
 	@# Formula half runs anywhere; the live-allocator half needs CUDA and skips off-box
 	@# (it runs for real under `make test-kernel`, which pytest-globs bench/test_*.py).
 	$(IN) if [ -f bench/test_kv_alignment.py ]; then python3 bench/test_kv_alignment.py; fi
+	@# compose <-> registry gate parity (round-2+): every VTL_ENABLE_* pin in docker-compose.yaml
+	@# equals the patch's `@register_patch(default=)`, with a two-name forced-on exception list.
+	@# This is the check that keeps the compose registry-gates header from becoming a lie.
+	$(IN) if [ -f bench/test_compose_gates.py ]; then \
+	  PYTHONPATH=. python3 bench/test_compose_gates.py --self-check; fi
+	@# Cheap syntax insurance for the shell we ship but cannot exercise here: the host tuner,
+	@# and the two BOLT heredocs inside Dockerfile.vllm-fork (extracted between their markers --
+	@# they only run on a `make vllm-fork VLLM_RS_PGO=1`, which is far too slow to be a check).
+	$(IN) if [ -f ../scripts/host-tune.sh ]; then bash -n ../scripts/host-tune.sh && echo "bash -n scripts/host-tune.sh: ok"; fi
+	@# grep-guarded as well as -f guarded: earlier rounds ship a Dockerfile.vllm-fork with no
+	@# BOLT stage at all, and a missing marker is an ERROR (not a skip) in the checker on
+	@# purpose -- that is what stops it from silently going quiet if the block is renamed.
+	$(IN) if [ -f Dockerfile.vllm-fork ] && grep -q "<<'BOLT_TOOLS'" Dockerfile.vllm-fork; then \
+	  python3 ../scripts/check_dockerfile_heredocs.py Dockerfile.vllm-fork BOLT_TOOLS BOLT_RUN; fi
 	$(IN) python3 -c "import vtl.patches, vtl.plugin; print('vtl imports without vLLM: ok')"
 
 # No compose, no server, no model: the kernel tests just need the image and a GPU.
@@ -302,18 +397,30 @@ BUILDX_FLAGS := --provenance=false --sbom=false $(NOCACHE)
 ##   make vllm-fork VLLM_RS_PGO=1   # + profile-guided optimization
 ##   make vllm-fork PUSH=1
 ##   make push VLLM_IMAGE=$(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)@sha256:<digest>
-vllm-fork:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg PGO_MODEL='$(PGO_MODEL)' --build-arg PGO_TARGET_CPU='$(PGO_TARGET_CPU)' $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-context hfmodel=$(PGO_HFMODEL)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
+# Stage a metadata-only copy of $(PGO_HFMODEL) for the buildx named context. The PGO stage
+# only reads the tokenizer/config JSONs (the frontend has no weight loader at all), but a
+# `RUN --mount=type=bind,from=hfmodel` makes buildx sync the WHOLE context to BuildKit —
+# with the full round-2 checkpoint in hf-model/ that is a 127.2 GB transfer plus a second
+# on-disk copy in the build cache, for ~25 MB actually used. Include patterns mirror
+# fetch-model.sh --meta-only (plus *.jinja for the dedicated chat template file).
+pgo-hfmodel-ctx:
+	$(IN) test -f "$(PGO_HFMODEL)/config.json" || { echo "FAIL: $(PGO_HFMODEL)/config.json missing -- run 'make model-fetch-meta' (~25 MB) first or point PGO_HFMODEL at a model dir"; exit 1; }
+	$(IN) test -f "$(WEKA_TRACE)" || { echo "FAIL: $(WEKA_TRACE) missing -- the PGO/BOLT training replay needs it; run 'make trace-weka' first"; exit 1; }
+	$(IN) rm -rf "$(PGO_HFMODEL_CTX)" && mkdir -p "$(PGO_HFMODEL_CTX)" && find "$(PGO_HFMODEL)" -maxdepth 1 -type f \( -name '*.json' -o -name '*.jinja' -o -name '*.txt' -o -name 'tokenizer*' -o -name 'vocab*' -o -name 'merges*' \) -exec cp {} "$(PGO_HFMODEL_CTX)/" \;
+	@$(IN) du -sh "$(PGO_HFMODEL_CTX)" | sed 's/^/staged metadata-only PGO context: /'
+
+vllm-fork: $(if $(filter 1,$(VLLM_RS_PGO)),pgo-hfmodel-ctx)
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg NO_PROXY=localhost,127.0.0.1 --build-arg no_proxy=localhost,127.0.0.1 --build-arg http_proxy="$(HTTP_PROXY)" --build-arg https_proxy="$(HTTPS_PROXY)" --build-arg HTTP_PROXY="$(HTTP_PROXY)" --build-arg HTTPS_PROXY="$(HTTPS_PROXY)" --build-arg VLLM_IMAGE='$(VLLM_STOCK)' --build-arg PGO_MODEL='$(PGO_MODEL)' --build-arg PGO_TARGET_CPU='$(PGO_TARGET_CPU)' $(if $(filter 1,$(VLLM_RS_PGO)),--build-arg RUST_BUILDER=rust-builder-pgo --build-context hfmodel=$(PGO_HFMODEL_CTX)) $(if $(PUSH),--push,--load) -t $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) -f Dockerfile.vllm-fork .
 	@echo "forked vLLM base: $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG)"
 	@if [ -n "$(PUSH)" ]; then $(IN) docker buildx imagetools inspect $(VLLM_FORK_IMAGE):$(VLLM_FORK_TAG) --format 'pin this digest: {{.Manifest.Digest}}'; fi
 
 build:
-	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --load -t $(IMAGE):$(TAG) .
+	$(IN) docker buildx build $(BUILDX_FLAGS) --platform $(PLATFORM) --build-arg http_proxy="$(HTTP_PROXY)" --build-arg https_proxy="$(HTTPS_PROXY)" --build-arg HTTP_PROXY="$(HTTP_PROXY)" --build-arg HTTPS_PROXY="$(HTTPS_PROXY)" --build-arg VLLM_IMAGE='$(VLLM_IMAGE)' --build-arg CUDA_ARCHS='$(CUDA_ARCHS)' --build-arg MAX_JOBS='$(MAX_JOBS)' --load -t $(IMAGE):$(TAG) .
 	@docker inspect $(IMAGE):$(TAG) --format 'built {{.Os}}/{{.Architecture}}'
 
 # `docker compose up --build` cannot take --build-arg, so build first (which honors it) then up.
 up:
-	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)'
+	$(IN) $(DC) build --build-arg http_proxy="$(HTTP_PROXY)" --build-arg https_proxy="$(HTTPS_PROXY)" --build-arg HTTP_PROXY="$(HTTP_PROXY)" --build-arg HTTPS_PROXY="$(HTTPS_PROXY)" --build-arg VLLM_IMAGE='$(VLLM_IMAGE)'
 	$(IN) $(DC) up
 
 down:
@@ -323,13 +430,18 @@ down:
 ## enough traffic to trigger compile + CUDA graph capture + FlashInfer autotune, then copy the
 ## caches back into the build context and rebuild. Two passes: open-loop warms low-concurrency
 ## shapes; closed-loop saturates a full batch so the multi-seq kernels compile into the cache too.
+## Replays the Weka-derived grading-shaped trace (`make trace-weka`), NOT the synthetic
+## trace-round2.jsonl -- caches baked here must cover the judge's real shapes (long contexts,
+## decode-heavy), which the synthetic trace predates (HANDOFF §6.3).
 WARM_CONCURRENCY ?= 16
-WARM_REQS ?= 32
+WARM_REQS ?= 64
+WARM_TRACE ?= $(WEKA_TRACE)
 warm:
-	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE)'
+	$(IN) test -f "$(WARM_TRACE)" || { echo "FAIL: $(WARM_TRACE) missing -- run 'make trace-weka' first"; exit 1; }
+	$(IN) $(DC) build --build-arg VLLM_IMAGE='$(VLLM_IMAGE_FORK)'
 	$(IN) $(DC) up -d --wait   # --wait blocks until the healthcheck passes
-	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) --limit 4 --out /dev/null
-	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(TRACE) \
+	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(WARM_TRACE) --limit 4 --out /dev/null
+	$(IN) python3 bench/replay.py --target $(TARGET) --trace $(WARM_TRACE) \
 	  --closed-loop $(WARM_CONCURRENCY) --limit $(WARM_REQS) --out /dev/null
 	$(IN) docker cp "$$($(DC) ps -q model)":/opt/vtl/cache/. docker/cache/
 	$(IN) $(DC) down

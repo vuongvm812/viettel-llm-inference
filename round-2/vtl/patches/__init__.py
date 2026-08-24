@@ -31,7 +31,45 @@ log = logging.getLogger("vllm.vtl.patches")
 _MODULES: tuple[str, ...] = (
     "quant_fp8",
     "quant_w4a8",       # int4 weights + fp8 acts; delegates un-int4-able layers back to quant_fp8
+    # AFTER quant_w4a8: imports its packing helpers (pack_int4_rows, CUTLASS encode) and extends
+    # the method to fp8-block checkpoints (dequant -> RTN int4 group-128). VTL_W4A8_FROM_FP8=1.
+    "w4a8_from_fp8",
     "rms_norm_quant",
+    # AFTER rms_norm_quant (HANDOFF 4.1): both register fusion patterns into the same
+    # RMSNormQuantFusionPass; gdn_kernels adds the RMSNormGated -> group-128-quant pattern
+    # (the fusion AITER ships on ROCm and CUDA lacks) for the 36 GDN layers.
+    "gdn_kernels",
+    "gdn_prefill_backend",  # env pin of the GDN prefill backend (triton/flashinfer/cutedsl A/B)
+    # NVRTC re-specialization of the stock block-quant ops at the loaded model's geometry
+    # (-DHIDDEN/-DGROUP). Op-identity-preserving: leaves the stock op untouched when NVRTC
+    # is off or the compile fails. First production consumer of vtl/nvrtc.py.
+    "nvrtc_block_quant",
+    # Fused greedy argmax over the vocab, -DVOCAB-specialized. Fills the seams the forked V2
+    # sampler and nstep_decode already have (torch.ops.vllm_cuda.greedy_argmax_i64 and
+    # nstep's `_ARGMAX`); registers nothing unless the compile succeeds AND a boot parity
+    # gate matches torch.argmax bit for bit, so both stay on torch.argmax otherwise. Needs
+    # VTL_NVRTC=1.
+    #
+    # ITS POSITION IN THIS TUPLE IS NOT LOAD-BEARING. The nstep rebind goes through
+    # `sys.modules["vtl.patches.nstep_decode"]` at MODEL LOAD, long after every module here
+    # has been imported, so it does not matter whether nstep_decode appears above or below.
+    # The real constraint is a runtime one this list cannot express: the rebind must happen
+    # before `capture_model()`, i.e. BaseModelLoader.load_model must run before the burst
+    # graphs are captured -- which it does, unconditionally.
+    #
+    # It does add ANOTHER wrapper on `BaseModelLoader.load_model` -- the fourth of the eight
+    # this package stacks there, in apply order: quant_w4a8, w4a8_from_fp8,
+    # nvrtc_block_quant, greedy_argmax, gdn_decode_step, moe_decode_gemv, l2_persist,
+    # megakernel_probe. They NEST rather than conflict (`already_patched`/`mark_patched`
+    # keep the stack sound and each swallows its own failure), but the ordering note on
+    # l2_persist at the bottom of this list applies to every one of them.
+    "greedy_argmax",
+    # Fused GDN decode step (conv1d update + gating delta rule, one NVRTC launch per layer,
+    # pure non-spec decode only; spec/MTP and prefill fall through to stock Triton).
+    "gdn_decode_step",
+    # MoE decode grouped-GEMV for the 256-expert layers at M<=VTL_MOE_GEMV_MAX_M; fp8 arm is
+    # memory-neutral, int4 arm rides w4a8_from_fp8's packing. Needs VTL_NVRTC=1.
+    "moe_decode_gemv",
     "dynamic_per_token_quant",
     "silu_mul_quant",
     "kv_cache_manager",
@@ -71,6 +109,9 @@ _MODULES: tuple[str, ...] = (
     "megakernel_probe",  # read-only go/no-go for a cooperative-grid decode megakernel. Same
                          # load_model seam as the two above, so it goes after them; it only
                          # reads device attributes, so the order between them does not matter.
+    "stall_dump",        # liveness flight recorder: running-but-frozen counters -> log the
+                         # burst state + all-thread stacks. AFTER rust_sched so it wraps the
+                         # finally-bound update_from_output. Diagnostics only.
 )
 
 for _name in _MODULES:
