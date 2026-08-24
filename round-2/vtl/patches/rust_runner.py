@@ -35,8 +35,12 @@ THE PER-STEP HANDSHAKE. Module globals, same lifetime story as ``BURST``:
 
   * ``STATE.step`` -- the STASH. ``rust_sched.commit_burst`` writes it at schedule time
     with everything the launch needs that only the scheduler knows (slot layout, the
-    committed burst width, the publish hint). ``nstep_decode``'s ``sample_tokens`` takes it,
-    matches it against the batch it is actually holding, and either launches or drops it.
+    committed burst width, the publish hint). ``nstep_decode``'s ``sample_tokens`` takes it
+    BY SEQ (``take_step_for``, off the ``SchedulerOutput`` its own step carries), matches it
+    against the batch it is actually holding, and either launches or drops it. A stash is
+    owned by exactly one scheduled step; ``update_from_output`` only ever sweeps stashes
+    whose step is at or before the one it is applying (``clear_step_upto``), because the
+    stash it usually finds belongs to the NEXT step, which has not been sampled yet.
   * ``STATE.pending`` -- update mode: the FIFO of ``(ring slot, stash, took)`` for launches
     whose ``update_from_output`` has not arrived yet. At most two, see below. ``took`` is
     what ``launch`` RETURNED, which is ``stash.steps`` unless the crate clamped itself to a
@@ -214,6 +218,25 @@ class _State:
         raises -- the caller keeps the stock path. The latch is dropped and the crate-side
         runner disarmed BEFORE the raise, so even the raising arm leaves consistent state
         if something upstream swallows it.
+
+        ``self.step`` IS DELIBERATELY LEFT ALONE. A refusal can land in the middle of a
+        step -- ``runner_commit`` calls this from ``update_from_output(k)`` -- and the stash
+        sitting there at that moment usually belongs to ``schedule(k+1)``, whose
+        ``sample_tokens`` has not run yet. Blind-clearing it is the exact race
+        ``clear_step_upto`` was introduced to stop. Nothing needs the clear either, and both
+        halves of that were checked in code rather than assumed:
+
+          * the stash's owner still pops it. ``nstep_decode``'s ``sample_tokens`` calls
+            ``take_step_for(seq)`` unconditionally, before any ``live`` check, and the
+            launch site it hands the stash to declines on ``not state.live``. So the stash
+            is consumed and the launch does not happen -- which is the whole point.
+          * a stash that survives anyway is inert, not a blocker. ``rust_sched``'s
+            ``runner_stash`` refuses on ``not state.live`` BEFORE it looks at
+            ``state.step``, so a refused state stashes nothing regardless; and
+            ``update_from_output``'s ``clear_step_upto`` sweep still collects it once the
+            step it belongs to has been applied.
+
+        The stand-down itself is ``live``, ``refused`` and the dropped FIFO -- not the stash.
         """
         if self.live:
             log.error("vtl: rust runner disabled for this boot -- %s", why)
@@ -222,7 +245,6 @@ class _State:
         self.live = False
         self.refused = True
         self.why = why
-        self.step = None
         self.done = None
         # Dropping the pending launches is SAFE, and that is a property of update mode
         # rather than a hope: a launch commits nothing, so a step whose entry is dropped is
@@ -238,12 +260,59 @@ class _State:
                 f"VTL_RUST_RUNNER_REQUIRE=1 but the Rust runner cannot run: {why}"
             )
 
-    def take_step(self) -> "_Stash | None":
-        """Pop the stash. Always popped, launch or no launch: a stash names a SCHEDULED
-        step, and the next step's batch can have the identical request-id key, so a
-        leftover would match a step it was never written for."""
-        stash, self.step = self.step, None
-        return stash
+    def take_step_for(self, seq) -> "_Stash | None":
+        """Pop the stash IFF it is the one written for scheduled step ``seq``.
+
+        THE OWNERSHIP RULE. A stash belongs to exactly one scheduled step -- the one whose
+        ``SchedulerOutput`` carries its ``vtl_runner_seq`` -- and only two callers ever know
+        that seq: the launch site (``nstep_decode``'s ``sample_tokens``, holding the very
+        ``SchedulerOutput`` the stash was written for) and the scheduler half of the same
+        step retracting its own commit. Both go through here. A blind pop would just as
+        happily destroy the stash a LATER ``schedule()`` already wrote -- the engine thread
+        runs ``schedule(k+1)`` before it applies ``update(k)``, so that stash exists more
+        often than not -- stranding a step that is still going to be launched.
+
+        ``seq`` of 0 is "no seq was ever stamped on this SchedulerOutput", which can name
+        no stash: seqs start at 1.
+
+        NO LOCK, and none needed: every caller of this and of ``clear_step_upto`` runs on a
+        GIL-holding Python thread, and the check-then-clear is a handful of bytecodes with
+        no call that can release the GIL between the read and the write (attribute loads on
+        a ``__slots__`` object and an integer compare). The crate side never touches
+        ``step``.
+        """
+        step = self.step
+        if seq and step is not None and step.seq == seq:
+            self.step = None
+            return step
+        return None
+
+    def clear_step_upto(self, seq) -> bool:
+        """Drop a stash left behind by scheduled step ``seq`` or an earlier one. Returns
+        whether anything was dropped.
+
+        THE UPDATE-SIDE SWEEP. ``update_from_output(k)`` runs after ``sample(k)`` has
+        provably returned, so any stash still sitting here with ``seq <= k`` is a leak: its
+        launch site either never ran or exited without popping, and nothing will ever claim
+        it. Left in place it would be matched by a LATER step's ``take_step_for`` only by
+        seq -- which it cannot be, seqs are unique -- so in practice it would simply pin the
+        step's ``_Stash`` (and the ``Request`` objects it holds) for the life of the boot,
+        and mask the leak that produced it.
+
+        ``<=``, and never a blind clear: the engine thread's order is ``schedule(k+1) ->
+        dispatch execute(k+1) -> update(k)``, and ``sample(k+1)`` -- the one caller
+        entitled to step k+1's stash -- runs on the worker side, concurrently with that
+        last step. So the stash this finds is very often the one ``schedule(k+1)`` just
+        wrote for a launch that has not happened yet. Destroying THAT is what kept the
+        runner from engaging.
+
+        Same GIL argument as ``take_step_for``: check-then-clear needs no lock here.
+        """
+        step = self.step
+        if step is not None and seq and step.seq <= seq:
+            self.step = None
+            return True
+        return False
 
     def free_slot(self) -> "int | None":
         """The ring index no outstanding launch holds, or ``None`` when both are taken.
@@ -665,15 +734,40 @@ def _self_check() -> None:
     finally:
         logging.disable(logging.NOTSET)
     assert not s.live and s.why == "testing"
-    assert s.step is None and s.done is None, "a refusal must strand no handshake"
+    assert s.done is None, "a refusal must strand no finished launch"
     assert s.pending == [], "a dropped launch is committed by decide(); a stranded one is not"
+    # ...and the stash is NOT part of the stand-down: it usually belongs to the NEXT
+    # scheduled step, whose `sample_tokens` pops it unconditionally (and then declines the
+    # launch, because `live` is False). Destroying it here is the race `clear_step_upto`
+    # exists to prevent, and leaving it blocks nothing -- `runner_stash` refuses on `live`
+    # before it ever reads `step`, and the update-side sweep collects it in due course.
+    assert s.step is stash, "refuse() leaves the stash for its owner / the sweep"
 
-    # The stash is POPPED, launch or no launch: the next step's batch can have the exact
-    # same request-id key, so a leftover would match a step it was never written for.
+    # `take_step_for` is the ONLY pop: it hands over the stash written for the step doing
+    # the asking, so a stash a LATER schedule already wrote survives untouched. The stash IS
+    # popped whenever its own step asks, launch or no launch -- the next step's batch can
+    # have the exact same request-id key, so a leftover would match a step it was never
+    # written for.
     s = _State()
-    s.step = stash
-    assert s.take_step() is stash
-    assert s.take_step() is None and s.step is None
+    s.step = stash                                  # stash.seq == 7
+    assert s.take_step_for(8) is None and s.step is stash, "another step's stash stays"
+    assert s.take_step_for(6) is None and s.step is stash, "...in both directions"
+    assert s.take_step_for(0) is None and s.step is stash, "0 names no scheduled step"
+    assert s.take_step_for(7) is stash and s.step is None
+    assert s.take_step_for(7) is None, "an empty stash pops nothing"
+
+    # `clear_step_upto` is the update-side sweep, and the whole truth table matters: the
+    # engine thread runs schedule(k+1) before it applies update(k), so the stash this finds
+    # is normally the NEXT step's and must survive. Only a stash at or before the step being
+    # updated is a leak -- that step's sample has provably returned.
+    s = _State()
+    s.step = stash                                  # stash.seq == 7
+    assert s.clear_step_upto(6) is False and s.step is stash, "a LATER step's stash stays"
+    assert s.clear_step_upto(0) is False and s.step is stash, "0 clears nothing"
+    assert s.clear_step_upto(7) is True and s.step is None, "its own step sweeps it"
+    s.step = _Stash(("a",), (0,), (object(),), 4, 1, 32768, True, True, 3)
+    assert s.clear_step_upto(7) is True and s.step is None, "an OLDER stash is a leak too"
+    assert _State().clear_step_upto(1) is False, "an empty state sweeps nothing"
 
     # `inflight` is the ordering interlock: a launch is only legal when this step is the
     # only one not yet applied. The counter itself is scheduler-side; what has to hold

@@ -18,7 +18,10 @@ status)``. If there ARE running requests and the signature has not changed for
   * one WARNING line per running request with the burst-relevant counters
     (``num_computed_tokens``, ``num_output_placeholders``, ``num_output_tokens``,
     ``is_prefill_chunk``, status) plus the waiting-queue length;
-  * the ``nstep_decode.BURST`` handshake state (ready/key/n/disabled reason), when present;
+  * the ``nstep_decode.BURST`` handshake state (armed/ready/key/n/mode and the per-step
+    commitments pending/pending1/pending_seq/rust_steps) and the ``rust_runner.STATE``
+    handshake (live/refused/why/inflight/pending/stash seq), whichever of the two modules
+    is loaded -- between them they say whether a step was committed and then never sampled;
   * ``faulthandler.dump_traceback(all_threads=True)`` to stderr -- the Python stack of every
     thread in the EngineCore process, which is the piece that names the wedged line.
 
@@ -83,17 +86,65 @@ def stalled(now: float, last_change: float, threshold: float, n_running: int) ->
 
 
 def _burst_state() -> str:
+    """The two handshakes a wedge lives in, one line each. Never raises.
+
+    ``sys.modules.get``, never an import: this runs on the watchdog thread against a
+    process that is already sick, and importing a patch module from here would either be a
+    no-op or a brand-new import with side effects at the worst possible moment. A module
+    that was never loaded is itself a finding ("absent").
+
+    THE FIELDS ARE THE WEDGE, not a dump of the objects. ``_Burst`` is a ``__slots__``
+    class, so a name that does not exist reads back as the ``'?'`` default rather than
+    raising -- which is how the previous list came to print ``disabled``/``reason``, two
+    fields that have never existed on it. Every name below is asserted against the real
+    ``__slots__`` in ``_self_check``:
+
+      * ``armed``/``ready``/``key``/``n``/``mode`` -- is the burst installed at all, and
+        which batch did the worker last publish as burstable;
+      * ``pending``/``pending1``/``pending_seq`` -- the per-step commitments. Non-zero here
+        while nothing moves means a ``sample_tokens`` that never ran (or never returned)
+        after an ``execute_model`` that did;
+      * ``rust_steps`` -- how many launches a burst step is allowed to chain.
+
+    The runner line answers the other half: whether the Rust runner is live, whether it
+    stood down and why, how many scheduled steps it thinks are unapplied (``inflight``),
+    how many launches are waiting for their commit (``pending``), and which scheduled step
+    owns the stash it is holding (``step.seq``) -- a stash that never moves is a launch
+    site that never came back for it.
+    """
+    lines = []
     try:
         import sys
 
         nd = sys.modules.get("vtl.patches.nstep_decode")
         b = getattr(nd, "BURST", None)
         if b is None:
-            return "BURST: absent"
-        fields = ("ready", "key", "n", "disabled", "reason")
-        return "BURST: " + " ".join(f"{f}={getattr(b, f, '?')!r}" for f in fields)
+            lines.append("BURST: absent")
+        else:
+            fields = ("armed", "ready", "key", "n", "mode", "pending", "pending1",
+                      "pending_seq", "rust_steps")
+            lines.append("BURST: " + " ".join(f"{f}={getattr(b, f, '?')!r}" for f in fields))
+
+        rr = sys.modules.get("vtl.patches.rust_runner")
+        st = getattr(rr, "STATE", None)
+        if st is None:
+            lines.append("RUNNER: absent")
+        else:
+            step = getattr(st, "step", None)
+            lines.append(
+                "RUNNER: live=%r refused=%r why=%r inflight=%r pending=%r stash_seq=%r"
+                % (
+                    getattr(st, "live", "?"),
+                    getattr(st, "refused", "?"),
+                    getattr(st, "why", "?"),
+                    getattr(st, "inflight", "?"),
+                    len(getattr(st, "pending", ()) or ()),
+                    getattr(step, "seq", None) if step is not None else None,
+                )
+            )
     except Exception as exc:
-        return f"BURST: unreadable ({exc!r})"
+        lines.append(f"BURST/RUNNER: unreadable ({exc!r})")
+    return "\n".join(lines)
 
 
 def _dump(sched) -> None:
@@ -119,7 +170,21 @@ def _dump(sched) -> None:
                 getattr(r, "num_output_tokens", "?"),
                 getattr(r, "is_prefill_chunk", "?"),
             )
-        log.warning("vtl: STALL %s", _burst_state())
+        for line in _burst_state().splitlines():
+            log.warning("vtl: STALL %s", line)
+        # The scheduler flight recorder (rust_sched.FLIGHT): what the last few schedule()
+        # calls fed the step -- token counts, block-id spans, the zeroing list, deferred
+        # frees. The third-incident wedge is GPU work that never completes, so the thread
+        # stacks below only ever catch a bystander host call blocked on the stream; THIS
+        # is the state that names the step that enqueued the wedge. Same `sys.modules.get`
+        # discipline as `_burst_state`: never import from the watchdog.
+        try:
+            rs = sys.modules.get("vtl.patches.rust_sched")
+            lines = rs.flight_lines() if hasattr(rs, "flight_lines") else ()
+            for line in lines:
+                log.warning("vtl: STALL %s", line)
+        except Exception:
+            log.exception("vtl: stall flight readout failed")
         faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
     except Exception:
         log.exception("vtl: stall dump itself failed")
@@ -241,7 +306,28 @@ def _self_check() -> None:
     os.environ.pop("VTL_STALL_DUMP_SECS")
     assert _threshold() == 20.0
 
-    assert "BURST" in _burst_state(), _burst_state()
+    # -- the two handshake summaries. Both halves report, loaded or not --
+    state = _burst_state()
+    assert "BURST" in state and "RUNNER" in state, state
+    assert len(state.splitlines()) == 2, state
+
+    # ...and every field named is a field that EXISTS. This is the whole reason the check
+    # is here: `_Burst` is a `__slots__` class and `getattr(..., '?')` swallows a typo
+    # silently, which is how the previous list came to print two fields (`disabled`,
+    # `reason`) that the class has never had. Importing is safe here (no vLLM, no torch at
+    # module scope) and is exactly what the watchdog itself refuses to do.
+    from vtl.patches import nstep_decode, rust_runner
+
+    for f in ("armed", "ready", "key", "n", "mode", "pending", "pending1", "pending_seq",
+              "rust_steps"):
+        assert f in nstep_decode._Burst.__slots__, f
+    for f in ("live", "refused", "why", "inflight", "pending", "step"):
+        assert f in rust_runner._State.__slots__, f
+    assert "seq" in rust_runner._Stash._fields
+    live = _burst_state()
+    assert "BURST: absent" not in live and "RUNNER: absent" not in live, live
+    assert "unreadable" not in live, live
+    assert "pending_seq=" in live and "stash_seq=" in live, live
 
     print("stall_dump self-check ok")
 

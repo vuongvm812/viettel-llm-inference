@@ -73,8 +73,48 @@ services:
       # is layered on via VTL_W4A8_FROM_FP8 / VTL_ENABLE_MOE_DECODE_GEMV below and degrades
       # to the stock fp8 path per-layer; bench/eval_quality.py is the accuracy gate.
       - --kv-cache-dtype=fp8_e4m3
+      # KV offloading: judge-specified 2026-08-17 (commit 3823158). The flags are left AS
+      # SPECIFIED; the third line below is this stack's requirement, not a change to them.
+      #
+      # THESE FLAGS CONFIGURE A vLLM V1 KV CONNECTOR (boot logs "Initializing
+      # KVConnectorBase_V1" + an OffloadingSpec) -- and that connector is now PORTED.
+      # OffloadingConnector on the "native" backend, at kv_role=kv_both, CPUOffloadingSpec,
+      # no offloaded block_size, recompute-on-load-failure is the ONE configuration
+      # rust_sched.py::offloading_connector_supported allow-lists, and for it authority mode
+      # no longer stands down: schedule() drives the connector protocol itself (probe ->
+      # get_num_new_matched_tokens -> allocate/park -> build_connector_meta), and the
+      # deferred-free queue that kv_role=kv_both + async scheduling (on by default here) turns
+      # on is routed through the Rust pool.
+      # With these three lines the FULL Rust stack serves alongside the offloading
+      # connector; the first schedule() proves it in one line:
+      #   rust_sched: RUNGS authority=on full=on ... connector=OffloadingConnector/native
+      # ANY OTHER connector -- LMCache, NIXL, SimpleCPUOffload, a different role, an
+      # offloaded block_size, or kv_load_failure_policy=fail -- still stands authority mode
+      # down to the stock scheduler, with one loud warning. That is a supported outcome, not
+      # a crash, but none of the Rust measurements apply to it.
+      #
+      # TWO RUNGS ARE OFF while a connector is live, deliberately and named in RUNGS:
+      #   * tokstore (Port-2) -- its facade freezes request.block_hashes, which the connector
+      #     reads on every build_connector_meta. RUNGS shows tokstore=OFF(connector ...).
+      #     Declared scope exclusion: it never raises, VTL_RUST_SCHED_REQUIRE included.
+      #   * r8/r9 -- step_packable refuses a step with a connector or defer_block_free, so
+      #     the packed output record and the collapsed residue loop are inert on this boot.
+      #     A documented trade (the connector's own bookkeeping is what they cannot express);
+      #     re-porting them under defer_block_free is an optional follow-up.
       - --kv-offloading-size=64
       - --kv-offloading-backend=native
+      # REQUIRED BY THE PORT, and the reason it is a separate flag: KVTransferConfig defaults
+      # kv_load_failure_policy to 'fail' (config/kv_transfer.py:69), which the allow-list
+      # refuses -- 'fail' repairs a bad load through _update_requests_with_invalid_blocks,
+      # whose `(req_block_ids,) = get_block_ids(req_id)` is single-group-only in stock (the
+      # "TODO (davidb): add support for hybrid memory allocator") and would raise on this
+      # model's two kv cache groups; it is not ported here either. 'recompute' just rewinds
+      # num_computed_tokens and prefills again. Nothing else is set here on purpose:
+      # VllmConfig._post_init_kv_transfer_config synthesizes kv_connector=OffloadingConnector
+      # and kv_role=kv_both ON TOP of whatever this provides (config/vllm.py:789-823), so
+      # naming them again would only be a second place to keep in sync. Delete this line and
+      # the boot stands authority mode down (RUNGS connector=OFF(kv_load_failure_policy ...)).
+      - '--kv-transfer-config={"kv_load_failure_policy": "recompute"}'
       # MTP speculative decoding: PERMITTED for round-2 (user-confirmed 2026-08-16; the
       # round-1.2 "cheating" ban does not carry over). The checkpoint ships a 1-layer MTP
       # drafter (Qwen3_5MoeMTP, registered stock in v0.25.0); greedy tree acceptance rides
@@ -126,6 +166,7 @@ services:
       DO_NOT_TRACK: "1" # disable anonymous usage stats / telemetry
       VLLM_NO_USAGE_STATS: "1"
       VTL_DISABLE: 0 # 1 = bypass every vtl patch, run stock vLLM
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512" # fix VllmConfig validation
 
       # ---- Registry gates ---------------------------------------------------------------
       # Every patch in vtl/patches/ reads VTL_ENABLE_<NAME>. All are pinned here so a
@@ -242,38 +283,38 @@ services:
       # allocated (was 3 vCPU on the round-1.2 MIG box -- every pin below was re-based).
       OMP_NUM_THREADS: "8"
       MKL_NUM_THREADS: "8"
-      OMP_WAIT_POLICY: "PASSIVE"         # ACTIVE was a mistake and is reverted. libgomp reads
-                                         #   this once and then its 7 worker threads spin at
-                                         #   100% for the LIFETIME of the process, whether or
-                                         #   not any OMP region is ever entered -- it is not a
-                                         #   "keep the pool hot between hot-path regions" knob.
-                                         #   At TP=1 there is no hot-path OMP region to keep
-                                         #   hot: the executor is uniproc, and the per-step CPU
-                                         #   tensors are 5 rows wide, far below ATen's OMP
-                                         #   grain size, so ATen runs them single-threaded.
-                                         #   The only thing ACTIVE bought was 7 cores of busy
-                                         #   spin competing for all-core turbo headroom with
-                                         #   the one thread that matters (the engine loop).
-                                         #   If a real OMP region ever shows up on the hot
-                                         #   path, the right shape is PASSIVE + a bounded
-                                         #   GOMP_SPINCOUNT, not ACTIVE. Keep PASSIVE plain.
-      OMP_PROC_BIND: "close"             # keep the OMP threads on the cores they started on:
-      OMP_PLACES: "cores"                #   every migration is a cold L1/L2
+      OMP_WAIT_POLICY: "PASSIVE" # ACTIVE was a mistake and is reverted. libgomp reads
+      #   this once and then its 7 worker threads spin at
+      #   100% for the LIFETIME of the process, whether or
+      #   not any OMP region is ever entered -- it is not a
+      #   "keep the pool hot between hot-path regions" knob.
+      #   At TP=1 there is no hot-path OMP region to keep
+      #   hot: the executor is uniproc, and the per-step CPU
+      #   tensors are 5 rows wide, far below ATen's OMP
+      #   grain size, so ATen runs them single-threaded.
+      #   The only thing ACTIVE bought was 7 cores of busy
+      #   spin competing for all-core turbo headroom with
+      #   the one thread that matters (the engine loop).
+      #   If a real OMP region ever shows up on the hot
+      #   path, the right shape is PASSIVE + a bounded
+      #   GOMP_SPINCOUNT, not ACTIVE. Keep PASSIVE plain.
+      OMP_PROC_BIND: "close" # keep the OMP threads on the cores they started on:
+      OMP_PLACES: "cores" #   every migration is a cold L1/L2
 
       # ---- Rust frontend ---------------------------------------------------------------
       VLLM_USE_RUST_FRONTEND: "1"
       VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "60" # multi-turn gaps tail out past 30s; 60 races a slow
-                                         #   turn's connection reuse less than the 30s default
-      TOKIO_WORKER_THREADS: "6"          # HTTP runtime only. MUST be a positive int -- empty
-                                         #   or 0 panics vllm-rs at boot. 6 for the 22-core
-                                         #   host (70 conversations stream SSE per-token).
+      #   turn's connection reuse less than the 30s default
+      TOKIO_WORKER_THREADS: "6" # HTTP runtime only. MUST be a positive int -- empty
+      #   or 0 panics vllm-rs at boot. 6 for the 22-core
+      #   host (70 conversations stream SSE per-token).
       # vllm-rs starts two more runtimes that ignore TOKIO_WORKER_THREADS. The old pin of 2
       # was judge-swept ON THE 3-vCPU MIG BOX and does not carry over; 4 is the 22-core
       # starting point -- re-sweep {2,4} with make bench before submission.
       VLLM_RS_ZMQ_WORKER_THREADS: "4"
       VLLM_RS_REQUEST_WORKER_THREADS: "4"
-      VLLM_RS_DISABLE_HTTP_TRACE: "1"    # drop the per-request axum TraceLayer span.
-                                         #   0 restores it (and rejected-request log visibility)
+      VLLM_RS_DISABLE_HTTP_TRACE: "1" # drop the per-request axum TraceLayer span.
+      #   0 restores it (and rejected-request log visibility)
 
       # ---- Quantization ----------------------------------------------------------------
       VTL_W4A8_IGNORE: ""
@@ -335,9 +376,9 @@ services:
       # resident = OOM at 116 GB of experts); that pair is the experiment, not the default.
       VTL_MOE_GEMV_WEIGHTS: "fp8" # fp8 | int4
       VTL_MOE_GEMV_MAX_M: "8" # decode band; larger M falls through to stock. 8, not 16:
-                              #   the judge pinned --max-num-seqs=5 and spec-decode is off,
-                              #   so decode M never exceeds 5 -- a tighter band claims
-                              #   fewer batches the GEMV was not measured on.
+      #   the judge pinned --max-num-seqs=5 and spec-decode is off,
+      #   so decode M never exceeds 5 -- a tighter band claims
+      #   fewer batches the GEMV was not measured on.
       VTL_MOE_GEMV_THREADS: "256"
       # Fused greedy argmax (VTL_ENABLE_GREEDY_ARGMAX above). Pinned here rather than left
       # to the code default so a sweep is a compose edit and the served value is visible.
@@ -412,6 +453,22 @@ services:
       VTL_RUST_SCHED_TABLE: 1
       VTL_RUST_SCHED_SPEC: 1
       VTL_SCHED_TIMING: 0 # diagnostic: schedule-phase p50/p95 every 500 steps
+      # Most waiting requests admitted on a step that ALREADY carries running (decode)
+      # rows. 0 = unlimited, which is stock behaviour; 1 is set here to remove the batch
+      # shape every engine wedge on this branch has needed (see
+      # docs/round-2-nstep-regression-investigation.md, incidents 3-5): a GDN batch that is
+      # mixed -- num_decodes > 0 AND num_prefills > 0 -- carrying three concurrent
+      # multi-thousand-token prefills. The 02:59 flight ring holds the control that pins it:
+      # 5201 tokens of PURE prefill served fine, and the next step (2 decode + 3 prefill,
+      # 7805 tokens) wedged in the GDN prefill branch. With the cap the deferred prefills
+      # land on the following step(s), where they are pure prefill or mixed with fewer rows.
+      #
+      # Costs a little TTFT in an arrival burst and nothing at steady state; it does NOT
+      # drop or reorder anything (the withheld tail goes back on the queue ahead of the next
+      # step, FCFS preserved). Keeps VTL_RUST_SCHED_FULL=1 -- i.e. the whole Rust stack --
+      # which is what makes it preferable to the FULL=0 / VTL_ENABLE_RUST_SCHED=0 reverts.
+      # Set to 0 to restore stock admission.
+      VTL_SCHED_MIXED_PREFILL_CAP: 1
 
       # ---- Hot path: micro-opts, output collapse, N-step burst -------------------------
       # INERT UNTIL THE FORK IMAGE IS REBUILT: VTL_HOTPATH_MICROOPT and VTL_STREAM_PER_TOKEN
@@ -560,23 +617,23 @@ services:
       # slice), so the L2 set-aside is REAL here -- expect the probe to report nonzero, and
       # the persisting window actually engages. Sweep 24/48 MiB; H200 L2 is 60 MB total.
       VTL_L2_PERSIST: 1
-      VTL_L2_PERSIST_BYTES: "50331648"       # 48 MiB request, clamped to the device max
-      VTL_L2_HIT_RATIO: "0.6"                # fraction of window lines marked persisting
-      VTL_KERNEL_SYNC: 0                     # DEBUG only: cudaStreamSynchronize per kernel (slow)
-      VTL_DISABLE_WARMUP: 0                  # 1 = pure /health check, skip system-prefix priming
+      VTL_L2_PERSIST_BYTES: "50331648" # 48 MiB request, clamped to the device max
+      VTL_L2_HIT_RATIO: "0.6" # fraction of window lines marked persisting
+      VTL_KERNEL_SYNC: 0 # DEBUG only: cudaStreamSynchronize per kernel (slow)
+      VTL_DISABLE_WARMUP: 0 # 1 = pure /health check, skip system-prefix priming
 
-      # ---- A/B CANDIDATES: left OFF on purpose. Turn ONE on, run `make bench` with >=3
-      # boots per arm, keep it only if the delta clears that run's reported noise floor.
-      #
-      # CUDA_DEVICE_MAX_CONNECTIONS: "1"
-      #   Fewer hardware work queues = less per-launch overhead, but it SERIALIZES independent
-      #   streams and so fights VTL_STREAM_PER_TOKEN. A/B the pair, not each alone.
-      # CUDA_MODULE_LOADING: "EAGER"
-      #   Moves per-module load cost onto boot, which the health-gated warm-up already hides.
-      #   Costs boot time and VRAM for modules never used.
-      # PYTHONMALLOC: "malloc"
-      #   Routes CPython's allocator through jemalloc (already LD_PRELOADed). Can cut
-      #   fragmentation, or lose to pymalloc's free lists on the decode path. Genuinely 50/50.
+    # ---- A/B CANDIDATES: left OFF on purpose. Turn ONE on, run `make bench` with >=3
+    # boots per arm, keep it only if the delta clears that run's reported noise floor.
+    #
+    # CUDA_DEVICE_MAX_CONNECTIONS: "1"
+    #   Fewer hardware work queues = less per-launch overhead, but it SERIALIZES independent
+    #   streams and so fights VTL_STREAM_PER_TOKEN. A/B the pair, not each alone.
+    # CUDA_MODULE_LOADING: "EAGER"
+    #   Moves per-module load cost onto boot, which the health-gated warm-up already hides.
+    #   Costs boot time and VRAM for modules never used.
+    # PYTHONMALLOC: "malloc"
+    #   Routes CPython's allocator through jemalloc (already LD_PRELOADed). Can cut
+    #   fragmentation, or lose to pymalloc's free lists on the decode path. Genuinely 50/50.
     shm_size: "2g" # tmpfs counts against the 8GB cgroup; TP=1 needs little
     # Pin every container thread to the NUMA node the H200 hangs off, so the per-step pinned
     # H2D/D2H staging buffers and the OMP pool stop paying cross-socket hops. SHIPS COMMENTED:
@@ -608,20 +665,20 @@ services:
       # silently halving H2D bandwidth on the per-step copies.
       memlock: -1
       nofile: 65536
-      # rtprio DELIBERATELY ABSENT (was 99). With RLIMIT_RTPRIO at its default of 0, any
-      # sched_setscheduler(SCHED_FIFO) request from a library (iceoryx2 can ask for RT
-      # listener threads) fails cleanly and the thread stays on CFS -- which is what every
-      # measured number in this file was produced under. With it, an RT thread that ends up
-      # sharing a core (CPU affinity, a future cpuset, or plain load) spins ABOVE the
-      # kernel's own housekeeping threads on that core: watchdog stalls, then a host-wide
-      # lockup. That failure takes down the whole VPS, not the container, and the judge box
-      # cannot be power-cycled by us. No RT = that failure mode cannot exist.
+    # rtprio DELIBERATELY ABSENT (was 99). With RLIMIT_RTPRIO at its default of 0, any
+    # sched_setscheduler(SCHED_FIFO) request from a library (iceoryx2 can ask for RT
+    # listener threads) fails cleanly and the thread stays on CFS -- which is what every
+    # measured number in this file was produced under. With it, an RT thread that ends up
+    # sharing a core (CPU affinity, a future cpuset, or plain load) spins ABOVE the
+    # kernel's own housekeeping threads on that core: watchdog stalls, then a host-wide
+    # lockup. That failure takes down the whole VPS, not the container, and the judge box
+    # cannot be power-cycled by us. No RT = that failure mode cannot exist.
     # Doubles as a one-shot KV-prefix warm-up: the first passing run replays the first few
     # trace requests so the prefix is cached and decode kernels are warm before the container
     # reports healthy. Readiness still gates ONLY on /health -- priming is best-effort and can
     # never leave the container un-healthy. See vtl/warmup_healthcheck.py.
     healthcheck:
-      test: [ "CMD", "python3", "/opt/vtl/warmup_healthcheck.py" ]
+      test: ["CMD", "python3", "/opt/vtl/warmup_healthcheck.py"]
       interval: 10s
       timeout: 30s
       retries: 40
@@ -632,4 +689,4 @@ services:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [ gpu ]
+              capabilities: [gpu]
