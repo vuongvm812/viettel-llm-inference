@@ -84,7 +84,7 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 **Key message:** An LLM is a function you call in a loop: each call reads everything so far and appends exactly one token.
 
 **On-slide text:**
-- lede: "One forward pass reads everything so far and predicts just the next token — append it, feed it back, repeat until `<end>`."
+- lede: "One forward pass reads everything so far and predicts just the next token (a token ≈ a word piece — 'inference' is two of them) — append it, feed it back, repeat until `<end>`."
 - one pass → one token
 - 500-token answer = 500 sequential passes
 - no token 400 before token 399 — strictly serial
@@ -117,7 +117,7 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 
 **On-slide text:**
 - lede: "One decode token = streaming every model weight from GPU memory for a tiny bit of math. Bandwidth sets the speed, not FLOPs."
-- note card: 7B @ fp16 ≈ 14 GB of weights, read every step · A100 HBM ≈ 2 TB/s → ~140 tok/s ceiling at batch = 1 (back-of-envelope) · batch = 1 low on the slope, compute idle · batch = 32 near the knee: same weight read, 32× the tokens
+- note card: 7B @ fp16 ≈ 14 GB of weights, read every step · A100 HBM ≈ 2 TB/s → ~140 tok/s ceiling at batch = 1 (back-of-envelope) · batch = 1 low on the slope, compute idle · batch = 32 near the knee: same weight read, 32× the tokens · x-axis "arithmetic intensity" = math done per byte moved — decode is far left
 - pills: decode speed ≈ bandwidth ÷ bytes moved · batching is nearly free throughput
 
 **Visual:** **Reuse `roofline.png`** — the blog's roofline chart (perf vs arithmetic intensity, with "mem bw bound" and "compute bound" zones). Add two overlay dots of our own: `batch = 1` low on the bandwidth-bound slope, `batch = 32` up near the knee, with an arrow between them labeled "same weight read, 32× the tokens". Optional small side sketch (custom, only if time to build): HBM cylinder → "memory bandwidth" pipe → compute grid, to make "reading all the weights" concrete for the audience before showing the chart.
@@ -131,7 +131,7 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 **Key message:** To avoid re-processing the whole sequence every step, the engine caches per-token attention state (keys/values) — and that cache grows with every token and eats GPU memory.
 
 **On-slide text:**
-- lede: "Attention looks back at every previous token. Cache each token's keys/values once instead of recomputing the whole history every step."
+- lede: "To predict the next token, the model compares it against every previous token — that's 'attention'. Each token's comparison data (its keys/values) can be computed once and cached."
 - ≈ 0.5 MB per token (7B-class, fp16)
 - 4k-token chat ≈ 2 GB — per request
 - batch size is now capped by KV memory
