@@ -106,7 +106,8 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** An LLM is a function you call in a loop: each call reads everything so far and appends exactly one token.
 
 **On-slide text:**
-- lede: "One forward pass reads everything so far and predicts just the next token (a token ≈ a word piece — 'inference' is two of them) — append it, feed it back, repeat until `<end>`."
+- lede: "One forward pass reads everything so far and predicts just the next token — append it, feed it back, repeat until `<end>`."
+- sub-line under the lede (small mono): a token ≈ a word piece — "inference" is two of them
 - one pass → one token
 - 500-token answer = 500 sequential passes
 - no token 400 before token 399 — strictly serial

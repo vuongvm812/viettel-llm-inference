@@ -182,6 +182,7 @@ h2 {
     color: var(--muted);
     font-size: clamp(0.85rem, 1.05rem, 1.3rem);
     text-align: center; max-width: 46rem;
+    text-wrap: balance; /* even line breaks, no one-word orphan lines */
 }
 .lede strong { color: var(--fg); font-weight: 600; }
 .lede code, .mono { font-family: var(--font-mono); }
@@ -561,7 +562,8 @@ h2 {
     <div class="slide-head"><span><span class="num">03</span> &middot; the token loop</span><span>1:30</span></div>
     <div class="slide-content">
         <h2 class="reveal">The <span class="accent">token loop</span></h2>
-        <p class="lede reveal">One forward pass reads <strong>everything so far</strong> and predicts just the next token (a token &asymp; a word piece &mdash; "inference" is two of them) &mdash; append it, feed it back, repeat until <code>&lt;end&gt;</code>.</p>
+        <p class="lede reveal">One forward pass reads <strong>everything so far</strong> and predicts just the next token &mdash; append it, feed it back, repeat until <code>&lt;end&gt;</code>.</p>
+        <p class="idea-strip reveal">a token &asymp; a word piece &mdash; "inference" is two of them</p>
         <div class="loop-wrap reveal">
             <div class="loop-row">
                 <span class="cell dim">Why</span><span class="cell dim">is</span><span class="cell dim">the</span><span class="cell dim">sky</span>
