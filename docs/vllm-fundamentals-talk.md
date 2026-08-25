@@ -1,7 +1,7 @@
 # vLLM Fundamentals — 15-minute talk, slide content spec
 
 - **Audience:** software engineers, little/no LLM-inference background
-- **Duration:** 15 min (12 slides, 15:00 of content — the buffer is spent; keep the pace)
+- **Duration:** 18 min (15 slides). For a hard 15-minute slot, the designated cut is the advanced trio (slides 11–13) — dropping them restores exactly 15:00 without touching the core arc.
 - **Goal:** after the talk, the audience can explain why serving LLMs is a memory problem and what vLLM's two core tricks (PagedAttention, continuous batching) do about it
 - **Style:** one big visual per slide, plus a one-line lede (the key idea in a full sentence) and a row of fact pills with concrete numbers — enough that the slides teach on their own; the speaker notes carry the narrative
 - **Primary source:** [Anatomy of vLLM](https://vllm.ai/blog/2025-09-05-anatomy-of-vllm) (vLLM team, Sep 2025)
@@ -45,6 +45,7 @@ Note: figures are drawn light-background; on a dark deck place them on a white r
 | < 4% KV waste with PagedAttention | 8 | same paper |
 | block size = 16 tokens | 8 | vLLM default |
 | prefix caching on by default | 10 | vLLM v1 default |
+| 14 GB → 7 GB (fp8) → 3.5 GB (int4) | 11 | arithmetic: same 7e9 params at 2 / 1 / 0.5 bytes |
 
 ## Agenda / time budget
 
@@ -64,19 +65,18 @@ Bookend structure: the architecture map is shown FIRST (slide 2) as orientation 
 | 8 | PagedAttention | 2:00 |
 | 9 | Continuous batching | 2:00 |
 | 10 | Prefix caching | 1:00 |
-| 11 | vLLM architecture — revisited | 1:00 |
-| 12 | The latency–throughput tradeoff | 1:30 |
-| | **Total** | **15:00** |
+| 11 | Quantization | 1:00 |
+| 12 | Speculative decoding | 1:00 |
+| 13 | CUDA graphs & host overhead | 1:00 |
+| 14 | vLLM architecture — revisited | 1:00 |
+| 15 | The latency–throughput tradeoff | 1:30 |
+| | **Total** | **18:00** |
 
 ## Scope: what this talk deliberately skips
 
-Advanced levers that sit on top of the core mental model — named on slide 12's "not covered today" strip (chunked prefill gets one pill on slide 9 since it answers an obvious audience question), taught nowhere in this talk:
+The advanced levers (quantization, speculative decoding, CUDA graphs & host overhead) are taught as short slides 11–13; chunked prefill gets one pill on slide 9. Still skipped, named on slide 15's "not covered today" strip:
 
-- **Quantization (fp8/int4)** — shrink weight/KV bytes to relax the slide-5/6 memory bottleneck; changes the memory math, not the mental model.
-- **Speculative decoding** — a cheap draft proposes k tokens, the main model verifies them in one pass; attacks decode's serial nature.
-- **Chunked prefill** — cap prompt tokens per step so one long prefill doesn't stall the batch.
-- **CUDA graphs & host overhead** — pre-capture GPU launch sequences because Python work between passes can dominate inter-token latency.
-- **Multi-GPU serving** (tensor/pipeline parallelism, disaggregated prefill/decode) — scale-out once one GPU isn't enough.
+- **Multi-GPU serving** (tensor/pipeline parallelism, disaggregated prefill/decode) — scale-out once one GPU isn't enough; a different problem class from the single-GPU mental model this talk builds.
 
 Practical follow-up topic for a second talk: the operator knobs (`--max-num-seqs`, `--max-model-len`, `gpu_memory_utilization`) — each maps directly onto a concept slide here.
 
@@ -199,6 +199,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 
 **On-slide text:**
 - lede: "Carve KV memory into fixed 16-token blocks; a per-request block table maps logical positions to any free physical block."
+- sub-line under the lede (small mono): the "v" in vLLM = virtual memory — this idea named the whole project
 - waste ≤ one partial block per request
 - measured waste: < 4%, vs 60–80% before
 - freed blocks return to the pool instantly
@@ -242,7 +243,55 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 
 ---
 
-## Slide 11 — vLLM architecture — revisited (1:00)
+## Slide 11 — Quantization (1:00)
+
+**Key message:** Shrink the bytes: storing weights in 8 or 4 bits instead of 16 directly raises the memory-bound speed ceiling from slide 5.
+
+**On-slide text:**
+- lede: "Decode speed ≈ bandwidth ÷ bytes moved (slide 5). Quantization shrinks the bytes: store weights in 8 or 4 bits instead of 16."
+- fp8 = half the bytes → ~2× the bandwidth ceiling
+- accuracy cost is real — measure it, don't assume it
+- the KV cache can be quantized too
+
+**Visual:** Bit-width bars, one row per precision: fp16 full-width bar labeled "14 GB", fp8 half-width "7 GB", int4 quarter-width "3.5 GB" (the same 7B example from slide 5). Caption: "same model, fewer bytes per weight".
+
+**Speaker notes:** Slide 5 said decode speed is bandwidth divided by bytes moved — so the most direct lever is moving fewer bytes. Quantization stores each weight in fewer bits: fp8 halves the weight traffic, int4 quarters it, and modern GPUs execute low-precision math natively. It is not free: the model loses a little precision, so quality must be measured on your workload, not assumed. Bonus: the KV cache can be quantized too, which both speeds decode and lets more requests fit — attacking slide 6's memory cap from the other side.
+
+---
+
+## Slide 12 — Speculative decoding (1:00)
+
+**Key message:** Attack the serial token loop: a cheap draft proposes several tokens and the big model verifies them all in one pass — with output guaranteed identical.
+
+**On-slide text:**
+- lede: "The token loop is serial (slide 3). Trick: a tiny draft model proposes k tokens; the big model verifies them all in ONE pass — accepted guesses are free speed."
+- output provably identical to the big model alone
+- wins only when the draft guesses well
+- vLLM drafts: n-gram, EAGLE, Medusa
+
+**Visual:** Flow: small "draft model" box emits 4 dashed gold token cells → arrow into a "big model — one verify pass" box → the 4 cells re-emerge as ✓✓✓ (green) and one ✗ (red, "rejected → resampled"). Caption: "3 tokens for the price of 1 big pass".
+
+**Speaker notes:** The token loop is serial per slide 3 — but verification doesn't have to be. If a cheap draft guesses the next few tokens, the big model can check all of them in one prefill-shaped parallel pass, which slide 4 told us is cheap. Accept left-to-right until the first mismatch, resample there, repeat. The accept/reject rule is designed so the output distribution is exactly the big model's — this is a pure latency trick, not an approximation. It pays off on predictable text (code, boilerplate, common phrasing) and does nothing on high-entropy output where the draft keeps missing.
+
+---
+
+## Slide 13 — CUDA graphs & host overhead (1:00)
+
+**Key message:** Between GPU passes the Python host schedules, samples, and launches kernels — at small batch those gaps dominate ITL, and CUDA graphs shrink them by replaying a pre-recorded step.
+
+**On-slide text:**
+- lede: "Each decode step is ~ms of GPU work — but the Python host must schedule, sample, and launch every kernel between steps. Those gaps add straight to ITL."
+- thousands of kernel launches → one graph replay
+- matters most at small batch / short steps
+- vLLM captures graphs at startup
+
+**Visual:** Two horizontal timelines. Top "eager": alternating segments — wide grey "host" gaps between blue "GPU" blocks. Bottom "CUDA graphs": thin host slivers, GPU blocks packed nearly back-to-back. Caption: "record once, replay every step".
+
+**Speaker notes:** The GPU never launches its own work — the CPU does, kernel by kernel, with Python scheduling and sampling in between. Each decode step is only a few milliseconds of GPU time, so even a millisecond of host work between steps lands directly on inter-token latency. CUDA graphs fix the launch half: record the step's entire kernel sequence once, then replay it as a single unit — that's what vLLM's capture phase at startup is doing. Classic Amdahl: at big batch the long GPU step hides host time; at small batch, host overhead is the bottleneck.
+
+---
+
+## Slide 14 — vLLM architecture — revisited (1:00)
 
 **Key message:** The same map from slide 2 — but now the audience knows every box; the whole machine is a schedule → forward → postprocess loop around the paged KV cache.
 
@@ -257,7 +306,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 
 ---
 
-## Slide 12 — The latency–throughput tradeoff (1:30)
+## Slide 15 — The latency–throughput tradeoff (1:30)
 
 **Key message:** Judge a serving stack by TTFT, ITL, and throughput — knowing they trade off — and remember five ideas.
 
@@ -265,9 +314,9 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 - lede: "Bigger batches buy throughput until the GPU saturates; past that point, every request's tokens arrive slower. Chat UIs live left of it, batch pipelines right."
 - TTFT · ITL · throughput — pick your tradeoff
 - recap pills: one token at a time · prefill ≠ decode · KV cache = the scarce resource · PagedAttention = virtual memory · continuous batching keeps the GPU full
-- strip: not covered today: quantization (fp8) · speculative decoding · CUDA graphs & host overhead · multi-GPU serving
+- strip: not covered today: multi-GPU serving — tensor/pipeline parallelism, disaggregated prefill/decode
 - vllm.ai/blog — "Anatomy of vLLM"
 
 **Visual:** Left: latency-vs-throughput curve — x-axis "batch size / load", left y-axis "tokens/sec" rising then flattening at a marked **saturation point**, right y-axis "per-token latency" flat then rising past saturation; two zone labels: "latency-friendly" before saturation, "throughput territory" after. Right: recap strip of five icons with two-word labels — token loop (3) · prefill/decode (4) · KV cache (6) · PagedAttention (8) · continuous batching (9). Footer: QR code / link to the Anatomy of vLLM post.
 
-**Speaker notes:** When you deploy or benchmark this, three numbers matter: time to first token, inter-token latency, and total token throughput. They fight each other: growing the batch is nearly free throughput up to the saturation point — that's slide 5's bandwidth story — but past saturation, each request's tokens arrive slower. If someone asks how both curves can rise at once: throughput is the aggregate across all requests (batch ÷ step time), latency is per-user (one token per step) — a bigger batch slows the step slightly while multiplying tokens per step, like a bigger bus: more passengers per hour, each trip a little slower. Chat UIs care about the left of this curve; batch pipelines care about the right; vLLM exposes the knobs to pick your point. If you keep five things: models emit one token at a time; prefill and decode are different workloads; the KV cache is the scarce resource; PagedAttention manages it like virtual memory; continuous batching keeps the GPU full. Everything deeper — speculative decoding, quantization, multi-GPU serving — is in the Anatomy of vLLM post, which this talk is built on. Questions?
+**Speaker notes:** When you deploy or benchmark this, three numbers matter: time to first token, inter-token latency, and total token throughput. They fight each other: growing the batch is nearly free throughput up to the saturation point — that's slide 5's bandwidth story — but past saturation, each request's tokens arrive slower. If someone asks how both curves can rise at once: throughput is the aggregate across all requests (batch ÷ step time), latency is per-user (one token per step) — a bigger batch slows the step slightly while multiplying tokens per step, like a bigger bus: more passengers per hour, each trip a little slower. Chat UIs care about the left of this curve; batch pipelines care about the right; vLLM exposes the knobs to pick your point. If you keep five things: models emit one token at a time; prefill and decode are different workloads; the KV cache is the scarce resource; PagedAttention manages it like virtual memory; continuous batching keeps the GPU full. Everything deeper — multi-GPU serving and the rest — is in the Anatomy of vLLM post, which this talk is built on. Questions?

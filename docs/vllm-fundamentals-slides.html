@@ -506,6 +506,35 @@ h2 {
     font-family: var(--font-mono); font-size: clamp(0.6rem, 0.75rem, 0.92rem);
     color: var(--muted); letter-spacing: 0.03em;
 }
+
+/* ===========================================
+   SLIDE 11 — QUANTIZATION bit-width bars
+   =========================================== */
+.qwrap { width: min(88vw, 38rem); display: flex; flex-direction: column; gap: 0.6rem; align-items: stretch; }
+.qrow2 { display: flex; align-items: center; gap: 0.7rem; }
+.qlabel { font-family: var(--font-mono); font-size: 0.78rem; color: var(--muted); width: 3.2rem; text-align: right; }
+.qtrack { flex: 1; }
+.qbar {
+    height: clamp(1.8rem, 4.5vh, 2.4rem); border-radius: 0.4rem;
+    background: rgba(48,162,255,0.22); border: 1px solid var(--blue);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-mono); font-size: 0.72rem; color: var(--fg);
+}
+
+/* ===========================================
+   SLIDE 12 — SPECULATIVE DECODING verify cells
+   =========================================== */
+.cell.red { background: rgba(255,107,107,0.14); border-color: var(--red); color: var(--red); }
+
+/* ===========================================
+   SLIDE 13 — CUDA GRAPHS host/GPU timelines
+   =========================================== */
+.tl { display: flex; gap: 2px; height: clamp(1.3rem, 3.4vh, 1.8rem); }
+.tl .host {
+    background: repeating-linear-gradient(45deg, transparent, transparent 5px, rgba(146,160,186,0.22) 5px, rgba(146,160,186,0.22) 10px);
+    border: 1px dashed var(--border); border-radius: 0.25rem;
+}
+.tl .gpu { background: rgba(48,162,255,0.35); border: 1px solid var(--blue); border-radius: 0.25rem; }
 </style>
 </head>
 <body>
@@ -711,6 +740,7 @@ h2 {
     <div class="slide-content">
         <h2 class="reveal"><span class="accent">PagedAttention</span></h2>
         <p class="lede reveal">Carve KV memory into fixed <strong>16-token blocks</strong>; a per-request block table maps logical positions to <strong>any</strong> free physical block.</p>
+        <p class="idea-strip reveal">the "v" in vLLM = virtual memory &mdash; this idea named the whole project</p>
         <div class="analogy reveal">
             <div class="col os">
                 <span class="ctitle">YOUR OS</span>
@@ -809,9 +839,84 @@ h2 {
     </div>
 </section>
 
-<!-- ============ SLIDE 10 — ARCHITECTURE (1:30) ============ -->
+<!-- ============ SLIDE 11 — QUANTIZATION (1:00) ============ -->
 <section class="slide">
-    <div class="slide-head"><span><span class="num">11</span> &middot; vllm architecture, revisited</span><span>1:00</span></div>
+    <div class="slide-head"><span><span class="num">11</span> &middot; quantization</span><span>1:00</span></div>
+    <div class="slide-content">
+        <h2 class="reveal"><span class="accent">Quantization</span></h2>
+        <p class="lede reveal">Decode speed &asymp; bandwidth &divide; bytes moved (slide 5). Quantization <strong>shrinks the bytes</strong>: store weights in 8 or 4 bits instead of 16.</p>
+        <div class="qwrap reveal">
+            <div class="qrow2"><span class="qlabel">fp16</span><div class="qtrack"><div class="qbar" style="width:100%">14&nbsp;GB</div></div></div>
+            <div class="qrow2"><span class="qlabel">fp8</span><div class="qtrack"><div class="qbar" style="width:50%">7&nbsp;GB</div></div></div>
+            <div class="qrow2"><span class="qlabel">int4</span><div class="qtrack"><div class="qbar" style="width:25%">3.5&nbsp;GB</div></div></div>
+            <div class="diagram-label" style="text-align:center">same model, fewer bytes per weight (the 7B example from slide 5)</div>
+        </div>
+        <div class="pills reveal">
+            <span class="pill">fp8: half the bytes &rarr; <b>~2&times; the bandwidth ceiling</b></span>
+            <span class="pill">accuracy cost is real &mdash; <b>measure it</b></span>
+            <span class="pill gold">the <b>KV cache</b> can be quantized too</span>
+        </div>
+    </div>
+</section>
+
+<!-- ============ SLIDE 12 — SPECULATIVE DECODING (1:00) ============ -->
+<section class="slide">
+    <div class="slide-head"><span><span class="num">12</span> &middot; speculative decoding</span><span>1:00</span></div>
+    <div class="slide-content">
+        <h2 class="reveal"><span class="accent">Speculative</span> decoding</h2>
+        <p class="lede reveal">The token loop is serial (slide 3). Trick: a tiny <strong>draft model</strong> proposes k tokens; the big model verifies them all in <strong>one pass</strong> &mdash; accepted guesses are free speed.</p>
+        <div class="loop-wrap reveal">
+            <div class="loop-row">
+                <div class="model-box">draft model<small>cheap, guesses k tokens</small></div>
+                <span class="arrow">&rarr;</span>
+                <span class="cell ghost">t1</span><span class="cell ghost">t2</span><span class="cell ghost">t3</span><span class="cell ghost">t4</span>
+                <span class="arrow">&rarr;</span>
+                <div class="model-box">big model<small>ONE verify pass</small></div>
+                <span class="arrow">&rarr;</span>
+                <span class="cell green">t1 &#10003;</span><span class="cell green">t2 &#10003;</span><span class="cell green">t3 &#10003;</span><span class="cell red">t4 &#10007;</span>
+            </div>
+            <div class="diagram-label">3 tokens for the price of 1 big pass &middot; rejected &rarr; resampled, loop continues</div>
+        </div>
+        <div class="pills reveal">
+            <span class="pill">output <b>provably identical</b> to the big model alone</span>
+            <span class="pill">wins only when the draft <b>guesses well</b></span>
+            <span class="pill">vLLM drafts: <b>n-gram, EAGLE, Medusa</b></span>
+        </div>
+    </div>
+</section>
+
+<!-- ============ SLIDE 13 — CUDA GRAPHS & HOST OVERHEAD (1:00) ============ -->
+<section class="slide">
+    <div class="slide-head"><span><span class="num">13</span> &middot; cuda graphs &amp; host overhead</span><span>1:00</span></div>
+    <div class="slide-content">
+        <h2 class="reveal">CUDA graphs &amp; <span class="accent">host overhead</span></h2>
+        <p class="lede reveal">Each decode step is ~ms of GPU work &mdash; but the Python host must schedule, sample, and launch every kernel between steps. <strong>Those gaps add straight to ITL.</strong></p>
+        <div class="panel reveal">
+            <span class="ptitle">EAGER &mdash; host work before every launch</span>
+            <div class="tl">
+                <div class="host" style="width:14%"></div><div class="gpu" style="width:19%"></div>
+                <div class="host" style="width:14%"></div><div class="gpu" style="width:19%"></div>
+                <div class="host" style="width:14%"></div><div class="gpu" style="width:19%"></div>
+            </div>
+            <span class="ptitle">CUDA GRAPHS &mdash; record once, replay every step</span>
+            <div class="tl">
+                <div class="host" style="width:3%"></div><div class="gpu" style="width:29%"></div>
+                <div class="host" style="width:3%"></div><div class="gpu" style="width:29%"></div>
+                <div class="host" style="width:3%"></div><div class="gpu" style="width:29%"></div>
+            </div>
+            <div class="cb-legend"><span><span class="swatch p"></span>GPU forward pass</span><span>hatched = host (Python + kernel launches)</span></div>
+        </div>
+        <div class="pills reveal">
+            <span class="pill">thousands of kernel launches &rarr; <b>one graph replay</b></span>
+            <span class="pill">matters most at <b>small batch</b> / short steps</span>
+            <span class="pill gold">vLLM <b>captures graphs at startup</b></span>
+        </div>
+    </div>
+</section>
+
+<!-- ============ SLIDE 14 — ARCHITECTURE REVISITED (1:00) ============ -->
+<section class="slide">
+    <div class="slide-head"><span><span class="num">14</span> &middot; vllm architecture, revisited</span><span>1:00</span></div>
     <div class="slide-content">
         <h2 class="reveal"><span class="accent">vLLM</span> architecture &mdash; revisited</h2>
         <p class="lede reveal">The map from slide 2, now readable: tokenize &rarr; waiting queue &rarr; scheduled into a batch &rarr; <strong>one GPU pass</strong> &rarr; sample &rarr; stream. Then the loop runs again.</p>
@@ -841,9 +946,9 @@ h2 {
     </div>
 </section>
 
-<!-- ============ SLIDE 11 — METRICS & TAKEAWAYS (1:30) ============ -->
+<!-- ============ SLIDE 15 — METRICS & TAKEAWAYS (1:30) ============ -->
 <section class="slide">
-    <div class="slide-head"><span><span class="num">12</span> &middot; latency vs throughput</span><span>1:30</span></div>
+    <div class="slide-head"><span><span class="num">15</span> &middot; latency vs throughput</span><span>1:30</span></div>
     <div class="slide-content">
         <h2 class="reveal">The latency&ndash;throughput <span class="gold-accent">tradeoff</span></h2>
         <p class="lede reveal">Bigger batches buy throughput until the GPU <strong>saturates</strong>; past that point, every request's tokens arrive slower. Chat UIs live left of it, batch pipelines right.</p>
@@ -872,7 +977,7 @@ h2 {
                 <span class="pill gold"><b>5</b> continuous batching keeps the GPU full</span>
             </div>
         </div>
-        <p class="idea-strip reveal">not covered today: quantization (fp8) &middot; speculative decoding &middot; CUDA graphs &amp; host overhead &middot; multi-GPU serving</p>
+        <p class="idea-strip reveal">not covered today: multi-GPU serving &mdash; tensor/pipeline parallelism, disaggregated prefill/decode</p>
         <p class="src-link reveal">go deeper &rarr; <a href="https://vllm.ai/blog/2025-09-05-anatomy-of-vllm">vllm.ai/blog &middot; "Anatomy of vLLM"</a></p>
     </div>
 </section>
