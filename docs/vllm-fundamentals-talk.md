@@ -56,7 +56,7 @@ Bookend structure: the architecture map is shown FIRST (slide 2) as orientation 
 |---|-------|------|
 | 1 | What happens after you POST? (hook) | 0:30 |
 | 2 | vLLM architecture — the map | 1:00 |
-| 3 | Autoregressive generation | 1:30 |
+| 3 | The token loop | 1:30 |
 | 4 | Prefill & decode | 1:30 |
 | 5 | Memory-bound decode | 1:30 |
 | 6 | The KV cache | 1:30 |
@@ -99,7 +99,9 @@ Bookend structure: the architecture map is shown FIRST (slide 2) as orientation 
 
 ---
 
-## Slide 3 — Autoregressive generation (1:30)
+## Slide 3 — The token loop (1:30)
+
+Title uses the plain term; the formal name "autoregressive generation" is introduced on-slide as a labeled pill, not assumed.
 
 **Key message:** An LLM is a function you call in a loop: each call reads everything so far and appends exactly one token.
 
@@ -108,6 +110,7 @@ Bookend structure: the architecture map is shown FIRST (slide 2) as orientation 
 - one pass → one token
 - 500-token answer = 500 sequential passes
 - no token 400 before token 399 — strictly serial
+- formal name: "autoregressive generation" — the output feeds back as input
 
 **Visual:** Loop diagram. A row of prompt tokens (`["Why", " is", " the", " sky"]`) enters a box labeled "model (one forward pass)". The box emits one token (`" blue"`), which is appended to the row, with a curved arrow feeding the extended row back into the box. A step counter (`step 1, 2, 3…`) advances; ideally animated per keystroke/click so the sequence visibly grows one token per step. End state shows generation stopping at an `<end>` token.
 

@@ -558,9 +558,9 @@ h2 {
 
 <!-- ============ SLIDE 3 — TOKEN LOOP (1:30) ============ -->
 <section class="slide" id="slide-loop">
-    <div class="slide-head"><span><span class="num">03</span> &middot; autoregressive generation</span><span>1:30</span></div>
+    <div class="slide-head"><span><span class="num">03</span> &middot; the token loop</span><span>1:30</span></div>
     <div class="slide-content">
-        <h2 class="reveal"><span class="accent">Autoregressive</span> generation</h2>
+        <h2 class="reveal">The <span class="accent">token loop</span></h2>
         <p class="lede reveal">One forward pass reads <strong>everything so far</strong> and predicts just the next token (a token &asymp; a word piece &mdash; "inference" is two of them) &mdash; append it, feed it back, repeat until <code>&lt;end&gt;</code>.</p>
         <div class="loop-wrap reveal">
             <div class="loop-row">
@@ -579,6 +579,7 @@ h2 {
             <span class="pill">one pass &rarr; <b>one token</b></span>
             <span class="pill">500-token answer = <b>500 sequential passes</b></span>
             <span class="pill">no token 400 before token 399 &mdash; <b>strictly serial</b></span>
+            <span class="pill">formal name: <b>"autoregressive generation"</b> &mdash; the output feeds back as input</span>
         </div>
     </div>
 </section>
