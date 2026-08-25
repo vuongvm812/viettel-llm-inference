@@ -2,7 +2,8 @@
 
 **30 min · Viettel "AI Race" LLM inference, task 3 · 21 slides.** One block = one slide:
 `visual:` names a class from [slide-design](slide-design.md) §3, `say:` is the line, and every
-`number:` traces to a repo source. Detail: [speaker notes](tech-talk-speaker-notes.md).
+`number:` traces to a repo source. Flow-shaped visuals carry a mermaid sketch of the
+final diagram. Detail: [speaker notes](tech-talk-speaker-notes.md).
 
 Open 01-03 (1.5) · Game 04-06 (3) · vLLM 07 (2.5) · Rung 1 flags 08-09 (3.5) · Rung 2 host 10-13 (4.5) · Rung 3 kernels 14-15 (2.5) · Rung 4 runner 16-18 (4.5) · Scored 19-20 (3) · Close 21 (2) — 27 min, leaving ~3 min Q&A.
 
@@ -25,6 +26,12 @@ number: 3 ms observed · ~1 ms GPU floor
 visual: .flow — registry image + our compose → judge mounts /model → scrapes :8000
 say: Locked entrypoint, no build context, finite attempts, and a dead endpoint scores zero — so the VM never builds, it pulls.
 number: images built in CI, pulled by digest · a gutted build fails silently
+
+```mermaid
+flowchart LR
+    A["registry image<br/>+ our compose"] --> B["judge VM pulls<br/>by digest"]
+    B --> C["mounts /model"] --> D["scrapes :8000"]
+```
 ## 05 · The scoreboard
 visual: .qrow — TPOT band 1-10 ms (round 1.2) vs 8-100 ms (round 2)
 say: Score is the fraction of requests landing inside the latency band, with γ=2 so tails are punished quadratically.
@@ -37,6 +44,14 @@ number: both 1.x rounds on one 18 GB slice — 16 SMs, 3 vCPU, 8 GB RAM
 visual: .arch — frontend │ EngineCore loop: scheduler → KV manager → model runner
 say: Prefill sets TTFT, decode sets TPOT, and every per-step cost the runner pays in Python lands straight on TPOT.
 number: 2 processes · 1 step = 1 forward pass over the whole in-flight batch
+
+```mermaid
+flowchart LR
+    F["frontend<br/>(process 1)"] <--> S
+    subgraph E["EngineCore loop (process 2)"]
+        S[scheduler] --> K[KV manager] --> M[model runner] --> S
+    end
+```
 ## 08 · Rung 1: the flags that mattered
 visual: .fact-row — prefix caching · max-model-len 32768 · max-num-seqs 256→16
 say: Prefix caching was the single biggest win and it is lossless; size the context to the trace, not to the model card.
@@ -53,14 +68,29 @@ number: 1 ms of TPOT ≈ 8.6 score points at our operating point
 visual: .stack — stock site-packages ← `patch -p1` overlay ← ~30 `VTL_ENABLE_*` modules
 say: Anything that could be a runtime monkey-patch is one; patches exist only where there is no Python seam to wrap.
 number: `VTL_DISABLE=1` = provably stock · a base-image bump fails the build loudly
+
+```mermaid
+flowchart BT
+    S["stock site-packages"] --> P["`patch -p1` overlay<br/>(no Python seam)"] --> V["~30 VTL_ENABLE_* modules<br/>(runtime monkey-patches)"]
+```
 ## 12 · Rung 2: the one-line win
 visual: .flow — `empty_like(hidden_states)` ✗ → `empty_like(residual)` ✓ → fusion fires
 say: The wrong allocation source gave the FX node a user outside the fusion pattern, so RMSNorm+quant silently never fired.
 number: 10 of 16 layers left unfused · one line to unblock a whole fusion pass
+
+```mermaid
+flowchart LR
+    A["empty_like(hidden_states) ✗<br/>extra FX user"] --> B["empty_like(residual) ✓"] --> C["RMSNorm+quant<br/>fusion fires"]
+```
 ## 13 · Rung 2: the Rust frontend
 visual: .flow — sonic-rs parse → iceoryx2 shared memory → per-token SSE
 say: Per-token SSE is mandatory — emit N tokens per record and a chunk-counting grader reports TPOT N times worse than reality.
 number: judge-swept worker threads at 1/2/3 → 71.5 / 72.5 / 72.1
+
+```mermaid
+flowchart LR
+    A["sonic-rs<br/>JSON parse"] --> B["iceoryx2<br/>shared memory"] --> C["per-token SSE<br/>(one token per record)"]
+```
 ## 14 · Rung 3: the kernel rules
 visual: .fact-row — bit-match stock · `*_supported()` refuses · parity vs the op chain
 say: More accurate is a different kernel, not a better one — we match stock element-for-element, double-rounding included.
@@ -77,10 +107,27 @@ number: `num_computed % block_size + N ≤ block_size` covers 13 of 16 decode st
 visual: .flow — Python: boot · capture · prefill │ Rust: cuGraphLaunch ×8 → 1 D2H → 1 sync
 say: torch 2.11 hands out the graph exec as a plain int and vLLM never re-instantiates a decode graph, so Rust can replay it.
 number: 8 back-to-back launches · one D2H · one event · one sync
+
+```mermaid
+flowchart LR
+    subgraph PY[Python]
+        A[boot] --> B[capture] --> C[prefill]
+    end
+    subgraph RS[Rust]
+        D["cuGraphLaunch ×8"] --> E["1 D2H"] --> F["1 sync"]
+    end
+    C --> D
+```
 ## 18 · Rung 4: hazard 8
 visual: .timeline — schedule(k) → sample(k) → update(k-1), commit landing out of order
 say: A depth-2 async queue let step k's tokens append ahead of step k−1's: scrambled output, and nothing to crash.
 number: fix = commit inside `update_from_output` · shadow-verify with TWO launches
+
+```mermaid
+flowchart LR
+    A["schedule(k)"] --> B["sample(k)"] --> C["update(k−1)"]
+    B -. "step k commits before k−1<br/>→ scrambled output" .-> C
+```
 ## 19 · What actually scored
 visual: .score-bars — 81.62 | 89.26 (gold) | 89.86 | 83.61
 say: Two flags on the untouched image bought 7.6 points. Everything we built after that bought under 0.6.
