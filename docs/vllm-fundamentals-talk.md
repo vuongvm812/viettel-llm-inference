@@ -1,7 +1,7 @@
 # vLLM Fundamentals — 15-minute talk, slide content spec
 
 - **Audience:** software engineers, little/no LLM-inference background
-- **Duration:** 15 min (11 slides, ~14 min content + 1 min buffer)
+- **Duration:** 15 min (12 slides, 15:00 of content — the buffer is spent; keep the pace)
 - **Goal:** after the talk, the audience can explain why serving LLMs is a memory problem and what vLLM's two core tricks (PagedAttention, continuous batching) do about it
 - **Style:** one big visual per slide, plus a one-line lede (the key idea in a full sentence) and a row of fact pills with concrete numbers — enough that the slides teach on their own; the speaker notes carry the narrative
 - **Primary source:** [Anatomy of vLLM](https://vllm.ai/blog/2025-09-05-anatomy-of-vllm) (vLLM team, Sep 2025)
@@ -13,17 +13,20 @@ All under `https://vllm.ai/blog-assets/figures/2025-vllm-anatomy/`:
 
 | File | Shows | Used on slide |
 |------|-------|---------------|
-| `latency_diagram.png` | query → token timeline with TTFT / ITL / e2e brackets | 3 |
-| `roofline.png` | roofline: memory-bandwidth-bound vs compute-bound zones | 4 |
-| `engine_loop.png` | waiting queue → schedule / forward pass / postprocess ring | 10 |
+| `engine_constructor.png` (**top panel only, cropped**) | requests in → processor → engine core (scheduler, KV cache manager, model executor) → output processor → result out | 2 |
+| `latency_diagram.png` | query → token timeline with TTFT / ITL / e2e brackets | 4 |
+| `roofline.png` | roofline: memory-bandwidth-bound vs compute-bound zones | 5 |
+| `engine_loop.png` | waiting queue → schedule / forward pass / postprocess ring | 11 |
 
-Rejected as too dense for slides (fine as speaker prep / "further reading"): `kv_cache_blocks.png`, `fwd_pass.png`, `prefix_pt1-3.png`, `engine_constructor.png` — all worked examples with heavy annotation text; slides 7–10 use simple custom diagrams instead.
+Crop note for `engine_constructor.png`: use only the top architecture panel — cut everything from the green "indexing structure" label downward. The panel alone passes the 5-second rule; the full image does not.
+
+Rejected as too dense for slides (fine as speaker prep / "further reading"): `kv_cache_blocks.png`, `fwd_pass.png`, `prefix_pt1-3.png`, and the lower panels of `engine_constructor.png` — all worked examples with heavy annotation text; the concept slides use simple custom diagrams instead.
 
 Download once for offline slides:
 
 ```bash
 mkdir -p assets && cd assets
-for f in latency_diagram roofline engine_loop; do
+for f in latency_diagram roofline engine_loop engine_constructor; do
   curl -sLO "https://vllm.ai/blog-assets/figures/2025-vllm-anatomy/$f.png"
 done
 ```
@@ -34,33 +37,36 @@ Note: figures are drawn light-background; on a dark deck place them on a white r
 
 | Number | Slide | Source / derivation |
 |--------|-------|---------------------|
-| 7B @ fp16 ≈ 14 GB of weights | 4 | arithmetic: 7e9 params × 2 bytes |
-| A100 HBM ≈ 2 TB/s → ~140 tok/s ceiling at batch = 1 | 4 | A100 80GB spec (2.0 TB/s); 2 TB/s ÷ 14 GB ≈ 143/s — labeled *back-of-envelope* on the slide |
-| ≈ 0.5 MB KV per token (7B-class, fp16) | 5 | arithmetic: 2 (K,V) × 32 layers × 4096 hidden × 2 bytes = 512 KB |
-| 4k-token chat ≈ 2 GB per request | 5 | 4096 × 0.5 MB |
-| 60–80% of KV memory wasted pre-vLLM | 6, 7 | PagedAttention paper (Kwon et al., SOSP 2023) |
-| < 4% KV waste with PagedAttention | 7 | same paper |
-| block size = 16 tokens | 7 | vLLM default |
-| prefix caching on by default | 9 | vLLM v1 default |
+| 7B @ fp16 ≈ 14 GB of weights | 5 | arithmetic: 7e9 params × 2 bytes |
+| A100 HBM ≈ 2 TB/s → ~140 tok/s ceiling at batch = 1 | 5 | A100 80GB spec (2.0 TB/s); 2 TB/s ÷ 14 GB ≈ 143/s — labeled *back-of-envelope* on the slide |
+| ≈ 0.5 MB KV per token (7B-class, fp16) | 6 | arithmetic: 2 (K,V) × 32 layers × 4096 hidden × 2 bytes = 512 KB |
+| 4k-token chat ≈ 2 GB per request | 6 | 4096 × 0.5 MB |
+| 60–80% of KV memory wasted pre-vLLM | 7, 8 | PagedAttention paper (Kwon et al., SOSP 2023) |
+| < 4% KV waste with PagedAttention | 8 | same paper |
+| block size = 16 tokens | 8 | vLLM default |
+| prefix caching on by default | 10 | vLLM v1 default |
 
 ## Agenda / time budget
 
 Slide titles are the pure concept being introduced (the hook slide 1 excepted); the lede sentence under the title carries the explanation.
 
+Bookend structure: the architecture map is shown FIRST (slide 2) as orientation — "here's the whole machine, we'll open each box" — and revisited near the end (slide 11) once every box is understood.
+
 | # | Slide | Time |
 |---|-------|------|
 | 1 | What happens after you POST? (hook) | 0:30 |
-| 2 | Autoregressive generation | 1:30 |
-| 3 | Prefill & decode | 1:30 |
-| 4 | Memory-bound decode | 1:30 |
-| 5 | The KV cache | 1:30 |
-| 6 | Fragmentation & head-of-line blocking | 1:00 |
-| 7 | PagedAttention | 2:00 |
-| 8 | Continuous batching | 2:00 |
-| 9 | Prefix caching | 1:00 |
-| 10 | vLLM architecture | 1:30 |
-| 11 | The latency–throughput tradeoff | 1:30 |
-| | **Total** | **14:30** |
+| 2 | vLLM architecture — the map | 1:00 |
+| 3 | Autoregressive generation | 1:30 |
+| 4 | Prefill & decode | 1:30 |
+| 5 | Memory-bound decode | 1:30 |
+| 6 | The KV cache | 1:30 |
+| 7 | Fragmentation & head-of-line blocking | 1:00 |
+| 8 | PagedAttention | 2:00 |
+| 9 | Continuous batching | 2:00 |
+| 10 | Prefix caching | 1:00 |
+| 11 | vLLM architecture — revisited | 1:00 |
+| 12 | The latency–throughput tradeoff | 1:30 |
+| | **Total** | **15:00** |
 
 ---
 
@@ -79,7 +85,21 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 
 ---
 
-## Slide 2 — Autoregressive generation (1:30)
+## Slide 2 — vLLM architecture — the map (1:00)
+
+**Key message:** Here is the whole machine; the rest of the talk opens one box at a time.
+
+**On-slide text:**
+- lede: "A request flows: in → processor → engine core (scheduler + KV cache manager + model executor) → output processor → out. Every box gets its own slide."
+- pill: scheduler → slide 9 · model executor → slides 3–5 · KV cache manager → slides 6/8/10
+
+**Visual:** **Reuse the top panel of `engine_constructor.png`, cropped** (cut everything from the green "indexing structure" label downward) on a white rounded card, standard credit line. Overlay small forward-pointing slide tags on three boxes: scheduler → "9", model executor → "3–5", KV cache manager → "6/8/10", using the accent colors those slides will use.
+
+**Speaker notes:** Before any theory, here's the map of what we're opening. A request comes in, a processor tokenizes it, and it enters the engine core — the heart of vLLM — which has three moving parts: a scheduler with waiting and running queues, a KV cache manager, and a model executor that drives the GPU. Results flow back out through an output processor. Don't worry about what any of these do yet — every box on this map gets its own slide, and we'll return to this exact picture at the end when you can read it fluently.
+
+---
+
+## Slide 3 — Autoregressive generation (1:30)
 
 **Key message:** An LLM is a function you call in a loop: each call reads everything so far and appends exactly one token.
 
@@ -95,7 +115,7 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 
 ---
 
-## Slide 3 — Prefill & decode (1:30)
+## Slide 4 — Prefill & decode (1:30)
 
 **Key message:** Serving one request has two very different phases — prefill (process the whole prompt at once) and decode (one token per step) — and each has its own latency metric.
 
@@ -105,13 +125,13 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 - decode: one token per pass → ITL = the "typing speed" users feel
 - prefill = compute-heavy, parallel · decode = thousands of tiny sequential steps
 
-**Visual:** **Reuse `latency_diagram.png`** — user at the bottom, vLLM server at the top, query going up, `token 1 … token n` coming down, with TTFT, ITL, and e2e-latency brackets already drawn. Add only two overlay labels of our own: "prefill" over the query→token-1 span and "decode" over the token-1→token-n span, in two distinct colors (these two colors recur on slide 8's caption and slide 10's tags).
+**Visual:** **Reuse `latency_diagram.png`** — user at the bottom, vLLM server at the top, query going up, `token 1 … token n` coming down, with TTFT, ITL, and e2e-latency brackets already drawn. Add only two overlay labels of our own: "prefill" over the query→token-1 span and "decode" over the token-1→token-n span, in two distinct colors (these two colors recur on slide 9's caption and slide 11's tags).
 
 **Speaker notes:** The prompt tokens all exist up front, so the engine can process them in a single big parallel pass — that's prefill, and it ends when the first output token appears, which the user experiences as time-to-first-token. Then the loop from the previous slide takes over: decode, one token per pass, and the gap between tokens is the inter-token latency users feel as "typing speed". These two phases stress the hardware in opposite ways — prefill is a big parallel computation, decode is thousands of tiny sequential ones — and that asymmetry drives the engine design we'll see next.
 
 ---
 
-## Slide 4 — Memory-bound decode (1:30)
+## Slide 5 — Memory-bound decode (1:30)
 
 **Key message:** Each decode step must stream all model weights from GPU memory to compute one token — the bottleneck is memory bandwidth, not compute.
 
@@ -126,7 +146,7 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 
 ---
 
-## Slide 5 — The KV cache (1:30)
+## Slide 6 — The KV cache (1:30)
 
 **Key message:** To avoid re-processing the whole sequence every step, the engine caches per-token attention state (keys/values) — and that cache grows with every token and eats GPU memory.
 
@@ -136,13 +156,13 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 - 4k-token chat ≈ 2 GB — per request
 - batch size is now capped by KV memory
 
-**Visual:** Left: the decode loop from slide 2, but the "re-read everything" arrow is replaced by a box labeled "KV cache" that the model reads from and appends one entry to per step — show the cache bar growing tick by tick. Right: a fixed-height container labeled "GPU memory": bottom section "model weights (fixed)", above it several per-request KV bars of different lengths growing upward toward a "full" line. Callout: "MB per token per request → GBs at scale".
+**Visual:** Left: the decode loop from slide 3, but the "re-read everything" arrow is replaced by a box labeled "KV cache" that the model reads from and appends one entry to per step — show the cache bar growing tick by tick. Right: a fixed-height container labeled "GPU memory": bottom section "model weights (fixed)", above it several per-request KV bars of different lengths growing upward toward a "full" line. Callout: "MB per token per request → GBs at scale".
 
-**Speaker notes:** Attention lets each new token look back at every previous token. Recomputing that state for the whole sequence on every step would be quadratically wasteful, so engines cache each token's keys and values — the KV cache — and each step only computes the new token's entry. The price is memory: every request carries a cache that grows linearly with its length, at roughly megabytes per token for mid-size models, so a handful of long conversations claims gigabytes. Remember slide 4: throughput comes from big batches, and batch size is now limited by how many KV caches fit in GPU memory. KV memory management *is* the serving problem.
+**Speaker notes:** Attention lets each new token look back at every previous token. Recomputing that state for the whole sequence on every step would be quadratically wasteful, so engines cache each token's keys and values — the KV cache — and each step only computes the new token's entry. The price is memory: every request carries a cache that grows linearly with its length, at roughly megabytes per token for mid-size models, so a handful of long conversations claims gigabytes. Remember slide 5: throughput comes from big batches, and batch size is now limited by how many KV caches fit in GPU memory. KV memory management *is* the serving problem.
 
 ---
 
-## Slide 6 — Fragmentation & head-of-line blocking (1:00)
+## Slide 7 — Fragmentation & head-of-line blocking (1:00)
 
 **Key message:** Pre-allocating contiguous KV memory per request wastes most of it, and static batching makes finished requests wait for the slowest one.
 
@@ -157,7 +177,7 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 
 ---
 
-## Slide 7 — PagedAttention (2:00)
+## Slide 8 — PagedAttention (2:00)
 
 **Key message:** vLLM manages KV cache like an OS manages RAM — fixed-size blocks, allocated on demand, with a per-request block table mapping logical positions to scattered physical blocks.
 
@@ -167,13 +187,13 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 - measured waste: < 4%, vs 60–80% before
 - freed blocks return to the pool instantly
 
-**Visual:** Simple custom, side-by-side analogy with mirrored layout. Left ("your OS"): a process's contiguous virtual address space → page table → scattered physical RAM frames. Right ("vLLM"): a request's logical token sequence chunked into 16-token blocks → block table → scattered physical KV blocks in GPU memory, plus a "free block pool" bucket blocks are grabbed from on demand and returned to when the request ends. Identical arrow styles on both sides so the analogy lands visually. No metadata, no hashes, no code — max ~12 boxes total. Small footer contrast: slide-6's wasteful strip vs this tightly packed grid.
+**Visual:** Simple custom, side-by-side analogy with mirrored layout. Left ("your OS"): a process's contiguous virtual address space → page table → scattered physical RAM frames. Right ("vLLM"): a request's logical token sequence chunked into 16-token blocks → block table → scattered physical KV blocks in GPU memory, plus a "free block pool" bucket blocks are grabbed from on demand and returned to when the request ends. Identical arrow styles on both sides so the analogy lands visually. No metadata, no hashes, no code — max ~12 boxes total. Small footer contrast: slide-7's wasteful strip vs this tightly packed grid.
 
 **Speaker notes:** This is the idea vLLM is named for. Instead of one contiguous slab per request, KV memory is carved into fixed-size blocks — 16 tokens each — and a request grabs a new block from a shared free pool only when it actually fills one. A per-request block table maps logical token positions to physical blocks, exactly like a page table maps virtual to physical memory, so physical blocks can live anywhere. Over-reservation disappears: waste is bounded by one partially-filled block per request. Freed blocks return to the pool instantly for anyone else. If you've ever taken an OS course, you already understood PagedAttention — it's virtual memory for the KV cache, and it's what lets vLLM pack far more concurrent requests into the same GPU.
 
 ---
 
-## Slide 8 — Continuous batching (2:00)
+## Slide 9 — Continuous batching (2:00)
 
 **Key message:** vLLM rebuilds the batch every single step, so requests join and leave mid-flight and the GPU never idles waiting for stragglers.
 
@@ -183,13 +203,13 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 - all tokens flattened into one GPU pass
 - GPU never waits for the slowest request
 
-**Visual:** Simple custom grid (inspired by the blog's Figure 4, radically simplified). Columns = engine steps (t1…t10), rows = requests R1…R5. Cells colored with the slide-3 palette: prefill color, decode color, empty when absent. R1 and R2 start at t1; R3 arrives at t3 (prefill cell appears mid-grid); R2 finishes at t5 and its row goes empty; R4 takes the freed capacity at t6. Bottom annotation row: each column's cells flatten into a single bar labeled "one forward pass". No token ids, no slot mappings — just colored cells. Caption contrast vs slide 6: "no idle slots, no waiting for the batch".
+**Visual:** Simple custom grid (inspired by the blog's Figure 4, radically simplified). Columns = engine steps (t1…t10), rows = requests R1…R5. Cells colored with the slide-4 palette: prefill color, decode color, empty when absent. R1 and R2 start at t1; R3 arrives at t3 (prefill cell appears mid-grid); R2 finishes at t5 and its row goes empty; R4 takes the freed capacity at t6. Bottom annotation row: each column's cells flatten into a single bar labeled "one forward pass". No token ids, no slot mappings — just colored cells. Caption contrast vs slide 7: "no idle slots, no waiting for the batch".
 
-**Speaker notes:** Second signature idea. Before each forward pass — each column here — the scheduler re-decides the batch: finished requests exit immediately and free their blocks, and waiting requests are pulled in immediately, running their prefill in the same pass where others decode; vLLM flattens all their tokens into one sequence for the GPU. Compare with static batching: no idle hatched bars, no queue stuck at a batch boundary. This is what keeps the batch full — which slide 4 told us is where all the throughput lives. PagedAttention supplies flexible memory; continuous batching supplies flexible scheduling; each is what makes the other work at scale.
+**Speaker notes:** Second signature idea. Before each forward pass — each column here — the scheduler re-decides the batch: finished requests exit immediately and free their blocks, and waiting requests are pulled in immediately, running their prefill in the same pass where others decode; vLLM flattens all their tokens into one sequence for the GPU. Compare with static batching: no idle hatched bars, no queue stuck at a batch boundary. This is what keeps the batch full — which slide 5 told us is where all the throughput lives. PagedAttention supplies flexible memory; continuous batching supplies flexible scheduling; each is what makes the other work at scale.
 
 ---
 
-## Slide 9 — Prefix caching (1:00)
+## Slide 10 — Prefix caching (1:00)
 
 **Key message:** Because KV lives in content-hashed blocks, identical prompt prefixes — like a shared system prompt — are computed once and reused by later requests.
 
@@ -201,26 +221,26 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 
 **Visual:** Simple custom, two request rows top-down. Request A: blocks `[sys][sys][sys][userA…]`, all in "computed" color. Request B below: its first three blocks are dashed outlines with arrows pointing up to A's physical blocks, labeled "reused (hash match)"; only `[userB…]` blocks are in computed color. One small `hash(block contents) → block` tag on a single shared block — no hash-map internals. Timeline inset: B's prefill bar visibly shorter, TTFT bracket shrunk.
 
-**Speaker notes:** Paging has a bonus. Since blocks are fixed-size chunks of token content, vLLM hashes each block's contents — the KV cache becomes content-addressable. When a new request starts with token blocks the engine has already computed — the app's system prompt, shared few-shot examples, earlier turns of the same chat — it just points its block table at the existing physical blocks and skips that part of prefill entirely. In production, where nearly every request shares a long system prompt, this routinely eliminates most prefill work and slashes time-to-first-token. Notice it costs nothing extra: it falls out of the block design from slide 7.
+**Speaker notes:** Paging has a bonus. Since blocks are fixed-size chunks of token content, vLLM hashes each block's contents — the KV cache becomes content-addressable. When a new request starts with token blocks the engine has already computed — the app's system prompt, shared few-shot examples, earlier turns of the same chat — it just points its block table at the existing physical blocks and skips that part of prefill entirely. In production, where nearly every request shares a long system prompt, this routinely eliminates most prefill work and slashes time-to-first-token. Notice it costs nothing extra: it falls out of the block design from slide 8.
 
 ---
 
-## Slide 10 — vLLM architecture (1:30)
+## Slide 11 — vLLM architecture — revisited (1:00)
 
-**Key message:** Everything so far assembles into one loop: schedule → forward pass → postprocess, running around the paged KV cache.
+**Key message:** The same map from slide 2 — but now the audience knows every box; the whole machine is a schedule → forward → postprocess loop around the paged KV cache.
 
 **On-slide text:**
 - lede: "Request lifecycle: tokenize → waiting queue → scheduled into a batch → one GPU pass → sample → stream. Then the loop runs again."
 - engine core loops every ~10 ms
-- slide tags on the boxes: scheduler → 8 · model executor → 2–4 · KV manager → 5/7/9
+- slide tags on the boxes: scheduler → 9 · model executor → 3–5 · KV manager → 6/8/10
 
-**Visual:** Split layout. Left: simple custom architecture map, ≤6 boxes — "API server (OpenAI-compatible)" on top, below it an "Engine core" ring containing **Scheduler** (waiting/running queues), **Model executor / GPU forward pass**, **postprocess: sample & stream**, with the **KV cache manager + block pool** in the center. Right: **reuse `engine_loop.png`** — the blog's clean drawing of a request entering the waiting queue and the schedule → forward pass → postprocess ring. Overlay small colored tags mapping boxes back to earlier slides: scheduler → "slide 8", model executor → "slides 2–4", KV cache manager → "slides 5/7/9", each echoing that slide's accent color so the map reads as a recap.
+**Visual:** Split layout. Left: simple custom architecture map, ≤6 boxes — "API server (OpenAI-compatible)" on top, below it an "Engine core" ring containing **Scheduler** (waiting/running queues), **Model executor / GPU forward pass**, **postprocess: sample & stream**, with the **KV cache manager + block pool** in the center. Right: **reuse `engine_loop.png`** — the blog's clean drawing of a request entering the waiting queue and the schedule → forward pass → postprocess ring. Overlay small colored tags mapping boxes back to earlier slides: scheduler → "slide 9", model executor → "slides 3–5", KV cache manager → "slides 6/8/10", each echoing that slide's accent color so the map reads as a recap.
 
-**Speaker notes:** Here's the whole machine, and you already know every box. Requests land on an OpenAI-compatible API server, get tokenized, and enter the scheduler's waiting queue. Then the engine loops: the scheduler builds this step's batch — admitting prefills, continuing decodes, asking the KV manager for blocks; the model executor runs one flattened forward pass on the GPU; postprocessing samples each request's next token and streams it back. Then the loop runs again, milliseconds later, on a freshly re-formed batch. That's it — the black box from slide 1 is a tight scheduler-plus-allocator loop wrapped around a GPU.
+**Speaker notes:** Remember the map from the start? You now know every box. Requests land on the API server, get tokenized, and enter the scheduler's waiting queue; every ~10 ms the loop runs — the scheduler builds a fresh batch, the KV manager hands out blocks, the model executor does one flattened GPU pass, postprocessing samples and streams each token. The black box from slide 1 is just a tight scheduler-plus-allocator loop wrapped around a GPU. (Keep this quick — it's a victory lap, not new material.)
 
 ---
 
-## Slide 11 — The latency–throughput tradeoff (1:30)
+## Slide 12 — The latency–throughput tradeoff (1:30)
 
 **Key message:** Judge a serving stack by TTFT, ITL, and throughput — knowing they trade off — and remember five ideas.
 
@@ -230,6 +250,6 @@ Slide titles are the pure concept being introduced (the hook slide 1 excepted); 
 - recap pills: one token at a time · prefill ≠ decode · KV cache = the scarce resource · PagedAttention = virtual memory · continuous batching keeps the GPU full
 - vllm.ai/blog — "Anatomy of vLLM"
 
-**Visual:** Left: latency-vs-throughput curve — x-axis "batch size / load", left y-axis "tokens/sec" rising then flattening at a marked **saturation knee**, right y-axis "per-token latency" flat then rising past the knee; two zone labels: "latency-friendly" before the knee, "throughput territory" after. Right: recap strip of five icons with two-word labels — token loop (2) · prefill/decode (3) · KV cache (5) · PagedAttention (7) · continuous batching (8). Footer: QR code / link to the Anatomy of vLLM post.
+**Visual:** Left: latency-vs-throughput curve — x-axis "batch size / load", left y-axis "tokens/sec" rising then flattening at a marked **saturation knee**, right y-axis "per-token latency" flat then rising past the knee; two zone labels: "latency-friendly" before the knee, "throughput territory" after. Right: recap strip of five icons with two-word labels — token loop (3) · prefill/decode (4) · KV cache (6) · PagedAttention (8) · continuous batching (9). Footer: QR code / link to the Anatomy of vLLM post.
 
-**Speaker notes:** When you deploy or benchmark this, three numbers matter: time to first token, inter-token latency, and total token throughput. They fight each other: growing the batch is nearly free throughput up to the saturation point — that's slide 4's bandwidth story — but past the knee, each request's tokens arrive slower. Chat UIs care about the left of this curve; batch pipelines care about the right; vLLM exposes the knobs to pick your point. If you keep five things: models emit one token at a time; prefill and decode are different workloads; the KV cache is the scarce resource; PagedAttention manages it like virtual memory; continuous batching keeps the GPU full. Everything deeper — speculative decoding, quantization, multi-GPU serving — is in the Anatomy of vLLM post, which this talk is built on. Questions?
+**Speaker notes:** When you deploy or benchmark this, three numbers matter: time to first token, inter-token latency, and total token throughput. They fight each other: growing the batch is nearly free throughput up to the saturation point — that's slide 5's bandwidth story — but past the knee, each request's tokens arrive slower. Chat UIs care about the left of this curve; batch pipelines care about the right; vLLM exposes the knobs to pick your point. If you keep five things: models emit one token at a time; prefill and decode are different workloads; the KV cache is the scarce resource; PagedAttention manages it like virtual memory; continuous batching keeps the GPU full. Everything deeper — speculative decoding, quantization, multi-GPU serving — is in the Anatomy of vLLM post, which this talk is built on. Questions?
