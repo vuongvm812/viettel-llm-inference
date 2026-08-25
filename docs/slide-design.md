@@ -1,8 +1,7 @@
 # Slide design spec — "Inside LLM Inference" tech-sharing deck
 
-Design system extracted from the approved HTML prototype so the deck can be
-regenerated once the content docs are refined. Target: a single self-contained
-HTML file (no build step, no external deps beyond Google Fonts).
+Design system extracted from the approved HTML prototype. Target: a single
+self-contained HTML file (no build step, no external deps beyond Google Fonts).
 
 ## 1. Theme — vllm.ai dark
 
@@ -102,19 +101,15 @@ Rules learned from review rounds:
   - stats → `.pill` (mono, big colored number + tiny label)
 - Density limits: ≤6 fact-rows, ≤4 cards, ≤5 ladder rungs, ≤4 lessons per slide.
   Content exceeds limits → split the slide, never shrink below the type scale.
-- Numbers stated on slides must come verbatim from the source docs
-  (`docs/tech-talk-hackathon-rounds.md`, `docs/vllm-architecture-primer.md`) —
-  no invented stats.
+- Numbers stated on slides must come verbatim from the source material — no
+  invented stats.
 - Tone: plain language for the audience ("bring friends", "never re-read the
   past"); jargon only after it's been defined.
 
-## 4. Regeneration & verification workflow
+## 4. Verification workflow
 
-1. Refine the content docs, then regenerate `docs/hackathon-talk-slides.html`
-   from this spec (single file, all CSS/JS inline).
-2. Verify with headless Chromium (playwright) before delivering: for each of
+1. Verify with headless Chromium (playwright) before delivering: for each of
    1280×720, 1920×1080, 2560×1440, 2560×1080 assert per-slide
    `scrollHeight − clientHeight ≤ 1` and `scrollWidth − clientWidth ≤ 1` on both
    `.slide` and `.slide-content`. Zero overflow is the acceptance bar.
-3. Screenshot spot-checks of the diagram-heavy slides (map, timeline,
-   architecture, ladder, kv-block, results) at 720p and 1440p.
+2. Screenshot spot-checks of the diagram-heavy slides at 720p and 1440p.
