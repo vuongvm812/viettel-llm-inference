@@ -2,8 +2,7 @@
 
 Design system extracted from the approved HTML prototype so the deck can be
 regenerated once the content docs are refined. Target: a single self-contained
-HTML file (no build step, no external deps beyond Google Fonts), ~23 slides,
-30 minutes.
+HTML file (no build step, no external deps beyond Google Fonts).
 
 ## 1. Theme — vllm.ai dark
 
@@ -83,48 +82,7 @@ Rules learned from review rounds:
   Nav dots clickable. Score-bar fills animate to `--w` on `.visible`.
 - No inline-edit code (explicitly declined).
 
-## 3. Presentation style (structure & pacing)
-
-**Framing decision:** teach-first for software engineers new to LLMs. The
-competition is the hook and the case study, NOT the subject.
-**Hard rule: never mix contest material into the knowledge section** — §2 must
-contain zero contest references; contest numbers live only in §1/§3/closing.
-
-| § | Section | Time | Slides |
-|---|---------|------|--------|
-| 1 | Why this talk (the hackathon hook: ship a server → judge hammers it → fastest wins; score pills) | 2 min | 2 |
-| 2 | How inference works (the knowledge share) | 14 min | 10 |
-| 3 | The race (the case study: 3 rounds, 3 rungs, results) | 9 min | 7 |
-| 4 | Lessons + takeaway + closing | 5 min | 4 |
-
-§2 opens with **"The map: nine ideas, one each"** — a 3×3 numbered grid listing
-every fundamental before teaching them, in teaching order:
-
-1. The next-token loop — generation is a loop, not a call
-2. Prefill vs decode — TTFT and TPOT, the two numbers
-3. Decode is memory-bound — every token reads every weight
-4. The KV cache — never re-read the past
-5. Paged & shared prefixes — cache blocks, reused across requests
-6. Continuous batching — requests join & leave every step (+ chunked prefill)
-7. The serving engine — vLLM puts it all together (diagram credits "Anatomy of vLLM")
-8. Quantization — smaller numbers, faster tokens
-9. The host overhead — the CPU between the steps (+ CUDA graphs)
-
-§2 grounding: the vLLM team's ["Anatomy of vLLM"](https://vllm.ai/blog/2025-09-05-anatomy-of-vllm)
-— use its terminology (waiting/running queues, "step", engine loop, "flattened
-into one long super sequence") and cite it on the architecture slide as the
-recommended deep-dive.
-
-§3 arc: bridge slide ("you now know enough to see everything we did") → three
-rounds as three different bottlenecks → rung 1 flags (incl. the 82.4%
-prefix-cache bar) → measurement discipline → rung 2 patch-the-engine → rung 3
-Rust → results bars + honest footnote.
-
-§4: 6 lessons as big one-liners (3 performance + 3 systems), a "remember three
-things" recap mirroring the fundamentals, closing slide reviving the line
-"From docker compose up to a Rust CUDA-graph runner".
-
-## 4. Content style
+## 3. Content style
 
 - **Visual-first, minimal text.** No paragraph bullets; the spoken talk and the
   repo docs carry the detail. Every concept slide = one visual + ≤1 short lede
@@ -150,7 +108,7 @@ things" recap mirroring the fundamentals, closing slide reviving the line
 - Tone: plain language for the audience ("bring friends", "never re-read the
   past"); jargon only after it's been defined.
 
-## 5. Regeneration & verification workflow
+## 4. Regeneration & verification workflow
 
 1. Refine the content docs, then regenerate `docs/hackathon-talk-slides.html`
    from this spec (single file, all CSS/JS inline).
