@@ -45,19 +45,21 @@ Note: figures are drawn light-background; on a dark deck place them on a white r
 
 ## Agenda / time budget
 
+Slide titles are the pure concept being introduced (the hook slide 1 excepted); the lede sentence under the title carries the explanation.
+
 | # | Slide | Time |
 |---|-------|------|
-| 1 | What happens after you POST? | 0:30 |
-| 2 | One token at a time | 1:30 |
-| 3 | Two phases: prefill vs decode | 1:30 |
-| 4 | Decode is memory-bound | 1:30 |
+| 1 | What happens after you POST? (hook) | 0:30 |
+| 2 | Autoregressive generation | 1:30 |
+| 3 | Prefill & decode | 1:30 |
+| 4 | Memory-bound decode | 1:30 |
 | 5 | The KV cache | 1:30 |
-| 6 | The naive serving problem | 1:00 |
+| 6 | Fragmentation & head-of-line blocking | 1:00 |
 | 7 | PagedAttention | 2:00 |
 | 8 | Continuous batching | 2:00 |
-| 9 | Free win: prefix caching | 1:00 |
-| 10 | vLLM in one picture | 1:30 |
-| 11 | What to measure & takeaways | 1:30 |
+| 9 | Prefix caching | 1:00 |
+| 10 | vLLM architecture | 1:30 |
+| 11 | The latency–throughput tradeoff | 1:30 |
 | | **Total** | **14:30** |
 
 ---
@@ -77,7 +79,7 @@ Note: figures are drawn light-background; on a dark deck place them on a white r
 
 ---
 
-## Slide 2 — One token at a time (1:30)
+## Slide 2 — Autoregressive generation (1:30)
 
 **Key message:** An LLM is a function you call in a loop: each call reads everything so far and appends exactly one token.
 
@@ -93,7 +95,7 @@ Note: figures are drawn light-background; on a dark deck place them on a white r
 
 ---
 
-## Slide 3 — Two phases: prefill vs decode (1:30)
+## Slide 3 — Prefill & decode (1:30)
 
 **Key message:** Serving one request has two very different phases — prefill (process the whole prompt at once) and decode (one token per step) — and each has its own latency metric.
 
@@ -109,7 +111,7 @@ Note: figures are drawn light-background; on a dark deck place them on a white r
 
 ---
 
-## Slide 4 — Decode is memory-bound (1:30)
+## Slide 4 — Memory-bound decode (1:30)
 
 **Key message:** Each decode step must stream all model weights from GPU memory to compute one token — the bottleneck is memory bandwidth, not compute.
 
@@ -140,14 +142,14 @@ Note: figures are drawn light-background; on a dark deck place them on a white r
 
 ---
 
-## Slide 6 — The naive serving problem (1:00)
+## Slide 6 — Fragmentation & head-of-line blocking (1:00)
 
 **Key message:** Pre-allocating contiguous KV memory per request wastes most of it, and static batching makes finished requests wait for the slowest one.
 
 **On-slide text:**
 - lede: "Output length is unknown → pre-reserve worst-case contiguous memory. Fixed batch → stragglers hold the whole GPU."
 - 60–80% of KV memory wasted in pre-vLLM systems (vLLM paper)
-- = fragmentation + head-of-line blocking
+- two classic systems problems → two vLLM ideas, next
 
 **Visual:** Two stacked panels. Top — "memory": a horizontal GPU-memory strip divided into equal contiguous reservations per request; within each, only a small colored head is "actually used", the long grey tail labeled "reserved, never used"; a rejected request bounces off the full strip. Bottom — "time": a static batch of 4 request rows starting together; three finish early and turn into hatched "idle" bars while the fourth still runs; new requests queue outside the batch boundary.
 
@@ -187,7 +189,7 @@ Note: figures are drawn light-background; on a dark deck place them on a white r
 
 ---
 
-## Slide 9 — Free win: prefix caching (1:00)
+## Slide 9 — Prefix caching (1:00)
 
 **Key message:** Because KV lives in content-hashed blocks, identical prompt prefixes — like a shared system prompt — are computed once and reused by later requests.
 
@@ -203,7 +205,7 @@ Note: figures are drawn light-background; on a dark deck place them on a white r
 
 ---
 
-## Slide 10 — vLLM in one picture (1:30)
+## Slide 10 — vLLM architecture (1:30)
 
 **Key message:** Everything so far assembles into one loop: schedule → forward pass → postprocess, running around the paged KV cache.
 
@@ -218,7 +220,7 @@ Note: figures are drawn light-background; on a dark deck place them on a white r
 
 ---
 
-## Slide 11 — What to measure & takeaways (1:30)
+## Slide 11 — The latency–throughput tradeoff (1:30)
 
 **Key message:** Judge a serving stack by TTFT, ITL, and throughput — knowing they trade off — and remember five ideas.
 
