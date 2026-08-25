@@ -68,6 +68,18 @@ Bookend structure: the architecture map is shown FIRST (slide 2) as orientation 
 | 12 | The latency–throughput tradeoff | 1:30 |
 | | **Total** | **15:00** |
 
+## Scope: what this talk deliberately skips
+
+Advanced levers that sit on top of the core mental model — named on slide 12's "not covered today" strip (chunked prefill gets one pill on slide 9 since it answers an obvious audience question), taught nowhere in this talk:
+
+- **Quantization (fp8/int4)** — shrink weight/KV bytes to relax the slide-5/6 memory bottleneck; changes the memory math, not the mental model.
+- **Speculative decoding** — a cheap draft proposes k tokens, the main model verifies them in one pass; attacks decode's serial nature.
+- **Chunked prefill** — cap prompt tokens per step so one long prefill doesn't stall the batch.
+- **CUDA graphs & host overhead** — pre-capture GPU launch sequences because Python work between passes can dominate inter-token latency.
+- **Multi-GPU serving** (tensor/pipeline parallelism, disaggregated prefill/decode) — scale-out once one GPU isn't enough.
+
+Practical follow-up topic for a second talk: the operator knobs (`--max-num-seqs`, `--max-model-len`, `gpu_memory_utilization`) — each maps directly onto a concept slide here.
+
 ---
 
 ## Slide 1 — What happens after you POST? (0:30)
@@ -141,7 +153,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 
 **On-slide text:**
 - lede: "One decode token = streaming every model weight from GPU memory for a tiny bit of math. Bandwidth sets the speed, not FLOPs."
-- note card: 7B @ fp16 ≈ 14 GB of weights, read every step · A100 HBM ≈ 2 TB/s → ~140 tok/s ceiling at batch = 1 (back-of-envelope) · batch = 1 low on the slope, compute idle · batch = 32 near the knee: same weight read, 32× the tokens · x-axis "arithmetic intensity" = math done per byte moved — decode is far left
+- note card: 7B @ fp16 ≈ 14 GB of weights, read every step · A100 HBM ≈ 2 TB/s → ~140 tok/s ceiling at batch = 1 (back-of-envelope) · batch = 1 low on the slope, compute idle · batch = 32 near saturation: same weight read, 32× the tokens · x-axis "arithmetic intensity" = math done per byte moved — decode is far left
 - pills: decode speed ≈ bandwidth ÷ bytes moved · batching is nearly free throughput
 
 **Visual:** **Reuse `roofline.png`** — the blog's roofline chart (perf vs arithmetic intensity, with "mem bw bound" and "compute bound" zones). Add two overlay dots of our own: `batch = 1` low on the bandwidth-bound slope, `batch = 32` up near the knee, with an arrow between them labeled "same weight read, 32× the tokens". Optional small side sketch (custom, only if time to build): HBM cylinder → "memory bandwidth" pipe → compute grid, to make "reading all the weights" concrete for the audience before showing the chart.
@@ -206,10 +218,11 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 - join instantly, leave instantly
 - all tokens flattened into one GPU pass
 - GPU never waits for the slowest request
+- long prompt? chunked prefill splits it across steps — no one stalls
 
 **Visual:** Simple custom grid (inspired by the blog's Figure 4, radically simplified). Columns = engine steps (t1…t10), rows = requests R1…R5. Cells colored with the slide-4 palette: prefill color, decode color, empty when absent. R1 and R2 start at t1; R3 arrives at t3 (prefill cell appears mid-grid); R2 finishes at t5 and its row goes empty; R4 takes the freed capacity at t6. Bottom annotation row: each column's cells flatten into a single bar labeled "one forward pass". No token ids, no slot mappings — just colored cells. Caption contrast vs slide 7: "no idle slots, no waiting for the batch".
 
-**Speaker notes:** Second signature idea. Before each forward pass — each column here — the scheduler re-decides the batch: finished requests exit immediately and free their blocks, and waiting requests are pulled in immediately, running their prefill in the same pass where others decode; vLLM flattens all their tokens into one sequence for the GPU. Compare with static batching: no idle hatched bars, no queue stuck at a batch boundary. This is what keeps the batch full — which slide 5 told us is where all the throughput lives. PagedAttention supplies flexible memory; continuous batching supplies flexible scheduling; each is what makes the other work at scale.
+**Speaker notes:** Second signature idea. Before each forward pass — each column here — the scheduler re-decides the batch: finished requests exit immediately and free their blocks, and waiting requests are pulled in immediately, running their prefill in the same pass where others decode; vLLM flattens all their tokens into one sequence for the GPU. Compare with static batching: no idle hatched bars, no queue stuck at a batch boundary. This is what keeps the batch full — which slide 5 told us is where all the throughput lives. PagedAttention supplies flexible memory; continuous batching supplies flexible scheduling; each is what makes the other work at scale. And if someone asks "doesn't a huge prompt stall everyone?" — no: chunked prefill caps how many prompt tokens one request may contribute per step, spreading a long prefill across several passes.
 
 ---
 
@@ -249,11 +262,12 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** Judge a serving stack by TTFT, ITL, and throughput — knowing they trade off — and remember five ideas.
 
 **On-slide text:**
-- lede: "Bigger batches buy throughput until the knee; past it, every request's tokens arrive slower. Chat UIs live left of the knee, batch pipelines right."
+- lede: "Bigger batches buy throughput until the GPU saturates; past that point, every request's tokens arrive slower. Chat UIs live left of it, batch pipelines right."
 - TTFT · ITL · throughput — pick your tradeoff
 - recap pills: one token at a time · prefill ≠ decode · KV cache = the scarce resource · PagedAttention = virtual memory · continuous batching keeps the GPU full
+- strip: not covered today: quantization (fp8) · speculative decoding · CUDA graphs & host overhead · multi-GPU serving
 - vllm.ai/blog — "Anatomy of vLLM"
 
-**Visual:** Left: latency-vs-throughput curve — x-axis "batch size / load", left y-axis "tokens/sec" rising then flattening at a marked **saturation knee**, right y-axis "per-token latency" flat then rising past the knee; two zone labels: "latency-friendly" before the knee, "throughput territory" after. Right: recap strip of five icons with two-word labels — token loop (3) · prefill/decode (4) · KV cache (6) · PagedAttention (8) · continuous batching (9). Footer: QR code / link to the Anatomy of vLLM post.
+**Visual:** Left: latency-vs-throughput curve — x-axis "batch size / load", left y-axis "tokens/sec" rising then flattening at a marked **saturation point**, right y-axis "per-token latency" flat then rising past saturation; two zone labels: "latency-friendly" before saturation, "throughput territory" after. Right: recap strip of five icons with two-word labels — token loop (3) · prefill/decode (4) · KV cache (6) · PagedAttention (8) · continuous batching (9). Footer: QR code / link to the Anatomy of vLLM post.
 
-**Speaker notes:** When you deploy or benchmark this, three numbers matter: time to first token, inter-token latency, and total token throughput. They fight each other: growing the batch is nearly free throughput up to the saturation point — that's slide 5's bandwidth story — but past the knee, each request's tokens arrive slower. Chat UIs care about the left of this curve; batch pipelines care about the right; vLLM exposes the knobs to pick your point. If you keep five things: models emit one token at a time; prefill and decode are different workloads; the KV cache is the scarce resource; PagedAttention manages it like virtual memory; continuous batching keeps the GPU full. Everything deeper — speculative decoding, quantization, multi-GPU serving — is in the Anatomy of vLLM post, which this talk is built on. Questions?
+**Speaker notes:** When you deploy or benchmark this, three numbers matter: time to first token, inter-token latency, and total token throughput. They fight each other: growing the batch is nearly free throughput up to the saturation point — that's slide 5's bandwidth story — but past saturation, each request's tokens arrive slower. Chat UIs care about the left of this curve; batch pipelines care about the right; vLLM exposes the knobs to pick your point. If you keep five things: models emit one token at a time; prefill and decode are different workloads; the KV cache is the scarce resource; PagedAttention manages it like virtual memory; continuous batching keeps the GPU full. Everything deeper — speculative decoding, quantization, multi-GPU serving — is in the Anatomy of vLLM post, which this talk is built on. Questions?

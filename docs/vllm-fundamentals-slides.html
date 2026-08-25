@@ -621,7 +621,7 @@ h2 {
                 <div class="row"><span>&#9632;</span><span>7B model @ fp16 &asymp; <b>14 GB</b> of weights &mdash; read <b>every step</b></span></div>
                 <div class="row"><span>&#9632;</span><span>A100 HBM &asymp; 2 TB/s &rarr; <b>~140 tok/s ceiling</b> at batch&nbsp;=&nbsp;1 <em>(back-of-envelope)</em></span></div>
                 <div class="row"><span class="dot blue"></span><span><b>batch&nbsp;=&nbsp;1</b> &mdash; low on the bandwidth-bound slope, compute idle</span></div>
-                <div class="row"><span class="dot gold"></span><span><b>batch&nbsp;=&nbsp;32</b> &mdash; near the knee: same weight read, <b>32&times; the tokens</b></span></div>
+                <div class="row"><span class="dot gold"></span><span><b>batch&nbsp;=&nbsp;32</b> &mdash; near saturation: same weight read, <b>32&times; the tokens</b></span></div>
                 <div class="row"><span>&#9632;</span><span>x-axis "arithmetic intensity" = <b>math done per byte moved</b> &mdash; decode is far left</span></div>
             </div>
         </div>
@@ -768,6 +768,7 @@ h2 {
             <span class="pill">join <b>instantly</b>, leave <b>instantly</b></span>
             <span class="pill">all tokens <b>flattened</b> into one GPU pass</span>
             <span class="pill gold">GPU never waits for the <b>slowest request</b></span>
+            <span class="pill">long prompt? <b>chunked prefill</b> splits it across steps &mdash; no one stalls</span>
         </div>
     </div>
 </section>
@@ -845,7 +846,7 @@ h2 {
     <div class="slide-head"><span><span class="num">12</span> &middot; latency vs throughput</span><span>1:30</span></div>
     <div class="slide-content">
         <h2 class="reveal">The latency&ndash;throughput <span class="gold-accent">tradeoff</span></h2>
-        <p class="lede reveal">Bigger batches buy throughput until the <strong>knee</strong>; past it, every request's tokens arrive slower. Chat UIs live left of the knee, batch pipelines right.</p>
+        <p class="lede reveal">Bigger batches buy throughput until the GPU <strong>saturates</strong>; past that point, every request's tokens arrive slower. Chat UIs live left of it, batch pipelines right.</p>
         <div class="metrics-wrap reveal">
             <div class="curve-card">
                 <!-- Latency-throughput tradeoff: throughput saturates at the knee, latency rises past it -->
@@ -857,7 +858,7 @@ h2 {
                     <path d="M 40 190 C 120 188, 200 185, 240 175 C 300 158, 360 90, 400 40" fill="none" stroke="#fdb517" stroke-width="3"/>
                     <text x="48" y="40"  fill="#30a2ff" font-size="13" font-family="JetBrains Mono">tokens/sec</text>
                     <text x="292" y="120" fill="#fdb517" font-size="13" font-family="JetBrains Mono">latency</text>
-                    <text x="236" y="34" fill="#92a0ba" font-size="12" font-family="JetBrains Mono">knee</text>
+                    <text x="236" y="34" fill="#92a0ba" font-size="12" font-family="JetBrains Mono">saturation</text>
                     <text x="60"  y="242" fill="#92a0ba" font-size="12" font-family="JetBrains Mono">latency-friendly</text>
                     <text x="250" y="242" fill="#92a0ba" font-size="12" font-family="JetBrains Mono">throughput territory</text>
                     <text x="330" y="216" fill="#92a0ba" font-size="12" font-family="JetBrains Mono">load &rarr;</text>
@@ -871,6 +872,7 @@ h2 {
                 <span class="pill gold"><b>5</b> continuous batching keeps the GPU full</span>
             </div>
         </div>
+        <p class="idea-strip reveal">not covered today: quantization (fp8) &middot; speculative decoding &middot; CUDA graphs &amp; host overhead &middot; multi-GPU serving</p>
         <p class="src-link reveal">go deeper &rarr; <a href="https://vllm.ai/blog/2025-09-05-anatomy-of-vllm">vllm.ai/blog &middot; "Anatomy of vLLM"</a></p>
     </div>
 </section>
