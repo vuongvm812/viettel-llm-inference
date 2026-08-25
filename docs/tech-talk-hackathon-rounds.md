@@ -3,22 +3,24 @@
 **A 30-minute tech-sharing talk on the Viettel "AI Race" LLM-inference hackathon (task 3)**
 
 > One repo, 383 commits, three rounds, three completely different problems:
-> a prefill-bound full H200, a latency-band MIG slice, and a 122B MoE agent workload.
+> a prefill-bound trace and a latency-band chat workload — both on an 18 GB H200
+> MIG slice — then a 122B MoE agent workload on a full H200.
 > This talk walks the ladder we climbed — vanilla flag tuning → forked vLLM +
 > custom CUDA → Rust ports of the scheduler and the decode launch loop — and the
 > lessons each rung taught us.
 
 | # | Section | Time |
 |---|---------|------|
-| 1 | The assignment: three rounds, three problems | 5 min |
-| 2 | The vanilla phase: tuning the plain vLLM image | 5 min |
-| 3 | Going custom: forked vLLM, CUDA kernels, Rust ports | 13 min |
-| 4 | Results | 2 min |
-| 5 | Lessons | 5 min |
+| 1 | The assignment: three rounds, three problems | 4 min |
+| 2 | vLLM in one slide: the machine we spent three rounds modifying | 3 min |
+| 3 | The vanilla phase: tuning the plain vLLM image | 5 min |
+| 4 | Going custom: forked vLLM, CUDA kernels, Rust ports | 12 min |
+| 5 | Results | 2 min |
+| 6 | Lessons | 4 min |
 
 ---
 
-## 1. The assignment (5 min)
+## 1. The assignment (4 min)
 
 ### How the competition works
 
@@ -38,9 +40,9 @@
 | | Round 1.1 | Round 1.2 | Round 2 |
 |---|---|---|---|
 | **Model** | Qwen3.5-2B (VL hybrid, GDN linear attention) | LiquidAI/LFM2.5-1.2B (10 short-conv + 6 GQA layers) | Qwen3.5-122B-A10B-FP8 (MoE 256-expert top-8, 36 GDN + 12 full-attn layers) |
-| **Hardware** | Full H200 (~120 GB KV budget) | **H200 MIG 1g.18gb: 18 GB, 16 SMs, 3 vCPU, 8 GB RAM** | Full H200 141 GB, 22-core Xeon |
+| **Hardware** | H200 MIG 1g.18gb: 18 GB VRAM, 3-core CPU, 8 GB RAM (official spec) | **H200 MIG 1g.18gb: 18 GB, 16 SMs, 3 vCPU, 8 GB RAM** | Full H200 141 GB, 22-core Xeon |
 | **Workload** | 120 reqs, p50 prompt 18.7k tok, **101:1 prefill-bound**, 82.4% prefix hit | 70 convs × 6 turns = 420 reqs, ~4.7k ctx, ~82% prefix hit | aiperf `inferencex-agentx-mvp`: **real Claude Code session traces**, 900 s, concurrency 5, ctx 204,800, hidden seed |
-| **Scoring** | Latency percentiles + throughput | ERS: TTFT 10/400 ms, TPOT **1/10 ms**, γ=2, w=0.5 | ERS: TTFT 200/6000 ms, TPOT **8/100 ms** |
+| **Scoring** | Effective Request Capacity (% reqs served on-time) + accuracy gate | ERS: TTFT 10/400 ms, TPOT **1/10 ms**, γ=2, w=0.5 | ERS: TTFT 200/6000 ms, TPOT **8/100 ms** |
 | **What mattered** | Prefill throughput + prefix cache | **Host overhead per decode step** | Finishing requests; TTFT tail; MoE bandwidth |
 
 **Speaker notes:**
@@ -65,7 +67,32 @@
 
 ---
 
-## 2. The vanilla phase: plain vLLM param tuning (5 min)
+## 2. vLLM in one slide (3 min)
+
+**Full primer: [`docs/vllm-architecture-primer.md`](vllm-architecture-primer.md)**
+(grounded in the vLLM team's ["Anatomy of vLLM"](https://vllm.ai/blog/2025-09-05-anatomy-of-vllm)).
+The one-paragraph version for the talk:
+
+vLLM runs as **two processes**: an OpenAI-compatible frontend (parse, tokenize,
+stream, detokenize) talking over ZMQ to the **EngineCore** — a loop where the
+**scheduler** picks which requests join the next *step* (one forward pass,
+continuous batching: requests join and leave every step), the **KV-cache manager**
+maps their tokens to paged KV blocks (which is what makes **prefix caching** and
+**chunked prefill** cheap), and the **GPU model runner** builds the step's inputs
+in Python and launches the forward — replaying pre-captured **CUDA graphs** to cut
+launch overhead. Prefill sets **TTFT**, decode sets **TPOT** — the two numbers ERS
+scores — and every per-step host cost the runner pays in Python lands directly on
+TPOT.
+
+**Why this map matters for the next 20 minutes:** every optimization in this talk
+lives on one of those boxes — the vanilla phase (§3) tunes the scheduler's and KV
+manager's knobs; the fork + kernels (§4a, §4b) attack the forward pass; the Rust
+ports (§4c) replace the frontend, the scheduler, and finally the CUDA-graph launch
+loop itself.
+
+---
+
+## 3. The vanilla phase: plain vLLM param tuning (5 min)
 
 ### The false start worth admitting
 
@@ -95,8 +122,11 @@ All of this is flags and env vars on the stock image — no code:
   tokens are prefill; Hopper fp8 tensor cores act on all of them.
 - **Chunked prefill + `--max-num-batched-tokens=8192`**: small prefill chunks stop a
   new turn's prefill from spiking in-flight decode latency (γ=2 punishes that tail).
-- Things measured and **rejected**: KV offload to CPU/NVMe (working set 15.7 GB vs
-  120 GB budget = 8× headroom, and the miss path is ~700× slower than HBM);
+- Things measured and **rejected**: KV offload to CPU/NVMe — the repo's "15.7 GB
+  working set vs ~120 GB budget = 8× headroom" numbers were measured on the team's
+  full-H200 dev box; on the 18 GB judge slice the honest version is that the fp8
+  working set (7.8 GB) still fits the ~13 GB KV budget, and the miss path is ~700×
+  slower than HBM either way;
   speculative decoding (decode is ~1% of tokens in a 101:1 trace — "measured, not
   assumed"); `--async-scheduling` passed explicitly (it's already the default; passing
   it only converts warnings into boot failures).
@@ -132,13 +162,13 @@ All of this is flags and env vars on the stock image — no code:
 
 ---
 
-## 3. Going custom (13 min)
+## 4. Going custom (12 min)
 
 **Framing:** on the round-1.2 MIG slice, decode was ~1 ms GPU + ~2 ms host per step.
 Under async scheduling, TPOT ≈ max(host, gpu) — **the host IS the TPOT.** Everything
 in this section attacks either host time or memory bandwidth.
 
-### 3a. The forked vLLM (3 min)
+### 4a. The forked vLLM (3 min)
 
 Not a real fork — a **`patch -p1` overlay onto stock v0.25.0 site-packages**, with the
 compiled `.so`s untouched and a version assert so a base-image bump fails the build
@@ -167,7 +197,7 @@ tokens per record, a chunk-counting grader would report TPOT **N× worse than re
 Plus PGO where the mock engine is paced to production cadence — PGO trained at memory
 speed ships a *slower* binary.
 
-### 3b. Custom CUDA kernels (4 min)
+### 4b. Custom CUDA kernels (4 min)
 
 Eight kernels for round 1.2 (`vtl/csrc/`), all sharing three design rules:
 **(1)** numerics match stock element-for-element — deliberately including
@@ -209,7 +239,7 @@ Round-2 kernels went NVRTC (runtime-compiled, per-op fallback ladder NVRTC → A
 stock): greedy argmax gated on a boot-time bit-exact parity check against
 `torch.argmax`, MoE GEMV band tuning, rms-norm block-quant.
 
-### 3c. The Rust ports (6 min)
+### 4c. The Rust ports (6 min)
 
 #### The scheduler crate (`vtl-sched`, ~8,000 lines)
 
@@ -280,11 +310,11 @@ The centerpiece: move the decode-step **launch loop itself** out of Python.
 Getting it to actually run took as long as building it: a boot-ordering rendezvous
 (capture runs before the Scheduler exists), a classify-priming fix (stock populates a
 field only on the first *real* forward, and capture only does dummy ones — so the
-whole burst ladder silently bailed every boot), and several review passes (§5).
+whole burst ladder silently bailed every boot), and several review passes (§6).
 
 ---
 
-## 4. Results (2 min)
+## 5. Results (2 min)
 
 | Round | Score trajectory | Notes |
 |---|---|---|
@@ -309,7 +339,7 @@ whole burst ladder silently bailed every boot), and several review passes (§5).
 
 ---
 
-## 5. Lessons (5 min)
+## 6. Lessons (4 min)
 
 1. **Silent fallback is the enemy.** A 9k-line Rust component that switches itself
    off looks *identical in every latency number* to one that ran and didn't help —
@@ -368,8 +398,9 @@ whole burst ladder silently bailed every boot), and several review passes (§5).
 
 ---
 
-## Sources (all in this repo)
+## Sources (all in this repo, except the last)
 
+- `docs/vllm-architecture-primer.md` — the vLLM arch & concepts backing section 2
 - `round-1.2/HANDOFF.md`, `round-2/HANDOFF.md` §6 — mission briefs, ERS math, constraints
 - `round-2/RUST-RUNNER.md` — runner design + the 8 hazards
 - `VTC-Go-README.md` — round-2 implementation summary
@@ -377,3 +408,4 @@ whole burst ladder silently bailed every boot), and several review passes (§5).
 - `docs/round-1.2-latency-optimization-plan.md`, `docs/round-1.2-nstep-r8-microopt-plan.md`, `round-1.2/docs/round-1.2-port-frontier-3.md` — score-point economics per operating point
 - `docs/round-2-nstep-regression-investigation.md` — the flight recorder, the wedge, the scored cap=1 A/B
 - `round-1.2/bench/_ci_report.py`, `round-2/bench/_ci_report.py` — the ERS reference implementations
+- ["Anatomy of vLLM"](https://vllm.ai/blog/2025-09-05-anatomy-of-vllm) (vLLM blog, external) — the architecture walkthrough the primer follows
