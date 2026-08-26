@@ -267,18 +267,14 @@ h2 {
     box-shadow: 0 0 2.2rem rgba(48,162,255,0.25);
 }
 .stream { display: flex; gap: 0.4rem; }
-/* One shared 3s cycle: tokens slide in one-by-one, a short beat with the
-   full phrase, quick fade, and the sequence immediately re-types — no
-   long pause parked on the finished phrase. */
-.stream .cell { opacity: 0; }
-.stream .cell:nth-child(1) { animation: stream1 3s infinite; }
-.stream .cell:nth-child(2) { animation: stream2 3s infinite; }
-.stream .cell:nth-child(3) { animation: stream3 3s infinite; }
-.stream .cell:nth-child(4) { animation: stream4 3s infinite; }
-@keyframes stream1 { 0%, 2%  { opacity: 0; transform: translateX(-0.4rem); } 8%, 80%  { opacity: 1; transform: translateX(0); } 88%, 100% { opacity: 0; } }
-@keyframes stream2 { 0%, 18% { opacity: 0; transform: translateX(-0.4rem); } 24%, 80% { opacity: 1; transform: translateX(0); } 88%, 100% { opacity: 0; } }
-@keyframes stream3 { 0%, 34% { opacity: 0; transform: translateX(-0.4rem); } 40%, 80% { opacity: 1; transform: translateX(0); } 88%, 100% { opacity: 0; } }
-@keyframes stream4 { 0%, 50% { opacity: 0; transform: translateX(-0.4rem); } 56%, 80% { opacity: 1; transform: translateX(0); } 88%, 100% { opacity: 0; } }
+/* Whole group: appear — hold — disappear — repeat. One gentle fade,
+   no per-token stagger, no sliding. */
+.stream { animation: streamBlink 3s infinite; }
+@keyframes streamBlink {
+    0%, 8%    { opacity: 0; }
+    22%, 78%  { opacity: 1; }
+    92%, 100% { opacity: 0; }
+}
 
 /* ===========================================
    SLIDE 2 — TOKEN LOOP
