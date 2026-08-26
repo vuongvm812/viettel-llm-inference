@@ -267,16 +267,18 @@ h2 {
     box-shadow: 0 0 2.2rem rgba(48,162,255,0.25);
 }
 .stream { display: flex; gap: 0.4rem; }
-.stream .cell { animation: streamIn 3s infinite; opacity: 0; }
-.stream .cell:nth-child(1) { animation-delay: 0.0s; }
-.stream .cell:nth-child(2) { animation-delay: 0.5s; }
-.stream .cell:nth-child(3) { animation-delay: 1.0s; }
-.stream .cell:nth-child(4) { animation-delay: 1.5s; }
-@keyframes streamIn {
-    0% { opacity: 0; transform: translateX(-0.4rem); }
-    12%, 80% { opacity: 1; transform: translateX(0); }
-    100% { opacity: 1; }
-}
+/* One shared 3s cycle: tokens slide in one-by-one, a short beat with the
+   full phrase, quick fade, and the sequence immediately re-types — no
+   long pause parked on the finished phrase. */
+.stream .cell { opacity: 0; }
+.stream .cell:nth-child(1) { animation: stream1 3s infinite; }
+.stream .cell:nth-child(2) { animation: stream2 3s infinite; }
+.stream .cell:nth-child(3) { animation: stream3 3s infinite; }
+.stream .cell:nth-child(4) { animation: stream4 3s infinite; }
+@keyframes stream1 { 0%, 2%  { opacity: 0; transform: translateX(-0.4rem); } 8%, 80%  { opacity: 1; transform: translateX(0); } 88%, 100% { opacity: 0; } }
+@keyframes stream2 { 0%, 18% { opacity: 0; transform: translateX(-0.4rem); } 24%, 80% { opacity: 1; transform: translateX(0); } 88%, 100% { opacity: 0; } }
+@keyframes stream3 { 0%, 34% { opacity: 0; transform: translateX(-0.4rem); } 40%, 80% { opacity: 1; transform: translateX(0); } 88%, 100% { opacity: 0; } }
+@keyframes stream4 { 0%, 50% { opacity: 0; transform: translateX(-0.4rem); } 56%, 80% { opacity: 1; transform: translateX(0); } 88%, 100% { opacity: 0; } }
 
 /* ===========================================
    SLIDE 2 — TOKEN LOOP
