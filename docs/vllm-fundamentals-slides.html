@@ -638,13 +638,13 @@ h2 {
         </div>
         <div class="pills reveal">
             <span class="pill">prefill: whole prompt, one pass &rarr; <b>TTFT</b> = how long until the answer starts</span>
-            <span class="pill gold">decode: one token per pass &rarr; <b>ITL</b> = the "typing speed" users feel</span>
+            <span class="pill gold">decode: one token per pass &rarr; <b>TPOT/TBT</b> = "typing speed"</span>
         </div>
         <div class="pills reveal">
             <span class="pill">prefill = <b>compute-heavy</b>, parallel</span>
             <span class="pill">decode = <b>thousands of tiny</b> sequential steps</span>
         </div>
-        <p class="credit reveal">Figure: Anatomy of vLLM &middot; vllm.ai</p>
+        <p class="credit reveal">Figure: Anatomy of vLLM &middot; vllm.ai &mdash; its "ITL" label = TPOT/TBT, same metric</p>
     </div>
 </section>
 
@@ -963,7 +963,7 @@ h2 {
         <h2 class="reveal">CUDA graphs &amp; <span class="accent">host overhead</span></h2>
         <ul class="lede-list reveal">
             <li>each step: ~ms of GPU work, but <strong>Python schedules &amp; launches</strong> in between</li>
-            <li>those host gaps add straight to <strong>ITL</strong></li>
+            <li>those host gaps add straight to <strong>TPOT</strong></li>
         </ul>
         <div class="panel reveal">
             <span class="ptitle">EAGER &mdash; host work before every launch</span>

@@ -138,12 +138,13 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **On-slide text:**
 - lede bullets: prompt tokens all exist up front → one big parallel pass (prefill) / after that: one pass per new token, forever (decode)
 - prefill: whole prompt, one pass → TTFT = how long until the answer starts
-- decode: one token per pass → ITL = the "typing speed" users feel
+- decode: one token per pass → TPOT/TBT = "typing speed"
+- credit line carries the bridge: the figure's "ITL" label = TPOT/TBT, same metric
 - prefill = compute-heavy, parallel · decode = thousands of tiny sequential steps
 
 **Visual:** **Reuse `latency_diagram.png`** — user at the bottom, vLLM server at the top, query going up, `token 1 … token n` coming down, with TTFT, ITL, and e2e-latency brackets already drawn. Add only two overlay labels of our own: "prefill" over the query→token-1 span and "decode" over the token-1→token-n span, in two distinct colors (these two colors recur on slide 9's caption and slide 11's tags).
 
-**Speaker notes:** The prompt tokens all exist up front, so the engine can process them in a single big parallel pass — that's prefill, and it ends when the first output token appears, which the user experiences as time-to-first-token. Then the loop from the previous slide takes over: decode, one token per pass, and the gap between tokens is the inter-token latency users feel as "typing speed". These two phases stress the hardware in opposite ways — prefill is a big parallel computation, decode is thousands of tiny sequential ones — and that asymmetry drives the engine design we'll see next.
+**Speaker notes:** The prompt tokens all exist up front, so the engine can process them in a single big parallel pass — that's prefill, and it ends when the first output token appears, which the user experiences as time-to-first-token. Then the loop from the previous slide takes over: decode, one token per pass, and the gap between tokens is the time per output token — TPOT, also called TBT, and labeled ITL on the figure — which users feel as "typing speed". These two phases stress the hardware in opposite ways — prefill is a big parallel computation, decode is thousands of tiny sequential ones — and that asymmetry drives the engine design we'll see next.
 
 ---
 
@@ -292,31 +293,31 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 
 ## Slide 14 — CUDA graphs & host overhead (1:00)
 
-**Key message:** Between GPU passes the Python host schedules, samples, and launches kernels — at small batch those gaps dominate ITL, and CUDA graphs shrink them by replaying a pre-recorded step.
+**Key message:** Between GPU passes the Python host schedules, samples, and launches kernels — at small batch those gaps dominate TPOT, and CUDA graphs shrink them by replaying a pre-recorded step.
 
 **On-slide text:**
-- lede bullets: each step: ~ms of GPU work, but Python schedules & launches in between / those host gaps add straight to ITL
+- lede bullets: each step: ~ms of GPU work, but Python schedules & launches in between / those host gaps add straight to TPOT
 - thousands of kernel launches → one graph replay
 - matters most at small batch / short steps
 - vLLM captures graphs at startup
 
 **Visual:** Two horizontal timelines. Top "eager": alternating segments — wide grey "host" gaps between blue "GPU" blocks. Bottom "CUDA graphs": thin host slivers, GPU blocks packed nearly back-to-back. Caption: "record once, replay every step".
 
-**Speaker notes:** The GPU never launches its own work — the CPU does, kernel by kernel, with Python scheduling and sampling in between. Each decode step is only a few milliseconds of GPU time, so even a millisecond of host work between steps lands directly on inter-token latency. CUDA graphs fix the launch half: record the step's entire kernel sequence once, then replay it as a single unit — that's what vLLM's capture phase at startup is doing. Classic Amdahl: at big batch the long GPU step hides host time; at small batch, host overhead is the bottleneck.
+**Speaker notes:** The GPU never launches its own work — the CPU does, kernel by kernel, with Python scheduling and sampling in between. Each decode step is only a few milliseconds of GPU time, so even a millisecond of host work between steps lands directly on the time between tokens. CUDA graphs fix the launch half: record the step's entire kernel sequence once, then replay it as a single unit — that's what vLLM's capture phase at startup is doing. Classic Amdahl: at big batch the long GPU step hides host time; at small batch, host overhead is the bottleneck.
 
 ---
 
 ## Slide 15 — The latency–throughput tradeoff (1:30)
 
-**Key message:** Judge a serving stack by TTFT, ITL, and throughput — knowing they trade off — and remember five ideas.
+**Key message:** Judge a serving stack by TTFT, TPOT, and throughput — knowing they trade off — and remember five ideas.
 
 **On-slide text:**
 - lede bullets: bigger batches buy throughput until the GPU is fully busy / past that point, every request's tokens arrive slower
-- TTFT · ITL · throughput — pick your tradeoff
+- TTFT · TPOT · throughput — pick your tradeoff
 - recap pills: one token at a time · prefill ≠ decode · KV cache = the scarce resource · PagedAttention = virtual memory · continuous batching keeps the GPU full
 - strip: not covered today: multi-GPU serving — tensor/pipeline parallelism, disaggregated prefill/decode
 - vllm.ai/blog — "Anatomy of vLLM"
 
 **Visual:** Left: latency-vs-throughput curve — x-axis "batch size / load", left y-axis "tokens/sec" rising then flattening where the GPU becomes **fully busy** (chart label: "GPU fully busy"), right y-axis "per-token latency" flat then rising past that point; two zone labels: "latency-friendly" before it, "throughput territory" after. Right: recap strip of five icons with two-word labels — token loop (3) · prefill/decode (4) · KV cache (6) · PagedAttention (8) · continuous batching (9). Footer: QR code / link to the Anatomy of vLLM post.
 
-**Speaker notes:** When you deploy or benchmark this, three numbers matter: time to first token, inter-token latency, and total token throughput. They fight each other: growing the batch is nearly free throughput until the GPU is fully busy — that's slide 5's bandwidth story (benchmarking docs call this the "saturation point") — but past it, each request's tokens arrive slower. If someone asks how both curves can rise at once: throughput is the aggregate across all requests (batch ÷ step time), latency is per-user (one token per step) — a bigger batch slows the step slightly while multiplying tokens per step, like a bigger bus: more passengers per hour, each trip a little slower. Chat UIs care about the left of this curve; batch pipelines care about the right; vLLM exposes the knobs to pick your point. If you keep five things: models emit one token at a time; prefill and decode are different workloads; the KV cache is the scarce resource; PagedAttention manages it like virtual memory; continuous batching keeps the GPU full. Everything deeper — multi-GPU serving and the rest — is in the Anatomy of vLLM post, which this talk is built on. Questions?
+**Speaker notes:** When you deploy or benchmark this, three numbers matter: time to first token, time per output token, and total token throughput. They fight each other: growing the batch is nearly free throughput until the GPU is fully busy — that's slide 5's bandwidth story (benchmarking docs call this the "saturation point") — but past it, each request's tokens arrive slower. If someone asks how both curves can rise at once: throughput is the aggregate across all requests (batch ÷ step time), latency is per-user (one token per step) — a bigger batch slows the step slightly while multiplying tokens per step, like a bigger bus: more passengers per hour, each trip a little slower. Chat UIs care about the left of this curve; batch pipelines care about the right; vLLM exposes the knobs to pick your point. If you keep five things: models emit one token at a time; prefill and decode are different workloads; the KV cache is the scarce resource; PagedAttention manages it like virtual memory; continuous batching keeps the GPU full. Everything deeper — multi-GPU serving and the rest — is in the Anatomy of vLLM post, which this talk is built on. Questions?
