@@ -1,7 +1,7 @@
 # vLLM Fundamentals — 15-minute talk, slide content spec
 
 - **Audience:** software engineers, little/no LLM-inference background
-- **Duration:** 18 min (15 slides). For a hard 15-minute slot, the designated cut is the advanced trio (slides 11–13) — dropping them restores exactly 15:00 without touching the core arc.
+- **Duration:** 18 min (15 slides). For a hard 15-minute slot, the designated cut is the advanced trio (slides 12–14) — dropping them restores exactly 15:00 without touching the core arc.
 - **Goal:** after the talk, the audience can explain why serving LLMs is a memory problem and what vLLM's two core tricks (PagedAttention, continuous batching) do about it
 - **Style:** one big visual per slide, plus a one-line lede (the key idea in a full sentence) and a row of fact pills with concrete numbers — enough that the slides teach on their own; the speaker notes carry the narrative
 - **Primary source:** [Anatomy of vLLM](https://vllm.ai/blog/2025-09-05-anatomy-of-vllm) (vLLM team, Sep 2025)
@@ -45,7 +45,7 @@ Note: figures are drawn light-background; on a dark deck place them on a white r
 | < 4% KV waste with PagedAttention | 8 | same paper |
 | block size = 16 tokens | 8 | vLLM default |
 | prefix caching on by default | 10 | vLLM v1 default |
-| 14 GB → 7 GB (fp8) → 3.5 GB (int4) | 11 | arithmetic: same 7e9 params at 2 / 1 / 0.5 bytes |
+| 14 GB → 7 GB (fp8) → 3.5 GB (int4) | 12 | arithmetic: same 7e9 params at 2 / 1 / 0.5 bytes |
 
 ## Agenda / time budget
 
@@ -65,16 +65,16 @@ Bookend structure: the architecture map is shown FIRST (slide 2) as orientation 
 | 8 | PagedAttention | 2:00 |
 | 9 | Continuous batching | 2:00 |
 | 10 | Prefix caching | 1:00 |
-| 11 | Quantization | 1:00 |
-| 12 | Speculative decoding | 1:00 |
-| 13 | CUDA graphs & host overhead | 1:00 |
-| 14 | vLLM architecture — revisited | 1:00 |
+| 11 | vLLM architecture — revisited | 1:00 |
+| 12 | Quantization | 1:00 |
+| 13 | Speculative decoding | 1:00 |
+| 14 | CUDA graphs & host overhead | 1:00 |
 | 15 | The latency–throughput tradeoff | 1:30 |
 | | **Total** | **18:00** |
 
 ## Scope: what this talk deliberately skips
 
-The advanced levers (quantization, speculative decoding, CUDA graphs & host overhead) are taught as short slides 11–13; chunked prefill gets one pill on slide 9. Still skipped, named on slide 15's "not covered today" strip:
+The advanced levers (quantization, speculative decoding, CUDA graphs & host overhead) are taught as short slides 12–14, placed after the architecture revisit closes the core arc; chunked prefill gets one pill on slide 9. Still skipped, named on slide 15's "not covered today" strip:
 
 - **Multi-GPU serving** (tensor/pipeline parallelism, disaggregated prefill/decode) — scale-out once one GPU isn't enough; a different problem class from the single-GPU mental model this talk builds.
 
@@ -243,7 +243,22 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 
 ---
 
-## Slide 11 — Quantization (1:00)
+## Slide 11 — vLLM architecture — revisited (1:00)
+
+**Key message:** The same map from slide 2 — but now the audience knows every box; the whole machine is a schedule → forward → postprocess loop around the paged KV cache.
+
+**On-slide text:**
+- lede: "Request lifecycle: tokenize → waiting queue → scheduled into a batch → one GPU pass → sample → stream. Then the loop runs again."
+- engine core loops every ~10 ms
+- slide tags on the boxes: scheduler → 9 · model executor → 3–5 · KV manager → 6/8/10
+
+**Visual:** Split layout. Left: simple custom architecture map, ≤6 boxes — "API server (OpenAI-compatible)" on top, below it an "Engine core" ring containing **Scheduler** (waiting/running queues), **Model executor / GPU forward pass**, **postprocess: sample & stream**, with the **KV cache manager + block pool** in the center. Right: **reuse `engine_loop.png`** — the blog's clean drawing of a request entering the waiting queue and the schedule → forward pass → postprocess ring. Overlay small colored tags mapping boxes back to earlier slides: scheduler → "slide 9", model executor → "slides 3–5", KV cache manager → "slides 6/8/10", each echoing that slide's accent color so the map reads as a recap.
+
+**Speaker notes:** Remember the map from the start? You now know every box. Requests land on the API server, get tokenized, and enter the scheduler's waiting queue; every ~10 ms the loop runs — the scheduler builds a fresh batch, the KV manager hands out blocks, the model executor does one flattened GPU pass, postprocessing samples and streams each token. The black box from slide 1 is just a tight scheduler-plus-allocator loop wrapped around a GPU. (Keep this quick — it's a victory lap, not new material.)
+
+---
+
+## Slide 12 — Quantization (1:00)
 
 **Key message:** Shrink the bytes: storing weights in 8 or 4 bits instead of 16 directly raises the memory-bound speed ceiling from slide 5.
 
@@ -259,7 +274,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 
 ---
 
-## Slide 12 — Speculative decoding (1:00)
+## Slide 13 — Speculative decoding (1:00)
 
 **Key message:** Attack the serial token loop: a cheap draft proposes several tokens and the big model verifies them all in one pass — with output guaranteed identical.
 
@@ -275,7 +290,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 
 ---
 
-## Slide 13 — CUDA graphs & host overhead (1:00)
+## Slide 14 — CUDA graphs & host overhead (1:00)
 
 **Key message:** Between GPU passes the Python host schedules, samples, and launches kernels — at small batch those gaps dominate ITL, and CUDA graphs shrink them by replaying a pre-recorded step.
 
@@ -288,21 +303,6 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Visual:** Two horizontal timelines. Top "eager": alternating segments — wide grey "host" gaps between blue "GPU" blocks. Bottom "CUDA graphs": thin host slivers, GPU blocks packed nearly back-to-back. Caption: "record once, replay every step".
 
 **Speaker notes:** The GPU never launches its own work — the CPU does, kernel by kernel, with Python scheduling and sampling in between. Each decode step is only a few milliseconds of GPU time, so even a millisecond of host work between steps lands directly on inter-token latency. CUDA graphs fix the launch half: record the step's entire kernel sequence once, then replay it as a single unit — that's what vLLM's capture phase at startup is doing. Classic Amdahl: at big batch the long GPU step hides host time; at small batch, host overhead is the bottleneck.
-
----
-
-## Slide 14 — vLLM architecture — revisited (1:00)
-
-**Key message:** The same map from slide 2 — but now the audience knows every box; the whole machine is a schedule → forward → postprocess loop around the paged KV cache.
-
-**On-slide text:**
-- lede: "Request lifecycle: tokenize → waiting queue → scheduled into a batch → one GPU pass → sample → stream. Then the loop runs again."
-- engine core loops every ~10 ms
-- slide tags on the boxes: scheduler → 9 · model executor → 3–5 · KV manager → 6/8/10
-
-**Visual:** Split layout. Left: simple custom architecture map, ≤6 boxes — "API server (OpenAI-compatible)" on top, below it an "Engine core" ring containing **Scheduler** (waiting/running queues), **Model executor / GPU forward pass**, **postprocess: sample & stream**, with the **KV cache manager + block pool** in the center. Right: **reuse `engine_loop.png`** — the blog's clean drawing of a request entering the waiting queue and the schedule → forward pass → postprocess ring. Overlay small colored tags mapping boxes back to earlier slides: scheduler → "slide 9", model executor → "slides 3–5", KV cache manager → "slides 6/8/10", each echoing that slide's accent color so the map reads as a recap.
-
-**Speaker notes:** Remember the map from the start? You now know every box. Requests land on the API server, get tokenized, and enter the scheduler's waiting queue; every ~10 ms the loop runs — the scheduler builds a fresh batch, the KV manager hands out blocks, the model executor does one flattened GPU pass, postprocessing samples and streams each token. The black box from slide 1 is just a tight scheduler-plus-allocator loop wrapped around a GPU. (Keep this quick — it's a victory lap, not new material.)
 
 ---
 
