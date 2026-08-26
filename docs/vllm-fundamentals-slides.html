@@ -665,7 +665,7 @@ h2 {
                 <div class="row"><span>&#9632;</span><span>7B model @ fp16 &asymp; <b>14 GB</b> of weights &mdash; read <b>every step</b></span></div>
                 <div class="row"><span>&#9632;</span><span>A100 HBM &asymp; 2 TB/s &rarr; <b>~140 tok/s ceiling</b> at batch&nbsp;=&nbsp;1 <em>(back-of-envelope)</em></span></div>
                 <div class="row"><span class="dot blue"></span><span><b>batch&nbsp;=&nbsp;1</b> &mdash; low on the bandwidth-bound slope, compute idle</span></div>
-                <div class="row"><span class="dot gold"></span><span><b>batch&nbsp;=&nbsp;32</b> &mdash; near saturation: same weight read, <b>32&times; the tokens</b></span></div>
+                <div class="row"><span class="dot gold"></span><span><b>batch&nbsp;=&nbsp;32</b> &mdash; GPU nearly fully busy: same weight read, <b>32&times; the tokens</b></span></div>
                 <div class="row"><span>&#9632;</span><span>x-axis "arithmetic intensity" = <b>math done per byte moved</b> &mdash; decode is far left</span></div>
             </div>
         </div>
@@ -994,13 +994,13 @@ h2 {
     <div class="slide-content">
         <h2 class="reveal">The latency&ndash;throughput <span class="gold-accent">tradeoff</span></h2>
         <ul class="lede-list reveal">
-            <li>bigger batches buy throughput until the GPU <strong>saturates</strong></li>
+            <li>bigger batches buy throughput until the GPU is <strong>fully busy</strong></li>
             <li>past that point, <strong>every request's tokens arrive slower</strong></li>
         </ul>
         <div class="metrics-wrap reveal">
             <div class="curve-card">
-                <!-- Latency-throughput tradeoff: throughput saturates at the knee, latency rises past it -->
-                <svg viewBox="0 0 420 260" role="img" aria-label="Latency versus throughput curve with saturation knee">
+                <!-- Latency-throughput tradeoff: throughput flattens once the GPU is fully busy, latency rises past that point -->
+                <svg viewBox="0 0 420 260" role="img" aria-label="Latency versus throughput curve; throughput flattens and latency rises once the GPU is fully busy">
                     <line x1="40" y1="220" x2="400" y2="220" stroke="#1e2b47" stroke-width="2"/>
                     <line x1="40" y1="20"  x2="40"  y2="220" stroke="#1e2b47" stroke-width="2"/>
                     <line x1="230" y1="20" x2="230" y2="220" stroke="#92a0ba" stroke-width="1" stroke-dasharray="4 5"/>
@@ -1008,7 +1008,7 @@ h2 {
                     <path d="M 40 190 C 120 188, 200 185, 240 175 C 300 158, 360 90, 400 40" fill="none" stroke="#fdb517" stroke-width="3"/>
                     <text x="48" y="40"  fill="#30a2ff" font-size="13" font-family="JetBrains Mono">tokens/sec</text>
                     <text x="292" y="120" fill="#fdb517" font-size="13" font-family="JetBrains Mono">latency</text>
-                    <text x="236" y="34" fill="#92a0ba" font-size="12" font-family="JetBrains Mono">saturation</text>
+                    <text x="236" y="34" fill="#92a0ba" font-size="12" font-family="JetBrains Mono">GPU fully busy</text>
                     <text x="60"  y="242" fill="#92a0ba" font-size="12" font-family="JetBrains Mono">latency-friendly</text>
                     <text x="250" y="242" fill="#92a0ba" font-size="12" font-family="JetBrains Mono">throughput territory</text>
                     <text x="330" y="216" fill="#92a0ba" font-size="12" font-family="JetBrains Mono">load &rarr;</text>
