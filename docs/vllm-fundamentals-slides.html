@@ -267,14 +267,18 @@ h2 {
     box-shadow: 0 0 2.2rem rgba(48,162,255,0.25);
 }
 .stream { display: flex; gap: 0.4rem; }
-/* Whole group: appear — hold — disappear — repeat. One gentle fade,
-   no per-token stagger, no sliding. */
-.stream { animation: streamBlink 3s infinite; }
-@keyframes streamBlink {
-    0%, 8%    { opacity: 0; }
-    22%, 78%  { opacity: 1; }
-    92%, 100% { opacity: 0; }
-}
+/* Typewriter cycle (3.6s): tokens pop in one-by-one and STAY solid,
+   phrase holds full, one quick clear, then it re-types. Opacity only,
+   near-instant transitions — nothing visible ever pulses. */
+.stream .cell { opacity: 0; }
+.stream .cell:nth-child(1) { animation: stream1 3.6s infinite; }
+.stream .cell:nth-child(2) { animation: stream2 3.6s infinite; }
+.stream .cell:nth-child(3) { animation: stream3 3.6s infinite; }
+.stream .cell:nth-child(4) { animation: stream4 3.6s infinite; }
+@keyframes stream1 { 0%, 4%  { opacity: 0; } 6%, 84%  { opacity: 1; } 86%, 100% { opacity: 0; } }
+@keyframes stream2 { 0%, 18% { opacity: 0; } 20%, 84% { opacity: 1; } 86%, 100% { opacity: 0; } }
+@keyframes stream3 { 0%, 32% { opacity: 0; } 34%, 84% { opacity: 1; } 86%, 100% { opacity: 0; } }
+@keyframes stream4 { 0%, 46% { opacity: 0; } 48%, 84% { opacity: 1; } 86%, 100% { opacity: 0; } }
 
 /* ===========================================
    SLIDE 2 — TOKEN LOOP
