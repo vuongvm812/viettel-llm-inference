@@ -3,7 +3,7 @@
 - **Audience:** software engineers, little/no LLM-inference background
 - **Duration:** 18 min (15 slides). For a hard 15-minute slot, the designated cut is the advanced trio (slides 12–14) — dropping them restores exactly 15:00 without touching the core arc.
 - **Goal:** after the talk, the audience can explain why serving LLMs is a memory problem and what vLLM's two core tricks (PagedAttention, continuous batching) do about it
-- **Style:** one big visual per slide, plus a one-line lede (the key idea in a full sentence) and a row of fact pills with concrete numbers — enough that the slides teach on their own; the speaker notes carry the narrative
+- **Style:** one big visual per slide, plus two concise lede bullets (each fits one line — never wrapped mid-sentence) and a row of fact pills with concrete numbers — enough that the slides teach on their own; the speaker notes carry the narrative
 - **Primary source:** [Anatomy of vLLM](https://vllm.ai/blog/2025-09-05-anatomy-of-vllm) (vLLM team, Sep 2025)
 - **Visuals policy:** reuse a blog figure only when it is simple enough to read from the back of the room in ~5 seconds. The blog's worked-example figures (block metadata, hash maps, slot mappings) are great for reading, too dense for a slide — for those, build a simple-stupid diagram of our own instead. Credit "Figure: Anatomy of vLLM, vllm.ai" on every reused image.
 
@@ -102,7 +102,7 @@ Practical follow-up topic for a second talk: the operator knobs (`--max-num-seqs
 **Key message:** Here is the whole machine; the rest of the talk opens one box at a time.
 
 **On-slide text:**
-- lede: "A request flows: in → processor → engine core (scheduler + KV cache manager + model executor) → output processor → out. Every box gets its own slide."
+- lede bullets: `request → processor → engine core → output processor → response` (mono) / engine core = scheduler + KV cache manager + model executor / every box gets its own slide
 - pill: scheduler → slide 9 · model executor → slides 3–5 · KV cache manager → slides 6/8/10
 
 **Visual:** **Reuse the top panel of `engine_constructor.png`, cropped** (cut everything from the green "indexing structure" label downward) on a white rounded card, standard credit line. Overlay small forward-pointing slide tags on three boxes: scheduler → "9", model executor → "3–5", KV cache manager → "6/8/10", using the accent colors those slides will use.
@@ -118,7 +118,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** An LLM is a function you call in a loop: each call reads everything so far and appends exactly one token.
 
 **On-slide text:**
-- lede: "One forward pass reads everything so far and predicts just the next token — append it, feed it back, repeat until `<end>`."
+- lede bullets: one forward pass reads everything so far — and predicts just the next token / append it, feed it back, repeat until `<end>`
 - sub-line under the lede (small mono): a token ≈ a word piece — "inference" is two of them
 - one pass → one token
 - 500-token answer = 500 sequential passes
@@ -136,7 +136,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** Serving one request has two very different phases — prefill (process the whole prompt at once) and decode (one token per step) — and each has its own latency metric.
 
 **On-slide text:**
-- lede: "Prompt tokens all exist up front → processed in one big parallel pass. After that: one pass per new token, forever."
+- lede bullets: prompt tokens all exist up front → one big parallel pass (prefill) / after that: one pass per new token, forever (decode)
 - prefill: whole prompt, one pass → TTFT = how long until the answer starts
 - decode: one token per pass → ITL = the "typing speed" users feel
 - prefill = compute-heavy, parallel · decode = thousands of tiny sequential steps
@@ -152,7 +152,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** Each decode step must stream all model weights from GPU memory to compute one token — the bottleneck is memory bandwidth, not compute.
 
 **On-slide text:**
-- lede: "One decode token = streaming every model weight from GPU memory for a tiny bit of math. Bandwidth sets the speed, not FLOPs."
+- lede bullets: one decode token = streaming EVERY model weight from GPU memory / bandwidth sets the speed, not FLOPs
 - note card: 7B @ fp16 ≈ 14 GB of weights, read every step · A100 HBM ≈ 2 TB/s → ~140 tok/s ceiling at batch = 1 (back-of-envelope) · batch = 1 low on the slope, compute idle · batch = 32 near saturation: same weight read, 32× the tokens · x-axis "arithmetic intensity" = math done per byte moved — decode is far left
 - pills: decode speed ≈ bandwidth ÷ bytes moved · batching is nearly free throughput
 
@@ -167,7 +167,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** To avoid re-processing the whole sequence every step, the engine caches per-token attention state (keys/values) — and that cache grows with every token and eats GPU memory.
 
 **On-slide text:**
-- lede: "To predict the next token, the model compares it against every previous token — that's 'attention'. Each token's comparison data (its keys/values) can be computed once and cached."
+- lede bullets: attention: each new token is compared against every previous token / cache each token's comparison data (keys/values) — compute once, reuse
 - ≈ 0.5 MB per token (7B-class, fp16)
 - 4k-token chat ≈ 2 GB — per request
 - batch size is now capped by KV memory
@@ -183,7 +183,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** Pre-allocating contiguous KV memory per request wastes most of it, and static batching makes finished requests wait for the slowest one.
 
 **On-slide text:**
-- lede: "Output length is unknown → pre-reserve worst-case contiguous memory. Fixed batch → stragglers hold the whole GPU."
+- lede bullets: output length unknown → pre-reserve worst-case contiguous memory / fixed batch → stragglers hold the whole GPU
 - 60–80% of KV memory wasted in pre-vLLM systems (vLLM paper)
 - two classic systems problems → two vLLM ideas, next
 
@@ -198,7 +198,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** vLLM manages KV cache like an OS manages RAM — fixed-size blocks, allocated on demand, with a per-request block table mapping logical positions to scattered physical blocks.
 
 **On-slide text:**
-- lede: "Carve KV memory into fixed 16-token blocks; a per-request block table maps logical positions to any free physical block."
+- lede bullets: carve KV memory into fixed 16-token blocks / a per-request block table maps logical position → any free physical block
 - sub-line under the lede (small mono): the "v" in vLLM = virtual memory — this idea named the whole project
 - waste ≤ one partial block per request
 - measured waste: < 4%, vs 60–80% before
@@ -215,7 +215,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** vLLM rebuilds the batch every single step, so requests join and leave mid-flight and the GPU never idles waiting for stragglers.
 
 **On-slide text:**
-- lede: "Before every forward pass the scheduler rebuilds the batch: finished requests leave, waiting ones join — prefill and decode run together."
+- lede bullets: before every pass the scheduler rebuilds the batch / finished leave, waiting join — prefill and decode run together
 - join instantly, leave instantly
 - all tokens flattened into one GPU pass
 - GPU never waits for the slowest request
@@ -232,7 +232,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** Because KV lives in content-hashed blocks, identical prompt prefixes — like a shared system prompt — are computed once and reused by later requests.
 
 **On-slide text:**
-- lede: "Blocks are content-hashed → the KV cache is content-addressable. Same prefix = same blocks = that prefill is skipped."
+- lede bullets: blocks are content-hashed → the KV cache is content-addressable / same prefix = same blocks = that prefill is skipped
 - shared system prompt / few-shot / chat history → computed once
 - cuts TTFT on nearly every production request
 - on by default in vLLM v1
@@ -248,7 +248,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** The same map from slide 2 — but now the audience knows every box; the whole machine is a schedule → forward → postprocess loop around the paged KV cache.
 
 **On-slide text:**
-- lede: "Request lifecycle: tokenize → waiting queue → scheduled into a batch → one GPU pass → sample → stream. Then the loop runs again."
+- lede bullets: the map from slide 2 — now you can read every box / `tokenize → queue → batch → one GPU pass → sample → stream` — repeat
 - engine core loops every ~10 ms
 - slide tags on the boxes: scheduler → 9 · model executor → 3–5 · KV manager → 6/8/10
 
@@ -263,7 +263,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** Shrink the bytes: storing weights in 8 or 4 bits instead of 16 directly raises the memory-bound speed ceiling from slide 5.
 
 **On-slide text:**
-- lede: "Decode speed ≈ bandwidth ÷ bytes moved (slide 5). Quantization shrinks the bytes: store weights in 8 or 4 bits instead of 16."
+- lede bullets: decode speed ≈ bandwidth ÷ bytes moved (slide 5) / store weights in 8 or 4 bits instead of 16 — fewer bytes to move
 - fp8 = half the bytes → ~2× the bandwidth ceiling
 - accuracy cost is real — measure it, don't assume it
 - the KV cache can be quantized too
@@ -279,7 +279,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** Attack the serial token loop: a cheap draft proposes several tokens and the big model verifies them all in one pass — with output guaranteed identical.
 
 **On-slide text:**
-- lede: "The token loop is serial (slide 3). Trick: a tiny draft model proposes k tokens; the big model verifies them all in ONE pass — accepted guesses are free speed."
+- lede bullets: the token loop is serial (slide 3) / a tiny draft guesses k tokens; the big model verifies all in ONE pass
 - output provably identical to the big model alone
 - wins only when the draft guesses well
 - vLLM drafts: n-gram, EAGLE, Medusa
@@ -295,7 +295,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** Between GPU passes the Python host schedules, samples, and launches kernels — at small batch those gaps dominate ITL, and CUDA graphs shrink them by replaying a pre-recorded step.
 
 **On-slide text:**
-- lede: "Each decode step is ~ms of GPU work — but the Python host must schedule, sample, and launch every kernel between steps. Those gaps add straight to ITL."
+- lede bullets: each step: ~ms of GPU work, but Python schedules & launches in between / those host gaps add straight to ITL
 - thousands of kernel launches → one graph replay
 - matters most at small batch / short steps
 - vLLM captures graphs at startup
@@ -311,7 +311,7 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **Key message:** Judge a serving stack by TTFT, ITL, and throughput — knowing they trade off — and remember five ideas.
 
 **On-slide text:**
-- lede: "Bigger batches buy throughput until the GPU saturates; past that point, every request's tokens arrive slower. Chat UIs live left of it, batch pipelines right."
+- lede bullets: bigger batches buy throughput until the GPU saturates / past that point, every request's tokens arrive slower
 - TTFT · ITL · throughput — pick your tradeoff
 - recap pills: one token at a time · prefill ≠ decode · KV cache = the scarce resource · PagedAttention = virtual memory · continuous batching keeps the GPU full
 - strip: not covered today: multi-GPU serving — tensor/pipeline parallelism, disaggregated prefill/decode
