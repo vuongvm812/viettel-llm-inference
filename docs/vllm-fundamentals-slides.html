@@ -790,13 +790,18 @@ h2 {
                     <span class="cell gold">b1</span><span class="cell"></span><span class="cell gold">b3</span><span class="cell"></span>
                     <span class="cell gold">b0</span><span class="cell"></span><span class="cell gold">b2</span><span class="cell"></span>
                 </div>
+                <div class="diagram-label">physical KV memory on GPU (scattered)</div>
                 <div class="freepool">free block pool &middot; grab on demand, return on finish</div>
             </div>
         </div>
         <div class="pills reveal">
+            <span class="pill">virtual page <b>&equiv;</b> 16-token block</span>
+            <span class="pill">page table <b>&equiv;</b> block table</span>
+            <span class="pill">RAM frame <b>&equiv;</b> KV block</span>
+        </div>
+        <div class="pills reveal">
             <span class="pill">waste &le; <b>one partial block</b> per request</span>
             <span class="pill gold">measured waste: <b>&lt; 4%</b>, vs 60&ndash;80% before</span>
-            <span class="pill">freed blocks return to the pool <b>instantly</b></span>
         </div>
     </div>
 </section>

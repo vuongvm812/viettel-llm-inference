@@ -201,11 +201,12 @@ Title uses the plain term; the formal name "autoregressive generation" is introd
 **On-slide text:**
 - lede bullets: carve KV memory into fixed 16-token blocks / a per-request block table maps logical position → any free physical block
 - sub-line under the lede (small mono): the "v" in vLLM = virtual memory — this idea named the whole project
+- equivalence chips: virtual page ≡ 16-token block · page table ≡ block table · RAM frame ≡ KV block
 - waste ≤ one partial block per request
 - measured waste: < 4%, vs 60–80% before
-- freed blocks return to the pool instantly
+- (dropped "freed blocks return instantly" pill — the free-pool note inside the column already says it)
 
-**Visual:** Simple custom, side-by-side analogy with mirrored layout. Left ("your OS"): a process's contiguous virtual address space → page table → scattered physical RAM frames. Right ("vLLM"): a request's logical token sequence chunked into 16-token blocks → block table → scattered physical KV blocks in GPU memory, plus a "free block pool" bucket blocks are grabbed from on demand and returned to when the request ends. Identical arrow styles on both sides so the analogy lands visually. No metadata, no hashes, no code — max ~12 boxes total. Small footer contrast: slide-7's wasteful strip vs this tightly packed grid.
+**Visual:** Simple custom, side-by-side analogy with mirrored layout. Left ("your OS"): a process's contiguous virtual address space → page table → scattered physical RAM frames. Right ("vLLM"): a request's logical token sequence chunked into 16-token blocks → block table → scattered physical KV blocks in GPU memory, plus a "free block pool" bucket blocks are grabbed from on demand and returned to when the request ends. Identical arrow styles on both sides so the analogy lands visually; both physical grids carry mirrored captions ("physical RAM (scattered)" / "physical KV memory on GPU (scattered)"). Below the columns, an explicit equivalence strip of three mono chips: virtual page ≡ 16-token block · page table ≡ block table · RAM frame ≡ KV block. No metadata, no hashes, no code — max ~12 boxes total.
 
 **Speaker notes:** This is the idea vLLM is named for. Instead of one contiguous slab per request, KV memory is carved into fixed-size blocks — 16 tokens each — and a request grabs a new block from a shared free pool only when it actually fills one. A per-request block table maps logical token positions to physical blocks, exactly like a page table maps virtual to physical memory, so physical blocks can live anywhere. Over-reservation disappears: waste is bounded by one partially-filled block per request. Freed blocks return to the pool instantly for anyone else. If you've ever taken an OS course, you already understood PagedAttention — it's virtual memory for the KV cache, and it's what lets vLLM pack far more concurrent requests into the same GPU.
 
